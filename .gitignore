@@ -1,0 +1,7 @@
+/build/
+*.luac
+*.out
+*.prof
+*.pgo
+*.test
+.DS_Store
