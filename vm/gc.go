@@ -1670,7 +1670,8 @@ func (s *State) drainFinalizers() {
 
 // Close closes the State: closes remaining mainThread <close> variables, runs ALL remaining
 // __gc finalizers in strict LIFO order regardless of reachability (matching lua_close /
-// gc.lua:653-668 / main.lua:333-360,491-501), and flushes/closes all open files.
+// gc.lua:653-668 / main.lua:333-360,491-501), flushes/closes all open files, and clears
+// host-pinned references once top-level finalization finishes.
 func (s *State) Close() {
 	if !s.gc.closing {
 		// Close any active <close> TBC variables on mainThread first (e.g. os.exit(true, true)).
@@ -1727,6 +1728,9 @@ func (s *State) Close() {
 		s.drainFinalizers()
 	}
 	s.closeOpenFiles()
+	if !s.gc.inGCTM {
+		s.gc.pinnedRefs = nil
+	}
 }
 
 func (s *State) drainFinalizersQueued() {
