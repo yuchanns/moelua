@@ -3,11 +3,16 @@ package bytecode
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
+	"strings"
 )
 
 type dumper struct {
 	buf     []byte
+	w       io.Writer // nil on in-memory Dump fast path; non-nil for streaming DumpTo
+	written int       // bytes already flushed to w
+	err     error     // sticky write error for streaming DumpTo
 	strip   bool
 	strings map[string]uint64 // 1-indexed saved strings for Lua 5.5 deduplication
 	nstr    uint64
@@ -36,31 +41,140 @@ func Dump(p *Proto, strip bool) ([]byte, error) {
 	return d.buf, nil
 }
 
+// DumpTo streams a PUC-Rio Lua 5.5.1 binary chunk directly to w using a small
+// chunk buffer (matching ldump.c byte-for-byte without materializing the full chunk).
+func DumpTo(w io.Writer, p *Proto, strip bool) error {
+	if w == nil {
+		return fmt.Errorf("dump: nil writer")
+	}
+	if p == nil {
+		return fmt.Errorf("dump: nil proto")
+	}
+	if len(p.Upvalues) > MaxArgA {
+		return fmt.Errorf("dump: too many root upvalues (%d)", len(p.Upvalues))
+	}
+	d := &dumper{
+		buf:     make([]byte, 0, 4096),
+		w:       w,
+		strip:   strip,
+		strings: make(map[string]uint64),
+	}
+	d.writeHeader()
+	d.writeByte(byte(len(p.Upvalues)))
+	if err := d.writeFunction(p); err != nil {
+		return err
+	}
+	return d.flush()
+}
+
+// DumpString serializes a Proto tree directly into a single Go string via DumpTo
+// without an intermediate full []byte copy.
+func DumpString(p *Proto, strip bool) (string, error) {
+	var sb strings.Builder
+	if err := DumpTo(&sb, p, strip); err != nil {
+		return "", err
+	}
+	return sb.String(), nil
+}
+
+func (d *dumper) flush() error {
+	if d.err != nil {
+		return d.err
+	}
+	if d.w == nil || len(d.buf) == 0 {
+		return nil
+	}
+	n, err := d.w.Write(d.buf)
+	d.written += n
+	d.buf = d.buf[:0]
+	if err != nil {
+		d.err = err
+		return err
+	}
+	return nil
+}
+
+func (d *dumper) maybeFlush() {
+	if d.w != nil && len(d.buf) >= 4096 {
+		_ = d.flush()
+	}
+}
+
 func (d *dumper) writeByte(b byte) {
+	if d.err != nil {
+		return
+	}
 	d.buf = append(d.buf, b)
+	d.maybeFlush()
 }
 
 func (d *dumper) writeBytes(b []byte) {
+	if d.err != nil {
+		return
+	}
+	if d.w != nil && len(d.buf)+len(b) >= 4096 {
+		if err := d.flush(); err != nil {
+			return
+		}
+		if len(b) >= 4096 {
+			n, err := d.w.Write(b)
+			d.written += n
+			if err != nil {
+				d.err = err
+			}
+			return
+		}
+	}
 	d.buf = append(d.buf, b...)
+	d.maybeFlush()
 }
 
 func (d *dumper) writeStringLiteral(s string) {
+	if d.err != nil {
+		return
+	}
+	if d.w != nil && len(d.buf)+len(s) >= 4096 {
+		if err := d.flush(); err != nil {
+			return
+		}
+		if len(s) >= 4096 {
+			n, err := io.WriteString(d.w, s)
+			d.written += n
+			if err != nil {
+				d.err = err
+			}
+			return
+		}
+	}
 	d.buf = append(d.buf, s...)
+	d.maybeFlush()
 }
 
 func (d *dumper) writeUint32(v uint32) {
+	if d.err != nil {
+		return
+	}
 	d.buf = binary.LittleEndian.AppendUint32(d.buf, v)
+	d.maybeFlush()
 }
 
 func (d *dumper) writeUint64(v uint64) {
+	if d.err != nil {
+		return
+	}
 	d.buf = binary.LittleEndian.AppendUint64(d.buf, v)
+	d.maybeFlush()
 }
 
 func (d *dumper) writeAlign(align int) {
-	pad := align - (len(d.buf) % align)
+	if d.err != nil {
+		return
+	}
+	pad := align - ((d.written + len(d.buf)) % align)
 	if pad < align {
 		var zeros [8]byte
 		d.buf = append(d.buf, zeros[:pad]...)
+		d.maybeFlush()
 	}
 }
 
@@ -293,6 +407,9 @@ func (d *dumper) writeDebug(p *Proto) error {
 }
 
 func (d *dumper) writeFunction(p *Proto) error {
+	if d.err != nil {
+		return d.err
+	}
 	if err := d.writeInt(p.LineDefined); err != nil {
 		return err
 	}
@@ -321,5 +438,8 @@ func (d *dumper) writeFunction(p *Proto) error {
 			return err
 		}
 	}
-	return d.writeDebug(p)
+	if err := d.writeDebug(p); err != nil {
+		return err
+	}
+	return d.err
 }

@@ -19,6 +19,7 @@ import (
 	"weak"
 
 	"github.com/yuchanns/moelua/bytecode"
+	"github.com/yuchanns/moelua/compiler"
 	"github.com/yuchanns/moelua/internal/luastdlib"
 )
 
@@ -223,6 +224,136 @@ func nativeWarn(s *State, args []Value) ([]Value, error) {
 	return nil, nil
 }
 
+type loadReaderLuaErr struct {
+	val Value
+}
+
+func (e loadReaderLuaErr) Error() string { return FormatValue(e.val) }
+
+type loadFileReadErr struct {
+	err error
+}
+
+func (e loadFileReadErr) Error() string { return e.err.Error() }
+
+func (e loadFileReadErr) Unwrap() error { return e.err }
+
+type fileErrReader struct {
+	r io.Reader
+}
+
+func (f fileErrReader) Read(p []byte) (int, error) {
+	n, err := f.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return n, loadFileReadErr{err: err}
+	}
+	return n, err
+}
+
+// luaFuncReader adapts a Lua reader function passed to load(reader, ...) into a lazy,
+// ZIO-style io.Reader without draining the whole stream into memory before compiling/undumping.
+type luaFuncReader struct {
+	s   *State
+	fn  Value
+	cur string
+	off int
+	eof bool
+}
+
+func (r *luaFuncReader) Read(p []byte) (int, error) {
+	if r.off < len(r.cur) {
+		n := copy(p, r.cur[r.off:])
+		r.off += n
+		if r.off >= len(r.cur) {
+			r.cur = ""
+			r.off = 0
+		}
+		return n, nil
+	}
+	if r.eof {
+		return 0, io.EOF
+	}
+	res, err := r.s.Call(r.fn)
+	if err != nil {
+		r.eof = true
+		if isUncatchableErr(err) {
+			return 0, err
+		}
+		return 0, loadReaderLuaErr{val: errorToLuaValue(r.s, err)}
+	}
+	if len(res) == 0 || res[0].IsNil() {
+		r.eof = true
+		return 0, io.EOF
+	}
+	if !res[0].IsString() && !res[0].IsNumber() {
+		r.eof = true
+		return 0, fmt.Errorf("reader function must return a string")
+	}
+	piece := FormatValue(res[0])
+	if piece == "" {
+		r.eof = true
+		return 0, io.EOF
+	}
+	n := copy(p, piece)
+	if n < len(piece) {
+		r.cur = piece
+		r.off = n
+	}
+	return n, nil
+}
+
+func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv bool) (Value, error) {
+	isBin := len(src) > 0 && src[0] == 0x1b
+	if isBin {
+		if !strings.ContainsRune(mode, 'b') {
+			return NilValue(), fmt.Errorf("attempt to load a binary chunk (mode is '%s')", mode)
+		}
+		p, err := bytecode.Undump([]byte(src))
+		if err != nil {
+			return NilValue(), err
+		}
+		cl, err := s.Load(p)
+		if err != nil {
+			return NilValue(), err
+		}
+		if hasEnv && len(cl.upvals) > 0 {
+			cl.upvals[0] = &Upvalue{closed: env}
+		}
+		return ClosureValue(cl), nil
+	}
+	if !strings.ContainsRune(mode, 't') {
+		return NilValue(), fmt.Errorf("attempt to load a text chunk (mode is '%s')", mode)
+	}
+	if s.compilerFn == nil {
+		return NilValue(), fmt.Errorf("text compiler not configured")
+	}
+	var p *bytecode.Proto
+	var err error
+	if s.compilerReaderFn != nil {
+		// Default compiler: preserve string fast path while honoring memLimit if configured.
+		var opts []compiler.Option
+		if s.memLimit > 0 {
+			opts = append(opts, compiler.WithMemoryCheck(func(n int64) error {
+				return s.checkMem(n)
+			}))
+		}
+		p, err = compiler.Compile(chunkName, src, opts...)
+	} else {
+		p, err = s.compilerFn(chunkName, src)
+	}
+	if err != nil {
+		return NilValue(), err
+	}
+	cl, err := s.Load(p)
+	if err != nil {
+		return NilValue(), err
+	}
+	if hasEnv && len(cl.upvals) > 0 {
+		cl.upvals[0] = &Upvalue{closed: env}
+	}
+	return ClosureValue(cl), nil
+}
+
 func (s *State) loadChunkBytes(data []byte, chunkName, mode string, env Value, hasEnv bool) (Value, error) {
 	isBin := len(data) > 0 && data[0] == 0x1b
 	if isBin {
@@ -242,19 +373,142 @@ func (s *State) loadChunkBytes(data []byte, chunkName, mode string, env Value, h
 		}
 		return ClosureValue(cl), nil
 	}
+	return s.loadChunkString(string(data), chunkName, mode, env, hasEnv)
+}
+
+func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, hasEnv, stripFileHeader bool) (Value, error) {
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReaderSize(r, 4096)
+	}
+	if stripFileHeader {
+		// Strip optional UTF-8 BOM (only peek 3 bytes if byte 0 == 0xEF).
+		b0, err := br.Peek(1)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return NilValue(), loadFileReadErr{err: err}
+		}
+		if len(b0) == 1 && b0[0] == 0xEF {
+			b3, perr := br.Peek(3)
+			if perr != nil && !errors.Is(perr, io.EOF) {
+				return NilValue(), loadFileReadErr{err: perr}
+			}
+			if len(b3) == 3 && b3[0] == 0xEF && b3[1] == 0xBB && b3[2] == 0xBF {
+				_, _ = br.Discard(3)
+			}
+		}
+		// Strip optional initial '#' comment line (lauxlib.c:luaL_loadfilex).
+		b0, err = br.Peek(1)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return NilValue(), loadFileReadErr{err: err}
+		}
+		if len(b0) == 1 && b0[0] == '#' {
+			for {
+				pb, perr := br.Peek(1)
+				if perr != nil {
+					if errors.Is(perr, io.EOF) {
+						break
+					}
+					return NilValue(), loadFileReadErr{err: perr}
+				}
+				if pb[0] == '\n' {
+					b2, perr2 := br.Peek(2)
+					if perr2 != nil && !errors.Is(perr2, io.EOF) {
+						return NilValue(), loadFileReadErr{err: perr2}
+					}
+					// Keep '\n' for text chunks so line 2 stays line 2; consume it if binary chunk follows.
+					if len(b2) == 2 && b2[1] == 0x1b {
+						_, _ = br.Discard(1)
+					}
+					break
+				}
+				if _, rerr := br.ReadByte(); rerr != nil {
+					if errors.Is(rerr, io.EOF) {
+						break
+					}
+					return NilValue(), loadFileReadErr{err: rerr}
+				}
+			}
+		}
+	}
+
+	b0, err := br.Peek(1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		if stripFileHeader {
+			return NilValue(), loadFileReadErr{err: err}
+		}
+		return NilValue(), err
+	}
+	isBin := len(b0) == 1 && b0[0] == 0x1b
+	var streamTempBytes int64
+	defer func() {
+		s.gc.tempBytes -= streamTempBytes
+	}()
+	var checkMem func(int64) error
+	if s.memLimit > 0 {
+		checkMem = func(n int64) error {
+			if n <= streamTempBytes {
+				return nil
+			}
+			delta := n - streamTempBytes
+			if merr := s.checkMem(delta); merr != nil {
+				return merr
+			}
+			streamTempBytes = n
+			s.gc.tempBytes += delta
+			return nil
+		}
+	}
+	if isBin {
+		if !strings.ContainsRune(mode, 'b') {
+			return NilValue(), fmt.Errorf("attempt to load a binary chunk (mode is '%s')", mode)
+		}
+		p, uerr := bytecode.UndumpReaderWithLimit(br, checkMem)
+		if uerr != nil {
+			return NilValue(), uerr
+		}
+		s.gc.tempBytes -= streamTempBytes
+		streamTempBytes = 0
+		cl, lerr := s.Load(p)
+		if lerr != nil {
+			return NilValue(), lerr
+		}
+		if hasEnv && len(cl.upvals) > 0 {
+			cl.upvals[0] = &Upvalue{closed: env}
+		}
+		return ClosureValue(cl), nil
+	}
 	if !strings.ContainsRune(mode, 't') {
 		return NilValue(), fmt.Errorf("attempt to load a text chunk (mode is '%s')", mode)
 	}
 	if s.compilerFn == nil {
 		return NilValue(), fmt.Errorf("text compiler not configured")
 	}
-	p, err := s.compilerFn(chunkName, string(data))
-	if err != nil {
-		return NilValue(), err
+	var p *bytecode.Proto
+	if s.compilerReaderFn != nil {
+		opts := []compiler.Option{compiler.SkipFileHeader(false)}
+		if checkMem != nil {
+			opts = append(opts, compiler.WithMemoryCheck(checkMem))
+		}
+		p, err = s.compilerReaderFn(chunkName, br, opts...)
+		if err != nil {
+			return NilValue(), err
+		}
+	} else {
+		// Custom host compiler registered via SetCompiler: read bounded stream and delegate.
+		data, rerr := s.readBoundedStream(br)
+		if rerr != nil {
+			return NilValue(), rerr
+		}
+		p, err = s.compilerFn(chunkName, string(data))
+		if err != nil {
+			return NilValue(), err
+		}
 	}
-	cl, err := s.Load(p)
-	if err != nil {
-		return NilValue(), err
+	s.gc.tempBytes -= streamTempBytes
+	streamTempBytes = 0
+	cl, lerr := s.Load(p)
+	if lerr != nil {
+		return NilValue(), lerr
 	}
 	if hasEnv && len(cl.upvals) > 0 {
 		cl.upvals[0] = &Upvalue{closed: env}
@@ -262,53 +516,46 @@ func (s *State) loadChunkBytes(data []byte, chunkName, mode string, env Value, h
 	return ClosureValue(cl), nil
 }
 
+func (s *State) readBoundedStream(r io.Reader) ([]byte, error) {
+	var buf bytes.Buffer
+	var readBytes int64
+	defer func() {
+		s.gc.tempBytes -= readBytes
+	}()
+	var tmp [4096]byte
+	for {
+		n, err := r.Read(tmp[:])
+		if n > 0 {
+			if merr := s.checkMem(int64(n)); merr != nil {
+				return nil, merr
+			}
+			if readBytes+int64(n) > (1 << 30) {
+				return nil, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+			}
+			buf.Write(tmp[:n])
+			readBytes += int64(n)
+			s.gc.tempBytes += int64(n)
+		}
+		if errors.Is(err, io.EOF) {
+			return buf.Bytes(), nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
 func nativeLoad(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'load'")
 	}
-	var data []byte
 	chunkName := "=(load)"
-	if args[0].IsString() || args[0].IsNumber() {
-		str := FormatValue(args[0])
-		data = []byte(str)
-		chunkName = str
-	} else if args[0].IsFunction() {
-		var buf bytes.Buffer
-		var readerBytes int64
-		defer func() {
-			s.gc.tempBytes -= readerBytes
-		}()
-		for {
-			res, err := s.Call(args[0])
-			if err != nil {
-				if isUncatchableErr(err) {
-					return nil, err
-				}
-				return []Value{NilValue(), errorToLuaValue(s, err)}, nil
-			}
-			if len(res) == 0 || res[0].IsNil() {
-				break
-			}
-			if !res[0].IsString() && !res[0].IsNumber() {
-				return []Value{NilValue(), StringValue(s.intern.Intern("reader function must return a string"))}, nil
-			}
-			piece := FormatValue(res[0])
-			if piece == "" {
-				break
-			}
-			pieceLen := int64(len(piece))
-			if err := s.checkMem(pieceLen); err != nil {
-				return []Value{NilValue(), errorToLuaValue(s, err)}, nil
-			}
-			if readerBytes+pieceLen > (1 << 30) {
-				return []Value{NilValue(), StringValue(s.intern.Intern("not enough memory"))}, nil
-			}
-			buf.WriteString(piece)
-			readerBytes += pieceLen
-			s.gc.tempBytes += pieceLen
-		}
-		data = buf.Bytes()
-	} else {
+	isStr := args[0].IsString() || args[0].IsNumber()
+	var strSrc string
+	if isStr {
+		strSrc = FormatValue(args[0])
+		chunkName = strSrc
+	} else if !args[0].IsFunction() {
 		return nil, fmt.Errorf("bad argument #1 to 'load' (string or function expected)")
 	}
 	if len(args) >= 2 && !args[1].IsNil() {
@@ -330,8 +577,26 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 	if hasEnv {
 		env = args[3]
 	}
-	fn, err := s.loadChunkBytes(data, chunkName, mode, env, hasEnv)
+	var fn Value
+	var err error
+	if isStr {
+		fn, err = s.loadChunkString(strSrc, chunkName, mode, env, hasEnv)
+	} else {
+		lr := &luaFuncReader{s: s, fn: args[0]}
+		fn, err = s.loadChunkReader(lr, chunkName, mode, env, hasEnv, false)
+	}
 	if err != nil {
+		if isUncatchableErr(err) {
+			return nil, err
+		}
+		var rle loadReaderLuaErr
+		if errors.As(err, &rle) {
+			return []Value{NilValue(), rle.val}, nil
+		}
+		var le *LuaError
+		if errors.As(err, &le) {
+			return []Value{NilValue(), le.Val}, nil
+		}
 		return []Value{NilValue(), StringValue(s.intern.Intern(err.Error()))}, nil
 	}
 	return []Value{fn}, nil
@@ -342,6 +607,15 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 func (s *State) LoadChunk(data []byte, chunkName string) (Value, error) {
 	data = stripBOMAndShebang(data)
 	return s.loadChunkBytes(data, chunkName, "bt", NilValue(), false)
+}
+
+// LoadChunkReader streams a text or binary Lua 5.5.1 chunk from r without materializing
+// the entire input buffer in memory, stripping UTF-8 BOM and an initial '#' comment line.
+func (s *State) LoadChunkReader(r io.Reader, chunkName string) (Value, error) {
+	if r == nil {
+		return NilValue(), fmt.Errorf("cannot read %s: nil reader", chunkName)
+	}
+	return s.loadChunkReader(r, chunkName, "bt", NilValue(), false, true)
 }
 
 func stripBOMAndShebang(data []byte) []byte {
@@ -361,25 +635,25 @@ func stripBOMAndShebang(data []byte) []byte {
 }
 
 func nativeLoadFile(s *State, args []Value) ([]Value, error) {
-	var data []byte
-	var err error
 	chunkName := "=stdin"
+	var fname string
+	var r io.Reader
+	var f *os.File
 	if len(args) == 0 || args[0].IsNil() {
-		data, err = s.ReadAllStdin()
+		// Pass io.stdin's *bufio.Reader directly so loadChunkReader reuses its buffer without
+		// creating a second read-ahead buffer that would consume bytes past the chunk.
+		r = s.StdinReader()
 	} else {
-		fname := FormatValue(args[0])
+		fname = FormatValue(args[0])
 		chunkName = "@" + fname
-		data, err = os.ReadFile(fname)
-	}
-	if err != nil {
-		var le *LuaError
-		if errors.As(err, &le) {
-			return []Value{NilValue(), le.Val}, nil
+		var err error
+		f, err = os.Open(fname)
+		if err != nil {
+			return []Value{NilValue(), StringValue(s.intern.Intern(fmt.Sprintf("cannot open %s", err.Error())))}, nil
 		}
-		return []Value{NilValue(), StringValue(s.intern.Intern(fmt.Sprintf("cannot open %s", err.Error())))}, nil
+		defer f.Close()
+		r = fileErrReader{r: f}
 	}
-	// Strip UTF-8 BOM and initial '#' comment line per Lua 5.5 lauxlib.c:luaL_loadfilex (files.lua:571,595).
-	data = stripBOMAndShebang(data)
 	mode := "bt"
 	if len(args) >= 2 && !args[1].IsNil() {
 		mode = FormatValue(args[1])
@@ -389,8 +663,23 @@ func nativeLoadFile(s *State, args []Value) ([]Value, error) {
 	if hasEnv {
 		env = args[2]
 	}
-	fn, err := s.loadChunkBytes(data, chunkName, mode, env, hasEnv)
+	fn, err := s.loadChunkReader(r, chunkName, mode, env, hasEnv, true)
 	if err != nil {
+		if isUncatchableErr(err) {
+			return nil, err
+		}
+		var le *LuaError
+		if errors.As(err, &le) {
+			return []Value{NilValue(), le.Val}, nil
+		}
+		var fre loadFileReadErr
+		if errors.As(err, &fre) {
+			target := "stdin"
+			if fname != "" {
+				target = fname
+			}
+			return []Value{NilValue(), StringValue(s.intern.Intern(fmt.Sprintf("cannot read %s: %s", target, fre.err.Error())))}, nil
+		}
 		return []Value{NilValue(), StringValue(s.intern.Intern(err.Error()))}, nil
 	}
 	return []Value{fn}, nil
@@ -1041,6 +1330,16 @@ func (s *State) ReadStdinLine() (string, error) {
 		return lf.reader().ReadString('\n')
 	}
 	return "", io.EOF
+}
+
+// StdinReader returns the buffered io.Reader backing the State's original io.stdin
+// so streaming script loads (`loadfile()`, `moelua -`) share buffering with earlier
+// `io.read` calls without draining all of stdin into memory up front.
+func (s *State) StdinReader() io.Reader {
+	if lf, ok := asLuaFile(s.stdinInput); ok && !lf.closed && lf.f != nil {
+		return lf.reader()
+	}
+	return bytes.NewReader(nil)
 }
 
 // ReadAllStdin reads all remaining bytes from the State's original io.stdin reader
@@ -2107,7 +2406,16 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	}
 	name := FormatValue(args[0])
 	key := s.intern.Intern(name)
-	if existing := s.loadedTbl.RawGetStr(key); !existing.IsFalsy() {
+	loadedVal := TableValue(s.loadedTbl)
+	existing := s.loadedTbl.RawGetStr(key)
+	if existing.IsNil() && s.loadedTbl.meta != nil {
+		var gerr error
+		existing, gerr = s.finishGet(loadedVal, StringValue(key))
+		if gerr != nil {
+			return nil, gerr
+		}
+	}
+	if !existing.IsFalsy() {
 		return []Value{existing}, nil
 	}
 	sv := s.pkgTbl.RawGetStr(s.intern.Intern("searchers"))
@@ -2171,11 +2479,26 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 		return nil, err
 	}
 	if len(res) > 0 && !res[0].IsNil() {
-		s.loadedTbl.RawSetStr(s, key, res[0])
-	} else if s.loadedTbl.RawGetStr(key).IsNil() {
-		s.loadedTbl.RawSetStr(s, key, TrueValue())
+		th.stack[baseTop] = res[0]
+		if err := s.tableSetStr(loadedVal, key, res[0]); err != nil {
+			return nil, err
+		}
 	}
-	return []Value{s.loadedTbl.RawGetStr(key), extra}, nil
+	finalVal := s.loadedTbl.RawGetStr(key)
+	if finalVal.IsNil() && s.loadedTbl.meta != nil {
+		var gerr error
+		finalVal, gerr = s.finishGet(loadedVal, StringValue(key))
+		if gerr != nil {
+			return nil, gerr
+		}
+	}
+	if finalVal.IsNil() {
+		finalVal = TrueValue()
+		if err := s.tableSetStr(loadedVal, key, finalVal); err != nil {
+			return nil, err
+		}
+	}
+	return []Value{finalVal, extra}, nil
 }
 
 func searchPath(name, path, sep, rep string) (string, string) {

@@ -1086,12 +1086,11 @@ func (s *State) tableSetInt(v Value, idx int64, val Value) error {
 				return fmt.Errorf("attempt to index a %s value", cur.TypeName())
 			}
 		}
-		if tm.IsTable() {
-			cur = tm
-			continue
+		if tm.IsFunction() {
+			_, err := s.Call(tm, cur, key, val)
+			return err
 		}
-		_, err := s.Call(tm, cur, key, val)
-		return err
+		cur = tm
 	}
 	return fmt.Errorf("'__newindex' chain too long; possible loop")
 }

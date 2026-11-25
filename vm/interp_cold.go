@@ -1529,6 +1529,41 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 			}
 			return ok, nil
 		}
+		if intr == intrDoFile {
+			th.top = calleeIdx + 1 + calleeArgs
+			loaded, lerr := nativeLoadFile(s, th.stack[calleeIdx+1:calleeIdx+1+calleeArgs])
+			if lerr != nil {
+				if s.handleError(th, 0, lerr) {
+					return true, nil
+				}
+				return false, lerr
+			}
+			if len(loaded) == 0 || loaded[0].IsNil() {
+				var derr error
+				if len(loaded) > 1 {
+					derr = &LuaError{Val: loaded[1]}
+				} else {
+					derr = fmt.Errorf("dofile failed")
+				}
+				if s.handleError(th, 0, derr) {
+					return true, nil
+				}
+				return false, derr
+			}
+			th.stack[calleeIdx] = loaded[0]
+			cl := loaded[0].AsClosure()
+			if err := th.pushLuaFrame(cl, calleeIdx, 0, -1); err != nil {
+				th.nframe--
+				return false, err
+			}
+			if herr := s.fireLuaCallHook(th, cl, 0); herr != nil {
+				if s.handleError(th, 0, herr) {
+					return true, nil
+				}
+				return false, herr
+			}
+			return true, nil
+		}
 		// General native inside pcall/xpcall (e.g. xpcall(coroutine.yield, msgh) in coroutine.lua:568!):
 		res, hookedNative, err := s.callNativeHooked(th, targetVal, calleeIdx, calleeArgs, extraDepth, frameLimit)
 		if errors.Is(err, errYieldSentinel) {
@@ -2646,6 +2681,30 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			}
 			if th.nframe <= entryDepth {
 				return coldReturn, 0, nil
+			}
+			return coldReload, 0, nil
+		}
+		if nf.Intrinsic == intrDoFile {
+			nres := cf.nresults
+			th.top = srcStart + 1 + nargs
+			loaded, lerr := nativeLoadFile(s, th.stack[srcStart+1:srcStart+1+nargs])
+			if lerr != nil {
+				return coldContinue, pc, lerr
+			}
+			if len(loaded) == 0 || loaded[0].IsNil() {
+				if len(loaded) > 1 {
+					return coldContinue, pc, &LuaError{Val: loaded[1]}
+				}
+				return coldContinue, pc, fmt.Errorf("dofile failed")
+			}
+			th.stack[funcIdx] = loaded[0]
+			th.nframe--
+			cl := loaded[0].AsClosure()
+			if err := th.pushLuaFrame(cl, funcIdx, 0, nres); err != nil {
+				return coldContinue, pc, err
+			}
+			if herr := s.fireLuaCallHook(th, cl, 0); herr != nil {
+				return coldContinue, pc, herr
 			}
 			return coldReload, 0, nil
 		}

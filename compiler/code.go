@@ -219,6 +219,10 @@ func (fs *funcState) fixLine(line int) {
 }
 
 func (fs *funcState) code(i bytecode.Instruction) int {
+	if fs.ls.checkMem != nil && len(fs.f.Code) == cap(fs.f.Code) {
+		grow := max(cap(fs.f.Code), 8)
+		fs.ls.accountMem(int64(grow) * 5) // 4B Instruction + 1B LineInfo
+	}
 	fs.f.Code = append(fs.f.Code, i)
 	fs.pc++
 	fs.saveLineInfo(fs.ls.lastline)
@@ -312,6 +316,13 @@ func (fs *funcState) freeExps(e1, e2 *expDesc) {
 func (fs *funcState) addK(c bytecode.Constant) int {
 	k := len(fs.f.Consts)
 	fs.checkLimit(k+1, bytecode.MaxArgAx+1, "constants")
+	if fs.ls.checkMem != nil {
+		extra := int64(32)
+		if c.Kind == bytecode.ConstString {
+			extra += int64(len(c.Str)) + 48
+		}
+		fs.ls.accountMem(extra)
+	}
 	fs.f.Consts = append(fs.f.Consts, c)
 	return k
 }

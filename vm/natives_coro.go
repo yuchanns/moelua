@@ -10,6 +10,9 @@ func (s *State) initCoroLib() {
 	s.registerFunc(coro, "create", intrNone, nativeCoroCreate)
 	s.registerFunc(coro, "resume", intrNone, nativeCoroResume)
 	s.registerFunc(coro, "yield", intrNone, nativeCoroYield)
+	if v := coro.RawGetStr(s.intern.Intern("yield")); v.IsNative() {
+		s.builtinCoroYield = v.AsNative()
+	}
 	s.registerFunc(coro, "status", intrNone, nativeCoroStatus)
 	s.registerFunc(coro, "running", intrNone, nativeCoroRunning)
 	s.registerFunc(coro, "isyieldable", intrNone, nativeCoroIsYieldable)

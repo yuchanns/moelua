@@ -156,11 +156,14 @@ type State struct {
 	startTime time.Time
 	nCcalls   int
 
-	compilerFn CompileFunc
+	compilerFn       CompileFunc
+	compilerReaderFn func(name string, r io.Reader, opts ...compiler.Option) (*bytecode.Proto, error)
 
-	// Cached builtin identities for TFORCALL / pcall fast paths & standard libs.
-	builtinNext       *NativeFunc
-	builtinIPairsIter *NativeFunc
+	// Cached builtin identities for TFORCALL / pcall / debug.getinfo fast paths & standard libs.
+	builtinNext         *NativeFunc
+	builtinIPairsIter   *NativeFunc
+	builtinDebugGetInfo *NativeFunc
+	builtinCoroYield    *NativeFunc
 	stringMeta        *Table
 	fileMeta          *Table
 	pkgTbl            *Table
@@ -197,6 +200,10 @@ func defaultCompileFunc(name, src string) (*bytecode.Proto, error) {
 	return compiler.Compile(name, src)
 }
 
+func defaultCompileReaderFunc(name string, r io.Reader, opts ...compiler.Option) (*bytecode.Proto, error) {
+	return compiler.CompileReader(name, r, opts...)
+}
+
 // NewState creates a new Lua 5.5.1 State with the complete standard library installed,
 // cloned rapidly from the process-wide frozen stdlib template.
 func NewState() *State {
@@ -216,8 +223,9 @@ func newBootstrapState() *State {
 		out:        os.Stdout,
 		errOut:     os.Stderr,
 		startTime:  time.Now(),
-		gc:         newGCState(),
-		compilerFn: defaultCompileFunc,
+		gc:               newGCState(),
+		compilerFn:       defaultCompileFunc,
+		compilerReaderFn: defaultCompileReaderFunc,
 	}
 	s.seedRNG(makeRandomSeed(s), 0)
 	s.shapes.root = &s.shapes.rootShape
@@ -289,7 +297,10 @@ func (s *State) checkMemAndAccount(delta int64) error {
 }
 
 // SetCompiler registers a source-to-bytecode compiler for load()/loadfile()/dofile()/require().
-func (s *State) SetCompiler(fn CompileFunc) { s.compilerFn = fn }
+func (s *State) SetCompiler(fn CompileFunc) {
+	s.compilerFn = fn
+	s.compilerReaderFn = nil
+}
 
 // SetOutput redirects print() output (useful for differential testing and benchmarks).
 func (s *State) SetOutput(w io.Writer) { s.out = w }
@@ -633,16 +644,15 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		}
 	}
 	if fn.IsNative() {
-		if th.hookMask == 0 || th.inHook {
-			return fn.AsNative().callMulti(s, args)
-		}
+		// Always root native callee and arguments on the active thread stack across the call
+		// so GC / finalizers cannot prematurely collect live arguments even when debug hooks are off.
 		savedTop := th.top
-		base := th.top
-		if th.nframe > 0 {
-			prev := &th.frames[th.nframe-1]
-			if prev.kind == frameLua && prev.cl != nil {
-				if prevEnd := prev.base + int(prev.cl.bp.proto.MaxStackSize); prevEnd > base {
-					base = prevEnd
+		base := savedTop
+		for fi := range th.nframe {
+			cf := &th.frames[fi]
+			if cf.kind == frameLua && cf.cl != nil {
+				if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > base {
+					base = end
 				}
 			}
 		}
@@ -651,8 +661,17 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		}
 		th.stack[base] = fn
 		copy(th.stack[base+1:base+1+len(args)], args)
+		th.top = base + 1 + len(args)
+		defer func() {
+			if end := min(base+1+len(args), len(th.stack)); base < end {
+				fillNil(th.stack[base:end])
+			}
+			th.top = savedTop
+		}()
+		if th.hookMask == 0 || th.inHook {
+			return fn.AsNative().callMulti(s, th.stack[base+1:base+1+len(args)])
+		}
 		res, _, err := s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
-		th.top = savedTop
 		return res, err
 	}
 
@@ -877,7 +896,7 @@ func (s *State) tableSetStr(tblVal Value, keyStr *LuaString, val Value) error {
 				return fmt.Errorf("attempt to index a %s value", cur.TypeName())
 			}
 		}
-		if tm.IsFunction() || !tm.IsTable() {
+		if tm.IsFunction() {
 			_, err := s.Call(tm, cur, key, val)
 			return err
 		}

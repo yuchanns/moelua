@@ -765,6 +765,127 @@ func (tr *gcTracer) clearDeadHashKeys() bool {
 	return anyDead
 }
 
+func (tr *gcTracer) icValAlive(v Value) bool {
+	if v.IsString() {
+		if tr.countStrings || tr.trackDeadStrings {
+			_, live := tr.seenStrings[v.AsString()]
+			return live
+		}
+		return true
+	}
+	if isCollectableWeak(v) {
+		return tr.isMarked(v)
+	}
+	return true
+}
+
+func (tr *gcTracer) icShapeAlive(sh *Shape) bool {
+	if sh == nil {
+		return true
+	}
+	if sh.meta != nil && sh.meta.gcMark != tr.epoch {
+		return false
+	}
+	if !sh.frozen {
+		if _, live := tr.seenShapes[sh]; !live {
+			return false
+		}
+	}
+	return true
+}
+
+func (tr *gcTracer) icEntryAlive(kind icKind, shape, targetShape *Shape, holder *Table, val Value, epoch uint32, noMeta bool) bool {
+	switch kind {
+	case icEmpty:
+		return false
+	case icEnvSlot:
+		if holder == nil || holder.gcMark != tr.epoch || holder.hash == nil || holder.hash.dictGen != epoch {
+			return false
+		}
+		return true
+	case icProtoVal:
+		if !noMeta && epoch != tr.s.protoEpoch {
+			return false
+		}
+		if !tr.icShapeAlive(shape) || !tr.icValAlive(val) {
+			return false
+		}
+		return true
+	case icAddSlot:
+		if !noMeta && epoch != tr.s.protoEpoch {
+			return false
+		}
+		return tr.icShapeAlive(shape) && tr.icShapeAlive(targetShape)
+	case icOwnSlot:
+		if !noMeta && epoch != tr.s.protoEpoch {
+			return false
+		}
+		return tr.icShapeAlive(shape)
+	default:
+		return false
+	}
+}
+
+// sweepInlineCaches clears invalidated or unreachable references from monomorphic and
+// polymorphic inline caches on all reachable boundProtos so IC entries act as weak caches
+// and never pin dead strings, tables, shapes, or closures across GC cycles.
+func (tr *gcTracer) sweepInlineCaches() {
+	for bp := range tr.seenProtos {
+		ics := bp.ic
+		for i := range ics {
+			ic := &ics[i]
+			if ic.kind == icEmpty && ic.poly == nil {
+				continue
+			}
+			// Filter polymorphic entries first.
+			if ic.poly != nil {
+				kept := 0
+				for j := range int(ic.polyCount) {
+					pe := ic.poly[j]
+					if tr.icEntryAlive(pe.kind, pe.shape, pe.targetShape, nil, pe.val, pe.epoch, pe.noMeta) {
+						if kept != j {
+							ic.poly[kept] = pe
+						}
+						kept++
+					}
+				}
+				for j := kept; j < int(ic.polyCount); j++ {
+					ic.poly[j] = polyEntry{}
+				}
+				ic.polyCount = uint8(kept)
+				if kept == 0 {
+					ic.poly = nil
+				}
+			}
+			if !tr.icEntryAlive(ic.kind, ic.shape, ic.targetShape, ic.holder, ic.val, ic.epoch, ic.noMeta) {
+				if ic.poly != nil && ic.polyCount > 0 {
+					// Promote first surviving poly entry to primary slot.
+					pe := ic.poly[0]
+					for j := 1; j < int(ic.polyCount); j++ {
+						ic.poly[j-1] = ic.poly[j]
+					}
+					ic.poly[ic.polyCount-1] = polyEntry{}
+					ic.polyCount--
+					if ic.polyCount == 0 {
+						ic.poly = nil
+					}
+					ic.shape = pe.shape
+					ic.targetShape = pe.targetShape
+					ic.holder = nil
+					ic.val = pe.val
+					ic.epoch = pe.epoch
+					ic.slot = pe.slot
+					ic.kind = pe.kind
+					ic.noMeta = pe.noMeta
+					ic.protoAbsent = pe.protoAbsent
+				} else {
+					*ic = ICEntry{}
+				}
+			}
+		}
+	}
+}
+
 // CollectFull executes a full deterministic Tier 1 GC cycle (exact lgc.c atomic() 6-step order)
 // and drains all newly separated __gc finalizers synchronously on the VM thread.
 func (s *State) CollectFull() {
@@ -821,6 +942,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		tr.markRoots()
 		tr.propagateAll()
 		s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
+		tr.sweepInlineCaches()
 		s.intern.Prune()
 		s.shapes.Prune()
 		s.gc.allocBytes = tr.liveBytes
@@ -922,8 +1044,10 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	tr.clearByValues(tr.weakVals)
 	tr.clearByValues(tr.allWeaks)
 
-	// Release strong Go pointers from unreachable dead/tombstoned hash keys (matching lgc.c:clearkey).
+	// Release strong Go pointers from unreachable dead/tombstoned hash keys (matching lgc.c:clearkey)
+	// and sweep invalidated/unreachable inline cache entries.
 	s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
+	tr.sweepInlineCaches()
 
 	// Close open upvalues belonging to threads that remain unreachable after Step 4 resurrection,
 	// so live closures keep their captured values and dead threads are unpinned for Go's GC.

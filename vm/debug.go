@@ -87,6 +87,9 @@ func shortSrc(source string) string {
 func (s *State) initDebugLib() {
 	dbg := s.NewTable(0, 16)
 	s.registerFunc(dbg, "getinfo", intrNone, nativeDebugGetInfo)
+	if v := dbg.RawGetStr(s.intern.Intern("getinfo")); v.IsNative() {
+		s.builtinDebugGetInfo = v.AsNative()
+	}
 	s.registerFunc(dbg, "traceback", intrNone, nativeDebugTraceback)
 	s.registerFunc(dbg, "getlocal", intrNone, nativeDebugGetLocal)
 	s.registerFunc(dbg, "setlocal", intrNone, nativeDebugSetLocal)
@@ -253,6 +256,45 @@ func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
 	return []Value{StringValue(s.intern.Intern(tb))}, nil
 }
 
+func fillCFrameInfo(s *State, what string, cfunc Value, cname, namewhat string, ftransfer, ntransfer int64) *Table {
+	info := s.NewTable(0, 10)
+	nups := int64(0)
+	if cfunc.IsNative() {
+		nups = int64(cfunc.AsNative().NumUpvals)
+	}
+	if strings.ContainsRune(what, 'S') {
+		info.RawSetStr(s, s.intern.Intern("what"), StringValue(s.intern.Intern("C")))
+		info.RawSetStr(s, s.intern.Intern("source"), StringValue(s.intern.Intern("=[C]")))
+		info.RawSetStr(s, s.intern.Intern("short_src"), StringValue(s.intern.Intern("[C]")))
+		info.RawSetStr(s, s.intern.Intern("linedefined"), IntValue(-1))
+		info.RawSetStr(s, s.intern.Intern("lastlinedefined"), IntValue(-1))
+	}
+	if strings.ContainsRune(what, 'l') {
+		info.RawSetStr(s, s.intern.Intern("currentline"), IntValue(-1))
+	}
+	if strings.ContainsRune(what, 'n') {
+		info.RawSetStr(s, s.intern.Intern("name"), StringValue(s.intern.Intern(cname)))
+		info.RawSetStr(s, s.intern.Intern("namewhat"), StringValue(s.intern.Intern(namewhat)))
+	}
+	if strings.ContainsRune(what, 'u') {
+		info.RawSetStr(s, s.intern.Intern("nups"), IntValue(nups))
+		info.RawSetStr(s, s.intern.Intern("nparams"), IntValue(0))
+		info.RawSetStr(s, s.intern.Intern("isvararg"), TrueValue())
+	}
+	if strings.ContainsRune(what, 't') {
+		info.RawSetStr(s, s.intern.Intern("istailcall"), FalseValue())
+		info.RawSetStr(s, s.intern.Intern("extraargs"), IntValue(0))
+	}
+	if strings.ContainsRune(what, 'r') {
+		info.RawSetStr(s, s.intern.Intern("ftransfer"), IntValue(ftransfer))
+		info.RawSetStr(s, s.intern.Intern("ntransfer"), IntValue(ntransfer))
+	}
+	if strings.ContainsRune(what, 'f') {
+		info.RawSetStr(s, s.intern.Intern("func"), cfunc)
+	}
+	return info
+}
+
 func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 	th, rest := optThreadArg(s, args)
 	if len(rest) == 0 {
@@ -282,41 +324,19 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		lvl := int(lv)
 		if th == s.cur && lvl == 0 {
 			// Level 0 is debug.getinfo itself (C/Go function).
-			info := s.NewTable(0, 8)
-			if strings.ContainsRune(what, 'S') {
-				info.RawSetStr(s, s.intern.Intern("what"), StringValue(s.intern.Intern("C")))
-				info.RawSetStr(s, s.intern.Intern("source"), StringValue(s.intern.Intern("=[C]")))
-				info.RawSetStr(s, s.intern.Intern("short_src"), StringValue(s.intern.Intern("[C]")))
-				info.RawSetStr(s, s.intern.Intern("linedefined"), IntValue(-1))
-				info.RawSetStr(s, s.intern.Intern("lastlinedefined"), IntValue(-1))
+			cfunc := NilValue()
+			if s.builtinDebugGetInfo != nil {
+				cfunc = NativeValue(s.builtinDebugGetInfo)
 			}
-			if strings.ContainsRune(what, 'l') {
-				info.RawSetStr(s, s.intern.Intern("currentline"), IntValue(-1))
-			}
-			if strings.ContainsRune(what, 'n') {
-				info.RawSetStr(s, s.intern.Intern("name"), StringValue(s.intern.Intern("getinfo")))
-				info.RawSetStr(s, s.intern.Intern("namewhat"), StringValue(s.intern.Intern("field")))
-			}
-			return []Value{TableValue(info)}, nil
+			return []Value{TableValue(fillCFrameInfo(s, what, cfunc, "getinfo", "field", 0, 0))}, nil
 		}
 		// Level 0 on a suspended coroutine is coroutine.yield (C frame).
 		if th != s.cur && th.status == ThreadSuspended && lvl == 0 {
-			info := s.NewTable(0, 8)
-			if strings.ContainsRune(what, 'S') {
-				info.RawSetStr(s, s.intern.Intern("what"), StringValue(s.intern.Intern("C")))
-				info.RawSetStr(s, s.intern.Intern("source"), StringValue(s.intern.Intern("=[C]")))
-				info.RawSetStr(s, s.intern.Intern("short_src"), StringValue(s.intern.Intern("[C]")))
-				info.RawSetStr(s, s.intern.Intern("linedefined"), IntValue(-1))
-				info.RawSetStr(s, s.intern.Intern("lastlinedefined"), IntValue(-1))
+			cfunc := NilValue()
+			if s.builtinCoroYield != nil {
+				cfunc = NativeValue(s.builtinCoroYield)
 			}
-			if strings.ContainsRune(what, 'l') {
-				info.RawSetStr(s, s.intern.Intern("currentline"), IntValue(-1))
-			}
-			if strings.ContainsRune(what, 'n') {
-				info.RawSetStr(s, s.intern.Intern("name"), StringValue(s.intern.Intern("yield")))
-				info.RawSetStr(s, s.intern.Intern("namewhat"), StringValue(s.intern.Intern("field")))
-			}
-			return []Value{TableValue(info)}, nil
+			return []Value{TableValue(fillCFrameInfo(s, what, cfunc, "yield", "field", 0, 0))}, nil
 		}
 		// Walk frames (1-based on current thread unless frameNative for getinfo itself is already on top;
 		// also 1-based on suspended coroutine because level 0 is coroutine.yield).
@@ -345,7 +365,6 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		}
 		if cf.kind != frameLua {
 			// framePCall / frameXPCall / frameNative C boundary frame!
-			info := s.NewTable(0, 10)
 			cname := "pcall"
 			cfunc := s.GetGlobal("pcall")
 			if cf.kind == frameXPCall {
@@ -357,37 +376,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 					cname = cf.nativeFn.AsNative().Name
 				}
 			}
-			if strings.ContainsRune(what, 'S') {
-				info.RawSetStr(s, s.intern.Intern("what"), StringValue(s.intern.Intern("C")))
-				info.RawSetStr(s, s.intern.Intern("source"), StringValue(s.intern.Intern("=[C]")))
-				info.RawSetStr(s, s.intern.Intern("short_src"), StringValue(s.intern.Intern("[C]")))
-				info.RawSetStr(s, s.intern.Intern("linedefined"), IntValue(-1))
-				info.RawSetStr(s, s.intern.Intern("lastlinedefined"), IntValue(-1))
-			}
-			if strings.ContainsRune(what, 'l') {
-				info.RawSetStr(s, s.intern.Intern("currentline"), IntValue(-1))
-			}
-			if strings.ContainsRune(what, 'n') {
-				info.RawSetStr(s, s.intern.Intern("name"), StringValue(s.intern.Intern(cname)))
-				info.RawSetStr(s, s.intern.Intern("namewhat"), StringValue(s.intern.Intern("global")))
-			}
-			if strings.ContainsRune(what, 'u') {
-				info.RawSetStr(s, s.intern.Intern("nups"), IntValue(0))
-				info.RawSetStr(s, s.intern.Intern("nparams"), IntValue(0))
-				info.RawSetStr(s, s.intern.Intern("isvararg"), TrueValue())
-			}
-			if strings.ContainsRune(what, 't') {
-				info.RawSetStr(s, s.intern.Intern("istailcall"), FalseValue())
-				info.RawSetStr(s, s.intern.Intern("extraargs"), IntValue(0))
-			}
-			if strings.ContainsRune(what, 'r') {
-				info.RawSetStr(s, s.intern.Intern("ftransfer"), IntValue(int64(cf.ftransfer)))
-				info.RawSetStr(s, s.intern.Intern("ntransfer"), IntValue(int64(cf.ntransfer)))
-			}
-			if strings.ContainsRune(what, 'f') {
-				info.RawSetStr(s, s.intern.Intern("func"), cfunc)
-			}
-			return []Value{TableValue(info)}, nil
+			return []Value{TableValue(fillCFrameInfo(s, what, cfunc, cname, "global", int64(cf.ftransfer), int64(cf.ntransfer)))}, nil
 		}
 	} else {
 		return nil, fmt.Errorf("bad argument #1 to 'getinfo' (function or level expected)")

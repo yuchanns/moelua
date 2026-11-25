@@ -1,8 +1,11 @@
 package bytecode
 
 import (
+	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 )
 
@@ -29,15 +32,41 @@ const (
 )
 
 type loader struct {
-	data    []byte
-	off     int
-	strings []string // 1-indexed saved strings for Lua 5.5 deduplication
+	data     []byte        // slice fast path (br == nil)
+	br       *bufio.Reader // streaming path (br != nil)
+	off      int
+	strings  []string          // 1-indexed saved strings for Lua 5.5 deduplication
+	checkMem func(int64) error // optional incremental memory budget check
+	memUsed  int64
+	scratch  [64]byte
 }
 
 // Undump parses a PUC-Rio Lua 5.5.1 binary chunk (as produced by luac 5.5.1 or string.dump)
 // and verifies it before returning an immutable Proto tree.
 func Undump(data []byte) (*Proto, error) {
-	l := &loader{data: data}
+	return undumpWithLoader(&loader{data: data})
+}
+
+// UndumpReader streams and verifies a PUC-Rio Lua 5.5.1 binary chunk from r without
+// materializing the entire input buffer in memory first.
+func UndumpReader(r io.Reader) (*Proto, error) {
+	return UndumpReaderWithLimit(r, nil)
+}
+
+// UndumpReaderWithLimit streams and verifies a PUC-Rio Lua 5.5.1 binary chunk from r,
+// invoking checkMem(totalBytes) before growing decoded Proto buffers when checkMem != nil.
+func UndumpReaderWithLimit(r io.Reader, checkMem func(int64) error) (*Proto, error) {
+	if r == nil {
+		return nil, fmt.Errorf("undump: nil reader")
+	}
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReaderSize(r, 4096)
+	}
+	return undumpWithLoader(&loader{br: br, checkMem: checkMem})
+}
+
+func undumpWithLoader(l *loader) (*Proto, error) {
 	if err := l.checkHeader(); err != nil {
 		return nil, err
 	}
@@ -58,22 +87,102 @@ func Undump(data []byte) (*Proto, error) {
 	return p, nil
 }
 
-func (l *loader) readByte() (byte, error) {
-	if l.off >= len(l.data) {
-		return 0, fmt.Errorf("undump: truncated chunk at offset %d", l.off)
+func (l *loader) accountMem(delta int64) error {
+	if l.checkMem == nil || delta <= 0 {
+		return nil
 	}
-	b := l.data[l.off]
+	if err := l.checkMem(l.memUsed + delta); err != nil {
+		return err
+	}
+	l.memUsed += delta
+	return nil
+}
+
+func (l *loader) readByte() (byte, error) {
+	if l.br == nil {
+		if l.off >= len(l.data) {
+			return 0, fmt.Errorf("undump: truncated chunk at offset %d", l.off)
+		}
+		b := l.data[l.off]
+		l.off++
+		return b, nil
+	}
+	b, err := l.br.ReadByte()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, fmt.Errorf("undump: truncated chunk at offset %d", l.off)
+		}
+		return 0, err
+	}
 	l.off++
 	return b, nil
 }
 
 func (l *loader) readBytes(n int) ([]byte, error) {
-	if n < 0 || n > len(l.data)-l.off {
+	if l.br == nil {
+		if n < 0 || n > len(l.data)-l.off {
+			return nil, fmt.Errorf("undump: truncated chunk reading %d bytes at offset %d", n, l.off)
+		}
+		b := l.data[l.off : l.off+n]
+		l.off += n
+		return b, nil
+	}
+	if n < 0 {
 		return nil, fmt.Errorf("undump: truncated chunk reading %d bytes at offset %d", n, l.off)
 	}
-	b := l.data[l.off : l.off+n]
-	l.off += n
-	return b, nil
+	if n == 0 {
+		return nil, nil
+	}
+	if n <= len(l.scratch) {
+		got, err := io.ReadFull(l.br, l.scratch[:n])
+		l.off += got
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, fmt.Errorf("undump: truncated chunk reading %d bytes at offset %d", n, l.off)
+			}
+			return nil, err
+		}
+		return l.scratch[:n], nil
+	}
+	// Stream large byte blocks in bounded 32 KiB chunks so truncated/corrupted streams
+	// declaring huge lengths fail at EOF without pre-allocating gigabytes.
+	const maxChunk = 32768
+	var out []byte
+	if n <= maxChunk {
+		if err := l.accountMem(int64(n)); err != nil {
+			return nil, err
+		}
+		out = make([]byte, n)
+		got, err := io.ReadFull(l.br, out)
+		l.off += got
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, fmt.Errorf("undump: truncated chunk reading %d bytes at offset %d", n, l.off)
+			}
+			return nil, err
+		}
+		return out, nil
+	}
+	out = make([]byte, 0, maxChunk)
+	var chunk [maxChunk]byte
+	rem := n
+	for rem > 0 {
+		want := min(rem, maxChunk)
+		got, err := io.ReadFull(l.br, chunk[:want])
+		l.off += got
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, fmt.Errorf("undump: truncated chunk reading %d bytes at offset %d", n, l.off)
+			}
+			return nil, err
+		}
+		if err := l.accountMem(int64(got)); err != nil {
+			return nil, err
+		}
+		out = append(out, chunk[:got]...)
+		rem -= got
+	}
+	return out, nil
 }
 
 func (l *loader) readAlign(align int) error {
@@ -253,6 +362,17 @@ func (l *loader) readString() (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
+	if l.br != nil {
+		if slen+1 <= len(l.scratch) {
+			if err := l.accountMem(int64(slen) + 48); err != nil {
+				return "", false, err
+			}
+		} else {
+			if err := l.accountMem(48); err != nil {
+				return "", false, err
+			}
+		}
+	}
 	s := string(raw[:slen])
 	l.strings = append(l.strings, s)
 	return s, true, nil
@@ -261,6 +381,9 @@ func (l *loader) readString() (string, bool, error) {
 func (l *loader) readFunction(depth int) (*Proto, error) {
 	if depth > maxProtoDepth {
 		return nil, fmt.Errorf("undump: function nesting depth exceeds limit (%d)", maxProtoDepth)
+	}
+	if err := l.accountMem(192); err != nil {
+		return nil, err
 	}
 	p := &Proto{}
 	var err error
@@ -290,16 +413,41 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	if err := l.readAlign(4); err != nil {
 		return nil, err
 	}
-	if ncode > (len(l.data)-l.off)/4 {
-		return nil, fmt.Errorf("undump: truncated chunk reading %d instructions", ncode)
-	}
-	codeBytes, err := l.readBytes(ncode * 4)
-	if err != nil {
-		return nil, err
-	}
-	p.Code = make([]Instruction, ncode)
-	for i := range ncode {
-		p.Code[i] = Instruction(binary.LittleEndian.Uint32(codeBytes[i*4 : i*4+4]))
+	if l.br == nil {
+		if ncode > (len(l.data)-l.off)/4 {
+			return nil, fmt.Errorf("undump: truncated chunk reading %d instructions", ncode)
+		}
+		codeBytes, err := l.readBytes(ncode * 4)
+		if err != nil {
+			return nil, err
+		}
+		p.Code = make([]Instruction, ncode)
+		for i := range ncode {
+			p.Code[i] = Instruction(binary.LittleEndian.Uint32(codeBytes[i*4 : i*4+4]))
+		}
+	} else if ncode > 0 {
+		const batchInsts = 1024
+		var batchBuf [batchInsts * 4]byte
+		p.Code = make([]Instruction, 0, min(ncode, batchInsts))
+		rem := ncode
+		for rem > 0 {
+			cnt := min(rem, batchInsts)
+			if err := l.accountMem(int64(cnt) * 4); err != nil {
+				return nil, err
+			}
+			got, rerr := io.ReadFull(l.br, batchBuf[:cnt*4])
+			l.off += got
+			if rerr != nil {
+				if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
+					return nil, fmt.Errorf("undump: truncated chunk reading %d instructions", ncode)
+				}
+				return nil, rerr
+			}
+			for i := range cnt {
+				p.Code = append(p.Code, Instruction(binary.LittleEndian.Uint32(batchBuf[i*4:i*4+4])))
+			}
+			rem -= cnt
+		}
 	}
 
 	// Constants
@@ -307,34 +455,44 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	if err != nil {
 		return nil, err
 	}
-	if nconst > len(l.data)-l.off {
-		return nil, fmt.Errorf("undump: truncated chunk reading %d constants", nconst)
+	if l.br == nil {
+		if nconst > len(l.data)-l.off {
+			return nil, fmt.Errorf("undump: truncated chunk reading %d constants", nconst)
+		}
+		p.Consts = make([]Constant, nconst)
+	} else {
+		p.Consts = make([]Constant, 0, min(nconst, 256))
 	}
-	p.Consts = make([]Constant, nconst)
 	for i := range nconst {
 		tag, err := l.readByte()
 		if err != nil {
 			return nil, err
 		}
+		if l.br != nil {
+			if err := l.accountMem(32); err != nil {
+				return nil, err
+			}
+		}
+		var c Constant
 		switch tag {
 		case luaVNil:
-			p.Consts[i] = Constant{Kind: ConstNil}
+			c = Constant{Kind: ConstNil}
 		case luaVFalse:
-			p.Consts[i] = Constant{Kind: ConstFalse}
+			c = Constant{Kind: ConstFalse}
 		case luaVTrue:
-			p.Consts[i] = Constant{Kind: ConstTrue}
+			c = Constant{Kind: ConstTrue}
 		case luaVNumFlt:
 			f, err := l.readNumber()
 			if err != nil {
 				return nil, err
 			}
-			p.Consts[i] = Constant{Kind: ConstFloat, Float: f}
+			c = Constant{Kind: ConstFloat, Float: f}
 		case luaVNumInt:
 			iv, err := l.readInteger()
 			if err != nil {
 				return nil, err
 			}
-			p.Consts[i] = Constant{Kind: ConstInt, Int: iv}
+			c = Constant{Kind: ConstInt, Int: iv}
 		case luaVShrStr, luaVLngStr:
 			s, ok, err := l.readString()
 			if err != nil {
@@ -343,13 +501,18 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 			if !ok {
 				return nil, fmt.Errorf("undump: null constant string")
 			}
-			p.Consts[i] = Constant{
+			c = Constant{
 				Kind:    ConstString,
 				Str:     s,
 				IsShort: len(s) <= maxShortLen,
 			}
 		default:
 			return nil, fmt.Errorf("undump: invalid constant tag 0x%02x", tag)
+		}
+		if l.br == nil {
+			p.Consts[i] = c
+		} else {
+			p.Consts = append(p.Consts, c)
 		}
 	}
 
@@ -358,19 +521,32 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	if err != nil {
 		return nil, err
 	}
-	if nup > (len(l.data)-l.off)/3 {
-		return nil, fmt.Errorf("undump: truncated chunk reading %d upvalues", nup)
+	if l.br == nil {
+		if nup > (len(l.data)-l.off)/3 {
+			return nil, fmt.Errorf("undump: truncated chunk reading %d upvalues", nup)
+		}
+		p.Upvalues = make([]UpvalDesc, nup)
+	} else {
+		p.Upvalues = make([]UpvalDesc, 0, min(nup, 256))
 	}
-	p.Upvalues = make([]UpvalDesc, nup)
 	for i := range nup {
-		if p.Upvalues[i].InStack, err = l.readByte(); err != nil {
+		var uv UpvalDesc
+		if uv.InStack, err = l.readByte(); err != nil {
 			return nil, err
 		}
-		if p.Upvalues[i].Idx, err = l.readByte(); err != nil {
+		if uv.Idx, err = l.readByte(); err != nil {
 			return nil, err
 		}
-		if p.Upvalues[i].Kind, err = l.readByte(); err != nil {
+		if uv.Kind, err = l.readByte(); err != nil {
 			return nil, err
+		}
+		if l.br == nil {
+			p.Upvalues[i] = uv
+		} else {
+			if err := l.accountMem(24); err != nil {
+				return nil, err
+			}
+			p.Upvalues = append(p.Upvalues, uv)
 		}
 	}
 
@@ -379,16 +555,24 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	if err != nil {
 		return nil, err
 	}
-	if np > len(l.data)-l.off {
-		return nil, fmt.Errorf("undump: truncated chunk reading %d protos", np)
+	if l.br == nil {
+		if np > len(l.data)-l.off {
+			return nil, fmt.Errorf("undump: truncated chunk reading %d protos", np)
+		}
+		p.Protos = make([]*Proto, np)
+	} else {
+		p.Protos = make([]*Proto, 0, min(np, 64))
 	}
-	p.Protos = make([]*Proto, np)
 	for i := range np {
 		sub, err := l.readFunction(depth + 1)
 		if err != nil {
 			return nil, err
 		}
-		p.Protos[i] = sub
+		if l.br == nil {
+			p.Protos[i] = sub
+		} else {
+			p.Protos = append(p.Protos, sub)
+		}
 	}
 
 	// Source
@@ -405,13 +589,38 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		return nil, err
 	}
 	if nline > 0 {
-		lb, err := l.readBytes(nline)
-		if err != nil {
-			return nil, err
-		}
-		p.LineInfo = make([]int8, nline)
-		for i, b := range lb {
-			p.LineInfo[i] = int8(b)
+		if l.br == nil {
+			lb, err := l.readBytes(nline)
+			if err != nil {
+				return nil, err
+			}
+			p.LineInfo = make([]int8, nline)
+			for i, b := range lb {
+				p.LineInfo[i] = int8(b)
+			}
+		} else {
+			const batchLines = 4096
+			var lbuf [batchLines]byte
+			p.LineInfo = make([]int8, 0, min(nline, batchLines))
+			rem := nline
+			for rem > 0 {
+				cnt := min(rem, batchLines)
+				if err := l.accountMem(int64(cnt)); err != nil {
+					return nil, err
+				}
+				got, rerr := io.ReadFull(l.br, lbuf[:cnt])
+				l.off += got
+				if rerr != nil {
+					if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
+						return nil, fmt.Errorf("undump: truncated chunk reading %d lineinfo bytes", nline)
+					}
+					return nil, rerr
+				}
+				for i := range cnt {
+					p.LineInfo = append(p.LineInfo, int8(lbuf[i]))
+				}
+				rem -= cnt
+			}
 		}
 	}
 	nabs, err := l.readInt()
@@ -422,18 +631,46 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		if err := l.readAlign(4); err != nil {
 			return nil, err
 		}
-		if nabs > (len(l.data)-l.off)/8 {
-			return nil, fmt.Errorf("undump: truncated chunk reading %d abslineinfo entries", nabs)
-		}
-		ab, err := l.readBytes(nabs * 8)
-		if err != nil {
-			return nil, err
-		}
-		p.AbsLineInfo = make([]AbsLineInfo, nabs)
-		for i := range nabs {
-			p.AbsLineInfo[i] = AbsLineInfo{
-				PC:   int32(binary.LittleEndian.Uint32(ab[i*8 : i*8+4])),
-				Line: int32(binary.LittleEndian.Uint32(ab[i*8+4 : i*8+8])),
+		if l.br == nil {
+			if nabs > (len(l.data)-l.off)/8 {
+				return nil, fmt.Errorf("undump: truncated chunk reading %d abslineinfo entries", nabs)
+			}
+			ab, err := l.readBytes(nabs * 8)
+			if err != nil {
+				return nil, err
+			}
+			p.AbsLineInfo = make([]AbsLineInfo, nabs)
+			for i := range nabs {
+				p.AbsLineInfo[i] = AbsLineInfo{
+					PC:   int32(binary.LittleEndian.Uint32(ab[i*8 : i*8+4])),
+					Line: int32(binary.LittleEndian.Uint32(ab[i*8+4 : i*8+8])),
+				}
+			}
+		} else {
+			const batchAbs = 512
+			var abuf [batchAbs * 8]byte
+			p.AbsLineInfo = make([]AbsLineInfo, 0, min(nabs, batchAbs))
+			rem := nabs
+			for rem > 0 {
+				cnt := min(rem, batchAbs)
+				if err := l.accountMem(int64(cnt) * 8); err != nil {
+					return nil, err
+				}
+				got, rerr := io.ReadFull(l.br, abuf[:cnt*8])
+				l.off += got
+				if rerr != nil {
+					if errors.Is(rerr, io.EOF) || errors.Is(rerr, io.ErrUnexpectedEOF) {
+						return nil, fmt.Errorf("undump: truncated chunk reading %d abslineinfo entries", nabs)
+					}
+					return nil, rerr
+				}
+				for i := range cnt {
+					p.AbsLineInfo = append(p.AbsLineInfo, AbsLineInfo{
+						PC:   int32(binary.LittleEndian.Uint32(abuf[i*8 : i*8+4])),
+						Line: int32(binary.LittleEndian.Uint32(abuf[i*8+4 : i*8+8])),
+					})
+				}
+				rem -= cnt
 			}
 		}
 	}
@@ -441,10 +678,14 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	if err != nil {
 		return nil, err
 	}
-	if nloc > len(l.data)-l.off {
-		return nil, fmt.Errorf("undump: truncated chunk reading %d locals", nloc)
+	if l.br == nil {
+		if nloc > len(l.data)-l.off {
+			return nil, fmt.Errorf("undump: truncated chunk reading %d locals", nloc)
+		}
+		p.LocVars = make([]LocVar, nloc)
+	} else {
+		p.LocVars = make([]LocVar, 0, min(nloc, 256))
 	}
-	p.LocVars = make([]LocVar, nloc)
 	for i := range nloc {
 		name, _, err := l.readString()
 		if err != nil {
@@ -458,7 +699,15 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		if err != nil {
 			return nil, err
 		}
-		p.LocVars[i] = LocVar{Name: name, StartPC: startPC, EndPC: endPC}
+		lv := LocVar{Name: name, StartPC: startPC, EndPC: endPC}
+		if l.br == nil {
+			p.LocVars[i] = lv
+		} else {
+			if err := l.accountMem(32); err != nil {
+				return nil, err
+			}
+			p.LocVars = append(p.LocVars, lv)
+		}
 	}
 	nupNames, err := l.readInt()
 	if err != nil {

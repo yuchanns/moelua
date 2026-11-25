@@ -698,23 +698,50 @@ func estimateDumpBytes(p *bytecode.Proto, strip bool) int64 {
 	return total
 }
 
+type limitedStringWriter struct {
+	sb        strings.Builder
+	checkSize func(int64) error
+}
+
+func (w *limitedStringWriter) Write(p []byte) (int, error) {
+	if w.checkSize != nil {
+		if err := w.checkSize(int64(w.sb.Len() + len(p))); err != nil {
+			return 0, err
+		}
+	}
+	return w.sb.Write(p)
+}
+
+func (w *limitedStringWriter) WriteString(s string) (int, error) {
+	if w.checkSize != nil {
+		if err := w.checkSize(int64(w.sb.Len() + len(s))); err != nil {
+			return 0, err
+		}
+	}
+	return w.sb.WriteString(s)
+}
+
 func nativeStringDump(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsClosure() {
 		return nil, fmt.Errorf("bad argument #1 to 'dump' (Lua function expected)")
 	}
 	strip := len(args) >= 2 && !args[1].IsFalsy()
 	p := args[0].AsClosure().bp.proto
+	var checkSize func(int64) error
 	if s.memLimit > 0 {
 		est := estimateDumpBytes(p, strip)
 		if err := s.checkMem(est + 48); err != nil {
 			return nil, err
 		}
+		checkSize = func(n int64) error {
+			return s.checkMem(n + 48)
+		}
 	}
-	data, err := bytecode.Dump(p, strip)
-	if err != nil {
+	w := limitedStringWriter{checkSize: checkSize}
+	if err := bytecode.DumpTo(&w, p, strip); err != nil {
 		return nil, err
 	}
-	ls, err := s.TryIntern(string(data))
+	ls, err := s.TryIntern(w.sb.String())
 	if err != nil {
 		return nil, err
 	}

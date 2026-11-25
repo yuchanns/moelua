@@ -544,6 +544,7 @@ func (ls *lexState) codeClosure(v *expDesc) {
 }
 
 func (ls *lexState) openFunc(fs *funcState, bl *blockCnt) {
+	ls.accountMem(192)
 	f := fs.f
 	fs.prev = ls.fs
 	fs.ls = ls
