@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOfficialMainLuaCLI(t *testing.T) {
@@ -240,4 +241,78 @@ func TestCLIFlagsREPLAndStdinParity(t *testing.T) {
 			t.Fatalf("expected '1\\tfirst', got %q", out)
 		}
 	})
+
+	// 11. -l honors _G's __index metamethod when resolving require.
+	t.Run("library_load_honors_global_require_metamethod", func(t *testing.T) {
+		out, stderr, err := run("", "", nil, "-E",
+			"-e", `local r = require; require = nil; setmetatable(_G, {__index = {require = r}})`,
+			"-l", "math",
+			"-e", `print(math.floor(3.9))`,
+		)
+		if err != nil {
+			t.Fatalf("err=%v stderr=%s", err, stderr)
+		}
+		if strings.TrimSpace(out) != "3" {
+			t.Fatalf("expected '3', got %q", out)
+		}
+	})
+
+	// 12. Explicitly empty script filename (`''` or `LUA_INIT=@`) fails to open rather than executing stdin.
+	t.Run("empty_script_filename_does_not_read_stdin", func(t *testing.T) {
+		out, stderr, err := run("", "print('EXECUTED_STDIN')\n", nil, "-E", "")
+		if err == nil {
+			t.Fatalf("expected error opening empty filename, got stdout=%q stderr=%q", out, stderr)
+		}
+		if strings.Contains(out, "EXECUTED_STDIN") {
+			t.Fatalf("empty filename erroneously executed stdin: stdout=%q", out)
+		}
+
+		out2, stderr2, err2 := run("", "print('EXECUTED_STDIN')\n", []string{"LUA_INIT_5_5=@"}, "-e", "print('AFTER')")
+		if err2 == nil {
+			t.Fatalf("expected error for LUA_INIT_5_5=@, got stdout=%q stderr=%q", out2, stderr2)
+		}
+		if strings.Contains(out2, "EXECUTED_STDIN") {
+			t.Fatalf("LUA_INIT_5_5=@ erroneously executed stdin: stdout=%q", out2)
+		}
+	})
+
+	// 13. Second SIGINT terminates a script that caught the first SIGINT via pcall.
+	if runtime.GOOS != "windows" {
+		t.Run("repeated_sigint_terminates_pcall_loop", func(t *testing.T) {
+			cmd := exec.Command(bin, "-E", "-e", `io.stdout:write("READY\n"); io.stdout:flush(); while true do pcall(function() while true do end end) end`)
+			stdoutPipe, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			// Wait for the Lua script to print READY so signal handler is armed.
+			buf := make([]byte, 16)
+			if _, err := stdoutPipe.Read(buf); err != nil {
+				_ = cmd.Process.Kill()
+				t.Fatalf("failed reading READY: %v", err)
+			}
+			if err := cmd.Process.Signal(os.Interrupt); err != nil {
+				_ = cmd.Process.Kill()
+				t.Fatalf("first SIGINT failed: %v", err)
+			}
+			time.Sleep(150 * time.Millisecond)
+			if err := cmd.Process.Signal(os.Interrupt); err != nil {
+				_ = cmd.Process.Kill()
+				t.Fatalf("second SIGINT failed: %v", err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatalf("expected non-zero exit after two SIGINTs")
+				}
+			case <-time.After(3 * time.Second):
+				_ = cmd.Process.Kill()
+				t.Fatalf("process survived two SIGINTs spaced 150ms apart")
+			}
+		})
+	}
 }

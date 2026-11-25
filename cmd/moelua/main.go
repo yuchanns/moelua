@@ -131,16 +131,18 @@ func armInterruptHandler(s *vm.State) func() {
 	signal.Notify(sigCh, os.Interrupt)
 	s.SetInterruptFlag(&intrFlag)
 	go func() {
-		for {
+		select {
+		case <-done:
+			return
+		case <-sigCh:
+			// Match lua.c:laction: restore default SIGINT disposition on the first signal
+			// so a second SIGINT terminates the process even if Lua caught the first via pcall.
+			signal.Reset(os.Interrupt)
+			intrFlag.Store(true)
 			select {
-			case <-done:
-				return
 			case <-sigCh:
-				if intrFlag.Swap(true) {
-					// Second SIGINT while previous interrupt not yet handled by VM -> exit (main.lua:586-596).
-					signal.Stop(sigCh)
-					os.Exit(130)
-				}
+				os.Exit(130)
+			default:
 			}
 		}
 	}()
@@ -245,7 +247,7 @@ func (c *cliState) doChunkFile(progName, path string, literalFile, passArgs bool
 	var data []byte
 	var err error
 	chunkName := "=stdin"
-	if path == "" || (path == "-" && !literalFile) {
+	if path == "-" && !literalFile {
 		data, err = c.s.ReadAllStdin()
 	} else {
 		chunkName = "@" + path
@@ -262,7 +264,11 @@ func (c *cliState) doChunkFile(progName, path string, literalFile, passArgs bool
 	}
 	var args []vm.Value
 	if passArgs {
-		argVal := c.s.GetGlobal("arg")
+		argVal, gerr := c.s.GetGlobalMM("arg")
+		if gerr != nil {
+			fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(gerr))
+			return false
+		}
 		if !argVal.IsTable() {
 			fmt.Fprintf(os.Stderr, "%s: 'arg' is not a table\n", progName)
 			return false
@@ -298,13 +304,20 @@ func (c *cliState) doLibrary(progName, spec string) bool {
 		// Lua 5.5 lua.c:dolibrary: strip version suffix after '-' from implicit global name.
 		globName = globName[:dash]
 	}
-	reqFn := c.s.GetGlobal("require")
+	reqFn, gerr := c.s.GetGlobalMM("require")
+	if gerr != nil {
+		fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(gerr))
+		return false
+	}
 	res, ok := c.doCall(progName, reqFn, vm.StringValue(c.s.Intern(modName)))
 	if !ok {
 		return false
 	}
 	if len(res) > 0 {
-		c.s.SetGlobal(globName, res[0])
+		if serr := c.s.SetGlobalMM(globName, res[0]); serr != nil {
+			fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(serr))
+			return false
+		}
 	}
 	return true
 }
@@ -367,15 +380,15 @@ func getPrompt(s *vm.State, firstLine bool) string {
 		name = "_PROMPT"
 		dflt = "> "
 	}
-	v := s.GetGlobal(name)
-	if v.IsNil() {
+	v, err := s.GetGlobalMM(name)
+	if err != nil || v.IsNil() {
 		return dflt
 	}
 	if v.IsString() {
 		return v.AsString().S
 	}
-	tsFn := s.GetGlobal("tostring")
-	if tsFn.IsFunction() {
+	tsFn, err := s.GetGlobalMM("tostring")
+	if err == nil && tsFn.IsFunction() {
 		res, err := s.Call(tsFn, v)
 		if err == nil && len(res) > 0 && res[0].IsString() {
 			return res[0].AsString().S
@@ -449,7 +462,11 @@ func (c *cliState) doREPL(progName string, noEnv bool) {
 			continue
 		}
 		if len(res) > 0 {
-			printFn := s.GetGlobal("print")
+			printFn, gerr := s.GetGlobalMM("print")
+			if gerr != nil {
+				fmt.Fprintf(os.Stderr, "%s: error calling 'print' (%s)\n", progName, s.FormatError(gerr))
+				continue
+			}
 			if _, perr := s.Call(printFn, res...); perr != nil {
 				fmt.Fprintf(os.Stderr, "%s: error calling 'print' (%s)\n", progName, s.FormatError(perr))
 			}
