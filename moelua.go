@@ -387,22 +387,46 @@ func (s *State) SetMetatable(v Value, mt *Table) error {
 	return s.vm.ConsumeMemErr()
 }
 
-// NewMetatable creates and registers a named metatable in the Lua registry (analogous to
-// luaL_newmetatable). If a table is already registered under name, it returns (existing, false);
-// otherwise it creates a new table with __name = name, stores it in the registry, and returns (mt, true).
-func (s *State) NewMetatable(name string) (*Table, bool) {
+// TryNewMetatable creates and registers a named metatable in the Lua registry (analogous to
+// luaL_newmetatable). If a table is already registered under name, it returns (existing, false, nil);
+// otherwise it allocates a new table with __name = name, stores it in the registry, and returns
+// (mt, true, nil). Returns an error if the State is closed or the memory limit prevents allocation
+// or registration, consuming any deferred VM memory error.
+func (s *State) TryNewMetatable(name string) (*Table, bool, error) {
 	if !s.ready() {
-		return nil, false
+		return nil, false, ErrStateClosed
 	}
 	reg := s.vm.Registry()
 	key := s.vm.Intern(name)
 	if existing := reg.RawGetStr(key); existing.IsTable() {
-		return &Table{state: s, raw: existing.AsTable()}, false
+		return &Table{state: s, raw: existing.AsTable()}, false, nil
 	}
-	mt := s.vm.NewTable(0, 4)
+	mt, err := s.vm.TryNewTable(0, 4)
+	if err != nil {
+		return nil, false, err
+	}
 	mt.RawSetStr(s.vm, s.vm.Intern("__name"), vm.StringValue(key))
+	if err := s.vm.ConsumeMemErr(); err != nil {
+		return nil, false, err
+	}
 	reg.RawSetStr(s.vm, key, vm.TableValue(mt))
-	return &Table{state: s, raw: mt}, true
+	if err := s.vm.ConsumeMemErr(); err != nil {
+		return nil, false, err
+	}
+	return &Table{state: s, raw: mt}, true, nil
+}
+
+// NewMetatable creates and registers a named metatable in the Lua registry (analogous to
+// luaL_newmetatable). If a table is already registered under name, it returns (existing, false);
+// otherwise it creates a new table with __name = name, stores it in the registry, and returns (mt, true).
+// Returns (nil, false) if the State is closed or the memory limit prevents allocation or registration
+// (use TryNewMetatable to inspect the error).
+func (s *State) NewMetatable(name string) (*Table, bool) {
+	mt, created, err := s.TryNewMetatable(name)
+	if err != nil {
+		return nil, false
+	}
+	return mt, created
 }
 
 // GetMetatableByName retrieves a named metatable previously created with NewMetatable
@@ -684,12 +708,17 @@ func (t *Table) Get(key Value) Value {
 	return t.raw.RawGet(key)
 }
 
-// Set performs rawset(t, key, val).
+// Set performs rawset(t, key, val), returning an error if the State is closed, key is invalid,
+// or memory limit is exceeded.
 func (t *Table) Set(key, val Value) error {
 	if !t.ready() {
 		return ErrStateClosed
 	}
-	return t.raw.RawSet(t.state.vm, key, val)
+	if err := t.raw.RawSet(t.state.vm, key, val); err != nil {
+		_ = t.state.vm.ConsumeMemErr()
+		return err
+	}
+	return t.state.vm.ConsumeMemErr()
 }
 
 // GetInt returns rawget(t, i).

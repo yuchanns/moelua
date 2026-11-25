@@ -880,3 +880,46 @@ func TestNewTableMemoryLimitEnforcement(t *testing.T) {
 		t.Fatalf("expected MemoryUsage to increase after TryNewTable(0, 200): before=%d after=%d", before, after)
 	}
 }
+
+func TestNewMetatableMemoryLimitEnforcement(t *testing.T) {
+	s := moelua.New(moelua.WithMemoryLimit(65536))
+	defer s.Close()
+
+	// Repeatedly register distinct metatable names until the 64 KiB limit is hit.
+	failedNew := false
+	for i := range 500 {
+		name := fmt.Sprintf("type_mt_%d", i)
+		mt, created := s.NewMetatable(name)
+		if mt == nil {
+			if created {
+				t.Fatalf("NewMetatable(%q) returned nil with created=true", name)
+			}
+			if got := s.GetMetatableByName(name); got != nil {
+				t.Fatalf("failed NewMetatable(%q) unexpectedly registered in registry", name)
+			}
+			failedNew = true
+			break
+		}
+		if !created {
+			t.Fatalf("expected first NewMetatable(%q) to report created=true", name)
+		}
+		if got := s.GetMetatableByName(name); got == nil || got.Raw() != mt.Raw() {
+			t.Fatalf("NewMetatable(%q) reported success but GetMetatableByName returned %v", name, got)
+		}
+	}
+	if !failedNew {
+		t.Fatalf("expected NewMetatable loop to eventually hit 64KiB memory limit")
+	}
+
+	// TryNewMetatable must expose the memory-limit error explicitly.
+	if mt, created, err := s.TryNewMetatable("type_mt_overflow"); mt != nil || created || err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected memory error from TryNewMetatable, got mt=%v created=%v err=%v", mt, created, err)
+	}
+
+	// No unconsumed memory error should poison subsequent Lua execution that fits in budget.
+	s.SetMemoryLimit(0)
+	res, err := s.DoString(`return 1 + 2`)
+	if err != nil || len(res) != 1 || res[0].Int() != 3 {
+		t.Fatalf("subsequent Lua execution failed after NewMetatable OOM: res=%v err=%v", res, err)
+	}
+}
