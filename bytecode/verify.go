@@ -424,7 +424,11 @@ func verifyDepth(p *Proto, depth int) error {
 			p.ICSlot[pc] = int32(icCount)
 			icCount++
 		case OP_RETURN:
-			if inst.B() > 0 && inst.A()+inst.B()-1 > maxStack {
+			if inst.B() == 0 {
+				if err := checkReg(pc, op, "A", inst.A()); err != nil {
+					return err
+				}
+			} else if inst.A()+inst.B()-1 > maxStack {
 				return fmt.Errorf("verify: pc %d RETURN A=%d B=%d > maxstack %d", pc, inst.A(), inst.B(), maxStack)
 			}
 		case OP_VARARGPREP:
@@ -442,6 +446,8 @@ func verifyDepth(p *Proto, depth int) error {
 				if err := checkReg(pc, op, "B", inst.B()); err != nil {
 					return err
 				}
+			} else if p.Flag&PFVarargHidden == 0 {
+				return fmt.Errorf("verify: pc %d VARARG k=0 in proto without PFVarargHidden", pc)
 			}
 			if inst.C() >= 2 && inst.A()+inst.C()-2 >= maxStack {
 				return fmt.Errorf("verify: pc %d VARARG A=%d C=%d >= maxstack %d", pc, inst.A(), inst.C(), maxStack)

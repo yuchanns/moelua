@@ -68,7 +68,7 @@ func (l *loader) readByte() (byte, error) {
 }
 
 func (l *loader) readBytes(n int) ([]byte, error) {
-	if n < 0 || l.off+n > len(l.data) {
+	if n < 0 || n > len(l.data)-l.off {
 		return nil, fmt.Errorf("undump: truncated chunk reading %d bytes at offset %d", n, l.off)
 	}
 	b := l.data[l.off : l.off+n]
@@ -290,6 +290,9 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	if err := l.readAlign(4); err != nil {
 		return nil, err
 	}
+	if ncode > (len(l.data)-l.off)/4 {
+		return nil, fmt.Errorf("undump: truncated chunk reading %d instructions", ncode)
+	}
 	codeBytes, err := l.readBytes(ncode * 4)
 	if err != nil {
 		return nil, err
@@ -355,7 +358,7 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	if err != nil {
 		return nil, err
 	}
-	if nup*3 > len(l.data)-l.off {
+	if nup > (len(l.data)-l.off)/3 {
 		return nil, fmt.Errorf("undump: truncated chunk reading %d upvalues", nup)
 	}
 	p.Upvalues = make([]UpvalDesc, nup)
@@ -418,6 +421,9 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	if nabs > 0 {
 		if err := l.readAlign(4); err != nil {
 			return nil, err
+		}
+		if nabs > (len(l.data)-l.off)/8 {
+			return nil, fmt.Errorf("undump: truncated chunk reading %d abslineinfo entries", nabs)
 		}
 		ab, err := l.readBytes(nabs * 8)
 		if err != nil {

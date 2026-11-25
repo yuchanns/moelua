@@ -391,3 +391,84 @@ func TestVerifyMMBinPredecessorAndTForCallScratch(t *testing.T) {
 		t.Fatalf("expected Verify to accept TFORCALL A=0 C=1 with MaxStackSize=6, got %v", err)
 	}
 }
+
+func TestVerifyReturnOpenBaseHiddenVarargAndUndumpOverflow(t *testing.T) {
+	mkABC := func(op bytecode.OpCode, a, b, c uint32) bytecode.Instruction {
+		return bytecode.Instruction(op) |
+			(bytecode.Instruction(a) << bytecode.PosA) |
+			(bytecode.Instruction(b) << bytecode.PosB) |
+			(bytecode.Instruction(c) << bytecode.PosC)
+	}
+
+	// 1. Reject hidden-vararg OP_VARARG (k=0) in non-vararg prototype.
+	badVararg := &bytecode.Proto{
+		Source:       "=bad_vararg",
+		Flag:         0,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			mkABC(bytecode.OP_VARARG, 0, 0, 2),
+			mkABC(bytecode.OP_RETURN0, 0, 0, 0),
+		},
+	}
+	if err := bytecode.Verify(badVararg); err == nil {
+		t.Fatalf("expected Verify to reject hidden OP_VARARG without PFVarargHidden")
+	}
+	goodVararg := &bytecode.Proto{
+		Source:       "=good_vararg",
+		Flag:         bytecode.PFVarargHidden,
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			mkABC(bytecode.OP_VARARGPREP, 0, 0, 0),
+			mkABC(bytecode.OP_VARARG, 0, 0, 2),
+			mkABC(bytecode.OP_RETURN0, 0, 0, 0),
+		},
+	}
+	if err := bytecode.Verify(goodVararg); err != nil {
+		t.Fatalf("expected Verify to accept hidden OP_VARARG with PFVarargHidden, got %v", err)
+	}
+
+	// 2. Reject OP_RETURN with B=0 and out-of-window base register A >= MaxStackSize.
+	badReturn := &bytecode.Proto{
+		Source:       "=bad_return",
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			mkABC(bytecode.OP_LOADNIL, 0, 0, 0),
+			mkABC(bytecode.OP_RETURN, 255, 0, 0),
+		},
+	}
+	if err := bytecode.Verify(badReturn); err == nil {
+		t.Fatalf("expected Verify to reject RETURN A=255 B=0 with MaxStackSize=2")
+	}
+	goodReturn := &bytecode.Proto{
+		Source:       "=good_return",
+		MaxStackSize: 2,
+		Code: []bytecode.Instruction{
+			mkABC(bytecode.OP_LOADNIL, 0, 0, 0),
+			mkABC(bytecode.OP_RETURN, 0, 0, 0),
+		},
+	}
+	if err := bytecode.Verify(goodReturn); err != nil {
+		t.Fatalf("expected Verify to accept RETURN A=0 B=0 with MaxStackSize=2, got %v", err)
+	}
+
+	// 3. Reject truncated chunk whose nline varint is math.MaxInt32 (2147483647) without 32-bit overflow panic.
+	base := &bytecode.Proto{
+		Source:       "=tiny",
+		MaxStackSize: 2,
+		Code:         []bytecode.Instruction{mkABC(bytecode.OP_RETURN0, 0, 0, 0)},
+	}
+	dumped, err := bytecode.Dump(base, true)
+	if err != nil {
+		t.Fatalf("Dump failed: %v", err)
+	}
+	// Strip last 4 zero-count debug varints (nline, nabs, nloc, nupNames) and replace nline with MaxInt32 varint.
+	if len(dumped) < 4 {
+		t.Fatalf("unexpected short dump: %d", len(dumped))
+	}
+	mut := append([]byte(nil), dumped[:len(dumped)-4]...)
+	// 2147483647 (0x7fffffff) in Lua 5.5 big-endian continuation-bit varint: 0x87 0xff 0xff 0xff 0x7f
+	mut = append(mut, 0x87, 0xff, 0xff, 0xff, 0x7f)
+	if _, err := bytecode.Undump(mut); err == nil {
+		t.Fatalf("expected Undump to reject truncated nline=MaxInt32 chunk")
+	}
+}
