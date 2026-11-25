@@ -2757,7 +2757,7 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 			tried = append(tried, fmt.Sprintf("no file '%s' (invalid fs path)", cand))
 			continue
 		}
-		data, err := fs.ReadFile(fsys, cand)
+		f, err := fsys.Open(cand)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				tried = append(tried, fmt.Sprintf("no file '%s' (in fs.FS)", cand))
@@ -2765,16 +2765,30 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 			}
 			return nil, fmt.Errorf("error reading module '%s' from file '%s': %w", name, cand, err)
 		}
-		if s.memLimit > 0 {
-			if err := s.checkMem(int64(len(data)) * 2); err != nil {
+		if fi, serr := f.Stat(); serr == nil && fi.IsDir() {
+			_ = f.Close()
+			return nil, fmt.Errorf("error reading module '%s' from file '%s': is a directory", name, cand)
+		}
+		fn, err := s.LoadChunkReader(fileErrReader{r: f}, "@"+cand)
+		_ = f.Close()
+		if err != nil {
+			if isUncatchableErr(err) {
 				return nil, err
 			}
-		}
-		fn, err := s.LoadChunk(data, "@"+cand)
-		if err != nil {
+			var fre loadFileReadErr
+			if errors.As(err, &fre) {
+				return nil, fmt.Errorf("error reading module '%s' from file '%s': %w", name, cand, fre.err)
+			}
+			if strings.Contains(err.Error(), "not enough memory") {
+				return nil, err
+			}
 			return nil, fmt.Errorf("error loading module '%s' from file '%s':\n\t%s", name, cand, err.Error())
 		}
-		return []Value{fn, StringValue(s.intern.Intern(cand))}, nil
+		candStr, ierr := s.TryIntern(cand)
+		if ierr != nil {
+			return nil, ierr
+		}
+		return []Value{fn, StringValue(candStr)}, nil
 	}
 	if len(tried) == 0 {
 		return []Value{StringValue(s.intern.Intern("no file in fs.FS"))}, nil

@@ -300,13 +300,27 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 		}
 		if co.hookMask&HookMaskCall != 0 && !co.inHook {
 			if herr := s.fireHook(co, "call", NilValue()); herr != nil {
-				co.status = ThreadDead
+				if errors.Is(herr, errCoroCloseSelf) {
+					return s.finishCoroCloseSelf(co)
+				}
 				if isUncatchableErr(herr) {
+					co.status = ThreadDead
 					return false, nil, herr
 				}
-				ev := errorToLuaValue(s, herr)
-				co.errObj = ev
-				return false, []Value{ev}, nil
+				if !s.handleError(co, 0, herr) {
+					if errors.Is(s.abortErr, errCoroCloseSelf) {
+						return s.finishCoroCloseSelf(co)
+					}
+					if isUncatchableErr(s.abortErr) {
+						uerr := s.abortErr
+						co.status = ThreadDead
+						return false, nil, uerr
+					}
+					co.status = ThreadDead
+					ev := errorToLuaValue(s, herr)
+					co.errObj = ev
+					return false, []Value{ev}, nil
+				}
 			}
 		}
 	} else if co.status == ThreadSuspended {
@@ -314,6 +328,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 		co.status = ThreadOK
 		if err := co.placeResults(co.yieldDst, args, co.yieldNRes); err != nil {
 			if !s.handleError(co, 0, err) {
+				if errors.Is(s.abortErr, errCoroCloseSelf) {
+					return s.finishCoroCloseSelf(co)
+				}
+				if isUncatchableErr(s.abortErr) {
+					uerr := s.abortErr
+					co.status = ThreadDead
+					return false, nil, uerr
+				}
 				co.status = ThreadDead
 				ev := errorToLuaValue(s, err)
 				co.errObj = ev
@@ -324,13 +346,27 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			co.yieldedNative = false
 			if co.hookMask&HookMaskRet != 0 && !co.inHook {
 				if herr := s.fireHook(co, "return", NilValue()); herr != nil {
-					co.status = ThreadDead
+					if errors.Is(herr, errCoroCloseSelf) {
+						return s.finishCoroCloseSelf(co)
+					}
 					if isUncatchableErr(herr) {
+						co.status = ThreadDead
 						return false, nil, herr
 					}
-					ev := errorToLuaValue(s, herr)
-					co.errObj = ev
-					return false, []Value{ev}, nil
+					if !s.handleError(co, 0, herr) {
+						if errors.Is(s.abortErr, errCoroCloseSelf) {
+							return s.finishCoroCloseSelf(co)
+						}
+						if isUncatchableErr(s.abortErr) {
+							uerr := s.abortErr
+							co.status = ThreadDead
+							return false, nil, uerr
+						}
+						co.status = ThreadDead
+						ev := errorToLuaValue(s, herr)
+						co.errObj = ev
+						return false, []Value{ev}, nil
+					}
 				}
 			}
 		}
@@ -345,11 +381,22 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				return true, out, nil
 			}
 			if cerr != nil {
+				if errors.Is(cerr, errCoroCloseSelf) {
+					return s.finishCoroCloseSelf(co)
+				}
 				if isUncatchableErr(cerr) {
 					co.status = ThreadDead
 					return false, nil, cerr
 				}
 				if !s.handleError(co, 0, cerr) {
+					if errors.Is(s.abortErr, errCoroCloseSelf) {
+						return s.finishCoroCloseSelf(co)
+					}
+					if isUncatchableErr(s.abortErr) {
+						uerr := s.abortErr
+						co.status = ThreadDead
+						return false, nil, uerr
+					}
 					co.status = ThreadDead
 					ev := errorToLuaValue(s, cerr)
 					co.errObj = ev
@@ -386,22 +433,7 @@ runCoro:
 		return true, out, nil
 	}
 	if errors.Is(err, errCoroCloseSelf) || errors.Is(s.abortErr, errCoroCloseSelf) {
-		if errors.Is(s.abortErr, errCoroCloseSelf) {
-			s.abortErr = nil
-		}
-		// Coroutine closed itself via coroutine.close(): run TBC finalizers (non-yieldable) and terminate!
-		co.nny++
-		errVal, hasErr, _ := co.closeAllSync(0, NilValue(), false)
-		co.nny--
-		co.status = ThreadDead
-		co.nframe = 0
-		co.top = 0
-		co.stack[0] = NilValue()
-		co.errObj = NilValue()
-		if hasErr {
-			return false, []Value{errVal}, nil
-		}
-		return true, nil, nil
+		return s.finishCoroCloseSelf(co)
 	}
 	if err != nil {
 		if isUncatchableErr(err) {
@@ -427,6 +459,25 @@ runCoro:
 	co.stack[0] = NilValue()
 	co.top = 0
 	return true, res, nil
+}
+
+func (s *State) finishCoroCloseSelf(co *Thread) (bool, []Value, error) {
+	if errors.Is(s.abortErr, errCoroCloseSelf) {
+		s.abortErr = nil
+	}
+	// Coroutine closed itself via coroutine.close(): run TBC finalizers (non-yieldable) and terminate!
+	co.nny++
+	errVal, hasErr, _ := co.closeAllSync(0, NilValue(), false)
+	co.nny--
+	co.status = ThreadDead
+	co.nframe = 0
+	co.top = 0
+	co.stack[0] = NilValue()
+	co.errObj = NilValue()
+	if hasErr {
+		return false, []Value{errVal}, nil
+	}
+	return true, nil, nil
 }
 
 func nativeCoroResume(s *State, args []Value) ([]Value, error) {

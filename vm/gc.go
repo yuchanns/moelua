@@ -284,6 +284,15 @@ func (tr *gcTracer) markRoots() {
 	if s.registry != nil {
 		tr.mark(TableValue(s.registry))
 	}
+	if s.pkgTbl != nil {
+		tr.mark(TableValue(s.pkgTbl))
+	}
+	if s.loadedTbl != nil {
+		tr.mark(TableValue(s.loadedTbl))
+	}
+	if s.preloadTbl != nil {
+		tr.mark(TableValue(s.preloadTbl))
+	}
 	for _, mt := range s.typeMetas {
 		if mt != nil {
 			tr.mark(TableValue(mt))
@@ -977,6 +986,39 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		}
 		tr.markRoots()
 		tr.propagateAll()
+		if emergency && (len(tr.ephemerons) > 0 || len(tr.weakVals) > 0 || len(tr.allWeaks) > 0 || len(s.gc.finalizable) > 0 || len(s.gc.weakFiles) > 0) {
+			// Match PUC-Rio lgc.c:luaC_fullgc(L, isemergency=1): clear unreachable weak entries
+			// so weak caches cannot pin gigabytes when collectgarbage("stop") is active, while
+			// deferring __gc execution and keeping pending-finalizer objects accounted in liveBytes.
+			tr.convergeEphemerons()
+			tr.clearByValues(tr.weakVals)
+			tr.clearByValues(tr.allWeaks)
+			for _, fe := range s.gc.finalizable {
+				if fe.obj.IsTable() && fe.obj.AsTable().flags&tblFlagGCFnzed != 0 {
+					continue
+				}
+				if fe.obj.IsUserdata() && fe.obj.AsUserdata().gcFnzed {
+					continue
+				}
+				if !tr.isMarked(fe.obj) {
+					tr.mark(fe.obj)
+				}
+			}
+			for _, wf := range s.gc.weakFiles {
+				if u := wf.u.Value(); u != nil && !u.gcFnzed {
+					obj := UserdataValue(u)
+					if !tr.isMarked(obj) {
+						tr.mark(obj)
+					}
+				}
+			}
+			tr.propagateAll()
+			tr.convergeEphemerons()
+			tr.clearByKeys(tr.ephemerons)
+			tr.clearByKeys(tr.allWeaks)
+			tr.clearByValues(tr.weakVals)
+			tr.clearByValues(tr.allWeaks)
+		}
 		tr.accountWeakStrings()
 		s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
 		tr.sweepInlineCaches()
