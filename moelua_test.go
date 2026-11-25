@@ -1371,3 +1371,81 @@ func TestRootValueBeforeKeyAllocationPreservesMemoryLimit(t *testing.T) {
 		}
 	})
 }
+
+func TestRootOperandsAcrossAllocationPreservesMemoryLimit(t *testing.T) {
+	t.Run("Table.SetInt", func(t *testing.T) {
+		s := moelua.New()
+		defer s.Close()
+		tbl := s.NewTable(2000, 0)
+		if err := s.TrySetGlobal("t", tbl.Value()); err != nil {
+			t.Fatal(err)
+		}
+		s.CollectGarbage()
+		// 50,000 bytes of headroom: the 30,000-byte value fits, value+array growth does not.
+		limit := s.MemoryUsage() + 50000
+		s.SetMemoryLimit(limit)
+		v, err := s.TryString(strings.Repeat("v", 30000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = tbl.SetInt(1, v)
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > limit {
+			t.Fatalf("SetInt err=%v but recounted MemoryUsage()=%d exceeded %d", err, usage, limit)
+		}
+	})
+
+	t.Run("Table.Set_int_key", func(t *testing.T) {
+		s := moelua.New()
+		defer s.Close()
+		tbl := s.NewTable(2000, 0)
+		if err := s.TrySetGlobal("t", tbl.Value()); err != nil {
+			t.Fatal(err)
+		}
+		s.CollectGarbage()
+		// 50,000 bytes of headroom: the 30,000-byte value fits, value+array growth does not.
+		limit := s.MemoryUsage() + 50000
+		s.SetMemoryLimit(limit)
+		v, err := s.TryString(strings.Repeat("v", 30000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = tbl.Set(moelua.Int(1), v)
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > limit {
+			t.Fatalf("Set err=%v but recounted MemoryUsage()=%d exceeded %d", err, usage, limit)
+		}
+	})
+
+	nameLimit := func(s *moelua.State, name string) int64 {
+		s.CollectGarbage()
+		// Room for the interned name (len+48) plus a few bytes: the following allocation must not fit.
+		l := s.MemoryUsage() + int64(len(name)) + 48 + 8
+		s.SetMemoryLimit(l)
+		return l
+	}
+
+	t.Run("Preload", func(t *testing.T) {
+		s := moelua.New()
+		defer s.Close()
+		name := strings.Repeat("p", 30000)
+		l := nameLimit(s, name)
+		err := s.Preload(name, func(*moelua.State, []moelua.Value) ([]moelua.Value, error) { return nil, nil })
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > l {
+			t.Fatalf("Preload err=%v but recounted MemoryUsage()=%d exceeded %d", err, usage, l)
+		}
+	})
+
+	t.Run("TryNewMetatable", func(t *testing.T) {
+		s := moelua.New()
+		defer s.Close()
+		name := strings.Repeat("m", 30000)
+		l := nameLimit(s, name)
+		_, _, err := s.TryNewMetatable(name)
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > l {
+			t.Fatalf("TryNewMetatable err=%v but recounted MemoryUsage()=%d exceeded %d", err, usage, l)
+		}
+	})
+}

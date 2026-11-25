@@ -73,7 +73,8 @@ func collectArgs(argv []string) cliFlags {
 			f.hasE = true
 			if len(arg) == 2 {
 				i++
-				if i >= len(argv) {
+				// lua.c:collectargs rejects a missing separated argument or one that is another option.
+				if i >= len(argv) || strings.HasPrefix(argv[i], "-") {
 					f.needArg = "-e"
 					return f
 				}
@@ -81,7 +82,8 @@ func collectArgs(argv []string) cliFlags {
 		case 'l':
 			if len(arg) == 2 {
 				i++
-				if i >= len(argv) {
+				// lua.c:collectargs rejects a missing separated argument or one that is another option.
+				if i >= len(argv) || strings.HasPrefix(argv[i], "-") {
 					f.needArg = "-l"
 					return f
 				}

@@ -491,3 +491,38 @@ func TestCLIFlagsREPLAndStdinParity(t *testing.T) {
 		})
 	}
 }
+
+func TestCLIRejectsOptionAsSeparatedArgument(t *testing.T) {
+	// Mirrors lua.c:collectargs: a separated -e/-l argument must exist and must not start with '-'.
+	bin := filepath.Join(t.TempDir(), "moelua")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build cmd/moelua failed: %v\n%s", err, out)
+	}
+	script := filepath.Join(t.TempDir(), "script.lua")
+	if err := os.WriteFile(script, []byte(`print("ran")`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		args    []string
+		needArg string
+	}{
+		{[]string{"-E", "-e", "--", script}, "-e"},
+		{[]string{"-E", "-l", "-x", script}, "-l"},
+		{[]string{"-E", "-e", "-"}, "-e"},
+	} {
+		cmd := exec.Command(bin, tc.args...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		if err == nil || strings.Contains(stdout.String(), "ran") || !strings.Contains(stderr.String(), "'"+tc.needArg+"' needs argument") {
+			t.Errorf("args=%q: err=%v stdout=%q stderr=%q", tc.args, err, stdout.String(), stderr.String())
+		}
+	}
+	out, err := exec.Command(bin, "-E", "-e--", script).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "ran") {
+		t.Errorf("concatenated -e-- should be accepted: err=%v out=%q", err, out)
+	}
+}

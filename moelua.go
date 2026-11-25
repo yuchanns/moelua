@@ -242,6 +242,8 @@ func (s *State) Preload(name string, loader GoFunc) error {
 		if err != nil {
 			return err
 		}
+		// Root the interned name across the loader allocation (emergency GC recount).
+		defer s.pinTemps(vm.StringValue(ls))()
 		v, err = s.TryNewFunc(name, loader)
 		if err != nil {
 			return err
@@ -479,6 +481,8 @@ func (s *State) TryNewMetatable(name string) (*Table, bool, error) {
 	if existing := reg.RawGetStr(key); existing.IsTable() {
 		return &Table{state: s, raw: existing.AsTable()}, false, nil
 	}
+	// Root the interned name across the metatable allocation (emergency GC recount).
+	defer s.pinTemps(vm.StringValue(key))()
 	mt, err := s.vm.TryNewTable(0, 4)
 	if err != nil {
 		return nil, false, err
@@ -665,6 +669,24 @@ func (s *State) RegisterFunc1(name string, fn GoFunc1) {
 	s.SetGlobal(name, v)
 }
 
+// pinTemps temporarily roots Go-held values so an emergency GC triggered by a following
+// allocation still traces and recounts them against the memory limit. Call the returned
+// function to release the roots once the values are reachable from Lua.
+func (s *State) pinTemps(vals ...Value) func() {
+	ids := make([]int, 0, len(vals))
+	for _, v := range vals {
+		if v.IsNil() {
+			continue
+		}
+		ids = append(ids, s.vm.Ref(v))
+	}
+	return func() {
+		for _, id := range ids {
+			s.vm.Unref(id)
+		}
+	}
+}
+
 // TrySetGlobal sets a global variable in _G after checking and accounting for the key string
 // and any table growth against the State's memory limit.
 func (s *State) TrySetGlobal(name string, v Value) error {
@@ -681,8 +703,7 @@ func (s *State) TrySetGlobal(name string, v Value) error {
 	} else {
 		// Root v (held only by Go) across key allocation so an emergency GC triggered by
 		// TryIntern recounts it against the memory limit.
-		ref := s.vm.Ref(v)
-		defer s.vm.Unref(ref)
+		defer s.pinTemps(v)()
 		var err error
 		ls, err = s.vm.TryIntern(name)
 		if err != nil {
@@ -906,6 +927,8 @@ func (t *Table) Set(key, val Value) error {
 	if !t.ready() {
 		return ErrStateClosed
 	}
+	// Root the table and operands across any array/hash growth (emergency GC recount).
+	defer t.state.pinTemps(vm.TableValue(t.raw), key, val)()
 	if err := t.raw.RawSet(t.state.vm, key, val); err != nil {
 		_ = t.state.vm.ConsumeMemErr()
 		return err
@@ -926,6 +949,8 @@ func (t *Table) SetInt(i int64, val Value) error {
 	if !t.ready() {
 		return ErrStateClosed
 	}
+	// Root the table and value across any array/hash growth (emergency GC recount).
+	defer t.state.pinTemps(vm.TableValue(t.raw), val)()
 	t.raw.RawSetInt(t.state.vm, i, val)
 	return t.state.vm.ConsumeMemErr()
 }
@@ -957,10 +982,7 @@ func (t *Table) SetString(key string, val Value) error {
 	} else {
 		// Root val and t (possibly held only by Go) across key allocation so an emergency GC
 		// triggered by TryIntern recounts them against the memory limit.
-		vref := t.state.vm.Ref(val)
-		defer t.state.vm.Unref(vref)
-		tref := t.state.vm.Ref(vm.TableValue(t.raw))
-		defer t.state.vm.Unref(tref)
+		defer t.state.pinTemps(val, vm.TableValue(t.raw))()
 		var err error
 		ls, err = t.state.vm.TryIntern(key)
 		if err != nil {
