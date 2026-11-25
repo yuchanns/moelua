@@ -1505,3 +1505,171 @@ func TestCodexReviewRound6VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound7VMRegressions(t *testing.T) {
+	// 1. Promoting specialized arrays (arrBool/arrInt/arrFloat -> arrGeneric) enforces State memory limits.
+	t.Run("specialized_array_promotion_memlimit", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			count int
+			val   string
+		}{
+			{"bool", 10000, "true"},
+			{"int", 3500, "1"},
+			{"float", 3500, "1.5"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				s := NewState()
+				defer s.Close()
+				s.SetMemoryLimit(65536)
+				cl, err := s.LoadChunk([]byte(fmt.Sprintf(`
+					local t = {}
+					for i = 1, %d do t[i] = %s end
+					local ok, err = pcall(function() t[1] = nil end)
+					assert(not ok and tostring(err):find("not enough memory", 1, true),
+						"expected memory error promoting %s array, got ok=" .. tostring(ok) .. " err=" .. tostring(err))
+					return "ok"
+				`, tc.count, tc.val, tc.name)), "=promo_mem_"+tc.name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+					t.Fatalf("Call failed: res=%v err=%v", res, err)
+				}
+			})
+		}
+	})
+
+	// 2. table.remove roots the removed value across subsequent __index/__newindex GC cycles.
+	t.Run("table_remove_roots_removed_value", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local fin = 0
+			local store = {}
+			local proxy = setmetatable({}, {
+				__len = function() return 2 end,
+				__index = function(_, i)
+					if i == 1 then
+						return setmetatable({ tag = "kept" }, { __gc = function() fin = fin + 1 end })
+					end
+					collectgarbage("collect")
+					return "second"
+				end,
+				__newindex = function(_, i, v)
+					collectgarbage("collect")
+					store[i] = v
+				end,
+			})
+			local removed = table.remove(proxy, 1)
+			assert(fin == 0, "removed value was finalized prematurely: fin=" .. fin)
+			assert(removed.tag == "kept" and store[1] == "second" and store[2] == nil)
+			return "ok"
+		`), "=remove_gc_root")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. Numeric file:read(n) bounds huge counts unconditionally without panicking Go's makeslice.
+	t.Run("file_read_maxinteger_no_panic", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local f = assert(io.tmpfile())
+			local ok, e = pcall(function() return f:read(math.maxinteger) end)
+			assert(not ok and tostring(e):find("too large", 1, true), tostring(e))
+			assert(f:write("hello"))
+			assert(f:seek("set", 0))
+			assert(f:read(1 << 28) == "hello")
+			assert(f:read(1 << 28) == nil)
+			f:close()
+			return "ok"
+		`), "=read_maxint_default")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+
+		s2 := NewState()
+		defer s2.Close()
+		s2.SetMemoryLimit(65536)
+		cl2, err := s2.LoadChunk([]byte(`
+			local f = assert(io.tmpfile())
+			local ok, e = pcall(function() return f:read(math.maxinteger) end)
+			assert(not ok and tostring(e):find("not enough memory", 1, true), tostring(e))
+			f:close()
+			return "ok"
+		`), "=read_maxint_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. Native call hooks that grow th.stack and mutate arguments via debug.setlocal take effect.
+	t.Run("native_call_hook_refreshes_args_after_stack_growth", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function grow(n)
+				if n <= 0 then return 0 end
+				local a, b, c, d = n, n+1, n+2, n+3
+				return grow(n - 1) + a - a + b - b + c - c + d - d
+			end
+			debug.sethook(function()
+				if debug.getinfo(2, "f").func == math.abs then
+					grow(120)
+					debug.setlocal(2, 1, -99)
+					local _, v = debug.getlocal(2, 1)
+					assert(v == -99)
+				end
+			end, "c")
+			local r = math.abs(-1)
+			debug.sethook()
+			assert(r == 99, "expected math.abs to observe modified arg -99 -> 99, got " .. tostring(r))
+			return "ok"
+		`), "=hook_native_args")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 5. xpcall on callable-table targets reuses recursive message-handler dispatch.
+	t.Run("xpcall_callable_table_reuses_recursive_msgh", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local callable = setmetatable({}, {
+				__call = function() error("boom") end,
+			})
+			local calls = 0
+			local ok, msg = xpcall(callable, function(err)
+				calls = calls + 1
+				if calls == 1 then
+					error("retry")
+				end
+				return "handled:" .. tostring(err):match("retry$")
+			end)
+			assert(not ok and calls == 2 and msg == "handled:retry",
+				string.format("ok=%s calls=%d msg=%s", tostring(ok), calls, tostring(msg)))
+			return "ok"
+		`), "=xpcall_callable_msgh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+}
