@@ -296,6 +296,9 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 			}
 			var val Value
 			t := repl.AsTable()
+			if herr := s.ensureLookupKeyHash(t, kv); herr != nil {
+				return "", false, herr
+			}
 			val = t.RawGet(kv)
 			if val.IsNil() && t.meta != nil {
 				var gerr error

@@ -470,7 +470,11 @@ func nativeRawGet(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad argument #2 to 'rawget' (value expected)")
 	}
-	return []Value{args[0].AsTable().RawGet(args[1])}, nil
+	t := args[0].AsTable()
+	if err := s.ensureLookupKeyHash(t, args[1]); err != nil {
+		return nil, err
+	}
+	return []Value{t.RawGet(args[1])}, nil
 }
 
 func nativeRawSet(s *State, args []Value) ([]Value, error) {
@@ -561,7 +565,7 @@ func nativeGetMetatable(s *State, args []Value) ([]Value, error) {
 	return []Value{TableValue(mt)}, nil
 }
 
-func nativeNext(_ *State, args []Value) ([]Value, error) {
+func nativeNext(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsTable() {
 		return nil, fmt.Errorf("bad argument #1 to 'next' (table expected)")
 	}
@@ -569,7 +573,11 @@ func nativeNext(_ *State, args []Value) ([]Value, error) {
 	if len(args) >= 2 {
 		key = args[1]
 	}
-	k, v, err := args[0].AsTable().Next(key)
+	t := args[0].AsTable()
+	if err := s.ensureLookupKeyHash(t, key); err != nil {
+		return nil, err
+	}
+	k, v, err := t.Next(key)
 	if err != nil {
 		return nil, err
 	}

@@ -193,7 +193,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					co.stack[1+i] = a
 				}
 				co.top = 1 + len(args)
-				if _, err := s.pushProtectedCall(co, 0, len(args), -1, false); err != nil {
+				if _, err := s.pushProtectedCall(co, 0, len(args), -1, false, 0); err != nil {
 					if errors.Is(err, errYieldSentinel) {
 						co.status = ThreadSuspended
 						out := co.yieldVals
@@ -225,7 +225,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					co.stack[1+i] = a
 				}
 				co.top = 1 + len(args)
-				if _, err := s.pushProtectedCall(co, 0, len(args), -1, true); err != nil {
+				if _, err := s.pushProtectedCall(co, 0, len(args), -1, true, 0); err != nil {
 					if errors.Is(err, errYieldSentinel) {
 						co.status = ThreadSuspended
 						out := co.yieldVals
@@ -303,6 +303,11 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				ev := s.runtimeErrorToValue(co, err)
 				co.errObj = ev
 				return false, []Value{ev}, nil
+			}
+			if len(res) > 0 && slicesOverlapValues(res, co.stack) {
+				cp := make([]Value, len(res))
+				copy(cp, res)
+				res = cp
 			}
 			return true, res, nil
 		}
@@ -498,6 +503,10 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 
 runCoro:
 	err := s.runThread(co, 0)
+	if co.uncaughtErr != nil {
+		err = co.uncaughtErr
+		co.uncaughtErr = nil
+	}
 	if errors.Is(err, errYieldSentinel) {
 		co.status = ThreadSuspended
 		out := co.yieldVals

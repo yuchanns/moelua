@@ -98,6 +98,8 @@ var tmNames = [tmCount]string{
 	TMPairs:    "__pairs",
 }
 
+const strHashCancelChunk = 4096
+
 // hashString computes a fast 32-bit FNV-1a hash seeded with state seed.
 func hashString(s string, seed uint32) uint32 {
 	h := uint32(2166136261) ^ seed
@@ -109,6 +111,28 @@ func hashString(s string, seed uint32) uint32 {
 		h = 1
 	}
 	return h
+}
+
+// hashStringWithCancel computes the same 32-bit FNV-1a hash as hashString, polling cancelFn
+// every strHashCancelChunk bytes so long string keys respect context deadlines and instruction limits.
+func hashStringWithCancel(s string, seed uint32, cancelFn func() error) (uint32, error) {
+	if cancelFn == nil || len(s) <= strHashCancelChunk {
+		return hashString(s, seed), nil
+	}
+	h := uint32(2166136261) ^ seed
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+		if (i & (strHashCancelChunk - 1)) == (strHashCancelChunk - 1) {
+			if err := cancelFn(); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if h == 0 {
+		h = 1
+	}
+	return h, nil
 }
 
 type stringInterner struct {
@@ -183,6 +207,54 @@ func (ls *LuaString) hash() uint32 {
 	h := hashString(ls.S, globalStrSeed)
 	atomic.StoreUint32(&ls.Hash, h)
 	return h
+}
+
+func (ls *LuaString) hashWithCancel(cancelFn func() error) (uint32, error) {
+	if ls.Short {
+		return ls.Hash, nil
+	}
+	if h := atomic.LoadUint32(&ls.Hash); h != 0 {
+		return h, nil
+	}
+	h, err := hashStringWithCancel(ls.S, globalStrSeed, cancelFn)
+	if err != nil {
+		return 0, err
+	}
+	atomic.StoreUint32(&ls.Hash, h)
+	return h, nil
+}
+
+func (s *State) ensureStrKeyHash(ls *LuaString) error {
+	if s == nil || ls == nil || ls.Short || len(ls.S) <= strHashCancelChunk || atomic.LoadUint32(&ls.Hash) != 0 {
+		return nil
+	}
+	cancelFn := s.nativeCancelFunc()
+	if cancelFn == nil {
+		return nil
+	}
+	_, err := ls.hashWithCancel(cancelFn)
+	return err
+}
+
+func (s *State) ensureLookupStrKeyHash(t *Table, ls *LuaString) error {
+	if t == nil || t.hash == nil || len(t.hash.nodes) == 0 {
+		return nil
+	}
+	return s.ensureStrKeyHash(ls)
+}
+
+func (s *State) ensureLookupKeyHash(t *Table, key Value) error {
+	if !key.IsString() {
+		return nil
+	}
+	return s.ensureLookupStrKeyHash(t, key.AsString())
+}
+
+func (s *State) ensureWriteStrKeyHash(t *Table, ls *LuaString, valNil bool) error {
+	if valNil && (t == nil || t.hash == nil || len(t.hash.nodes) == 0) {
+		return nil
+	}
+	return s.ensureStrKeyHash(ls)
 }
 
 // lookupExistingShort returns an already-interned short *LuaString if present (without allocating).

@@ -557,6 +557,9 @@ func (t *Table) RawGetStr(k *LuaString) Value {
 
 // RawSetStr stores a LuaString key -> val.
 func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
+	if err := s.ensureWriteStrKeyHash(t, k, val.IsNil()); err != nil {
+		return
+	}
 	if k == s.intern.tms[TMGC] || k == s.intern.tms[TMMode] {
 		s.activateTier1()
 		if k == s.intern.tms[TMGC] && t == s.fileMeta {
@@ -1083,6 +1086,9 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 		t.RawSetInt(s, key.Int(), val)
 		return s.ConsumeMemErr()
 	case key.IsString():
+		if err := s.ensureWriteStrKeyHash(t, key.AsString(), val.IsNil()); err != nil {
+			return err
+		}
 		t.RawSetStr(s, key.AsString(), val)
 		return s.ConsumeMemErr()
 	case key.IsFloat():

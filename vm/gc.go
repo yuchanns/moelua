@@ -522,9 +522,15 @@ func (tr *gcTracer) markRoots() {
 		tr.mark(ThreadValue(s.cur))
 	}
 	for _, v := range s.gc.pinnedRefs {
+		if tr.cancelFn != nil && tr.tickCancel() {
+			return
+		}
 		tr.mark(v)
 	}
 	for _, v := range s.gc.toBeFnz {
+		if tr.cancelFn != nil && tr.tickCancel() {
+			return
+		}
 		tr.mark(v)
 	}
 }
@@ -651,6 +657,9 @@ func (tr *gcTracer) propagateAll() {
 		switch {
 		case v.IsTable():
 			tr.traverseTable(v.AsTable())
+			if tr.aborted {
+				return
+			}
 		case v.IsClosure():
 			c := v.AsClosure()
 			for _, uv := range c.upvals {
@@ -678,6 +687,9 @@ func (tr *gcTracer) propagateAll() {
 				tr.mark(TableValue(u.Meta))
 			}
 			for _, uv := range u.UValues {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return
+				}
 				tr.mark(uv)
 			}
 			for _, rv := range u.gcRefs {
@@ -685,6 +697,9 @@ func (tr *gcTracer) propagateAll() {
 			}
 		case v.IsThread():
 			tr.traverseThread(v.AsThread())
+			if tr.aborted {
+				return
+			}
 		}
 	}
 }
@@ -692,6 +707,9 @@ func (tr *gcTracer) propagateAll() {
 func (tr *gcTracer) traverseThread(th *Thread) {
 	// Mirror lgc.c:traversethread literally: mark only stack[0..th.top) and nil-fill stack[th.top:)!
 	for i := range th.nframe {
+		if tr.cancelFn != nil && tr.tickCancel() {
+			return
+		}
 		cf := &th.frames[i]
 		if cf.cl != nil {
 			tr.mark(ClosureValue(cf.cl))
@@ -736,6 +754,9 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 		lim = len(th.stack)
 	}
 	for i := 0; i < lim; i++ {
+		if tr.cancelFn != nil && tr.tickCancel() {
+			return
+		}
 		tr.mark(th.stack[i])
 	}
 	if lim < len(th.stack) {
@@ -743,6 +764,9 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 	}
 	maxOpenUpvalIdx := -1
 	for uv := th.openUpvals; uv != nil; uv = uv.next {
+		if tr.cancelFn != nil && tr.tickCancel() {
+			return
+		}
 		if uv.stackIdx < len(th.stack) {
 			tr.mark(th.stack[uv.stackIdx])
 		}
@@ -810,15 +834,24 @@ func (tr *gcTracer) traverseTable(t *Table) {
 		// Strong table: mark all keys and values.
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
 			for _, v := range t.arrValSlice() {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return
+				}
 				tr.mark(v)
 			}
 		}
 		for _, v := range t.slots {
+			if tr.cancelFn != nil && tr.tickCancel() {
+				return
+			}
 			tr.mark(v)
 		}
 		if t.hash != nil {
 			nodes := t.hash.nodes
 			for i := range nodes {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return
+				}
 				nd := &nodes[i]
 				if nd.used && !nd.dead && !nd.val.IsNil() {
 					tr.mark(nd.key)
@@ -838,6 +871,9 @@ func (tr *gcTracer) traverseTable(t *Table) {
 		if t.hash != nil {
 			nodes := t.hash.nodes
 			for i := range nodes {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return
+				}
 				nd := &nodes[i]
 				if nd.used && !nd.dead && !nd.val.IsNil() {
 					tr.mark(nd.key)
@@ -851,15 +887,24 @@ func (tr *gcTracer) traverseTable(t *Table) {
 	// Dense array & shape slots have non-collectable keys (int / string) -> always strong!
 	if t.arrKind == arrGeneric && t.arrLen > 0 {
 		for _, v := range t.arrValSlice() {
+			if tr.cancelFn != nil && tr.tickCancel() {
+				return
+			}
 			tr.mark(v)
 		}
 	}
 	for _, v := range t.slots {
+		if tr.cancelFn != nil && tr.tickCancel() {
+			return
+		}
 		tr.mark(v)
 	}
 	if t.hash != nil {
 		nodes := t.hash.nodes
 		for i := range nodes {
+			if tr.cancelFn != nil && tr.tickCancel() {
+				return
+			}
 			nd := &nodes[i]
 			if nd.used && !nd.dead && !nd.val.IsNil() {
 				if tr.isMarked(nd.key) {
@@ -921,10 +966,18 @@ func (tr *gcTracer) convergeEphemerons() {
 
 func (tr *gcTracer) clearByValues(tables []*Table) {
 	cleared := false
+	defer func() {
+		if cleared {
+			tr.s.protoEpoch++
+		}
+	}()
 	for _, t := range tables {
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
 			arr := t.arrValSlice()
 			for i := range arr {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return
+				}
 				if !arr[i].IsNil() && !tr.isMarked(arr[i]) {
 					arr[i] = NilValue()
 					cleared = true
@@ -932,6 +985,9 @@ func (tr *gcTracer) clearByValues(tables []*Table) {
 			}
 		}
 		for i := range t.slots {
+			if tr.cancelFn != nil && tr.tickCancel() {
+				return
+			}
 			if !t.slots[i].IsNil() && !tr.isMarked(t.slots[i]) {
 				t.slots[i] = NilValue()
 				cleared = true
@@ -940,6 +996,9 @@ func (tr *gcTracer) clearByValues(tables []*Table) {
 		if h := t.hash; h != nil {
 			nodes := h.nodes
 			for i := range nodes {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return
+				}
 				nd := &nodes[i]
 				if nd.used && !nd.dead && !nd.val.IsNil() && !tr.isMarked(nd.val) {
 					nd.val = NilValue()
@@ -951,17 +1010,22 @@ func (tr *gcTracer) clearByValues(tables []*Table) {
 			}
 		}
 	}
-	if cleared {
-		tr.s.protoEpoch++
-	}
 }
 
 func (tr *gcTracer) clearByKeys(tables []*Table) {
 	cleared := false
+	defer func() {
+		if cleared {
+			tr.s.protoEpoch++
+		}
+	}()
 	for _, t := range tables {
 		if h := t.hash; h != nil {
 			nodes := h.nodes
 			for i := range nodes {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return
+				}
 				nd := &nodes[i]
 				if nd.used && !nd.dead && !nd.val.IsNil() && !tr.isMarked(nd.key) {
 					// Key is provably unreachable; clear both key and val so Go's GC reclaims the key immediately.
@@ -975,9 +1039,6 @@ func (tr *gcTracer) clearByKeys(tables []*Table) {
 			}
 		}
 	}
-	if cleared {
-		tr.s.protoEpoch++
-	}
 }
 
 func (tr *gcTracer) accountWeakStrings() {
@@ -988,12 +1049,18 @@ func (tr *gcTracer) accountWeakStrings() {
 		for _, t := range tables {
 			if t.arrKind == arrGeneric && t.arrLen > 0 {
 				for _, v := range t.arrValSlice() {
+					if tr.cancelFn != nil && tr.tickCancel() {
+						return
+					}
 					if v.IsString() {
 						tr.mark(v)
 					}
 				}
 			}
 			for _, v := range t.slots {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return
+				}
 				if v.IsString() {
 					tr.mark(v)
 				}
@@ -1001,6 +1068,9 @@ func (tr *gcTracer) accountWeakStrings() {
 			if t.hash != nil {
 				nodes := t.hash.nodes
 				for i := range nodes {
+					if tr.cancelFn != nil && tr.tickCancel() {
+						return
+					}
 					nd := &nodes[i]
 					if nd.used && !nd.dead && !nd.val.IsNil() {
 						if nd.key.IsString() {
@@ -1015,7 +1085,13 @@ func (tr *gcTracer) accountWeakStrings() {
 		}
 	}
 	markTableStrings(tr.weakVals)
+	if tr.aborted {
+		return
+	}
 	markTableStrings(tr.ephemerons)
+	if tr.aborted {
+		return
+	}
 	markTableStrings(tr.allWeaks)
 }
 
@@ -1027,6 +1103,9 @@ func (tr *gcTracer) clearDeadHashKeys() bool {
 	for _, t := range tr.hashedTables {
 		nodes := t.hash.nodes
 		for i := range nodes {
+			if tr.cancelFn != nil && tr.tickCancel() {
+				return true
+			}
 			nd := &nodes[i]
 			if !nd.used || !nd.dead || nd.key.IsNil() {
 				continue
@@ -1119,6 +1198,9 @@ func (tr *gcTracer) sweepInlineCaches() {
 	for bp := range tr.seenProtos {
 		ics := bp.ic
 		for i := range ics {
+			if tr.cancelFn != nil && tr.tickCancel() {
+				return
+			}
 			ic := &ics[i]
 			if ic.kind == icEmpty && ic.poly == nil {
 				continue
@@ -1228,6 +1310,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 			cancelFn:         cancelFn,
 		}
 		tr.markRoots()
+		if tr.aborted {
+			return
+		}
 		tr.propagateAll()
 		if tr.aborted {
 			return
@@ -1241,8 +1326,17 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 				return
 			}
 			tr.clearByValues(tr.weakVals)
+			if tr.aborted {
+				return
+			}
 			tr.clearByValues(tr.allWeaks)
+			if tr.aborted {
+				return
+			}
 			for _, fe := range s.gc.finalizable {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return
+				}
 				if fe.obj.IsTable() && fe.obj.AsTable().flags&tblFlagGCFnzed != 0 {
 					continue
 				}
@@ -1254,6 +1348,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 				}
 			}
 			for _, wf := range s.gc.weakFiles {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return
+				}
 				if u := wf.userdata(); u != nil && !u.gcFnzed {
 					obj := UserdataValue(u)
 					if !tr.isMarked(obj) {
@@ -1262,18 +1359,42 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 				}
 			}
 			tr.propagateAll()
+			if tr.aborted {
+				return
+			}
 			tr.convergeEphemerons()
 			if tr.aborted {
 				return
 			}
 			tr.clearByKeys(tr.ephemerons)
+			if tr.aborted {
+				return
+			}
 			tr.clearByKeys(tr.allWeaks)
+			if tr.aborted {
+				return
+			}
 			tr.clearByValues(tr.weakVals)
+			if tr.aborted {
+				return
+			}
 			tr.clearByValues(tr.allWeaks)
+			if tr.aborted {
+				return
+			}
 		}
 		tr.accountWeakStrings()
+		if tr.aborted {
+			return
+		}
 		s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
+		if tr.aborted {
+			return
+		}
 		tr.sweepInlineCaches()
+		if tr.aborted {
+			return
+		}
 		// Close open upvalues belonging to threads that remain unreachable, so dead
 		// coroutines are unpinned for Go's GC even in Tier 0 / emergency GC paths.
 		for _, uv := range tr.liveOpenUpvals {
@@ -1306,6 +1427,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 
 	// Mark all VM roots.
 	tr.markRoots()
+	if tr.aborted {
+		return
+	}
 	tr.propagateAll()
 	if tr.aborted {
 		return
@@ -1319,7 +1443,13 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 
 	// Step 2: clearByValues BEFORE __gc separation (weak values are nil inside __gc!).
 	tr.clearByValues(tr.weakVals)
+	if tr.aborted {
+		return
+	}
 	tr.clearByValues(tr.allWeaks)
+	if tr.aborted {
+		return
+	}
 
 	// Step 3: separateToBeFnz in STRICT REVERSE (LIFO) registration order across tables,
 	// userdata, and file handles using the shared monotonic registration sequence!
@@ -1386,6 +1516,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 
 	// Step 4: markBeingFnz + propagate (resurrection: keeps dying object & its refs alive during __gc!).
 	for _, obj := range s.gc.toBeFnz {
+		if tr.cancelFn != nil && tr.tickCancel() {
+			return
+		}
 		tr.mark(obj)
 	}
 	tr.propagateAll()
@@ -1399,20 +1532,41 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		return
 	}
 	tr.clearByKeys(tr.ephemerons)
+	if tr.aborted {
+		return
+	}
 	tr.clearByKeys(tr.allWeaks)
+	if tr.aborted {
+		return
+	}
 
 	// Step 6: clearByValues again on ALL weak-value/all-weak tables (including any resurrected in Step 4, gc.lua:444!).
 	tr.clearByValues(tr.weakVals)
+	if tr.aborted {
+		return
+	}
 	tr.clearByValues(tr.allWeaks)
+	if tr.aborted {
+		return
+	}
 
 	// Strings are value-like in Lua 5.5 and survive weak clearing; account for surviving strings
 	// in weak table positions before sweeping dead hash keys and updating allocBytes.
 	tr.accountWeakStrings()
+	if tr.aborted {
+		return
+	}
 
 	// Release strong Go pointers from unreachable dead/tombstoned hash keys (matching lgc.c:clearkey)
 	// and sweep invalidated/unreachable inline cache entries.
 	s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
+	if tr.aborted {
+		return
+	}
 	tr.sweepInlineCaches()
+	if tr.aborted {
+		return
+	}
 
 	// Close open upvalues belonging to threads that remain unreachable after Step 4 resurrection,
 	// so live closures keep their captured values and dead threads are unpinned for Go's GC.

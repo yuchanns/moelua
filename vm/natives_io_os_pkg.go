@@ -2753,7 +2753,11 @@ func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'searcher_preload' (string expected)")
 	}
 	name := FormatValue(args[0])
-	v := s.preloadTbl.RawGetStr(s.intern.Intern(name))
+	key := s.intern.Intern(name)
+	if err := s.ensureLookupStrKeyHash(s.preloadTbl, key); err != nil {
+		return nil, err
+	}
+	v := s.preloadTbl.RawGetStr(key)
 	if v.IsNil() {
 		if s.memLimit > 0 {
 			if err := s.checkMem(int64(len(name)) + 80); err != nil {
@@ -2830,6 +2834,9 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	name := FormatValue(args[0])
 	key := s.intern.Intern(name)
 	loadedVal := TableValue(s.loadedTbl)
+	if err := s.ensureLookupStrKeyHash(s.loadedTbl, key); err != nil {
+		return nil, err
+	}
 	existing := s.loadedTbl.RawGetStr(key)
 	if existing.IsNil() && s.loadedTbl.meta != nil {
 		var gerr error
@@ -2912,6 +2919,9 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 		if err := s.tableSetStr(loadedVal, key, res[0]); err != nil {
 			return nil, err
 		}
+	}
+	if err := s.ensureLookupStrKeyHash(s.loadedTbl, key); err != nil {
+		return nil, err
 	}
 	finalVal := s.loadedTbl.RawGetStr(key)
 	if finalVal.IsNil() && s.loadedTbl.meta != nil {

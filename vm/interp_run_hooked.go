@@ -138,8 +138,8 @@ reloadFrame:
 							continue
 						}
 					}
-				} else {
-					if v := t.RawGetStr(ev.bp.strConsts[uint8(w>>bytecode.PosC)]); !v.IsNil() || t.meta == nil {
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
 					}
@@ -174,8 +174,8 @@ reloadFrame:
 							continue
 						}
 					}
-				} else {
-					if v := t.RawGetStr(ev.bp.strConsts[uint8(w>>bytecode.PosC)]); !v.IsNil() || t.meta == nil {
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
 					}
@@ -262,8 +262,8 @@ reloadFrame:
 							}
 						}
 					}
-				} else {
-					if v := t.RawGetStr(ev.bp.strConsts[uint8(w>>bytecode.PosC)]); !v.IsNil() || t.meta == nil {
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
 					}

@@ -111,6 +111,7 @@ type Thread struct {
 	status        ThreadStatus
 	errObj        Value   // last error object when dead due to error
 	lastErrNative Value   // native function that raised an uncaught error on this thread (for dead-coro traceback)
+	uncaughtErr   error   // replacement error raised while unwinding a protected call that escaped entryDepth
 	syncCloseErrs []Value // active error objects held across synchronous closeAllSync callbacks (GC-traced)
 	caller        *Thread // resuming parent thread (non-nil while running)
 

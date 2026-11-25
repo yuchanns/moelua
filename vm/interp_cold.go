@@ -22,6 +22,10 @@ func (s *State) catchSlow(th *Thread, ev *frameEnv, pushed bool, err error) (boo
 		if s.handleError(th, ev.entryDepth, err) {
 			return true, nil
 		}
+		if th.uncaughtErr != nil {
+			err = th.uncaughtErr
+			th.uncaughtErr = nil
+		}
 		if s.abortErr != nil {
 			return false, s.abortErr
 		}
@@ -47,6 +51,10 @@ func (s *State) prepareLuaFrame(th *Thread, entryDepth int) (bool, error) {
 				if s.handleError(th, entryDepth, err) {
 					continue
 				}
+				if th.uncaughtErr != nil {
+					err = th.uncaughtErr
+					th.uncaughtErr = nil
+				}
 				if s.abortErr != nil {
 					return false, s.abortErr
 				}
@@ -61,6 +69,10 @@ func (s *State) prepareLuaFrame(th *Thread, entryDepth int) (bool, error) {
 			if err != nil {
 				if s.handleError(th, entryDepth, err) {
 					continue
+				}
+				if th.uncaughtErr != nil {
+					err = th.uncaughtErr
+					th.uncaughtErr = nil
 				}
 				if s.abortErr != nil {
 					return false, s.abortErr
@@ -289,7 +301,13 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 				return false
 			}
 			// Nested sync error during yieldable TBC setup: recurse to handle!
-			return s.handleError(th, entryDepth, cerr)
+			if s.handleError(th, entryDepth, cerr) {
+				return true
+			}
+			if th.uncaughtErr == nil {
+				th.uncaughtErr = cerr
+			}
+			return false
 		}
 		if !cont {
 			return true
@@ -319,14 +337,26 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 				s.abortErr = herr
 				return false
 			}
-			return s.handleError(th, entryDepth, herr)
+			if s.handleError(th, entryDepth, herr) {
+				return true
+			}
+			if th.uncaughtErr == nil {
+				th.uncaughtErr = herr
+			}
+			return false
 		}
 	}
 	funcIdx := cf.funcIdx
 	nres := cf.nresults
 	th.nframe--
 	if perr := th.placeResults(funcIdx, []Value{FalseValue(), errVal}, nres); perr != nil {
-		return s.handleError(th, entryDepth, perr)
+		if s.handleError(th, entryDepth, perr) {
+			return true
+		}
+		if th.uncaughtErr == nil {
+			th.uncaughtErr = perr
+		}
+		return false
 	}
 	return true
 }
@@ -589,6 +619,9 @@ func (s *State) getTabUpSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 	key := ev.bp.strConsts[c]
 	if tv.IsTable() {
 		t := tv.AsTable()
+		if err := s.ensureLookupStrKeyHash(t, key); err != nil {
+			return s.catchSlow(th, ev, false, err)
+		}
 		if OptimizeEnabled {
 			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
 			if t.shape != nil && key.Short {
@@ -702,6 +735,9 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 				}
 			}
 		}
+		if err := s.ensureLookupStrKeyHash(t, key); err != nil {
+			return s.catchSlow(th, ev, false, err)
+		}
 		v := t.RawGetStr(key)
 		if !v.IsNil() || t.meta == nil {
 			regs[a] = v
@@ -725,6 +761,9 @@ func (s *State) walkIndexChainOrFn(orig *Table, key *LuaString) (val Value, fnTM
 			t := cur.AsTable()
 			if loop > 0 {
 				t.markProto(s)
+				if herr := s.ensureLookupStrKeyHash(t, key); herr != nil {
+					return NilValue(), NilValue(), NilValue(), false, herr
+				}
 				v := t.RawGetStr(key)
 				if !v.IsNil() {
 					return v, NilValue(), NilValue(), true, nil
@@ -864,12 +903,17 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 				}
 				return false, nil
 			}
-		} else if !t.RawGetStr(key).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
-			t.RawSetStr(s, key, val)
-			if err := s.ConsumeMemErr(); err != nil {
+		} else {
+			if err := s.ensureLookupStrKeyHash(t, key); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
-			return false, nil
+			if !t.RawGetStr(key).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+				t.RawSetStr(s, key, val)
+				if err := s.ConsumeMemErr(); err != nil {
+					return s.catchSlow(th, ev, false, err)
+				}
+				return false, nil
+			}
 		}
 	}
 	pushed, err := s.finishSetYieldable(th, ev, ra, ev.consts[b], val)
@@ -900,6 +944,9 @@ func (s *State) getTableSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, r
 	rc := regs[uint8(w>>bytecode.PosC)]
 	if rb.IsTable() {
 		t := rb.AsTable()
+		if err := s.ensureLookupKeyHash(t, rc); err != nil {
+			return s.catchSlow(th, ev, false, err)
+		}
 		v := t.RawGet(rc)
 		if !v.IsNil() || t.meta == nil {
 			regs[a] = v
@@ -926,9 +973,8 @@ func (s *State) setISlow(th *Thread, ev *frameEnv, w bytecode.Instruction, regs 
 		t := ra.AsTable()
 		if !t.RawGetInt(b).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 			t.RawSetInt(s, b, val)
-			if s.memExceeded {
-				s.memExceeded = false
-				return s.catchSlow(th, ev, false, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))})
+			if err := s.ConsumeMemErr(); err != nil {
+				return s.catchSlow(th, ev, false, err)
 			}
 			return false, nil
 		}
@@ -951,6 +997,9 @@ func (s *State) setTableSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, r
 	ra := regs[a]
 	if ra.IsTable() {
 		t := ra.AsTable()
+		if err := s.ensureLookupKeyHash(t, rb); err != nil {
+			return s.catchSlow(th, ev, false, err)
+		}
 		if !t.RawGet(rb).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 			return s.catchSlow(th, ev, false, t.RawSet(s, rb, val))
 		}
@@ -993,6 +1042,9 @@ func (s *State) finishGetYieldable(th *Thread, ev *frameEnv, obj, key Value, dst
 		if cur.IsTable() {
 			t := cur.AsTable()
 			if loop > 0 {
+				if err := s.ensureLookupKeyHash(t, key); err != nil {
+					return false, err
+				}
 				v := t.RawGet(key)
 				if !v.IsNil() {
 					th.stack[ev.base+int(dstReg)] = v
@@ -1029,6 +1081,9 @@ func (s *State) finishSetYieldable(th *Thread, ev *frameEnv, obj, key, val Value
 		if cur.IsTable() {
 			t := cur.AsTable()
 			if loop > 0 {
+				if err := s.ensureLookupKeyHash(t, key); err != nil {
+					return false, err
+				}
 				if !t.RawGet(key).IsNil() {
 					return false, t.RawSet(s, key, val)
 				}
@@ -1062,6 +1117,9 @@ func (s *State) finishGet(obj, key Value) (Value, error) {
 		if cur.IsTable() {
 			t := cur.AsTable()
 			if loop > 0 {
+				if err := s.ensureLookupKeyHash(t, key); err != nil {
+					return NilValue(), err
+				}
 				v := t.RawGet(key)
 				if !v.IsNil() {
 					return v, nil
@@ -1113,11 +1171,11 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		if nf.Intrinsic != intrNone {
 			// Yieldable flat-stack pcall / xpcall (including nested pcall(pcall, ...) / xpcall(pcall, ...))!
 			if nf.Intrinsic == intrPCall && nargs >= 1 && isFlatProtectedTarget(th.stack[funcIdx+1]) {
-				p, e := s.pushProtectedCall(th, funcIdx, nargs, nresults, false)
+				p, e := s.pushProtectedCall(th, funcIdx, nargs, nresults, false, ev.entryDepth)
 				return s.catchSlow(th, ev, p, e)
 			}
 			if nf.Intrinsic == intrXPCall && nargs >= 2 && isFlatProtectedTarget(th.stack[funcIdx+1]) && th.stack[funcIdx+2].IsFunction() {
-				p, e := s.pushProtectedCall(th, funcIdx, nargs, nresults, true)
+				p, e := s.pushProtectedCall(th, funcIdx, nargs, nresults, true, ev.entryDepth)
 				return s.catchSlow(th, ev, p, e)
 			}
 			if nf.Intrinsic == intrDoFile {
@@ -1550,7 +1608,7 @@ func isFlatProtectedTarget(_ Value) bool {
 // pushProtectedCall pushes a framePCall/frameXPCall boundary frame + target Lua closure,
 // callable table (__call chain), or native (including nested pcall/xpcall and coroutine.yield!)
 // directly onto th.frames so protected calls remain yieldable without a Go C-call boundary.
-func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP bool) (bool, error) {
+func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP bool, entryDepth int) (bool, error) {
 	// Enforce Lua 5.5 LUAI_MAXCCALLS (200) across nested pcall/xpcall frames (calls.lua:162).
 	pcalls := 0
 	for i := 0; i < th.nframe; i++ {
@@ -1607,6 +1665,16 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 		}
 	}
 	outerDepth := th.nframe
+	uncaught := func(err error) error {
+		if th.uncaughtErr != nil {
+			err = th.uncaughtErr
+			th.uncaughtErr = nil
+		}
+		if s.abortErr != nil {
+			return s.abortErr
+		}
+		return err
+	}
 	var extraDepth uint8
 	if !targetVal.IsClosure() && !targetVal.IsNative() {
 		cur := targetVal
@@ -1615,10 +1683,10 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 			tm := s.getTMByObj(cur, TMCall)
 			if tm.IsNil() {
 				err := fmt.Errorf("attempt to call a %s value", cur.TypeName())
-				if s.handleError(th, 0, err) {
+				if s.handleError(th, entryDepth, err) {
 					return true, nil
 				}
-				return false, err
+				return false, uncaught(err)
 			}
 			prepended = append(prepended, cur)
 			cur = tm
@@ -1629,17 +1697,17 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 		}
 		if !cur.IsClosure() && !cur.IsNative() {
 			err := fmt.Errorf("'__call' chain too long")
-			if s.handleError(th, 0, err) {
+			if s.handleError(th, entryDepth, err) {
 				return true, nil
 			}
-			return false, err
+			return false, uncaught(err)
 		}
 		k := len(prepended)
 		if err := th.ensureStack(calleeIdx + 1 + k + calleeArgs + 8); err != nil {
-			if s.handleError(th, 0, err) {
+			if s.handleError(th, entryDepth, err) {
 				return true, nil
 			}
-			return false, err
+			return false, uncaught(err)
 		}
 		copy(th.stack[calleeIdx+1+k:calleeIdx+1+k+calleeArgs], th.stack[calleeIdx+1:calleeIdx+1+calleeArgs])
 		for i := range k {
@@ -1654,33 +1722,27 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 		intr := nf.Intrinsic
 		if (intr == intrPCall && calleeArgs >= 1 && isFlatProtectedTarget(th.stack[calleeIdx+1])) ||
 			(intr == intrXPCall && calleeArgs >= 2 && isFlatProtectedTarget(th.stack[calleeIdx+1]) && th.stack[calleeIdx+2].IsFunction()) {
-			ok, err := s.pushProtectedCall(th, calleeIdx, calleeArgs, -1, intr == intrXPCall)
+			ok, err := s.pushProtectedCall(th, calleeIdx, calleeArgs, -1, intr == intrXPCall, entryDepth)
 			if err != nil {
 				if errors.Is(err, errYieldSentinel) {
 					return false, errYieldSentinel
 				}
 				if th.nframe == outerDepth {
-					if s.handleError(th, 0, err) {
+					if s.handleError(th, entryDepth, err) {
 						return th.nframe != outerDepth-1, nil
 					}
 				}
-				if s.abortErr != nil {
-					return false, s.abortErr
-				}
-				return false, err
+				return false, uncaught(err)
 			}
 			// If the nested protected call completed synchronously (either via a normal native
 			// return or by catching an error at its own inner frame), our outer framePCall/frameXPCall
 			// is back on top of th.frames with the inner results at calleeIdx..th.top. Complete it now!
 			if th.nframe == outerDepth && th.frames[outerDepth-1].kind != frameLua {
-				if _, ferr := s.finishPCallReturn(th, 0); ferr != nil {
-					if s.handleError(th, 0, ferr) {
+				if _, ferr := s.finishPCallReturn(th, entryDepth); ferr != nil {
+					if s.handleError(th, entryDepth, ferr) {
 						return true, nil
 					}
-					if s.abortErr != nil {
-						return false, s.abortErr
-					}
-					return false, ferr
+					return false, uncaught(ferr)
 				}
 				return false, nil
 			}
@@ -1690,10 +1752,10 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 			th.top = calleeIdx + 1 + calleeArgs
 			loaded, lerr := nativeLoadFile(s, th.stack[calleeIdx+1:calleeIdx+1+calleeArgs])
 			if lerr != nil {
-				if s.handleError(th, 0, lerr) {
+				if s.handleError(th, entryDepth, lerr) {
 					return true, nil
 				}
-				return false, lerr
+				return false, uncaught(lerr)
 			}
 			if len(loaded) == 0 || loaded[0].IsNil() {
 				var derr error
@@ -1702,10 +1764,10 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 				} else {
 					derr = fmt.Errorf("dofile failed")
 				}
-				if s.handleError(th, 0, derr) {
+				if s.handleError(th, entryDepth, derr) {
 					return true, nil
 				}
-				return false, derr
+				return false, uncaught(derr)
 			}
 			th.stack[calleeIdx] = loaded[0]
 			cl := loaded[0].AsClosure()
@@ -1714,10 +1776,10 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 				return false, err
 			}
 			if herr := s.fireLuaCallHook(th, cl, 0); herr != nil {
-				if s.handleError(th, 0, herr) {
+				if s.handleError(th, entryDepth, herr) {
 					return true, nil
 				}
-				return false, herr
+				return false, uncaught(herr)
 			}
 			return true, nil
 		}
@@ -1735,23 +1797,23 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 				th.lastErrNative = targetVal
 			}
 			// Let handleError catch it at the framePCall/frameXPCall we just pushed!
-			if s.handleError(th, 0, err) {
+			if s.handleError(th, entryDepth, err) {
 				return true, nil
 			}
-			return false, err
+			return false, uncaught(err)
 		}
 		// Normal return from native inside pcall/xpcall: place results at calleeIdx and finishPCallReturn!
 		if perr := th.placeResults(calleeIdx, res, -1); perr != nil {
-			if s.handleError(th, 0, perr) {
+			if s.handleError(th, entryDepth, perr) {
 				return true, nil
 			}
-			return false, perr
+			return false, uncaught(perr)
 		}
-		if _, ferr := s.finishPCallReturn(th, 0); ferr != nil {
-			if s.handleError(th, 0, ferr) {
+		if _, ferr := s.finishPCallReturn(th, entryDepth); ferr != nil {
+			if s.handleError(th, entryDepth, ferr) {
 				return true, nil
 			}
-			return false, ferr
+			return false, uncaught(ferr)
 		}
 		return false, nil
 	}
@@ -1762,10 +1824,10 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 	}
 	th.frames[th.nframe-1].extraArgs = extraDepth
 	if herr := s.fireLuaCallHook(th, cl, calleeArgs); herr != nil {
-		if s.handleError(th, 0, herr) {
+		if s.handleError(th, entryDepth, herr) {
 			return true, nil
 		}
-		return false, herr
+		return false, uncaught(herr)
 	}
 	return true, nil
 }
@@ -1776,7 +1838,12 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 	fnIdx := base + int(a) + 3
 	fn := th.stack[base+int(a)]
 	if OptimizeEnabled && (th.hookMask&(HookMaskCall|HookMaskRet) == 0 || th.inHook || th.suppressHook) && fn.IsNative() && fn.AsNative().Intrinsic == intrNext && th.stack[base+int(a)+1].IsTable() {
-		k, v, err := th.stack[base+int(a)+1].AsTable().Next(th.stack[base+int(a)+3])
+		t := th.stack[base+int(a)+1].AsTable()
+		ctrl := th.stack[base+int(a)+3]
+		if herr := s.ensureLookupKeyHash(t, ctrl); herr != nil {
+			return s.catchSlow(th, ev, false, herr)
+		}
+		k, v, err := t.Next(ctrl)
 		if err == nil {
 			th.stack[fnIdx] = k
 			if c >= 2 {
@@ -2158,6 +2225,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		key := ev.bp.strConsts[b]
 		if tv.IsTable() {
 			t := tv.AsTable()
+			if err := s.ensureLookupStrKeyHash(t, key); err != nil {
+				return coldContinue, pc, err
+			}
 			if !t.RawGetStr(key).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 				t.RawSetStr(s, key, val)
 				if err := s.ConsumeMemErr(); err != nil {
@@ -2837,7 +2907,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			if pc < len(ev.bp.proto.Code) && ev.bp.proto.Code[pc].Op() == bytecode.OP_RETURN {
 				// Keep caller Lua frame alive across C pcall so stack trace & return hooks match Lua 5.5!
 				cf.pc = pc
-				pushed, err := s.pushProtectedCall(th, srcStart, nargs, -1, false)
+				pushed, err := s.pushProtectedCall(th, srcStart, nargs, -1, false, entryDepth)
 				if err != nil {
 					return coldContinue, pc, err
 				}
@@ -2852,7 +2922,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			}
 			copy(th.stack[funcIdx:funcIdx+1+nargs], th.stack[srcStart:srcStart+1+nargs])
 			th.nframe--
-			_, err := s.pushProtectedCall(th, funcIdx, nargs, nres, false)
+			_, err := s.pushProtectedCall(th, funcIdx, nargs, nres, false, entryDepth)
 			if err != nil {
 				return coldContinue, pc, err
 			}
@@ -2866,7 +2936,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		if nf.Intrinsic == intrXPCall && nargs >= 2 && isFlatProtectedTarget(th.stack[srcStart+1]) && th.stack[srcStart+2].IsFunction() {
 			if pc < len(ev.bp.proto.Code) && ev.bp.proto.Code[pc].Op() == bytecode.OP_RETURN {
 				cf.pc = pc
-				pushed, err := s.pushProtectedCall(th, srcStart, nargs, -1, true)
+				pushed, err := s.pushProtectedCall(th, srcStart, nargs, -1, true, entryDepth)
 				if err != nil {
 					return coldContinue, pc, err
 				}
@@ -2881,7 +2951,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			}
 			copy(th.stack[funcIdx:funcIdx+1+nargs], th.stack[srcStart:srcStart+1+nargs])
 			th.nframe--
-			_, err := s.pushProtectedCall(th, funcIdx, nargs, nres, true)
+			_, err := s.pushProtectedCall(th, funcIdx, nargs, nres, true, entryDepth)
 			if err != nil {
 				return coldContinue, pc, err
 			}

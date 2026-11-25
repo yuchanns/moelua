@@ -6,6 +6,7 @@ package vm
 
 import (
 	"math"
+	"sync/atomic"
 
 	"github.com/yuchanns/moelua/bytecode"
 )
@@ -143,8 +144,8 @@ reloadFrame:
 							continue
 						}
 					}
-				} else {
-					if v := t.RawGetStr(ev.bp.strConsts[uint8(w>>bytecode.PosC)]); !v.IsNil() || t.meta == nil {
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
 					}
@@ -179,8 +180,8 @@ reloadFrame:
 							continue
 						}
 					}
-				} else {
-					if v := t.RawGetStr(ev.bp.strConsts[uint8(w>>bytecode.PosC)]); !v.IsNil() || t.meta == nil {
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
 					}
@@ -267,8 +268,8 @@ reloadFrame:
 							}
 						}
 					}
-				} else {
-					if v := t.RawGetStr(ev.bp.strConsts[uint8(w>>bytecode.PosC)]); !v.IsNil() || t.meta == nil {
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
 					}
@@ -1115,7 +1116,15 @@ func execIntrinsic1(intr uint8, regs *[256]Value, a uint8, nargs int) bool {
 		}
 	case intrRawGet:
 		if nargs >= 2 && arg0.IsTable() {
-			regs[a] = arg0.AsTable().RawGet(regs[a+2])
+			t := arg0.AsTable()
+			k := regs[a+2]
+			if t.hash != nil && k.IsString() {
+				ls := k.AsString()
+				if !ls.Short && len(ls.S) > strHashCancelChunk && atomic.LoadUint32(&ls.Hash) == 0 {
+					return false
+				}
+			}
+			regs[a] = t.RawGet(k)
 			return true
 		}
 	case intrRawLen:

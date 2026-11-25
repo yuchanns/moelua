@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/compiler"
@@ -269,8 +270,13 @@ func (s *State) MemoryUsage() int64 {
 	return s.gc.allocBytes + s.gc.tempBytes
 }
 
-// ConsumeMemErr returns and clears a pending deferred memory-limit error from table mutation.
+// ConsumeMemErr returns and clears a pending deferred memory-limit error (or uncatchable abort error)
+// from table mutation.
 func (s *State) ConsumeMemErr() error {
+	if s.abortErr != nil {
+		s.memExceeded = false
+		return s.abortErr
+	}
 	if s.memExceeded {
 		s.memExceeded = false
 		return &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
@@ -657,6 +663,17 @@ func (s *State) Call(fn Value, args ...Value) ([]Value, error) {
 	return s.callOnThread(s.cur, fn, args)
 }
 
+func slicesOverlapValues(a, b []Value) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	aStart := uintptr(unsafe.Pointer(unsafe.SliceData(a)))
+	aEnd := aStart + uintptr(len(a))*unsafe.Sizeof(Value{})
+	bStart := uintptr(unsafe.Pointer(unsafe.SliceData(b)))
+	bEnd := bStart + uintptr(len(b))*unsafe.Sizeof(Value{})
+	return aStart < bEnd && bStart < aEnd
+}
+
 func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error) {
 	if s.nCcalls == 0 {
 		s.abortErr = nil
@@ -744,6 +761,11 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		} else {
 			res, _, err = s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
 		}
+		if err == nil && len(res) > 0 && slicesOverlapValues(res, th.stack) {
+			cp := make([]Value, len(res))
+			copy(cp, res)
+			res = cp
+		}
 		if err == nil && s.gcNeedsCheck() {
 			// Root all native return values before running Tier-1 GC / finalizers so
 			// newly created values in res cannot be collected before State.Call returns.
@@ -821,6 +843,10 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		}
 	}
 	err := s.runThread(th, entryDepth)
+	if th.uncaughtErr != nil {
+		err = th.uncaughtErr
+		th.uncaughtErr = nil
+	}
 	if err == nil && s.abortErr != nil {
 		err = s.abortErr
 	}
@@ -951,6 +977,9 @@ func (s *State) TableGetInt(v Value, i int64) (Value, error) { return s.tableGet
 // (matching PUC-Rio `lua_getglobal`).
 func (s *State) GetGlobalMM(name string) (Value, error) {
 	key := s.intern.Intern(name)
+	if err := s.ensureLookupStrKeyHash(s.env, key); err != nil {
+		return NilValue(), err
+	}
 	v := s.env.RawGetStr(key)
 	if !v.IsNil() || s.env.meta == nil {
 		return v, nil
@@ -1015,6 +1044,9 @@ func (s *State) SetGlobalMM(name string, val Value) error {
 func (s *State) tableSetStr(tblVal Value, keyStr *LuaString, val Value) error {
 	if tblVal.IsTable() {
 		t := tblVal.AsTable()
+		if err := s.ensureLookupStrKeyHash(t, keyStr); err != nil {
+			return err
+		}
 		if !t.RawGetStr(keyStr).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 			t.RawSetStr(s, keyStr, val)
 			return s.ConsumeMemErr()
@@ -1026,11 +1058,16 @@ func (s *State) tableSetStr(tblVal Value, keyStr *LuaString, val Value) error {
 		var tm Value
 		if cur.IsTable() {
 			t := cur.AsTable()
-			if loop > 0 && !t.RawGet(key).IsNil() {
-				if err := t.RawSet(s, key, val); err != nil {
+			if loop > 0 {
+				if err := s.ensureLookupKeyHash(t, key); err != nil {
 					return err
 				}
-				return s.ConsumeMemErr()
+				if !t.RawGet(key).IsNil() {
+					if err := t.RawSet(s, key, val); err != nil {
+						return err
+					}
+					return s.ConsumeMemErr()
+				}
 			}
 			tm = s.getTM(t.meta, TMNewIndex)
 			if tm.IsNil() {
