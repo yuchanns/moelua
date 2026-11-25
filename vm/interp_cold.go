@@ -1,0 +1,2833 @@
+package vm
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+
+	"github.com/yuchanns/moelua/bytecode"
+	"github.com/yuchanns/moelua/internal/luastdlib"
+)
+
+type coldAction uint8
+
+const (
+	coldContinue coldAction = iota
+	coldReload
+	coldReturn
+)
+
+func (s *State) catchSlow(th *Thread, ev *frameEnv, pushed bool, err error) (bool, error) {
+	if err != nil {
+		if s.handleError(th, ev.entryDepth, err) {
+			return true, nil
+		}
+		if s.abortErr != nil {
+			return false, s.abortErr
+		}
+		return false, err
+	}
+	return pushed, nil
+}
+
+// prepareLuaFrame completes any pending non-Lua boundary frame (framePCall/frameXPCall)
+// or yieldable continuation (finish != finishNone) at the top of th.frames.
+// Outlined out of (*State).run so reloadFrame stays a single fast branch.
+//
+//go:noinline
+func (s *State) prepareLuaFrame(th *Thread, entryDepth int) (bool, error) {
+	for th.nframe > entryDepth {
+		cf := &th.frames[th.nframe-1]
+		if cf.finish != finishNone {
+			cont, err := s.completeFinishOp(th, cf, entryDepth)
+			if err != nil {
+				if err == errYieldSentinel {
+					return false, errYieldSentinel
+				}
+				if s.handleError(th, entryDepth, err) {
+					continue
+				}
+				return false, err
+			}
+			if !cont {
+				continue
+			}
+		}
+		if cf.kind != frameLua {
+			if s.finishPCallReturn(th, entryDepth) {
+				return true, nil
+			}
+			continue
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+// finishPCallReturn completes a protected call frame (framePCall / frameXPCall)
+// whose callee returned normally, prepending `true` to the callee's results.
+//
+//go:noinline
+func (s *State) finishPCallReturn(th *Thread, entryDepth int) bool {
+	cf := &th.frames[th.nframe-1]
+	funcIdx := cf.funcIdx
+	nres := cf.nresults
+	calleeStart := cf.base
+	got := th.top - calleeStart
+	if got < 0 {
+		got = 0
+	}
+	th.nframe--
+	// Results are at th.stack[calleeStart : calleeStart+got].
+	// We need [true, res0, res1, ...] at th.stack[funcIdx..].
+	total := 1 + got
+	if nres < 0 { // MULTRET
+		th.ensureStack(funcIdx + total + 4)
+		copy(th.stack[funcIdx+1:funcIdx+1+got], th.stack[calleeStart:calleeStart+got])
+		th.stack[funcIdx] = TrueValue()
+		th.top = funcIdx + total
+	} else {
+		th.ensureStack(funcIdx + nres + 4)
+		if nres > 0 {
+			cp := min(got, nres-1)
+			if cp > 0 {
+				copy(th.stack[funcIdx+1:funcIdx+1+cp], th.stack[calleeStart:calleeStart+cp])
+			}
+			th.stack[funcIdx] = TrueValue()
+			if 1+cp < nres {
+				fillNil(th.stack[funcIdx+1+cp : funcIdx+nres])
+			}
+		}
+		th.top = funcIdx + nres
+	}
+	return th.nframe <= entryDepth
+}
+
+// handleError unwinds th.frames inside the flat loop (ZERO Go panic/recover!),
+// closing upvalues & <close> TBC vars, catching errors at framePCall/frameXPCall.
+// Returns true if caught by pcall/xpcall (caller should goto reloadFrame).
+//
+//go:noinline
+func (s *State) callXPCallHandler(th *Thread, msgh Value, errVal Value) (Value, error) {
+	prevErrH := th.inErrHandler
+	th.inErrHandler = true
+	defer func() { th.inErrHandler = prevErrH }()
+	for depth := 0; depth <= maxCCalls; depth++ {
+		if depth == maxCCalls || s.nCcalls >= maxCCalls-2 {
+			// Give msgh one last chance with "C stack overflow" (errors.lua:639); if that errors too -> "error in error handling".
+			overflowMsg := StringValue(s.intern.Intern("C stack overflow"))
+			savedCC := s.nCcalls
+			if s.nCcalls >= maxCCalls-2 {
+				s.nCcalls = maxCCalls - 4
+			}
+			hres, herr := s.callOnThread(th, msgh, []Value{overflowMsg})
+			s.nCcalls = savedCC
+			if herr != nil {
+				if isUncatchableErr(herr) {
+					return NilValue(), herr
+				}
+				return StringValue(s.intern.Intern("error in error handling")), nil
+			}
+			if len(hres) == 0 || hres[0].IsNil() {
+				return StringValue(s.intern.Intern("<no error object>")), nil
+			}
+			return hres[0], nil
+		}
+		hres, herr := s.callOnThread(th, msgh, []Value{errVal})
+		if herr != nil {
+			if isUncatchableErr(herr) {
+				return NilValue(), herr
+			}
+			// Per Lua 5.5 ldo.c:luaG_errormsg, an error inside msgh re-invokes msgh with the new error (errors.lua:635)!
+			errVal = s.runtimeErrorToValue(th, herr)
+			continue
+		}
+		if len(hres) == 0 || hres[0].IsNil() {
+			return StringValue(s.intern.Intern("<no error object>")), nil
+		}
+		return hres[0], nil
+	}
+	return StringValue(s.intern.Intern("error in error handling")), nil
+}
+
+func (s *State) runtimeErrorToValue(th *Thread, err error) Value {
+	if err == nil {
+		return NilValue()
+	}
+	var le *LuaError
+	if errors.As(err, &le) {
+		if le.Val.IsNil() {
+			return StringValue(s.intern.Intern("<no error object>"))
+		}
+		return le.Val
+	}
+	msg := err.Error()
+	// Prepend Lua file:line: prefix for runtime VM errors (matching ldebug.c:luaG_addinfo / lauxlib.c:luaL_where(1)).
+	// Do NOT walk past framePCall/frameXPCall (C boundary), so pcall(require, 'XXX') has no caller prefix (attrib.lua:67).
+	if th != nil && th.nframe > 0 {
+		topIdx := th.nframe - 1
+		if th.frames[topIdx].kind == frameNative {
+			topIdx--
+		}
+		if topIdx >= 0 {
+			cf := &th.frames[topIdx]
+			if cf.kind == frameLua && cf.cl != nil {
+				p := cf.cl.bp.proto
+				pc := cf.pc - 1
+				if pc < 0 {
+					pc = 0
+				}
+				line := getFuncLine(p, pc)
+				if line > 0 {
+					msg = fmt.Sprintf("%s:%d: %s", shortSrc(p.Source), line, msg)
+				} else {
+					// Stripped function with no debug line info (errors.lua:309: "?:?: ...")
+					src := "?"
+					if !p.NoSource && p.Source != "" {
+						src = shortSrc(p.Source)
+					}
+					msg = fmt.Sprintf("%s:?: %s", src, msg)
+				}
+			}
+		}
+	}
+	return StringValue(s.intern.Intern(msg))
+}
+
+func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
+	if err == errYieldSentinel || err == errCoroCloseSelf || errors.Is(err, errYieldSentinel) || errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
+		return false
+	}
+	errVal := s.runtimeErrorToValue(th, err)
+	// Locate nearest enclosing pcall/xpcall frame before unwinding anything.
+	catchIdx := -1
+	for j := th.nframe - 1; j >= entryDepth; j-- {
+		if th.frames[j].kind == framePCall || th.frames[j].kind == frameXPCall {
+			catchIdx = j
+			break
+		}
+	}
+	if catchIdx < 0 {
+		// Uncaught error: leave TBC open on dead coroutine (for coroutine.close) or let top Call clean up.
+		return false
+	}
+	isXP := th.frames[catchIdx].kind == frameXPCall
+	var msgh Value
+	if isXP {
+		msgh = th.frames[catchIdx].errFunc
+		// Call xpcall message handler BEFORE unwinding so debug.traceback/getinfo see full stack!
+		var uerr error
+		errVal, uerr = s.callXPCallHandler(th, msgh, errVal)
+		if uerr != nil {
+			s.abortErr = uerr
+			return false
+		}
+	}
+	// Unwind frames down to catchIdx BEFORE running TBC __close so debug.getinfo(2) sees pcall/xpcall (coroutine.lua:249)!
+	cf := &th.frames[catchIdx]
+	th.nframe = catchIdx + 1
+	th.closeUpvals(cf.base)
+	// If inside a yieldable coroutine and TBC vars remain, close them yieldably via finishClose (locals.lua:1015)!
+	if th.nny == 0 && th.hasTBCAtOrAbove(cf.base) {
+		cf.closeLevel = cf.base
+		cf.closeErr = errVal
+		cf.closeHasErr = true
+		cf.closeResume = 2 // finish protected-call error return after all TBC close
+		cont, cerr := s.resumeCloseTBC(th, cf, entryDepth)
+		if cerr != nil {
+			if isUncatchableErr(cerr) {
+				s.abortErr = cerr
+				return false
+			}
+			// Nested sync error during yieldable TBC setup: recurse to handle!
+			return s.handleError(th, entryDepth, cerr)
+		}
+		if !cont {
+			return true
+		}
+		// All closed synchronously (e.g. only falsy/native TBC) — fall through to place [false, errVal]!
+		errVal = cf.closeErr
+	} else {
+		newErr, _, raised := th.closeAllSync(cf.base, errVal, true)
+		if s.abortErr != nil {
+			return false
+		}
+		if raised && isXP {
+			var uerr error
+			errVal, uerr = s.callXPCallHandler(th, msgh, newErr)
+			if uerr != nil {
+				s.abortErr = uerr
+				return false
+			}
+		} else {
+			errVal = newErr
+		}
+	}
+	funcIdx := cf.funcIdx
+	nres := cf.nresults
+	th.nframe--
+	th.placeResults(funcIdx, []Value{FalseValue(), errVal}, nres)
+	return true
+}
+
+// completeFinishOp finishes an interrupted Lua opcode after its yieldable metamethod frame returned.
+// Returns (true, nil) to continue executing cf at cf.pc, or (false, nil) if another frame was pushed.
+//
+//go:noinline
+func (s *State) completeFinishOp(th *Thread, cf *callFrame, entryDepth int) (bool, error) {
+	fk := cf.finish
+	cf.finish = finishNone
+	retSlot := cf.oldTop
+	var res Value
+	if th.top > retSlot {
+		res = th.stack[retSlot]
+	} else {
+		res = NilValue()
+	}
+	switch fk {
+	case finishSetReg:
+		th.stack[cf.base+int(cf.finishReg)] = res
+		return true, nil
+	case finishSetDrop:
+		return true, nil
+	case finishCondJump:
+		cond := !res.IsFalsy()
+		if cond != cf.finishFlag {
+			cf.pc++
+		} else {
+			cf.pc += 1 + cf.cl.bp.proto.Code[cf.pc].SJ()
+		}
+		return true, nil
+	case finishCondNot:
+		cond := res.IsFalsy()
+		if cond != cf.finishFlag {
+			cf.pc++
+		} else {
+			cf.pc += 1 + cf.cl.bp.proto.Code[cf.pc].SJ()
+		}
+		return true, nil
+	case finishConcat:
+		// Store metamethod result back at concatIdx and resume remaining right-to-left steps.
+		th.stack[cf.concatIdx] = res
+		if cf.concatIdx > cf.concatStart {
+			pushed, err := s.concatStep(th, cf, cf.concatStart, cf.concatIdx)
+			if err != nil {
+				return false, err
+			}
+			if pushed {
+				return false, nil
+			}
+		}
+		return true, nil
+	case finishClose:
+		return s.resumeCloseTBC(th, cf, entryDepth)
+	}
+	return true, nil
+}
+
+// pushMetamethodFrame pushes a yieldable metamethod call onto th.frames (ZERO Go recursion when closure!).
+// Returns (true, nil) if a Lua closure frame was pushed (caller must goto reloadFrame),
+// or (false, nil) if completed inline via native function.
+func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []Value, fk finishKind, reg uint8, flag bool) (bool, error) {
+	if tm.IsClosure() {
+		cf := &th.frames[ev.ci]
+		slot := cf.base + int(cf.cl.bp.proto.MaxStackSize)
+		if th.top > slot {
+			slot = th.top
+		}
+		th.ensureStack(slot + 1 + len(args) + 8)
+		th.stack[slot] = tm
+		for i, a := range args {
+			th.stack[slot+1+i] = a
+		}
+		cf.dirty = true
+		cf.oldTop = slot
+		cf.finish = fk
+		cf.finishReg = reg
+		cf.finishFlag = flag
+		if err := th.pushLuaFrame(tm.AsClosure(), slot, len(args), 1); err != nil {
+			cf.finish = finishNone
+			return false, err
+		}
+		return true, nil
+	}
+	// Native or callable table fallback
+	if !tm.IsNative() && s.getTMByObj(tm, TMCall).IsNil() {
+		// Decorate non-callable metamethod error with "(metamethod '<name>')" per Lua 5.5 (errors.lua:175-182).
+		cf := &th.frames[ev.ci]
+		p := cf.cl.bp.proto
+		ipc := cf.pc - 1
+		if ipc >= 0 && ipc < len(p.Code) {
+			w := p.Code[ipc]
+			mm := ""
+			switch w.Op() {
+			case bytecode.OP_MMBIN, bytecode.OP_MMBINI, bytecode.OP_MMBINK:
+				t := TM(w.C())
+				if t < tmCount {
+					mm = strings.TrimPrefix(tmNames[t], "__")
+				}
+			case bytecode.OP_LT, bytecode.OP_LTI, bytecode.OP_GTI:
+				mm = "lt"
+			case bytecode.OP_LE, bytecode.OP_LEI, bytecode.OP_GEI:
+				if fk == finishCondNot {
+					mm = "lt"
+				} else {
+					mm = "le"
+				}
+			case bytecode.OP_EQ:
+				mm = "eq"
+			case bytecode.OP_LEN:
+				mm = "len"
+			case bytecode.OP_UNM:
+				mm = "unm"
+			case bytecode.OP_BNOT:
+				mm = "bnot"
+			case bytecode.OP_CONCAT:
+				mm = "concat"
+			}
+			if mm != "" {
+				return false, fmt.Errorf("attempt to call a %s value (metamethod '%s')", tm.TypeName(), mm)
+			}
+		}
+	}
+	res, err := s.callOnThread(th, tm, args)
+	if err != nil {
+		return false, err
+	}
+	v := NilValue()
+	if len(res) > 0 {
+		v = res[0]
+	}
+	cf := &th.frames[ev.ci]
+	switch fk {
+	case finishSetReg:
+		th.stack[ev.base+int(reg)] = v
+	case finishCondJump:
+		if (!v.IsFalsy()) != flag {
+			cf.pc++
+		} else {
+			cf.pc += 1 + cf.cl.bp.proto.Code[cf.pc].SJ()
+		}
+	case finishCondNot:
+		if v.IsFalsy() != flag {
+			cf.pc++
+		} else {
+			cf.pc += 1 + cf.cl.bp.proto.Code[cf.pc].SJ()
+		}
+	}
+	return false, nil
+}
+
+//go:noinline
+func (s *State) getTabUpSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruction, regs *[256]Value) (bool, error) {
+	a := uint8(w >> bytecode.PosA)
+	b := uint8(w >> bytecode.PosB)
+	c := uint8(w >> bytecode.PosC)
+	uv := ev.cl.upvals[b]
+	tv := uv.Get()
+	key := ev.bp.strConsts[c]
+	if tv.IsTable() {
+		t := tv.AsTable()
+		if OptimizeEnabled {
+			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
+			if t.shape != nil && key.Short {
+				if slot := t.shape.Lookup(key); slot >= 0 {
+					v := t.slots[slot]
+					if !v.IsNil() || t.meta == nil {
+						*ic = ICEntry{kind: icOwnSlot, shape: t.shape, slot: slot, noMeta: t.meta == nil}
+						regs[a] = v
+						return false, nil
+					}
+				}
+			} else if t.shape == nil {
+				if slot, ok := t.hashFindStrSlot(key); ok {
+					v := t.hash.nodes[slot].val
+					if !v.IsNil() || t.meta == nil {
+						*ic = ICEntry{kind: icEnvSlot, holder: t, epoch: t.hash.dictGen, slot: int32(slot), noMeta: t.meta == nil}
+						regs[a] = v
+						return false, nil
+					}
+				}
+			}
+		}
+		v := t.RawGetStr(key)
+		if !v.IsNil() || t.meta == nil {
+			regs[a] = v
+			return false, nil
+		}
+	}
+	pushed, err := s.finishGetYieldable(th, ev, tv, ev.consts[c], a)
+	return s.catchSlow(th, ev, pushed, err)
+}
+
+//go:noinline
+func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruction, regs *[256]Value) (bool, error) {
+	a := uint8(w >> bytecode.PosA)
+	b := uint8(w >> bytecode.PosB)
+	c := uint8(w >> bytecode.PosC)
+	rb := regs[b]
+	key := ev.bp.strConsts[c]
+	if rb.IsTable() {
+		t := rb.AsTable()
+		if OptimizeEnabled && t.shape != nil && key.Short {
+			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
+			if ic.polyLookup(t.shape) {
+				if ic.kind == icOwnSlot {
+					v := t.slots[ic.slot]
+					if !v.IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
+						regs[a] = v
+						return false, nil
+					}
+				} else if ic.kind == icProtoVal && (ic.noMeta || s.protoEpoch == ic.epoch) {
+					regs[a] = ic.val
+					return false, nil
+				}
+			}
+			if ic.shape != nil && ic.shape != t.shape {
+				ic.polySavePrimary()
+			}
+			if slot := t.shape.Lookup(key); slot >= 0 {
+				v := t.slots[slot]
+				if !v.IsNil() || t.meta == nil {
+					ic.kind = icOwnSlot
+					ic.shape = t.shape
+					ic.slot = slot
+					ic.noMeta = t.meta == nil
+					ic.protoAbsent = false
+					regs[a] = v
+					return false, nil
+				}
+				// Slot is nil and t.meta != nil: try table-only __index chain; if function, use yieldable call!
+				if pv, fnTM, fnObj, cacheable, err := s.walkIndexChainOrFn(t, key); err != nil {
+					return s.catchSlow(th, ev, false, err)
+				} else if !fnTM.IsNil() {
+					p, e := s.pushMetamethodFrame(th, ev, fnTM, []Value{fnObj, StringValue(key)}, finishSetReg, a, false)
+					return s.catchSlow(th, ev, p, e)
+				} else {
+					if cacheable && pv.IsNil() {
+						ic.kind = icOwnSlot
+						ic.shape = t.shape
+						ic.slot = slot
+						ic.noMeta = false
+						ic.protoAbsent = true
+						ic.epoch = s.protoEpoch
+					}
+					regs[a] = pv
+					return false, nil
+				}
+			} else if t.meta == nil {
+				ic.kind = icProtoVal
+				ic.shape = t.shape
+				ic.noMeta = true
+				ic.val = NilValue()
+				regs[a] = NilValue()
+				return false, nil
+			} else {
+				if v, fnTM, fnObj, cacheable, err := s.walkIndexChainOrFn(t, key); err != nil {
+					return s.catchSlow(th, ev, false, err)
+				} else if !fnTM.IsNil() {
+					p, e := s.pushMetamethodFrame(th, ev, fnTM, []Value{fnObj, StringValue(key)}, finishSetReg, a, false)
+					return s.catchSlow(th, ev, p, e)
+				} else {
+					if cacheable {
+						ic.kind = icProtoVal
+						ic.shape = t.shape
+						ic.noMeta = false
+						ic.epoch = s.protoEpoch
+						ic.val = v
+					}
+					regs[a] = v
+					return false, nil
+				}
+			}
+		}
+		v := t.RawGetStr(key)
+		if !v.IsNil() || t.meta == nil {
+			regs[a] = v
+			return false, nil
+		}
+	}
+	pushed, err := s.finishGetYieldable(th, ev, rb, ev.consts[c], a)
+	return s.catchSlow(th, ev, pushed, err)
+}
+
+//go:noinline
+func (s *State) selfSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruction, regs *[256]Value) (bool, error) {
+	return s.getFieldSlow(th, ev, ipc, w, regs)
+}
+
+func (s *State) walkIndexChainOrFn(orig *Table, key *LuaString) (val Value, fnTM Value, fnObj Value, cacheable bool, err error) {
+	cur := TableValue(orig)
+	for loop := 0; loop < 2000; loop++ {
+		var tm Value
+		if cur.IsTable() {
+			t := cur.AsTable()
+			if loop > 0 {
+				t.markProto(s)
+				v := t.RawGetStr(key)
+				if !v.IsNil() {
+					return v, NilValue(), NilValue(), true, nil
+				}
+			}
+			if t.meta == nil {
+				return NilValue(), NilValue(), NilValue(), true, nil
+			}
+			t.meta.markProto(s)
+			tm = s.getTM(t.meta, TMIndex)
+			if tm.IsNil() {
+				return NilValue(), NilValue(), NilValue(), true, nil
+			}
+		} else {
+			tm = s.getTMByObj(cur, TMIndex)
+			if tm.IsNil() {
+				return NilValue(), NilValue(), NilValue(), false, fmt.Errorf("attempt to index a %s value", cur.TypeName())
+			}
+		}
+		if tm.IsFunction() {
+			return NilValue(), tm, cur, false, nil
+		}
+		cur = tm
+	}
+	return NilValue(), NilValue(), NilValue(), false, fmt.Errorf("'__index' chain too long; possible loop")
+}
+
+//go:noinline
+func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruction, regs *[256]Value) (bool, error) {
+	a := uint8(w >> bytecode.PosA)
+	b := uint8(w >> bytecode.PosB)
+	c := uint8(w >> bytecode.PosC)
+	ra := regs[a]
+	var val Value
+	if w.K() {
+		val = ev.consts[c]
+	} else {
+		val = regs[c]
+	}
+	key := ev.bp.strConsts[b]
+	if ra.IsTable() {
+		t := ra.AsTable()
+		if OptimizeEnabled && t.shape != nil && key.Short {
+			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
+			if !t.isProto() && ic.polyLookup(t.shape) {
+				if ic.kind == icOwnSlot {
+					if !t.slots[ic.slot].IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
+						t.slots[ic.slot] = val
+						return false, nil
+					}
+				} else if ic.kind == icAddSlot && !val.IsNil() && (ic.noMeta || s.protoEpoch == ic.epoch) {
+					slot := int(ic.slot)
+					if slot < cap(t.slots) {
+						t.slots = t.slots[:slot+1]
+						t.slots[slot] = val
+						t.shape = ic.targetShape
+						return false, nil
+					}
+				}
+			}
+			if !t.isProto() && ic.shape != nil && ic.shape != t.shape {
+				ic.polySavePrimary()
+			}
+			if slot := t.shape.Lookup(key); slot >= 0 {
+				noNewIdx := t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil()
+				if !t.slots[slot].IsNil() || noNewIdx {
+					if key == s.intern.tms[TMMode] || key == s.intern.tms[TMGC] {
+						s.activateTier1()
+					}
+					t.slots[slot] = val
+					if t.tmFlags != 0 {
+						t.tmFlags = 0
+					}
+					if t.isProto() {
+						s.protoEpoch++
+					} else {
+						ic.kind = icOwnSlot
+						ic.shape = t.shape
+						ic.slot = slot
+						ic.noMeta = t.meta == nil
+						ic.protoAbsent = noNewIdx && t.meta != nil
+						ic.epoch = s.protoEpoch
+					}
+					return false, nil
+				}
+			} else if t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+				if val.IsNil() {
+					return false, nil
+				}
+				if key == s.intern.tms[TMGC] || key == s.intern.tms[TMMode] {
+					s.activateTier1()
+				}
+				oldShape := t.shape
+				if next := s.shapes.Transition(oldShape, key); next != nil {
+					if s.memLimit > 0 && len(t.slots) == cap(t.slots) {
+						if err := s.checkMemAndAccount(int64(max(cap(t.slots), 4)) * 16); err != nil {
+							return s.catchSlow(th, ev, false, err)
+						}
+					}
+					t.shape = next
+					t.slots = append(t.slots, val)
+					if t.tmFlags != 0 {
+						t.tmFlags = 0
+					}
+					if t.isProto() {
+						s.protoEpoch++
+					} else {
+						ic.kind = icAddSlot
+						ic.shape = oldShape
+						ic.targetShape = next
+						ic.slot = next.slot
+						ic.epoch = s.protoEpoch
+						ic.noMeta = oldShape.meta == nil
+						ic.protoAbsent = false
+					}
+					return false, nil
+				}
+				t.demoteToDict()
+				t.RawSetStr(s, key, val)
+				if err := s.ConsumeMemErr(); err != nil {
+					return s.catchSlow(th, ev, false, err)
+				}
+				return false, nil
+			}
+		} else if !t.RawGetStr(key).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+			t.RawSetStr(s, key, val)
+			if err := s.ConsumeMemErr(); err != nil {
+				return s.catchSlow(th, ev, false, err)
+			}
+			return false, nil
+		}
+	}
+	pushed, err := s.finishSetYieldable(th, ev, ra, ev.consts[b], val)
+	return s.catchSlow(th, ev, pushed, err)
+}
+
+//go:noinline
+func (s *State) getISlow(th *Thread, ev *frameEnv, w bytecode.Instruction, regs *[256]Value) (bool, error) {
+	a := uint8(w >> bytecode.PosA)
+	rb := regs[uint8(w>>bytecode.PosB)]
+	c := int64(uint8(w >> bytecode.PosC))
+	if rb.IsTable() {
+		t := rb.AsTable()
+		v := t.RawGetInt(c)
+		if !v.IsNil() || t.meta == nil {
+			regs[a] = v
+			return false, nil
+		}
+	}
+	pushed, err := s.finishGetYieldable(th, ev, rb, IntValue(c), a)
+	return s.catchSlow(th, ev, pushed, err)
+}
+
+//go:noinline
+func (s *State) getTableSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, regs *[256]Value) (bool, error) {
+	a := uint8(w >> bytecode.PosA)
+	rb := regs[uint8(w>>bytecode.PosB)]
+	rc := regs[uint8(w>>bytecode.PosC)]
+	if rb.IsTable() {
+		t := rb.AsTable()
+		v := t.RawGet(rc)
+		if !v.IsNil() || t.meta == nil {
+			regs[a] = v
+			return false, nil
+		}
+	}
+	pushed, err := s.finishGetYieldable(th, ev, rb, rc, a)
+	return s.catchSlow(th, ev, pushed, err)
+}
+
+//go:noinline
+func (s *State) setISlow(th *Thread, ev *frameEnv, w bytecode.Instruction, regs *[256]Value) (bool, error) {
+	a := uint8(w >> bytecode.PosA)
+	b := int64(uint8(w >> bytecode.PosB))
+	c := uint8(w >> bytecode.PosC)
+	var val Value
+	if w.K() {
+		val = ev.consts[c]
+	} else {
+		val = regs[c]
+	}
+	ra := regs[a]
+	if ra.IsTable() {
+		t := ra.AsTable()
+		if !t.RawGetInt(b).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+			t.RawSetInt(s, b, val)
+			if s.memExceeded {
+				s.memExceeded = false
+				return s.catchSlow(th, ev, false, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))})
+			}
+			return false, nil
+		}
+	}
+	pushed, err := s.finishSetYieldable(th, ev, ra, IntValue(b), val)
+	return s.catchSlow(th, ev, pushed, err)
+}
+
+//go:noinline
+func (s *State) setTableSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, regs *[256]Value) (bool, error) {
+	a := uint8(w >> bytecode.PosA)
+	rb := regs[uint8(w>>bytecode.PosB)]
+	c := uint8(w >> bytecode.PosC)
+	var val Value
+	if w.K() {
+		val = ev.consts[c]
+	} else {
+		val = regs[c]
+	}
+	ra := regs[a]
+	if ra.IsTable() {
+		t := ra.AsTable()
+		if !t.RawGet(rb).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+			return s.catchSlow(th, ev, false, t.RawSet(s, rb, val))
+		}
+	}
+	pushed, err := s.finishSetYieldable(th, ev, ra, rb, val)
+	return s.catchSlow(th, ev, pushed, err)
+}
+
+func indexVarInfo(th *Thread, ev *frameEnv) string {
+	cf := &th.frames[ev.ci]
+	p := ev.bp.proto
+	ipc := cf.pc - 1
+	if p == nil || ipc < 0 || ipc >= len(p.Code) {
+		return ""
+	}
+	w := p.Code[ipc]
+	switch w.Op() {
+	case bytecode.OP_GETFIELD, bytecode.OP_GETTABLE, bytecode.OP_GETI, bytecode.OP_SELF:
+		return varInfo(p, ipc, int(w.B()))
+	case bytecode.OP_SETFIELD, bytecode.OP_SETTABLE, bytecode.OP_SETI:
+		return varInfo(p, ipc, int(w.A()))
+	case bytecode.OP_GETTABUP:
+		uv := int(w.B())
+		if uv < len(p.Upvalues) && p.Upvalues[uv].Name != "" {
+			return fmt.Sprintf(" (upvalue '%s')", p.Upvalues[uv].Name)
+		}
+	case bytecode.OP_SETTABUP:
+		uv := int(w.A())
+		if uv < len(p.Upvalues) && p.Upvalues[uv].Name != "" {
+			return fmt.Sprintf(" (upvalue '%s')", p.Upvalues[uv].Name)
+		}
+	}
+	return ""
+}
+
+func (s *State) finishGetYieldable(th *Thread, ev *frameEnv, obj, key Value, dstReg uint8) (bool, error) {
+	cur := obj
+	for loop := 0; loop < 2000; loop++ {
+		var tm Value
+		if cur.IsTable() {
+			t := cur.AsTable()
+			if loop > 0 {
+				v := t.RawGet(key)
+				if !v.IsNil() {
+					th.stack[ev.base+int(dstReg)] = v
+					return false, nil
+				}
+			}
+			tm = s.getTM(t.meta, TMIndex)
+			if tm.IsNil() {
+				th.stack[ev.base+int(dstReg)] = NilValue()
+				return false, nil
+			}
+		} else {
+			tm = s.getTMByObj(cur, TMIndex)
+			if tm.IsNil() {
+				info := ""
+				if loop == 0 {
+					info = indexVarInfo(th, ev)
+				}
+				return false, fmt.Errorf("attempt to index a %s value%s", cur.TypeName(), info)
+			}
+		}
+		if tm.IsFunction() {
+			return s.pushMetamethodFrame(th, ev, tm, []Value{cur, key}, finishSetReg, dstReg, false)
+		}
+		cur = tm
+	}
+	return false, fmt.Errorf("'__index' chain too long; possible loop")
+}
+
+func (s *State) finishSetYieldable(th *Thread, ev *frameEnv, obj, key, val Value) (bool, error) {
+	cur := obj
+	for loop := 0; loop < 2000; loop++ {
+		var tm Value
+		if cur.IsTable() {
+			t := cur.AsTable()
+			if loop > 0 {
+				if !t.RawGet(key).IsNil() {
+					return false, t.RawSet(s, key, val)
+				}
+			}
+			tm = s.getTM(t.meta, TMNewIndex)
+			if tm.IsNil() {
+				return false, t.RawSet(s, key, val)
+			}
+		} else {
+			tm = s.getTMByObj(cur, TMNewIndex)
+			if tm.IsNil() {
+				info := ""
+				if loop == 0 {
+					info = indexVarInfo(th, ev)
+				}
+				return false, fmt.Errorf("attempt to index a %s value%s", s.objTypeName(cur), info)
+			}
+		}
+		if tm.IsFunction() {
+			return s.pushMetamethodFrame(th, ev, tm, []Value{cur, key, val}, finishSetDrop, 0, false)
+		}
+		cur = tm
+	}
+	return false, fmt.Errorf("'__newindex' chain too long; possible loop")
+}
+
+func (s *State) finishGet(obj, key Value) (Value, error) {
+	cur := obj
+	for loop := 0; loop < 2000; loop++ {
+		var tm Value
+		if cur.IsTable() {
+			t := cur.AsTable()
+			if loop > 0 {
+				v := t.RawGet(key)
+				if !v.IsNil() {
+					return v, nil
+				}
+			}
+			tm = s.getTM(t.meta, TMIndex)
+			if tm.IsNil() {
+				return NilValue(), nil
+			}
+		} else {
+			tm = s.getTMByObj(cur, TMIndex)
+			if tm.IsNil() {
+				return NilValue(), fmt.Errorf("attempt to index a %s value", s.objTypeName(cur))
+			}
+		}
+		if !tm.IsFunction() {
+			cur = tm
+			continue
+		}
+		res, err := s.Call(tm, cur, key)
+		if err != nil {
+			return NilValue(), err
+		}
+		if len(res) == 0 {
+			return NilValue(), nil
+		}
+		return res[0], nil
+	}
+	return NilValue(), fmt.Errorf("'__index' chain too long; possible loop")
+}
+
+//go:noinline
+func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, nargs, nresults int) (bool, error) {
+	funcIdx := ev.base + a
+	fn := th.stack[funcIdx]
+
+	if fn.IsClosure() {
+		cl := fn.AsClosure()
+		if err := th.pushLuaFrame(cl, funcIdx, nargs, nresults); err != nil {
+			return s.catchSlow(th, ev, false, err)
+		}
+		if th.hookMask&HookMaskCall != 0 && !th.inHook {
+			nt := min(nargs, int(cl.bp.proto.NumParams))
+			th.frames[th.nframe-1].ftransfer = 1
+			th.frames[th.nframe-1].ntransfer = uint16(nt)
+			if herr := s.fireHook(th, "call", NilValue()); herr != nil {
+				return s.catchSlow(th, ev, false, herr)
+			}
+		}
+		return true, nil
+	}
+	if fn.IsNative() {
+		nf := fn.AsNative()
+		if nf.Intrinsic != intrNone {
+			// Yieldable flat-stack pcall / xpcall (including nested pcall(pcall, ...) / xpcall(pcall, ...))!
+			if nf.Intrinsic == intrPCall && nargs >= 1 && isFlatProtectedTarget(th.stack[funcIdx+1]) {
+				p, e := s.pushProtectedCall(th, funcIdx, nargs, nresults, false)
+				return s.catchSlow(th, ev, p, e)
+			}
+			if nf.Intrinsic == intrXPCall && nargs >= 2 && isFlatProtectedTarget(th.stack[funcIdx+1]) && th.stack[funcIdx+2].IsFunction() {
+				p, e := s.pushProtectedCall(th, funcIdx, nargs, nresults, true)
+				return s.catchSlow(th, ev, p, e)
+			}
+			if nf.Intrinsic == intrDoFile {
+				th.top = funcIdx + 1 + nargs
+				loaded, lerr := nativeLoadFile(s, th.stack[funcIdx+1:funcIdx+1+nargs])
+				if lerr != nil {
+					return s.catchSlow(th, ev, false, lerr)
+				}
+				if len(loaded) == 0 || loaded[0].IsNil() {
+					if len(loaded) > 1 {
+						return s.catchSlow(th, ev, false, &LuaError{Val: loaded[1]})
+					}
+					return s.catchSlow(th, ev, false, fmt.Errorf("dofile failed"))
+				}
+				th.stack[funcIdx] = loaded[0]
+				if err := th.pushLuaFrame(loaded[0].AsClosure(), funcIdx, 0, nresults); err != nil {
+					return s.catchSlow(th, ev, false, err)
+				}
+				return true, nil
+			}
+			if nf.Intrinsic == intrPairs && nargs >= 1 {
+				if tm := s.getTMByObj(th.stack[funcIdx+1], TMPairs); !tm.IsNil() && tm.IsClosure() {
+					th.stack[funcIdx] = tm
+					if err := th.pushLuaFrame(tm.AsClosure(), funcIdx, 1, nresults); err != nil {
+						return s.catchSlow(th, ev, false, err)
+					}
+					return true, nil
+				}
+			}
+		}
+		th.top = funcIdx + 1 + nargs
+		args := th.stack[funcIdx+1 : funcIdx+1+nargs]
+		hookedNative := false
+		if th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook {
+			hookedNative = true
+			if th.nframe >= len(th.frames) {
+				nfrm := make([]callFrame, len(th.frames)*2)
+				copy(nfrm, th.frames)
+				th.frames = nfrm
+			}
+			th.frames[th.nframe] = callFrame{
+				kind:      frameNative,
+				base:      funcIdx + 1,
+				funcIdx:   funcIdx,
+				nativeFn:  fn,
+				ftransfer: 1,
+				ntransfer: uint16(nargs),
+				dirty:     true,
+			}
+			th.nframe++
+			if th.hookMask&HookMaskCall != 0 {
+				if herr := s.fireHook(th, "call", NilValue()); herr != nil {
+					th.nframe--
+					return s.catchSlow(th, ev, false, herr)
+				}
+			}
+		}
+		if nf.FastFn != nil && !hookedNative {
+			rv, err := nf.FastFn(s, args)
+			if err == nil && (th.hookMask == 0 || th.hookMask&HookMaskRet == 0 || th.inHook) {
+				switch nresults {
+				case 1:
+					th.stack[funcIdx] = rv
+					if end := ev.base + int(ev.bp.maxStack); th.top < end {
+						th.top = end
+					}
+				case 0:
+					if end := ev.base + int(ev.bp.maxStack); th.top < end {
+						th.top = end
+					}
+				case -1:
+					th.stack[funcIdx] = rv
+					th.top = funcIdx + 1
+				default:
+					th.ensureStack(funcIdx + nresults + 4)
+					th.stack[funcIdx] = rv
+					fillNil(th.stack[funcIdx+1 : funcIdx+nresults])
+					th.top = funcIdx + nresults
+					if end := ev.base + int(ev.bp.maxStack); th.top < end {
+						th.top = end
+					}
+				}
+				return false, nil
+			}
+			if err != nil {
+				if err == errYieldSentinel || errors.Is(err, errYieldSentinel) {
+					th.yieldDst = funcIdx
+					th.yieldNRes = nresults
+					return false, errYieldSentinel
+				}
+				if !errors.Is(err, errCoroCloseSelf) {
+					th.lastErrNative = fn
+				}
+				return s.catchSlow(th, ev, false, err)
+			}
+			// Hook was enabled during FastFn call: fire return hook and place result.
+			if th.nframe >= len(th.frames) {
+				nfrm := make([]callFrame, len(th.frames)*2)
+				copy(nfrm, th.frames)
+				th.frames = nfrm
+			}
+			th.ensureStack(funcIdx + 2 + 4)
+			th.stack[funcIdx+1] = rv
+			th.frames[th.nframe] = callFrame{
+				kind:      frameNative,
+				base:      funcIdx + 1,
+				funcIdx:   funcIdx,
+				nativeFn:  fn,
+				ftransfer: 1,
+				ntransfer: 1,
+				dirty:     true,
+			}
+			th.nframe++
+			_ = s.fireHook(th, "return", NilValue())
+			th.nframe--
+			th.placeResults(funcIdx, []Value{rv}, nresults)
+			if nresults >= 0 {
+				if end := ev.base + int(ev.bp.maxStack); th.top < end {
+					th.top = end
+				}
+			}
+			return false, nil
+		}
+		res, err := nf.callMulti(s, args)
+		if hookedNative || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook) {
+			if hookedNative {
+				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook {
+					// Place returned results at cf.base so debug.getlocal(2, i) in return hook sees them (db.lua:555)!
+					th.ensureStack(funcIdx + 1 + len(res) + 4)
+					copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
+					th.frames[th.nframe-1].ftransfer = 1
+					th.frames[th.nframe-1].ntransfer = uint16(len(res))
+					_ = s.fireHook(th, "return", NilValue())
+				}
+				th.nframe--
+			} else {
+				// Hook was enabled during this native call (e.g. debug.sethook(hook, "r") in locals.lua:842)!
+				if th.nframe >= len(th.frames) {
+					nfrm := make([]callFrame, len(th.frames)*2)
+					copy(nfrm, th.frames)
+					th.frames = nfrm
+				}
+				th.ensureStack(funcIdx + 1 + len(res) + 4)
+				copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
+				th.frames[th.nframe] = callFrame{
+					kind:      frameNative,
+					base:      funcIdx + 1,
+					funcIdx:   funcIdx,
+					nativeFn:  fn,
+					ftransfer: 1,
+					ntransfer: uint16(len(res)),
+					dirty:     true,
+				}
+				th.nframe++
+				_ = s.fireHook(th, "return", NilValue())
+				th.nframe--
+			}
+		}
+		if err != nil {
+			if err == errYieldSentinel || errors.Is(err, errYieldSentinel) {
+				th.yieldDst = funcIdx
+				th.yieldNRes = nresults
+				th.yieldedNative = hookedNative
+				return false, errYieldSentinel
+			}
+			if !errors.Is(err, errCoroCloseSelf) {
+				th.lastErrNative = fn
+			}
+			return s.catchSlow(th, ev, false, err)
+		}
+		if nresults == 1 && len(res) >= 1 {
+			th.stack[funcIdx] = res[0]
+			if end := ev.base + int(ev.bp.proto.MaxStackSize); th.top < end {
+				th.top = end
+			}
+			return false, nil
+		}
+		th.placeResults(funcIdx, res, nresults)
+		if nresults >= 0 {
+			if end := ev.base + int(ev.bp.proto.MaxStackSize); th.top < end {
+				th.top = end
+			}
+		}
+		return false, nil
+	}
+	// Try __call chain (max 15 per Lua 5.5).
+	for depth := 1; depth <= 15; depth++ {
+		tm := s.getTMByObj(fn, TMCall)
+		if tm.IsNil() {
+			return s.catchSlow(th, ev, false, fmt.Errorf("attempt to call a %s value%s", fn.TypeName(), varInfo(ev.bp.proto, th.frames[ev.ci].pc-1, a)))
+		}
+		th.ensureStack(funcIdx + nargs + 4)
+		copy(th.stack[funcIdx+2:funcIdx+2+nargs], th.stack[funcIdx+1:funcIdx+1+nargs])
+		th.stack[funcIdx+1] = fn
+		th.stack[funcIdx] = tm
+		nargs++
+		fn = tm
+		if fn.IsClosure() {
+			if err := th.pushLuaFrame(fn.AsClosure(), funcIdx, nargs, nresults); err != nil {
+				return s.catchSlow(th, ev, false, err)
+			}
+			th.frames[th.nframe-1].extraArgs = uint8(depth)
+			return true, nil
+		}
+		if fn.IsNative() {
+			th.top = funcIdx + 1 + nargs
+			args := th.stack[funcIdx+1 : funcIdx+1+nargs]
+			res, err := fn.AsNative().callMulti(s, args)
+			if err != nil {
+				if errors.Is(err, errYieldSentinel) {
+					th.yieldDst = funcIdx
+					th.yieldNRes = nresults
+					return false, errYieldSentinel
+				}
+				return s.catchSlow(th, ev, false, err)
+			}
+			th.placeResults(funcIdx, res, nresults)
+			if nresults >= 0 {
+				if end := ev.base + int(ev.bp.proto.MaxStackSize); th.top < end {
+					th.top = end
+				}
+			}
+			return false, nil
+		}
+	}
+	return s.catchSlow(th, ev, false, fmt.Errorf("'__call' chain too long"))
+}
+
+func isFlatProtectedTarget(v Value) bool {
+	return v.IsClosure() || v.IsNative()
+}
+
+// pushProtectedCall pushes a framePCall/frameXPCall boundary frame + target Lua closure or native
+// (including nested pcall/xpcall and yieldable coroutine.yield!) directly onto th.frames.
+func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP bool) (bool, error) {
+	// Enforce Lua 5.5 LUAI_MAXCCALLS (200) across nested pcall/xpcall frames (calls.lua:162).
+	pcalls := 0
+	for i := 0; i < th.nframe; i++ {
+		if th.frames[i].kind == framePCall || th.frames[i].kind == frameXPCall {
+			pcalls++
+		}
+	}
+	cLimit := maxCCalls
+	if th.inErrHandler {
+		cLimit = maxCCalls + 20
+	}
+	if s.nCcalls+pcalls >= cLimit {
+		return false, fmt.Errorf("C stack overflow")
+	}
+	if th.nframe+2 >= len(th.frames) {
+		if len(th.frames) >= maxFrames {
+			return false, fmt.Errorf("stack overflow")
+		}
+		newCap := len(th.frames) * 2
+		if newCap > maxFrames {
+			newCap = maxFrames
+		}
+		nf := make([]callFrame, newCap)
+		copy(nf, th.frames)
+		th.frames = nf
+	}
+	targetVal := th.stack[funcIdx+1]
+	var errFunc Value
+	var calleeIdx, calleeArgs int
+	kind := framePCall
+	if isXP {
+		kind = frameXPCall
+		errFunc = th.stack[funcIdx+2]
+		// Shift target to funcIdx+2 (overwriting msgh which is saved in frame.errFunc)
+		// so args start at funcIdx+3!
+		th.stack[funcIdx+2] = th.stack[funcIdx+1]
+		calleeIdx = funcIdx + 2
+		calleeArgs = nargs - 2
+	} else {
+		calleeIdx = funcIdx + 1
+		calleeArgs = nargs - 1
+	}
+	th.frames[th.nframe] = callFrame{
+		kind:     kind,
+		base:     calleeIdx,
+		funcIdx:  funcIdx,
+		nresults: nresults,
+		errFunc:  errFunc,
+		dirty:    true,
+	}
+	th.nframe++
+	if targetVal.IsNative() {
+		nf := targetVal.AsNative()
+		intr := nf.Intrinsic
+		if intr == intrPCall && calleeArgs >= 1 && isFlatProtectedTarget(th.stack[calleeIdx+1]) {
+			ok, err := s.pushProtectedCall(th, calleeIdx, calleeArgs, -1, false)
+			if err != nil {
+				th.nframe--
+				return false, err
+			}
+			return ok, nil
+		}
+		if intr == intrXPCall && calleeArgs >= 2 && isFlatProtectedTarget(th.stack[calleeIdx+1]) && th.stack[calleeIdx+2].IsFunction() {
+			ok, err := s.pushProtectedCall(th, calleeIdx, calleeArgs, -1, true)
+			if err != nil {
+				th.nframe--
+				return false, err
+			}
+			return ok, nil
+		}
+		// General native inside pcall/xpcall (e.g. xpcall(coroutine.yield, msgh) in coroutine.lua:568!):
+		th.top = calleeIdx + 1 + calleeArgs
+		nargsSlice := th.stack[calleeIdx+1 : calleeIdx+1+calleeArgs]
+		res, err := nf.callMulti(s, nargsSlice)
+		if errors.Is(err, errYieldSentinel) {
+			th.yieldDst = calleeIdx
+			th.yieldNRes = -1
+			return false, errYieldSentinel
+		}
+		if err != nil {
+			// Let handleError catch it at the framePCall/frameXPCall we just pushed!
+			if s.handleError(th, 0, err) {
+				return true, nil
+			}
+			return false, err
+		}
+		// Normal return from native inside pcall/xpcall: place results at calleeIdx and finishPCallReturn!
+		th.placeResults(calleeIdx, res, -1)
+		s.finishPCallReturn(th, 0)
+		return false, nil
+	}
+	if err := th.pushLuaFrame(targetVal.AsClosure(), calleeIdx, calleeArgs, -1); err != nil {
+		th.nframe--
+		return false, err
+	}
+	return true, nil
+}
+
+//go:noinline
+func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, error) {
+	base := ev.base
+	fnIdx := base + int(a) + 3
+	fn := th.stack[base+int(a)]
+	if OptimizeEnabled && fn.IsNative() && fn.AsNative().Intrinsic == intrNext && th.stack[base+int(a)+1].IsTable() {
+		k, v, err := th.stack[base+int(a)+1].AsTable().Next(th.stack[base+int(a)+3])
+		if err == nil {
+			th.stack[fnIdx] = k
+			if c >= 2 {
+				th.stack[fnIdx+1] = v
+				if c > 2 {
+					fillNil(th.stack[fnIdx+2 : fnIdx+c])
+				}
+			}
+			return false, nil
+		}
+	}
+	th.ensureStack(fnIdx + max(c, 3) + 4)
+	th.stack[fnIdx+2] = th.stack[base+int(a)+3] // control var
+	th.stack[fnIdx+1] = th.stack[base+int(a)+1] // state
+	th.stack[fnIdx] = fn                        // iterator fn
+	if fn.IsNative() {
+		res, err := fn.AsNative().callMulti(s, th.stack[fnIdx+1:fnIdx+3])
+		if err != nil {
+			if errors.Is(err, errYieldSentinel) {
+				th.yieldDst = fnIdx
+				th.yieldNRes = c
+				return false, errYieldSentinel
+			}
+			if !errors.Is(err, errCoroCloseSelf) {
+				th.lastErrNative = fn
+			}
+			return s.catchSlow(th, ev, false, err)
+		}
+		th.placeResults(fnIdx, res, c)
+		return false, nil
+	}
+	if fn.IsClosure() {
+		if err := th.pushLuaFrame(fn.AsClosure(), fnIdx, 2, c); err != nil {
+			return s.catchSlow(th, ev, false, err)
+		}
+		return true, nil
+	}
+	return s.callSlow(th, ev, 0, int(a)+3, 2, c)
+}
+
+// resumeCloseTBC continues closing remaining <close> TBC vars in a yieldable loop.
+func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool, error) {
+	level := cf.closeLevel
+	for len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level {
+		idx := th.tbc[len(th.tbc)-1]
+		th.tbc = th.tbc[:len(th.tbc)-1]
+		obj := th.stack[idx]
+		if obj.IsFalsy() {
+			continue
+		}
+		tm := s.getTMByObj(obj, TMClose)
+		if tm.IsNil() {
+			return false, fmt.Errorf("attempt to call a nil value (metamethod 'close')")
+		}
+		ncloseArgs := 1
+		if cf.closeHasErr {
+			ncloseArgs = 2
+		}
+		slotBase := cf.base
+		if cf.cl != nil {
+			slotBase = cf.base + int(cf.cl.bp.proto.MaxStackSize)
+		} else if len(th.tbc) > 0 {
+			// Keep stack slot above any remaining TBC indices in th.tbc!
+			if topTBC := th.tbc[len(th.tbc)-1] + 2; topTBC > slotBase {
+				slotBase = topTBC
+			}
+		}
+		if idx+2 > slotBase {
+			slotBase = idx + 2
+		}
+		if tm.IsClosure() {
+			slot := slotBase
+			if th.top > slot {
+				slot = th.top
+			}
+			th.ensureStack(slot + 4)
+			th.stack[slot] = tm
+			th.stack[slot+1] = obj
+			if ncloseArgs == 2 {
+				th.stack[slot+2] = cf.closeErr
+			}
+			cf.dirty = true
+			cf.oldTop = slot
+			cf.finish = finishClose
+			if err := th.pushLuaFrame(tm.AsClosure(), slot, ncloseArgs, 0); err != nil {
+				cf.finish = finishNone
+				return false, err
+			}
+			return false, nil
+		}
+		var cargs []Value
+		if ncloseArgs == 2 {
+			cargs = []Value{obj, cf.closeErr}
+		} else {
+			cargs = []Value{obj}
+		}
+		if tm.IsNative() {
+			_, err := tm.AsNative().callMulti(s, cargs)
+			if errors.Is(err, errYieldSentinel) {
+				slot := slotBase
+				if th.top > slot {
+					slot = th.top
+				}
+				cf.dirty = true
+				cf.oldTop = slot
+				cf.finish = finishClose
+				th.yieldDst = slot
+				th.yieldNRes = 0
+				return false, errYieldSentinel
+			}
+			if err != nil {
+				return false, err
+			}
+			continue
+		}
+		if _, err := s.callOnThread(th, tm, cargs); err != nil {
+			return false, err
+		}
+	}
+	// All TBC vars >= level are closed!
+	if cf.closeResume == 2 {
+		// Finish protected-call error unwind after yieldable TBC close (locals.lua:1015)!
+		funcIdx := cf.funcIdx
+		nres := cf.nresults
+		errVal := cf.closeErr
+		cf.closeResume = 0
+		th.nframe--
+		th.placeResults(funcIdx, []Value{FalseValue(), errVal}, nres)
+		return false, nil
+	}
+	if cf.closeResume == 1 {
+		// Finish pending OP_RETURN (fire return hook while cf is still on top of stack, locals.lua:852)!
+		if th.hookMask&HookMaskRet != 0 && !th.inHook {
+			cf.ftransfer = uint16(cf.closeRetSrc - cf.base + 1)
+			cf.ntransfer = uint16(cf.closeRetN)
+			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+				return false, herr
+			}
+		}
+		funcIdx := cf.funcIdx
+		nres := cf.nresults
+		srcStart := cf.closeRetSrc
+		n := cf.closeRetN
+		th.nframe--
+		if nres < 0 {
+			th.ensureStack(funcIdx + n + 4)
+			copy(th.stack[funcIdx:funcIdx+n], th.stack[srcStart:srcStart+n])
+			th.top = funcIdx + n
+		} else {
+			th.ensureStack(funcIdx + nres + 4)
+			cp := min(n, nres)
+			copy(th.stack[funcIdx:funcIdx+cp], th.stack[srcStart:srcStart+cp])
+			if cp < nres {
+				fillNil(th.stack[funcIdx+cp : funcIdx+nres])
+			}
+			th.top = funcIdx + nres
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+func strToNumForLoop(v Value) Value {
+	if !v.IsString() {
+		return v
+	}
+	str := v.AsString().S
+	if i, ok := luastdlib.StrToInt(str); ok {
+		return IntValue(i)
+	}
+	if f, ok := luastdlib.StrToFloat(str); ok {
+		return FloatValue(f)
+	}
+	return v
+}
+
+//go:noinline
+func (s *State) forPrepSlow(regs *[256]Value, a uint8) (bool, error) {
+	pinit, plim, pstep := strToNumForLoop(regs[a]), strToNumForLoop(regs[a+1]), strToNumForLoop(regs[a+2])
+	if BothInt(pinit, pstep) {
+		initV := pinit.Int()
+		step := pstep.Int()
+		if step == 0 {
+			return false, fmt.Errorf("'for' step is zero")
+		}
+		var lim int64
+		var ok bool
+		if plim.IsInt() {
+			lim, ok = plim.Int(), true
+		} else if plim.IsFloat() {
+			f := plim.Float()
+			if step < 0 {
+				lim, ok = FloatToIntCeil(f)
+			} else {
+				lim, ok = FloatToIntFloor(f)
+			}
+			if !ok {
+				if math.IsNaN(f) {
+					return true, nil
+				}
+				if f > 0 {
+					if step < 0 {
+						return true, nil
+					}
+					lim = math.MaxInt64
+					ok = true
+				} else {
+					if step > 0 {
+						return true, nil
+					}
+					lim = math.MinInt64
+					ok = true
+				}
+			}
+			if !ok {
+				return false, fmt.Errorf("bad 'for' limit (number expected, got %s)", s.objTypeName(plim))
+			}
+		} else {
+			return false, fmt.Errorf("bad 'for' limit (number expected, got %s)", s.objTypeName(plim))
+		}
+		if (step > 0 && initV > lim) || (step < 0 && initV < lim) {
+			return true, nil
+		}
+		var cnt uint64
+		if step > 0 {
+			cnt = uint64(lim) - uint64(initV)
+			if step != 1 {
+				cnt /= uint64(step)
+			}
+		} else {
+			cnt = uint64(initV) - uint64(lim)
+			cnt /= uint64(-(step+1)) + 1
+		}
+		regs[a].SetInt(int64(cnt))
+		regs[a+1].SetInt(step)
+		regs[a+2].SetInt(initV)
+		return false, nil
+	}
+	lim, ok := plim.ToFloat()
+	if !ok {
+		return false, fmt.Errorf("bad 'for' limit (number expected, got %s)", s.objTypeName(plim))
+	}
+	step, ok := pstep.ToFloat()
+	if !ok {
+		return false, fmt.Errorf("bad 'for' step (number expected, got %s)", s.objTypeName(pstep))
+	}
+	initV, ok := pinit.ToFloat()
+	if !ok {
+		return false, fmt.Errorf("bad 'for' initial value (number expected, got %s)", s.objTypeName(pinit))
+	}
+	if step == 0 {
+		return false, fmt.Errorf("'for' step is zero")
+	}
+	if (step > 0 && lim < initV) || (step < 0 && initV < lim) {
+		return true, nil
+	}
+	regs[a].SetFloat(lim)
+	regs[a+1].SetFloat(step)
+	regs[a+2].SetFloat(initV)
+	return false, nil
+}
+
+//go:noinline
+func (s *State) coldOp(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruction, regs *[256]Value, entryDepth int) (coldAction, int, error) {
+	act, newPC, err := s.coldOpImpl(th, ev, ipc, w, regs, entryDepth)
+	if err == nil && s.abortErr != nil {
+		err = s.abortErr
+	}
+	if err != nil {
+		if s.handleError(th, entryDepth, err) {
+			return coldReload, 0, nil
+		}
+		if s.abortErr != nil {
+			return coldContinue, 0, s.abortErr
+		}
+		return coldContinue, 0, err
+	}
+	return act, newPC, nil
+}
+
+func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruction, regs *[256]Value, entryDepth int) (coldAction, int, error) {
+	pc := ipc + 1
+	a := uint8(w >> bytecode.PosA)
+	op := bytecode.OpCode(w & 0x7f)
+
+	switch op {
+	case bytecode.OP_LOADKX:
+		ax := ev.insns.at(pc).Ax()
+		pc++
+		regs[a] = ev.consts[ax]
+		return coldContinue, pc, nil
+
+	case bytecode.OP_SETTABUP:
+		uv := ev.cl.upvals[a]
+		tv := uv.Get()
+		b := uint8(w >> bytecode.PosB)
+		c := uint8(w >> bytecode.PosC)
+		var val Value
+		if w.K() {
+			val = ev.consts[c]
+		} else {
+			val = regs[c]
+		}
+		key := ev.bp.strConsts[b]
+		if tv.IsTable() {
+			t := tv.AsTable()
+			if !t.RawGetStr(key).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+				t.RawSetStr(s, key, val)
+				if err := s.ConsumeMemErr(); err != nil {
+					return coldContinue, pc, err
+				}
+				return coldContinue, pc, nil
+			}
+		}
+		pushed, err := s.finishSetYieldable(th, ev, tv, ev.consts[b], val)
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_NEWTABLE:
+		vb := w.VB()
+		vc := w.VC()
+		nrec := 0
+		if vb > 0 {
+			nrec = 1 << (vb - 1)
+		}
+		nseq := vc
+		if w.K() {
+			nseq += ev.insns.at(pc).Ax() * (bytecode.MaxArgvC + 1)
+		}
+		pc++
+		estBytes := int64(64 + nseq*16 + nrec*32)
+		if s.memLimit > 0 {
+			if err := s.checkMem(estBytes); err != nil {
+				return coldContinue, pc, err
+			}
+		}
+		regs[a] = TableValue(s.NewTable(nseq, nrec))
+		if s.gc.tier1 {
+			s.gcRecordAlloc(estBytes, ev.base+int(a)+1)
+		} else if s.memLimit > 0 {
+			s.gc.allocBytes += estBytes
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_ADDK, bytecode.OP_SUBK, bytecode.OP_MULK, bytecode.OP_DIVK:
+		rb, kc := regs[uint8(w>>bytecode.PosB)], ev.consts[uint8(w>>bytecode.PosC)]
+		if rb.IsNumber() && kc.IsNumber() {
+			fb, _ := rb.ToFloat()
+			fc, _ := kc.ToFloat()
+			switch op {
+			case bytecode.OP_ADDK:
+				regs[a].SetFloat(fb + fc)
+			case bytecode.OP_SUBK:
+				regs[a].SetFloat(fb - fc)
+			case bytecode.OP_MULK:
+				regs[a].SetFloat(fb * fc)
+			case bytecode.OP_DIVK:
+				regs[a].SetFloat(fb / fc)
+			}
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_ADD, bytecode.OP_SUB, bytecode.OP_MUL, bytecode.OP_DIV:
+		rb, rc := regs[uint8(w>>bytecode.PosB)], regs[uint8(w>>bytecode.PosC)]
+		if rb.IsNumber() && rc.IsNumber() {
+			fb, _ := rb.ToFloat()
+			fc, _ := rc.ToFloat()
+			switch op {
+			case bytecode.OP_ADD:
+				regs[a].SetFloat(fb + fc)
+			case bytecode.OP_SUB:
+				regs[a].SetFloat(fb - fc)
+			case bytecode.OP_MUL:
+				regs[a].SetFloat(fb * fc)
+			case bytecode.OP_DIV:
+				regs[a].SetFloat(fb / fc)
+			}
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_MODK:
+		rb, kc := regs[uint8(w>>bytecode.PosB)], ev.consts[uint8(w>>bytecode.PosC)]
+		if BothInt(rb, kc) {
+			r, err := IntMod(rb.Int(), kc.Int())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			regs[a].SetInt(r)
+			return coldContinue, pc + 1, nil
+		}
+		if rb.IsNumber() && kc.IsNumber() {
+			fb, _ := rb.ToFloat()
+			fc, _ := kc.ToFloat()
+			regs[a].SetFloat(FloatMod(fb, fc))
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_POWK:
+		rb, kc := regs[uint8(w>>bytecode.PosB)], ev.consts[uint8(w>>bytecode.PosC)]
+		if rb.IsNumber() && kc.IsNumber() {
+			fb, _ := rb.ToFloat()
+			fc, _ := kc.ToFloat()
+			regs[a].SetFloat(math.Pow(fb, fc))
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_IDIVK:
+		rb, kc := regs[uint8(w>>bytecode.PosB)], ev.consts[uint8(w>>bytecode.PosC)]
+		if BothInt(rb, kc) {
+			r, err := IntDiv(rb.Int(), kc.Int())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			regs[a].SetInt(r)
+			return coldContinue, pc + 1, nil
+		}
+		if rb.IsNumber() && kc.IsNumber() {
+			fb, _ := rb.ToFloat()
+			fc, _ := kc.ToFloat()
+			regs[a].SetFloat(math.Floor(fb / fc))
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_BANDK:
+		rb, kc := regs[uint8(w>>bytecode.PosB)], ev.consts[uint8(w>>bytecode.PosC)]
+		if i1, ok := rb.ToInt(); ok {
+			regs[a].SetInt(i1 & kc.Int())
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_BORK:
+		rb, kc := regs[uint8(w>>bytecode.PosB)], ev.consts[uint8(w>>bytecode.PosC)]
+		if i1, ok := rb.ToInt(); ok {
+			regs[a].SetInt(i1 | kc.Int())
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_BXORK:
+		rb, kc := regs[uint8(w>>bytecode.PosB)], ev.consts[uint8(w>>bytecode.PosC)]
+		if i1, ok := rb.ToInt(); ok {
+			regs[a].SetInt(i1 ^ kc.Int())
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_SHLI:
+		rb := regs[uint8(w>>bytecode.PosB)]
+		if ib, ok := rb.ToInt(); ok {
+			regs[a].SetInt(ShiftLeft(int64(w.SC()), ib))
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_SHRI:
+		rb := regs[uint8(w>>bytecode.PosB)]
+		if ib, ok := rb.ToInt(); ok {
+			regs[a].SetInt(ShiftRight(ib, int64(w.SC())))
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_MOD:
+		rb, rc := regs[uint8(w>>bytecode.PosB)], regs[uint8(w>>bytecode.PosC)]
+		if BothInt(rb, rc) {
+			r, err := IntMod(rb.Int(), rc.Int())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			regs[a].SetInt(r)
+			return coldContinue, pc + 1, nil
+		}
+		if rb.IsNumber() && rc.IsNumber() {
+			fb, _ := rb.ToFloat()
+			fc, _ := rc.ToFloat()
+			regs[a].SetFloat(FloatMod(fb, fc))
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_POW:
+		rb, rc := regs[uint8(w>>bytecode.PosB)], regs[uint8(w>>bytecode.PosC)]
+		if rb.IsNumber() && rc.IsNumber() {
+			fb, _ := rb.ToFloat()
+			fc, _ := rc.ToFloat()
+			regs[a].SetFloat(math.Pow(fb, fc))
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_IDIV:
+		rb, rc := regs[uint8(w>>bytecode.PosB)], regs[uint8(w>>bytecode.PosC)]
+		if BothInt(rb, rc) {
+			r, err := IntDiv(rb.Int(), rc.Int())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			regs[a].SetInt(r)
+			return coldContinue, pc + 1, nil
+		}
+		if rb.IsNumber() && rc.IsNumber() {
+			fb, _ := rb.ToFloat()
+			fc, _ := rc.ToFloat()
+			regs[a].SetFloat(math.Floor(fb / fc))
+			return coldContinue, pc + 1, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_BAND:
+		rb, rc := regs[uint8(w>>bytecode.PosB)], regs[uint8(w>>bytecode.PosC)]
+		if i1, ok := rb.ToInt(); ok {
+			if i2, ok := rc.ToInt(); ok {
+				regs[a].SetInt(i1 & i2)
+				return coldContinue, pc + 1, nil
+			}
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_BOR:
+		rb, rc := regs[uint8(w>>bytecode.PosB)], regs[uint8(w>>bytecode.PosC)]
+		if i1, ok := rb.ToInt(); ok {
+			if i2, ok := rc.ToInt(); ok {
+				regs[a].SetInt(i1 | i2)
+				return coldContinue, pc + 1, nil
+			}
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_BXOR:
+		rb, rc := regs[uint8(w>>bytecode.PosB)], regs[uint8(w>>bytecode.PosC)]
+		if i1, ok := rb.ToInt(); ok {
+			if i2, ok := rc.ToInt(); ok {
+				regs[a].SetInt(i1 ^ i2)
+				return coldContinue, pc + 1, nil
+			}
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_SHL:
+		rb, rc := regs[uint8(w>>bytecode.PosB)], regs[uint8(w>>bytecode.PosC)]
+		if i1, ok := rb.ToInt(); ok {
+			if i2, ok := rc.ToInt(); ok {
+				regs[a].SetInt(ShiftLeft(i1, i2))
+				return coldContinue, pc + 1, nil
+			}
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_SHR:
+		rb, rc := regs[uint8(w>>bytecode.PosB)], regs[uint8(w>>bytecode.PosC)]
+		if i1, ok := rb.ToInt(); ok {
+			if i2, ok := rc.ToInt(); ok {
+				regs[a].SetInt(ShiftRight(i1, i2))
+				return coldContinue, pc + 1, nil
+			}
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_BNOT:
+		b := uint8(w >> bytecode.PosB)
+		rb := regs[b]
+		if ib, ok := rb.ToInt(); ok {
+			regs[a].SetInt(^ib)
+			return coldContinue, pc, nil
+		}
+		f := s.getTMByObj(rb, TMBnot)
+		if f.IsNil() {
+			if rb.IsFloat() {
+				return coldContinue, pc, fmt.Errorf("number%s has no integer representation", varInfo(ev.bp.proto, ipc, int(b)))
+			}
+			return coldContinue, pc, fmt.Errorf("attempt to perform bitwise operation on a %s value%s", s.objTypeName(rb), varInfo(ev.bp.proto, ipc, int(b)))
+		}
+		pushed, err := s.pushMetamethodFrame(th, ev, f, []Value{rb, rb}, finishSetReg, a, false)
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_UNM:
+		b := uint8(w >> bytecode.PosB)
+		rb := regs[b]
+		f := s.getTMByObj(rb, TMUnm)
+		if f.IsNil() {
+			return coldContinue, pc, fmt.Errorf("attempt to perform arithmetic on a %s value%s", s.objTypeName(rb), varInfo(ev.bp.proto, ipc, int(b)))
+		}
+		pushed, err := s.pushMetamethodFrame(th, ev, f, []Value{rb, rb}, finishSetReg, a, false)
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_LEN:
+		rb := regs[uint8(w>>bytecode.PosB)]
+		tm := s.getTMByObj(rb, TMLen)
+		if tm.IsNil() {
+			return coldContinue, pc, fmt.Errorf("attempt to get length of a %s value", rb.TypeName())
+		}
+		pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{rb, rb}, finishSetReg, a, false)
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_MMBIN:
+		prev := ev.insns.at(ipc - 1)
+		dst := uint8(prev >> bytecode.PosA)
+		tm := TM(uint8(w >> bytecode.PosC))
+		b := uint8(w >> bytecode.PosB)
+		p1, p2 := regs[a], regs[b]
+		f := s.getTMByObj(p1, tm)
+		if f.IsNil() {
+			f = s.getTMByObj(p2, tm)
+		}
+		if f.IsNil() {
+			return coldContinue, pc, s.mmBinError(ev.bp.proto, ipc-1, tm, p1, p2, int(a), int(b))
+		}
+		pushed, err := s.pushMetamethodFrame(th, ev, f, []Value{p1, p2}, finishSetReg, dst, false)
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_MMBINI:
+		prev := ev.insns.at(ipc - 1)
+		dst := uint8(prev >> bytecode.PosA)
+		tm := TM(uint8(w >> bytecode.PosC))
+		p1, p2 := regs[a], IntValue(int64(w.SB()))
+		r1, r2 := int(a), -1
+		if w.K() {
+			p1, p2 = p2, p1
+			r1, r2 = -1, int(a)
+		}
+		f := s.getTMByObj(p1, tm)
+		if f.IsNil() {
+			f = s.getTMByObj(p2, tm)
+		}
+		if f.IsNil() {
+			return coldContinue, pc, s.mmBinError(ev.bp.proto, ipc-1, tm, p1, p2, r1, r2)
+		}
+		pushed, err := s.pushMetamethodFrame(th, ev, f, []Value{p1, p2}, finishSetReg, dst, false)
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_MMBINK:
+		prev := ev.insns.at(ipc - 1)
+		dst := uint8(prev >> bytecode.PosA)
+		tm := TM(uint8(w >> bytecode.PosC))
+		p1, p2 := regs[a], ev.consts[uint8(w>>bytecode.PosB)]
+		r1, r2 := int(a), -1
+		if w.K() {
+			p1, p2 = p2, p1
+			r1, r2 = -1, int(a)
+		}
+		f := s.getTMByObj(p1, tm)
+		if f.IsNil() {
+			f = s.getTMByObj(p2, tm)
+		}
+		if f.IsNil() {
+			return coldContinue, pc, s.mmBinError(ev.bp.proto, ipc-1, tm, p1, p2, r1, r2)
+		}
+		pushed, err := s.pushMetamethodFrame(th, ev, f, []Value{p1, p2}, finishSetReg, dst, false)
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_CONCAT:
+		b := int(uint8(w >> bytecode.PosB))
+		pushed, err := s.concatYieldable(th, &th.frames[ev.ci], ev.base+int(a), b)
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_CLOSE:
+		level := ev.base + int(a)
+		th.closeUpvals(level)
+		if th.hasTBCAtOrAbove(level) {
+			cf := &th.frames[ev.ci]
+			cf.dirty = true
+			cf.closeLevel = level
+			cf.closeHasErr = false
+			cf.closeResume = 0
+			cont, err := s.resumeCloseTBC(th, cf, entryDepth)
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			if !cont {
+				return coldReload, 0, nil
+			}
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_TBC:
+		if err := th.markTBC(ev.base + int(a)); err != nil {
+			if name, ok := findLocalName(ev.bp.proto, int(a)+1, pc); ok && name != "" {
+				return coldContinue, pc, fmt.Errorf("variable '%s' got a non-closable value", name)
+			}
+			return coldContinue, pc, err
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_TFORPREP:
+		tmp := regs[a+3]
+		regs[a+3] = regs[a+2]
+		regs[a+2] = tmp
+		if !tmp.IsFalsy() {
+			if err := th.markTBC(ev.base + int(a) + 2); err != nil {
+				return coldContinue, pc, err
+			}
+		}
+		return coldContinue, pc + w.Bx(), nil
+
+	case bytecode.OP_EQ:
+		ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
+		if RawEqual(ra, rb) {
+			if true != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			return coldContinue, pc, nil
+		}
+		if (ra.IsTable() && rb.IsTable()) || (ra.IsUserdata() && rb.IsUserdata()) {
+			tm := s.getTMByObj(ra, TMEq)
+			if tm.IsNil() {
+				tm = s.getTMByObj(rb, TMEq)
+			}
+			if !tm.IsNil() {
+				pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, rb}, finishCondJump, 0, w.K())
+				if err != nil {
+					return coldContinue, pc, err
+				}
+				if pushed {
+					return coldReload, 0, nil
+				}
+				return coldContinue, th.frames[ev.ci].pc, nil
+			}
+		}
+		if false != w.K() {
+			pc++
+		} else {
+			pc += 1 + ev.insns.at(pc).SJ()
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_LT:
+		ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
+		if ra.IsString() && rb.IsString() {
+			cond := ra.AsString().S < rb.AsString().S
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			return coldContinue, pc, nil
+		}
+		if ra.IsInt() && rb.IsFloat() {
+			cond := LTIntFloat(ra.Int(), rb.Float())
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			return coldContinue, pc, nil
+		}
+		if ra.IsFloat() && rb.IsInt() {
+			cond := LTFloatInt(ra.Float(), rb.Int())
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			return coldContinue, pc, nil
+		}
+		tm := s.getTMByObj(ra, TMLt)
+		if tm.IsNil() {
+			tm = s.getTMByObj(rb, TMLt)
+		}
+		if tm.IsNil() {
+			return coldContinue, pc, s.compareError(ra, rb)
+		}
+		pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, rb}, finishCondJump, 0, w.K())
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, th.frames[ev.ci].pc, nil
+
+	case bytecode.OP_LE:
+		ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
+		if ra.IsString() && rb.IsString() {
+			cond := ra.AsString().S <= rb.AsString().S
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			return coldContinue, pc, nil
+		}
+		if ra.IsInt() && rb.IsFloat() {
+			cond := LEIntFloat(ra.Int(), rb.Float())
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			return coldContinue, pc, nil
+		}
+		if ra.IsFloat() && rb.IsInt() {
+			cond := LEFloatInt(ra.Float(), rb.Int())
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			return coldContinue, pc, nil
+		}
+		tm := s.getTMByObj(ra, TMLe)
+		if tm.IsNil() {
+			tm = s.getTMByObj(rb, TMLe)
+		}
+		if !tm.IsNil() {
+			pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, rb}, finishCondJump, 0, w.K())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			if pushed {
+				return coldReload, 0, nil
+			}
+			return coldContinue, th.frames[ev.ci].pc, nil
+		}
+		tm = s.getTMByObj(ra, TMLt)
+		if tm.IsNil() {
+			tm = s.getTMByObj(rb, TMLt)
+		}
+		if tm.IsNil() {
+			return coldContinue, pc, s.compareError(ra, rb)
+		}
+		pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{rb, ra}, finishCondNot, 0, w.K())
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, th.frames[ev.ci].pc, nil
+
+	case bytecode.OP_LTI, bytecode.OP_LEI, bytecode.OP_GTI, bytecode.OP_GEI:
+		ra := regs[a]
+		im := IntValue(int64(w.SB()))
+		if w.C() != 0 {
+			im = FloatValue(float64(w.SB()))
+		}
+		switch op {
+		case bytecode.OP_LTI:
+			tm := s.getTMByObj(ra, TMLt)
+			if tm.IsNil() {
+				return coldContinue, pc, fmt.Errorf("attempt to compare %s with number", ra.TypeName())
+			}
+			pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, im}, finishCondJump, 0, w.K())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			if pushed {
+				return coldReload, 0, nil
+			}
+			return coldContinue, th.frames[ev.ci].pc, nil
+		case bytecode.OP_LEI:
+			tm := s.getTMByObj(ra, TMLe)
+			if !tm.IsNil() {
+				pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, im}, finishCondJump, 0, w.K())
+				if err != nil {
+					return coldContinue, pc, err
+				}
+				if pushed {
+					return coldReload, 0, nil
+				}
+				return coldContinue, th.frames[ev.ci].pc, nil
+			}
+			tm = s.getTMByObj(ra, TMLt)
+			if tm.IsNil() {
+				return coldContinue, pc, fmt.Errorf("attempt to compare %s with number", ra.TypeName())
+			}
+			pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{im, ra}, finishCondNot, 0, w.K())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			if pushed {
+				return coldReload, 0, nil
+			}
+			return coldContinue, th.frames[ev.ci].pc, nil
+		case bytecode.OP_GTI:
+			tm := s.getTMByObj(ra, TMLt)
+			if tm.IsNil() {
+				return coldContinue, pc, fmt.Errorf("attempt to compare number with %s", ra.TypeName())
+			}
+			pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{im, ra}, finishCondJump, 0, w.K())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			if pushed {
+				return coldReload, 0, nil
+			}
+			return coldContinue, th.frames[ev.ci].pc, nil
+		case bytecode.OP_GEI:
+			tm := s.getTMByObj(ra, TMLe)
+			if !tm.IsNil() {
+				pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{im, ra}, finishCondJump, 0, w.K())
+				if err != nil {
+					return coldContinue, pc, err
+				}
+				if pushed {
+					return coldReload, 0, nil
+				}
+				return coldContinue, th.frames[ev.ci].pc, nil
+			}
+			tm = s.getTMByObj(ra, TMLt)
+			if tm.IsNil() {
+				return coldContinue, pc, fmt.Errorf("attempt to compare number with %s", ra.TypeName())
+			}
+			pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, im}, finishCondNot, 0, w.K())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			if pushed {
+				return coldReload, 0, nil
+			}
+			return coldContinue, th.frames[ev.ci].pc, nil
+		}
+
+	case bytecode.OP_TAILCALL:
+		b := int(uint8(w >> bytecode.PosB))
+		nargs := b - 1
+		if b == 0 {
+			nargs = max(0, th.top-(ev.base+int(a)+1))
+		}
+		if w.K() {
+			th.closeUpvals(ev.base)
+		}
+		cf := &th.frames[ev.ci]
+		funcIdx := cf.funcIdx
+		srcStart := ev.base + int(a)
+		fn := th.stack[srcStart]
+		// Resolve __call metamethod chain IN-PLACE (max 15 hops per Lua 5.5) so tail calls stay O(1) stack!
+		extraDepth := uint8(0)
+		if !fn.IsClosure() && !fn.IsNative() {
+			for depth := 1; depth <= 15; depth++ {
+				tm := s.getTMByObj(fn, TMCall)
+				if tm.IsNil() {
+					return coldContinue, pc, fmt.Errorf("attempt to call a %s value%s", fn.TypeName(), varInfo(ev.bp.proto, ipc, int(a)))
+				}
+				th.ensureStack(srcStart + nargs + 4)
+				copy(th.stack[srcStart+2:srcStart+2+nargs], th.stack[srcStart+1:srcStart+1+nargs])
+				th.stack[srcStart+1] = fn
+				th.stack[srcStart] = tm
+				nargs++
+				fn = tm
+				extraDepth = uint8(depth)
+				if fn.IsClosure() || fn.IsNative() {
+					break
+				}
+			}
+			if !fn.IsClosure() && !fn.IsNative() {
+				return coldContinue, pc, fmt.Errorf("'__call' chain too long")
+			}
+		}
+		if fn.IsClosure() {
+			callee := fn.AsClosure()
+			p := callee.bp.proto
+			th.ensureStack(funcIdx + 1 + max(nargs, int(p.MaxStackSize)) + int(p.NumParams) + 8)
+			copy(th.stack[funcIdx:funcIdx+1+nargs], th.stack[srcStart:srcStart+1+nargs])
+			newBase := funcIdx + 1
+			if p.IsVararg() {
+				th.top = newBase + nargs
+			} else {
+				nparams := int(p.NumParams)
+				if nargs < nparams {
+					fillNil(th.stack[newBase+nargs : newBase+nparams])
+				}
+				if int(p.MaxStackSize) > nparams {
+					fillNil(th.stack[newBase+nparams : newBase+int(p.MaxStackSize)])
+				}
+				th.top = newBase + int(p.MaxStackSize)
+			}
+			cf.cl = callee
+			cf.base = newBase
+			cf.pc = 0
+			cf.dirty = true
+			cf.nextraargs = 0
+			cf.varargTab = nil
+			cf.isTailCall = true
+			cf.extraArgs = extraDepth
+			cf.oldPC = -1
+			if th.hookMask&HookMaskCall != 0 && !th.inHook {
+				nt := min(nargs, int(p.NumParams))
+				cf.ftransfer = 1
+				cf.ntransfer = uint16(nt)
+				if herr := s.fireHook(th, "tail call", NilValue()); herr != nil {
+					return coldContinue, pc, herr
+				}
+			}
+			return coldReload, 0, nil
+		}
+		// Tailcall to native (check yieldable pcall/xpcall and coroutine.yield!)
+		nf := fn.AsNative()
+		if nf.Intrinsic == intrPCall && nargs >= 1 && isFlatProtectedTarget(th.stack[srcStart+1]) {
+			nres := cf.nresults
+			th.ensureStack(funcIdx + 1 + nargs + 4)
+			copy(th.stack[funcIdx:funcIdx+1+nargs], th.stack[srcStart:srcStart+1+nargs])
+			th.nframe--
+			_, err := s.pushProtectedCall(th, funcIdx, nargs, nres, false)
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			return coldReload, 0, nil
+		}
+		if nf.Intrinsic == intrXPCall && nargs >= 2 && isFlatProtectedTarget(th.stack[srcStart+1]) && th.stack[srcStart+2].IsFunction() {
+			nres := cf.nresults
+			th.ensureStack(funcIdx + 1 + nargs + 4)
+			copy(th.stack[funcIdx:funcIdx+1+nargs], th.stack[srcStart:srcStart+1+nargs])
+			th.nframe--
+			_, err := s.pushProtectedCall(th, funcIdx, nargs, nres, true)
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			return coldReload, 0, nil
+		}
+		args := make([]Value, nargs)
+		copy(args, th.stack[srcStart+1:srcStart+1+nargs])
+		nres := cf.nresults
+		th.top = srcStart + 1 + nargs
+		res, err := nf.callMulti(s, args)
+		if errors.Is(err, errYieldSentinel) {
+			th.nframe--
+			th.yieldDst = funcIdx
+			th.yieldNRes = nres
+			return coldContinue, pc, errYieldSentinel
+		}
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		th.nframe--
+		th.placeResults(funcIdx, res, nres)
+		if th.nframe <= entryDepth {
+			return coldReturn, 0, nil
+		}
+		return coldReload, 0, nil
+
+	case bytecode.OP_RETURN:
+		b := int(uint8(w >> bytecode.PosB))
+		n := b - 1
+		if n < 0 {
+			n = max(0, th.top-(ev.base+int(a)))
+		}
+		cf := &th.frames[ev.ci]
+		srcStart := ev.base + int(a)
+		if srcStart+n > len(th.stack) {
+			n = max(0, len(th.stack)-srcStart)
+		}
+		if w.K() {
+			th.closeUpvals(ev.base)
+			if th.hasTBCAtOrAbove(ev.base) {
+				// Yieldable TBC close before completing return!
+				// Protect multret return values above MaxStackSize while closing TBC variables.
+				if srcStart+n > th.top {
+					th.top = srcStart + n
+				}
+				cf.dirty = true
+				cf.closeLevel = ev.base
+				cf.closeHasErr = false
+				cf.closeResume = 1
+				cf.closeRetSrc = srcStart
+				cf.closeRetN = n
+				cont, err := s.resumeCloseTBC(th, cf, entryDepth)
+				if err != nil {
+					return coldContinue, pc, err
+				}
+				if !cont {
+					if th.nframe <= entryDepth {
+						return coldReturn, 0, nil
+					}
+					return coldReload, 0, nil
+				}
+			}
+		}
+		if th.hookMask&HookMaskRet != 0 && !th.inHook {
+			cf.dirty = true
+			cf.ftransfer = uint16(srcStart - cf.base + 1)
+			cf.ntransfer = uint16(n)
+			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+				return coldContinue, pc, herr
+			}
+		}
+		funcIdx := cf.funcIdx
+		nres := cf.nresults
+		th.nframe--
+		if nres < 0 {
+			th.ensureStack(funcIdx + n + 4)
+			copy(th.stack[funcIdx:funcIdx+n], th.stack[srcStart:srcStart+n])
+			th.top = funcIdx + n
+		} else {
+			th.ensureStack(funcIdx + nres + 4)
+			cp := min(n, nres)
+			copy(th.stack[funcIdx:funcIdx+cp], th.stack[srcStart:srcStart+cp])
+			if cp < nres {
+				fillNil(th.stack[funcIdx+cp : funcIdx+nres])
+			}
+			th.top = funcIdx + nres
+		}
+		if th.nframe <= entryDepth {
+			return coldReturn, 0, nil
+		}
+		return coldReload, 0, nil
+
+	case bytecode.OP_SETLIST:
+		n := w.VB()
+		last := w.VC()
+		if n == 0 {
+			n = max(0, th.top-(ev.base+int(a))-1)
+		}
+		if w.K() {
+			last += ev.insns.at(pc).Ax() * (bytecode.MaxArgvC + 1)
+			pc++
+		}
+		if !regs[a].IsTable() {
+			return coldContinue, pc, fmt.Errorf("invalid table in SETLIST")
+		}
+		if ev.base+int(a)+n >= len(th.stack) {
+			n = max(0, len(th.stack)-1-(ev.base+int(a)))
+		}
+		t := regs[a].AsTable()
+		for i := 1; i <= n; i++ {
+			t.RawSetInt(s, int64(last+i), th.stack[ev.base+int(a)+i])
+			if s.memExceeded {
+				s.memExceeded = false
+				return coldContinue, pc, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+			}
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_CLOSURE:
+		bx := w.Bx()
+		sub := ev.bp.proto.Protos[bx]
+		sbp := ev.bp.sub[bx]
+		if sbp == nil {
+			sbp = s.bindProto(sub)
+			ev.bp.sub[bx] = sbp
+		}
+		cl := &Closure{
+			bp:     sbp,
+			upvals: make([]*Upvalue, len(sub.Upvalues)),
+		}
+		for i, ud := range sub.Upvalues {
+			if ud.InStack != 0 {
+				cl.upvals[i] = th.findOrCreateUpval(ev.base + int(ud.Idx))
+			} else {
+				cl.upvals[i] = ev.cl.upvals[ud.Idx]
+			}
+		}
+		estBytes := int64(48 + len(sub.Upvalues)*16)
+		if s.memLimit > 0 {
+			if err := s.checkMem(estBytes); err != nil {
+				return coldContinue, pc, err
+			}
+		}
+		regs[a] = ClosureValue(cl)
+		if s.gc.tier1 {
+			s.gcRecordAlloc(estBytes, ev.base+int(a)+1)
+		} else if s.memLimit > 0 {
+			s.gc.allocBytes += estBytes
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_VARARGPREP:
+		cf := &th.frames[ev.ci]
+		p := ev.bp.proto
+		nparams := int(p.NumParams)
+		nactual := max(0, th.top-cf.base)
+		if cf.base+nactual > len(th.stack) {
+			nactual = max(0, len(th.stack)-cf.base)
+		}
+		if nactual < nparams {
+			fillNil(th.stack[cf.base+nactual : cf.base+nparams])
+			nactual = nparams
+		}
+		nextra := nactual - nparams
+		if p.Flag&bytecode.PFVarargTable != 0 {
+			if s.memLimit > 0 {
+				if err := s.checkMemAndAccount(int64(96 + nextra*16)); err != nil {
+					return coldContinue, pc, err
+				}
+			}
+			vt := s.NewTable(nextra, 1)
+			for i := 0; i < nextra; i++ {
+				vt.RawSetInt(s, int64(i+1), th.stack[cf.base+nparams+i])
+				if err := s.ConsumeMemErr(); err != nil {
+					return coldContinue, pc, err
+				}
+			}
+			vt.RawSetStr(s, s.intern.Intern("n"), IntValue(int64(nextra)))
+			if err := s.ConsumeMemErr(); err != nil {
+				return coldContinue, pc, err
+			}
+			th.ensureStack(cf.base + int(p.MaxStackSize) + 8)
+			th.stack[cf.base+nparams] = TableValue(vt)
+			if int(p.MaxStackSize) > nparams+1 {
+				fillNil(th.stack[cf.base+nparams+1 : cf.base+int(p.MaxStackSize)])
+			}
+			cf.dirty = true
+			cf.varargTab = vt
+			cf.nextraargs = nextra
+			th.top = cf.base + int(p.MaxStackSize)
+			return coldContinue, pc, nil
+		}
+		if nextra > 0 {
+			newBase := cf.base + nactual
+			th.ensureStack(newBase + int(p.MaxStackSize) + 8)
+			copy(th.stack[newBase:newBase+nparams], th.stack[cf.base:cf.base+nparams])
+			if int(p.MaxStackSize) > nparams {
+				fillNil(th.stack[newBase+nparams : newBase+int(p.MaxStackSize)])
+			}
+			cf.dirty = true
+			cf.base = newBase
+			cf.nextraargs = nextra
+			ev.base = newBase
+			th.top = newBase + int(p.MaxStackSize)
+		} else {
+			th.ensureStack(cf.base + int(p.MaxStackSize) + 8)
+			if int(p.MaxStackSize) > nparams {
+				fillNil(th.stack[cf.base+nparams : cf.base+int(p.MaxStackSize)])
+			}
+			cf.nextraargs = 0
+			th.top = cf.base + int(p.MaxStackSize)
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_VARARG:
+		cf := &th.frames[ev.ci]
+		want := int(uint8(w>>bytecode.PosC)) - 1
+		if w.K() {
+			vtv := regs[uint8(w>>bytecode.PosB)]
+			if !vtv.IsTable() {
+				return coldContinue, pc, fmt.Errorf("vararg table expected")
+			}
+			vt := vtv.AsTable()
+			nv := vt.RawGetStr(s.intern.Intern("n"))
+			if !nv.IsInt() || nv.Int() < 0 || nv.Int() > math.MaxInt32/2 {
+				return coldContinue, pc, fmt.Errorf("vararg table has no proper 'n'")
+			}
+			n := int(nv.Int())
+			if want < 0 {
+				want = n
+				th.top = ev.base + int(a) + want
+			}
+			if ev.base+int(a)+want+4 > 1000000 {
+				return coldContinue, pc, fmt.Errorf("stack overflow")
+			}
+			th.ensureStack(ev.base + int(a) + want + 4)
+			for i := 0; i < want; i++ {
+				if i < n {
+					th.stack[ev.base+int(a)+i] = vt.RawGetInt(int64(i + 1))
+				} else {
+					th.stack[ev.base+int(a)+i] = NilValue()
+				}
+			}
+			return coldContinue, pc, nil
+		}
+		nextra := cf.nextraargs
+		if want < 0 {
+			want = nextra
+			th.top = ev.base + int(a) + want
+		}
+		th.ensureStack(ev.base + int(a) + want + 4)
+		extraStart := ev.base - nextra
+		for i := 0; i < want; i++ {
+			if i < nextra {
+				th.stack[ev.base+int(a)+i] = th.stack[extraStart+i]
+			} else {
+				th.stack[ev.base+int(a)+i] = NilValue()
+			}
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_GETVARG:
+		cf := &th.frames[ev.ci]
+		rc := regs[uint8(w>>bytecode.PosC)]
+		if idx, ok := rc.ToInt(); ok {
+			if idx >= 1 && idx <= int64(cf.nextraargs) {
+				regs[a] = th.stack[ev.base-cf.nextraargs+int(idx)-1]
+			} else {
+				regs[a] = NilValue()
+			}
+		} else if rc.IsString() && rc.AsString().S == "n" {
+			regs[a] = IntValue(int64(cf.nextraargs))
+		} else {
+			regs[a] = NilValue()
+		}
+		return coldContinue, pc, nil
+
+	case bytecode.OP_ERRNNIL:
+		if !regs[a].IsNil() {
+			bx := w.Bx()
+			if bx > 0 && bx-1 < len(ev.bp.strConsts) && ev.bp.strConsts[bx-1] != nil {
+				return coldContinue, pc, fmt.Errorf("global '%s' already defined", ev.bp.strConsts[bx-1].S)
+			}
+			return coldContinue, pc, fmt.Errorf("global already defined")
+		}
+		return coldContinue, pc, nil
+
+	default:
+		return coldContinue, pc, fmt.Errorf("unimplemented opcode %s (%d) at pc %d", bytecode.OpNames[op], op, ipc)
+	}
+	return coldContinue, pc, nil
+}
+
+func varInfo(p *bytecode.Proto, pc, reg int) string {
+	if p == nil || reg < 0 || pc < 0 || pc >= len(p.Code) {
+		return ""
+	}
+	name, kind := findObjectName(p, reg, pc)
+	if kind == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (%s '%s')", kind, name)
+}
+
+// objTypeName returns Lua 5.5's human-readable type name, honoring mt.__name and "light userdata" (errors.lua:268-280).
+func (s *State) objTypeName(v Value) string {
+	if v.IsLightUD() {
+		return "light userdata"
+	}
+	if mt := s.getMetatableOf(v); mt != nil {
+		if nm := mt.RawGetStr(s.intern.Intern("__name")); nm.IsString() {
+			return nm.AsString().S
+		}
+	}
+	return v.TypeName()
+}
+
+func (s *State) mmBinError(p *bytecode.Proto, pc int, tm TM, p1, p2 Value, r1, r2 int) error {
+	bad := p1
+	badReg := r1
+	switch tm {
+	case TMBand, TMBor, TMBxor, TMShl, TMShr, TMBnot:
+		if p1.IsNumber() {
+			if _, ok := p1.ToInt(); !ok {
+				return fmt.Errorf("number%s has no integer representation", varInfo(p, pc, r1))
+			}
+			bad = p2
+			badReg = r2
+		}
+		if bad.IsNumber() {
+			if _, ok := bad.ToInt(); !ok {
+				return fmt.Errorf("number%s has no integer representation", varInfo(p, pc, badReg))
+			}
+		}
+		return fmt.Errorf("attempt to perform bitwise operation on a %s value%s", s.objTypeName(bad), varInfo(p, pc, badReg))
+	default:
+		if p1.IsNumber() {
+			bad = p2
+			badReg = r2
+		}
+		return fmt.Errorf("attempt to perform arithmetic on a %s value%s", s.objTypeName(bad), varInfo(p, pc, badReg))
+	}
+}
+
+func (s *State) compareError(a, b Value) error {
+	t1, t2 := s.objTypeName(a), s.objTypeName(b)
+	if t1 == t2 {
+		return fmt.Errorf("attempt to compare two %s values", t1)
+	}
+	return fmt.Errorf("attempt to compare %s with %s", t1, t2)
+}
+
+func (s *State) lessThan(a, b Value) (bool, error) {
+	if a.IsString() && b.IsString() {
+		return a.AsString().S < b.AsString().S, nil
+	}
+	if BothInt(a, b) {
+		return a.Int() < b.Int(), nil
+	}
+	if BothFloat(a, b) {
+		return a.Float() < b.Float(), nil
+	}
+	if a.IsInt() && b.IsFloat() {
+		return LTIntFloat(a.Int(), b.Float()), nil
+	}
+	if a.IsFloat() && b.IsInt() {
+		return LTFloatInt(a.Float(), b.Int()), nil
+	}
+	tm := s.getTMByObj(a, TMLt)
+	if tm.IsNil() {
+		tm = s.getTMByObj(b, TMLt)
+	}
+	if tm.IsNil() {
+		return false, fmt.Errorf("attempt to compare %s with %s", a.TypeName(), b.TypeName())
+	}
+	res, err := s.Call(tm, a, b)
+	if err != nil {
+		return false, err
+	}
+	return len(res) > 0 && !res[0].IsFalsy(), nil
+}
+
+func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, error) {
+	if n <= 1 {
+		return false, nil
+	}
+	allSimple := true
+	totalLen := 0
+	for i := 0; i < n; i++ {
+		v := th.stack[start+i]
+		if v.IsString() {
+			totalLen += len(v.AsString().S)
+		} else if !v.IsNumber() {
+			allSimple = false
+			break
+		}
+	}
+	if allSimple {
+		if totalLen > (1<<30) || (s.memLimit > 0 && int64(totalLen)+48 > s.memLimit-s.gc.allocBytes) {
+			if err := s.checkMem(int64(totalLen) + 48); err != nil {
+				return false, err
+			}
+		}
+		var sb strings.Builder
+		sb.Grow(totalLen)
+		for i := 0; i < n; i++ {
+			v := th.stack[start+i]
+			if v.IsString() {
+				sb.WriteString(v.AsString().S)
+			} else {
+				sb.WriteString(FormatValue(v))
+			}
+		}
+		out := sb.String()
+		th.stack[start] = StringValue(s.intern.Intern(out))
+		if s.gc.tier1 {
+			s.gcRecordAlloc(int64(48+len(out)), start+1)
+		} else if s.memLimit > 0 {
+			s.gc.allocBytes += int64(48 + len(out))
+		}
+		return false, nil
+	}
+	return s.concatStep(th, cf, start, start+n-1)
+}
+
+func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, error) {
+	for cur > start {
+		lhs := th.stack[cur-1]
+		rhs := th.stack[cur]
+		if (lhs.IsString() || lhs.IsNumber()) && (rhs.IsString() || rhs.IsNumber()) {
+			joined := FormatValue(lhs) + FormatValue(rhs)
+			if s.memLimit > 0 {
+				if err := s.checkMemAndAccount(int64(len(joined)) + 48); err != nil {
+					return false, err
+				}
+			}
+			th.stack[cur-1] = StringValue(s.intern.Intern(joined))
+			cur--
+			continue
+		}
+		tm := s.getTMByObj(lhs, TMConcat)
+		if tm.IsNil() {
+			tm = s.getTMByObj(rhs, TMConcat)
+		}
+		if tm.IsNil() {
+			bad := lhs
+			if lhs.IsString() || lhs.IsNumber() {
+				bad = rhs
+			}
+			return false, fmt.Errorf("attempt to concatenate a %s value", bad.TypeName())
+		}
+		if tm.IsClosure() {
+			slot := cf.base + int(cf.cl.bp.proto.MaxStackSize)
+			if th.top > slot {
+				slot = th.top
+			}
+			th.ensureStack(slot + 4)
+			th.stack[slot] = tm
+			th.stack[slot+1] = lhs
+			th.stack[slot+2] = rhs
+			cf.dirty = true
+			cf.oldTop = slot
+			cf.finish = finishConcat
+			cf.concatStart = start
+			cf.concatIdx = cur - 1
+			if err := th.pushLuaFrame(tm.AsClosure(), slot, 2, 1); err != nil {
+				cf.finish = finishNone
+				return false, err
+			}
+			return true, nil
+		}
+		res, err := s.callOnThread(th, tm, []Value{lhs, rhs})
+		if err != nil {
+			return false, err
+		}
+		if len(res) > 0 {
+			th.stack[cur-1] = res[0]
+		} else {
+			th.stack[cur-1] = NilValue()
+		}
+		cur--
+	}
+	return false, nil
+}
