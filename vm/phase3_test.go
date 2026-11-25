@@ -3693,3 +3693,231 @@ func TestStreamingLoadAndDump(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound16VMRegressions(t *testing.T) {
+	// 1. os.date enforces memLimit while building output and accounts for the interned result.
+	t.Run("os_date_memory_budget_and_accounting", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(131072)
+
+		cl1, err := s.LoadChunk([]byte(`
+			assert(os.date("!%Y-%m-%d", 0) == "1970-01-01")
+			local dt = os.date("!*t", 0)
+			assert(dt.year == 1970 and dt.month == 1 and dt.day == 1)
+			local kept = {}
+			local fmt = string.rep("%c", 1000)
+			local ok, err = pcall(function()
+				for i = 1, 100 do
+					kept[i] = os.date(fmt, 0)
+				end
+			end)
+			local nkept = #kept
+			local memPeak = collectgarbage("count") * 1024
+			kept = nil
+			collectgarbage("collect")
+			assert(not ok and string.find(tostring(err), "not enough memory", 1, true),
+				"expected OOM retaining os.date results, got " .. tostring(ok) .. "," .. tostring(err))
+			assert(nkept > 0 and nkept < 10, "expected 1..9 retained 24KB results under 128KiB limit, got " .. tostring(nkept))
+			assert(memPeak >= nkept * 20000, "expected accounted memory >= retained os.date bytes, got " .. tostring(memPeak))
+			return "ok"
+		`), "=os_date_retain_oom")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl1); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("os.date retain OOM failed: res=%v err=%v", res, err)
+		}
+
+		// Also verify a single oversized format string fails before materializing the full output.
+		s2 := NewState()
+		defer s2.Close()
+		cl2, err := s2.LoadChunk([]byte(`
+			local fmt = string.rep("%c", 50000)
+			local ok, err = pcall(os.date, fmt, 0)
+			assert(not ok and string.find(tostring(err), "not enough memory", 1, true),
+				"expected OOM on single huge os.date, got " .. tostring(ok) .. "," .. tostring(err))
+			return "ok"
+		`), "=os_date_single_oom")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2.SetMemoryLimit(262144)
+		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("os.date single OOM failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. utf8.codepoint enforces memLimit before allocating codepoint slices.
+	t.Run("utf8_codepoint_prealloc_budget", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local a, b, c = utf8.codepoint("A\xc3\xa9!", 1, 4)
+			assert(a == 65 and b == 0xE9 and c == 33)
+			local big = string.rep("a", 32768)
+			local ok, err = pcall(utf8.codepoint, big, 1, #big)
+			assert(not ok and string.find(tostring(err), "not enough memory", 1, true),
+				"expected OOM from utf8.codepoint, got " .. tostring(ok) .. "," .. tostring(err))
+			local okBad, errBad = pcall(utf8.codepoint, "\xff", 1, 1)
+			assert(not okBad and string.find(tostring(errBad), "invalid UTF-8", 1, true),
+				"expected invalid UTF-8 error, got " .. tostring(okBad) .. "," .. tostring(errBad))
+			return "ok"
+		`), "=utf8_codepoint_oom")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res, err := s.Call(cl)
+		runtime.ReadMemStats(&after)
+		if err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("utf8.codepoint OOM failed: res=%v err=%v", res, err)
+		}
+		// Previously allocated ~1.16 MB before failing; zero-alloc pass 1 must stay far below 256 KiB.
+		if delta := after.TotalAlloc - before.TotalAlloc; delta > 262144 {
+			t.Fatalf("utf8.codepoint allocated %d bytes before OOM (expected <= 262144)", delta)
+		}
+	})
+
+	// 3. package.searchers uses raw integer indexing per PUC-Rio Lua 5.5.1 loadlib.c:629 (lua_rawgeti).
+	t.Run("package_searchers_raw_lookup_parity", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local orig = package.searchers
+			package.searchers = setmetatable({}, {
+				__index = function(_, k)
+					if k == 1 then
+						return function(m) return function() return "FROM_INDEX:" .. m end end
+					end
+				end,
+			})
+			local ok, msg = pcall(require, "test_searchers_raw_parity")
+			package.searchers = orig
+			assert(not ok and string.find(tostring(msg), "module 'test_searchers_raw_parity' not found:", 1, true),
+				"expected raw package.searchers lookup to ignore __index, got " .. tostring(ok) .. "," .. tostring(msg))
+			return "ok"
+		`), "=searchers_raw_parity")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("package.searchers parity failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. Native closures expose their actual captured upvalues through debug.getupvalue / setupvalue / upvalueid.
+	t.Run("native_closure_upvalues_exposed", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local it = string.gmatch("abc", ".")
+			assert(debug.getinfo(it, "u").nups == 3)
+			local n1, v1 = debug.getupvalue(it, 1)
+			local n2, v2 = debug.getupvalue(it, 2)
+			local n3, v3 = debug.getupvalue(it, 3)
+			local n4, v4 = debug.getupvalue(it, 4)
+			assert(n1 == "" and v1 == "abc", "uv1: " .. tostring(n1) .. "," .. tostring(v1))
+			assert(n2 == "" and v2 == ".", "uv2: " .. tostring(n2) .. "," .. tostring(v2))
+			assert(n3 == "" and type(v3) == "userdata", "uv3: " .. tostring(n3) .. "," .. type(v3))
+			assert(n4 == nil and v4 == nil)
+			assert(debug.upvalueid(it, 1) ~= nil and debug.upvalueid(it, 1) ~= debug.upvalueid(it, 2))
+			local sn = table.pack(debug.setupvalue(it, 1, "xyz"))
+			assert(sn.n == 1 and sn[1] == "", "setupvalue must return single empty name")
+			local _, v1new = debug.getupvalue(it, 1)
+			assert(v1new == "xyz", "expected updated upvalue 'xyz', got " .. tostring(v1new))
+
+			local wr = coroutine.wrap(function() return 7 end)
+			assert(debug.getinfo(wr, "u").nups == 1)
+			local wn, wv = debug.getupvalue(wr, 1)
+			assert(wn == "" and type(wv) == "thread")
+			assert(wr() == 7)
+
+			local f = assert(io.tmpfile())
+			local ln = f:lines("l", 5)
+			assert(debug.getinfo(ln, "u").nups == 5)
+			local _, l1 = debug.getupvalue(ln, 1)
+			local _, l2 = debug.getupvalue(ln, 2)
+			local _, l3 = debug.getupvalue(ln, 3)
+			local _, l4 = debug.getupvalue(ln, 4)
+			local _, l5 = debug.getupvalue(ln, 5)
+			assert(l1 == f and l2 == 2 and l3 == false and l4 == "l" and l5 == 5)
+			f:close()
+
+			local uc = utf8.codes("abc")
+			assert(debug.getinfo(uc, "u").nups == 0)
+			assert(debug.getupvalue(uc, 1) == nil)
+			return "ok"
+		`), "=native_upvals")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("native closure upvalues failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 5. io.popen flushes buffered open output streams before spawning the child process.
+	t.Run("io_popen_flushes_buffered_output", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		fname := filepath.Join(t.TempDir(), "buffered.txt")
+		cl, err := s.LoadChunk([]byte(fmt.Sprintf(`
+			local fname = %q
+			local fh = assert(io.open(fname, "w"))
+			assert(fh:setvbuf("full", 4096))
+			assert(fh:write("payload"))
+			local p = assert(io.popen("exit 0", "r"))
+			p:close()
+			local r = assert(io.open(fname, "r"))
+			local got = r:read("a")
+			r:close()
+			fh:close()
+			assert(got == "payload", "expected 'payload' flushed before io.popen, got " .. string.format("%%q", tostring(got)))
+			return "ok"
+		`, fname)), "=popen_flush")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("io.popen flush failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 6. os.difftime validates integer timestamps and preserves precision above 2^53 without overflow.
+	t.Run("os_difftime_integer_precision_and_validation", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			assert(os.difftime(9007199254740993, 9007199254740992) == 1.0)
+			assert(math.type(os.difftime(9007199254740993, 9007199254740992)) == "float")
+			assert(os.difftime(math.maxinteger, math.maxinteger - 1) == 1.0)
+			assert(os.difftime(math.maxinteger - 1, math.maxinteger) == -1.0)
+			local dmin = os.difftime(math.mininteger, math.maxinteger)
+			local dmax = os.difftime(math.maxinteger, math.mininteger)
+			assert(dmin < -1e19 and dmin > -2e19 and dmax == -dmin)
+			assert(os.difftime("10", "3") == 7.0)
+			assert(os.difftime(10.0, 3.0) == 7.0)
+			assert(os.difftime(5, 5) == 0.0)
+
+			local ok1, e1 = pcall(os.difftime, 1.5, 1)
+			assert(not ok1 and string.find(tostring(e1), "no integer representation", 1, true), "got " .. tostring(e1))
+			local ok2, e2 = pcall(os.difftime, 1, 1.5)
+			assert(not ok2 and string.find(tostring(e2), "no integer representation", 1, true), "got " .. tostring(e2))
+			local ok3, e3 = pcall(os.difftime, math.huge, 1)
+			assert(not ok3 and string.find(tostring(e3), "no integer representation", 1, true), "got " .. tostring(e3))
+			local ok4, e4 = pcall(os.difftime, 10)
+			assert(not ok4 and string.find(tostring(e4), "number expected", 1, true), "got " .. tostring(e4))
+			return "ok"
+		`), "=os_difftime_precision")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("os.difftime precision failed: res=%v err=%v", res, err)
+		}
+	})
+}
