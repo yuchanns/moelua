@@ -166,46 +166,59 @@ func matchClass(c, cl byte) bool {
 	return !res
 }
 
-func (ms *matchState) matchBracketClass(c byte, p, ec int) bool {
+func (ms *matchState) pollCancel() error {
+	if ms.checkCancel != nil {
+		ms.steps++
+		if ms.steps&0x3ff == 0 {
+			return ms.checkCancel()
+		}
+	}
+	return nil
+}
+
+func (ms *matchState) matchBracketClass(c byte, p, ec int) (bool, error) {
 	sig := true
 	if ms.pat[p+1] == '^' {
 		sig = false
 		p++ // skip '^'
 	}
 	for p++; p < ec; p++ {
+		if err := ms.pollCancel(); err != nil {
+			return false, err
+		}
 		if ms.pat[p] == lEsc {
 			p++
 			if matchClass(c, ms.pat[p]) {
-				return sig
+				return sig, nil
 			}
 		} else if p+2 < ec && ms.pat[p+1] == '-' {
 			lo := ms.pat[p]
 			hi := ms.pat[p+2]
 			p += 2
 			if lo <= c && c <= hi {
-				return sig
+				return sig, nil
 			}
 		} else if ms.pat[p] == c {
-			return sig
+			return sig, nil
 		}
 	}
-	return !sig
+	return !sig, nil
 }
 
-func (ms *matchState) singleMatch(s, p, ep int) bool {
+func (ms *matchState) singleMatch(s, p, ep int) (bool, error) {
 	if s >= len(ms.src) {
-		return false
+		return false, nil
 	}
 	c := ms.src[s]
 	switch ms.pat[p] {
 	case '.':
-		return true
+		return true, nil
 	case lEsc:
-		return matchClass(c, ms.pat[p+1])
+		return matchClass(c, ms.pat[p+1]), nil
 	case '[':
 		return ms.matchBracketClass(c, p, ep-1)
 	default:
-		return ms.pat[p] == c
+		return ms.pat[p] == c, nil
 	}
 }
 
@@ -220,6 +233,9 @@ func (ms *matchState) matchBalance(s, p int) (int, error) {
 	e := ms.pat[p+1]
 	cont := 1
 	for s++; s < len(ms.src); s++ {
+		if err := ms.pollCancel(); err != nil {
+			return -1, err
+		}
 		if ms.src[s] == e {
 			cont--
 			if cont == 0 {
@@ -234,7 +250,17 @@ func (ms *matchState) matchBalance(s, p int) (int, error) {
 
 func (ms *matchState) maxExpand(s, p, ep int) (int, error) {
 	i := 0
-	for ms.singleMatch(s+i, p, ep) {
+	for {
+		if err := ms.pollCancel(); err != nil {
+			return -1, err
+		}
+		ok, err := ms.singleMatch(s+i, p, ep)
+		if err != nil {
+			return -1, err
+		}
+		if !ok {
+			break
+		}
 		i++
 	}
 	for i >= 0 {
@@ -259,7 +285,11 @@ func (ms *matchState) minExpand(s, p, ep int) (int, error) {
 		if res >= 0 {
 			return res, nil
 		}
-		if ms.singleMatch(s, p, ep) {
+		ok, err := ms.singleMatch(s, p, ep)
+		if err != nil {
+			return -1, err
+		}
+		if ok {
 			s++
 		} else {
 			return -1, nil
@@ -321,14 +351,6 @@ func (ms *matchState) matchCapture(s int, ch byte) (int, error) {
 }
 
 func (ms *matchState) match(s, p int) (int, error) {
-	if ms.checkCancel != nil {
-		ms.steps++
-		if ms.steps&0x3ff == 0 {
-			if err := ms.checkCancel(); err != nil {
-				return -1, err
-			}
-		}
-	}
 	if ms.matchDepth == 0 {
 		return -1, errPatternTooComplex
 	}
@@ -336,6 +358,9 @@ func (ms *matchState) match(s, p int) (int, error) {
 	defer func() { ms.matchDepth++ }()
 
 	for {
+		if err := ms.pollCancel(); err != nil {
+			return -1, err
+		}
 		if p == len(ms.pat) {
 			return s, nil
 		}
@@ -387,9 +412,19 @@ func (ms *matchState) match(s, p int) (int, error) {
 				if s < len(ms.src) {
 					curr = ms.src[s]
 				}
-				if !ms.matchBracketClass(prev, p, ep-1) && ms.matchBracketClass(curr, p, ep-1) {
-					p = ep
-					continue
+				mPrev, err := ms.matchBracketClass(prev, p, ep-1)
+				if err != nil {
+					return -1, err
+				}
+				if !mPrev {
+					mCurr, err := ms.matchBracketClass(curr, p, ep-1)
+					if err != nil {
+						return -1, err
+					}
+					if mCurr {
+						p = ep
+						continue
+					}
 				}
 				return -1, nil
 			case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
@@ -417,7 +452,11 @@ func (ms *matchState) match(s, p int) (int, error) {
 		if ep < len(ms.pat) {
 			suffix = ms.pat[ep]
 		}
-		if !ms.singleMatch(s, p, ep) {
+		matched, err := ms.singleMatch(s, p, ep)
+		if err != nil {
+			return -1, err
+		}
+		if !matched {
 			if suffix == '*' || suffix == '?' || suffix == '-' {
 				p = ep + 1
 				continue

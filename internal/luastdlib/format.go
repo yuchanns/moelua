@@ -309,12 +309,18 @@ func formatInteger(b *strings.Builder, pf parsedFormat, n int64) {
 func formatSpecialFloat(b *strings.Builder, pf parsedFormat, f float64, upper bool) {
 	var body string
 	if math.IsNaN(f) {
+		var prefix string
+		if pf.flagPlus {
+			prefix = "+"
+		} else if pf.flagSpace {
+			prefix = " "
+		}
 		if upper {
 			body = "NAN"
 		} else {
 			body = "nan"
 		}
-		writePadded(b, "", body, pf.width, pf.flagMinus, false)
+		writePadded(b, prefix, body, pf.width, pf.flagMinus, false)
 		return
 	}
 	var prefix string

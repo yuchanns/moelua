@@ -1561,3 +1561,41 @@ func TestCoercionsAndEdgePaths(t *testing.T) {
 		t.Fatalf("StrToIntBase invalid base 37 should fail")
 	}
 }
+
+func TestMatchWithCancelExpensiveLoops(t *testing.T) {
+	cancelErr := fmt.Errorf("cancelled")
+	polls := 0
+	check := func() error {
+		polls++
+		if polls >= 2 {
+			return cancelErr
+		}
+		return nil
+	}
+	// Bracket-class + greedy expansion loop inside a single match() call.
+	_, _, err := MatchWithCancel(strings.Repeat("a", 10000), "^["+strings.Repeat("b", 10000)+"a]*$", 1, check)
+	if err != cancelErr {
+		t.Fatalf("expected cancelErr from expensive bracket loop, got %v (polls=%d)", err, polls)
+	}
+
+	// Balance scan loop inside a single match() call.
+	polls = 0
+	_, _, err = MatchWithCancel("("+strings.Repeat("x", 10000)+")", "^%b()$", 1, check)
+	if err != cancelErr {
+		t.Fatalf("expected cancelErr from expensive balance loop, got %v (polls=%d)", err, polls)
+	}
+}
+
+func TestFormatNaNSignFlags(t *testing.T) {
+	nan := math.NaN()
+	got, err := Format("%+f|% f|%+a|% G|%+10f|% 10A", []FormatArg{
+		FloatArg(nan), FloatArg(nan), FloatArg(nan), FloatArg(nan), FloatArg(nan), FloatArg(nan),
+	})
+	if err != nil {
+		t.Fatalf("Format NaN sign flags err: %v", err)
+	}
+	want := "+nan| nan|+nan| NAN|      +nan|       NAN"
+	if got != want {
+		t.Fatalf("Format NaN sign flags:\n  got:  %q\n  want: %q", got, want)
+	}
+}
