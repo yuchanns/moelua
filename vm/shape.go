@@ -18,16 +18,17 @@ type Shape struct {
 	// Fast lookup for >8 properties (lazily populated).
 	index map[*LuaString]int32
 
-	// Transitions: inline small list for <= 4 children, map beyond that.
-	transSmall [4]shapeTrans
-	nTrans     uint8
-	frozen     bool // true for read-only shapes from frozen stdlib template (transitions go to shapeRegistry.frozenTrans)
-	transMap   map[*LuaString]*Shape
+	// Transitions: inline small list for <= 4 children, weak map beyond that so unused shapes/keys can be reclaimed.
+	transSmall   [4]shapeTrans
+	nTrans       uint8
+	frozen       bool // true for read-only shapes from frozen stdlib template (transitions go to shapeRegistry.frozenTrans)
+	transMap     map[weak.Pointer[LuaString]]weak.Pointer[Shape]
+	transInserts uint32
 }
 
 type shapeTrans struct {
-	key   *LuaString
-	child *Shape
+	key   weak.Pointer[LuaString]
+	child weak.Pointer[Shape]
 }
 
 // Lookup returns the slot index for short-string key k, or -1 if absent.
@@ -61,9 +62,9 @@ func (sh *Shape) Keys() []*LuaString {
 	return out
 }
 
-type frozenTransKey struct {
-	shape *Shape
-	key   *LuaString
+type weakFrozenTransKey struct {
+	shape weak.Pointer[Shape]
+	key   weak.Pointer[LuaString]
 }
 
 type shapeRegistry struct {
@@ -74,8 +75,8 @@ type shapeRegistry struct {
 	metaRoots map[weak.Pointer[Table]]weak.Pointer[Shape]
 	// metaTrans weakly caches (shape, newMeta) -> shape with same keys and newMeta.
 	metaTrans map[weakMetaTransKey]weak.Pointer[Shape]
-	// frozenTrans caches transitions out of read-only frozen stdlib shapes without mutating them.
-	frozenTrans map[frozenTransKey]*Shape
+	// frozenTrans weakly caches transitions out of read-only frozen stdlib shapes without mutating them.
+	frozenTrans map[weakFrozenTransKey]weak.Pointer[Shape]
 	metaInserts uint32
 }
 
@@ -97,7 +98,15 @@ func newShapeRegistry() shapeRegistry {
 	return sr
 }
 
-// Prune removes dead weak entries from metaRoots and metaTrans.
+func pruneShapeTransMap(sh *Shape) {
+	for k, v := range sh.transMap {
+		if k.Value() == nil || v.Value() == nil {
+			delete(sh.transMap, k)
+		}
+	}
+}
+
+// Prune removes dead weak entries from metaRoots, metaTrans, frozenTrans, and root transitions.
 func (sr *shapeRegistry) Prune() {
 	for k, v := range sr.metaRoots {
 		if k.Value() == nil || v.Value() == nil {
@@ -108,6 +117,14 @@ func (sr *shapeRegistry) Prune() {
 		if k.shape.Value() == nil || (k.hasMeta && k.meta.Value() == nil) || v.Value() == nil {
 			delete(sr.metaTrans, k)
 		}
+	}
+	for k, v := range sr.frozenTrans {
+		if k.shape.Value() == nil || k.key.Value() == nil || v.Value() == nil {
+			delete(sr.frozenTrans, k)
+		}
+	}
+	if sr.root != nil && sr.root.transMap != nil {
+		pruneShapeTransMap(sr.root)
 	}
 }
 
@@ -142,14 +159,17 @@ func (sr *shapeRegistry) Transition(sh *Shape, k *LuaString) *Shape {
 	if sh.length >= maxShapeProps {
 		return nil
 	}
+	wk := weak.Make(k)
 	if sh.frozen {
-		fk := frozenTransKey{shape: sh, key: k}
+		fk := weakFrozenTransKey{shape: weak.Make(sh), key: wk}
 		if sr.frozenTrans != nil {
-			if child, ok := sr.frozenTrans[fk]; ok {
-				return child
+			if wp, ok := sr.frozenTrans[fk]; ok {
+				if child := wp.Value(); child != nil {
+					return child
+				}
 			}
 		} else {
-			sr.frozenTrans = make(map[frozenTransKey]*Shape, 8)
+			sr.frozenTrans = make(map[weakFrozenTransKey]weak.Pointer[Shape], 8)
 		}
 		sr.nextID++
 		child := &Shape{
@@ -167,17 +187,27 @@ func (sr *shapeRegistry) Transition(sh *Shape, k *LuaString) *Shape {
 			}
 			child.index = idx
 		}
-		sr.frozenTrans[fk] = child
+		sr.frozenTrans[fk] = weak.Make(child)
+		sr.maybePrune()
 		return child
 	}
+	freeSmall := -1
 	for i := range int(sh.nTrans) {
-		if sh.transSmall[i].key == k {
-			return sh.transSmall[i].child
+		st := sh.transSmall[i]
+		if st.key == wk {
+			if child := st.child.Value(); child != nil {
+				return child
+			}
+			freeSmall = i
+		} else if freeSmall < 0 && (st.key.Value() == nil || st.child.Value() == nil) {
+			freeSmall = i
 		}
 	}
 	if sh.transMap != nil {
-		if child, ok := sh.transMap[k]; ok {
-			return child
+		if wp, ok := sh.transMap[wk]; ok {
+			if child := wp.Value(); child != nil {
+				return child
+			}
 		}
 	}
 	sr.nextID++
@@ -196,14 +226,20 @@ func (sr *shapeRegistry) Transition(sh *Shape, k *LuaString) *Shape {
 		}
 		child.index = idx
 	}
-	if sh.nTrans < 4 {
-		sh.transSmall[sh.nTrans] = shapeTrans{key: k, child: child}
+	if freeSmall >= 0 {
+		sh.transSmall[freeSmall] = shapeTrans{key: wk, child: weak.Make(child)}
+	} else if sh.nTrans < 4 {
+		sh.transSmall[sh.nTrans] = shapeTrans{key: wk, child: weak.Make(child)}
 		sh.nTrans++
 	} else {
 		if sh.transMap == nil {
-			sh.transMap = make(map[*LuaString]*Shape, 8)
+			sh.transMap = make(map[weak.Pointer[LuaString]]weak.Pointer[Shape], 8)
 		}
-		sh.transMap[k] = child
+		sh.transMap[wk] = weak.Make(child)
+		sh.transInserts++
+		if sh.transInserts&255 == 0 {
+			pruneShapeTransMap(sh)
+		}
 	}
 	return child
 }

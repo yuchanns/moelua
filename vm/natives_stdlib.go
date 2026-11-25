@@ -270,7 +270,13 @@ func nativeStringPack(s *State, args []Value) ([]Value, error) {
 			pargs[i] = luastdlib.PackStringVal(FormatValue(a))
 		}
 	}
-	res, err := luastdlib.Pack(fmtStr, pargs...)
+	var checkSize func(int64) error
+	if s.memLimit > 0 {
+		checkSize = func(n int64) error {
+			return s.checkMem(n + 48)
+		}
+	}
+	res, err := luastdlib.PackWithLimits(fmtStr, checkSize, pargs...)
 	if err != nil {
 		return nil, err
 	}

@@ -3,6 +3,7 @@ package vm
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"unsafe"
@@ -844,17 +845,14 @@ func nativeDebugGetLocal(s *State, args []Value) ([]Value, error) {
 	}
 	p := cf.cl.bp.proto
 	if idx < 0 {
-		// Negative index accesses hidden varargs (Lua 5.5 PF_VAHID or PF_VATAB).
-		vi := int(-idx)
-		if cf.varargTab != nil {
-			nv := cf.varargTab.RawGetStr(s.intern.Intern("n"))
-			if nv.IsInt() && int64(vi) <= nv.Int() {
-				return []Value{StringValue(s.intern.Intern("(vararg)")), cf.varargTab.RawGetInt(int64(vi))}, nil
-			}
+		// Negative index accesses hidden varargs only (matching PUC-Rio ldebug.c:findvararg: PF_VAHID).
+		// Guard against -math.MinInt64 overflow.
+		if p.Flag&bytecode.PFVarargHidden == 0 || idx == math.MinInt64 {
 			return []Value{NilValue()}, nil
 		}
-		if vi <= cf.nextraargs {
-			return []Value{StringValue(s.intern.Intern("(vararg)")), th.stack[cf.base-cf.nextraargs+vi-1]}, nil
+		vi := -idx
+		if vi >= 1 && vi <= int64(cf.nextraargs) {
+			return []Value{StringValue(s.intern.Intern("(vararg)")), th.stack[cf.base-cf.nextraargs+int(vi)-1]}, nil
 		}
 		return []Value{NilValue()}, nil
 	}
@@ -866,7 +864,7 @@ func nativeDebugGetLocal(s *State, args []Value) ([]Value, error) {
 		pc--
 	}
 	limit := frameLocalLimit(s, th, cfIdx)
-	if int(idx) > limit {
+	if idx > int64(limit) {
 		return []Value{NilValue()}, nil
 	}
 	if name, ok := findLocalName(p, int(idx), pc); ok {
@@ -891,7 +889,7 @@ func nativeDebugSetLocal(s *State, args []Value) ([]Value, error) {
 	}
 	cf := &th.frames[cfIdx]
 	if cf.kind != frameLua {
-		if idx < 1 || int(idx) > int(cf.ntransfer) {
+		if idx < 1 || idx > int64(cf.ntransfer) {
 			return []Value{NilValue()}, nil
 		}
 		th.stack[cf.base+int(idx)-1] = rest[2]
@@ -899,15 +897,19 @@ func nativeDebugSetLocal(s *State, args []Value) ([]Value, error) {
 	}
 	p := cf.cl.bp.proto
 	if idx < 0 {
-		vi := int(-idx)
-		if vi <= cf.nextraargs {
-			th.stack[cf.base-cf.nextraargs+vi-1] = rest[2]
+		// Negative index accesses hidden varargs only (matching PUC-Rio ldebug.c:findvararg: PF_VAHID).
+		if p.Flag&bytecode.PFVarargHidden == 0 || idx == math.MinInt64 {
+			return []Value{NilValue()}, nil
+		}
+		vi := -idx
+		if vi >= 1 && vi <= int64(cf.nextraargs) {
+			th.stack[cf.base-cf.nextraargs+int(vi)-1] = rest[2]
 			return []Value{StringValue(s.intern.Intern("(vararg)"))}, nil
 		}
 		return []Value{NilValue()}, nil
 	}
 	limit := frameLocalLimit(s, th, cfIdx)
-	if idx < 1 || int(idx) > limit {
+	if idx < 1 || idx > int64(limit) {
 		return []Value{NilValue()}, nil
 	}
 	th.stack[cf.base+int(idx)-1] = rest[2]

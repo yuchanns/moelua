@@ -986,6 +986,11 @@ func (t *Table) hashFindSlotForNext(key Value) (int, bool) {
 	if h == nil || len(h.nodes) == 0 {
 		return -1, false
 	}
+	if key.IsFloat() {
+		if iv, ok := FloatToIntExact(key.Float()); ok {
+			key = IntValue(iv)
+		}
+	}
 	mask := h.mask
 	idx := hashValue(key) & mask
 	for {
@@ -1007,6 +1012,11 @@ func (t *Table) Next(key Value) (Value, Value, error) {
 	startIdx := 0
 
 	if !key.IsNil() {
+		if key.IsFloat() {
+			if iv, ok := FloatToIntExact(key.Float()); ok {
+				key = IntValue(iv)
+			}
+		}
 		found := false
 		// Check array first if integer key.
 		if i, ok := key.ToInt(); ok && i >= 1 && i <= int64(arrLen) {

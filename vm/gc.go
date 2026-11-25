@@ -363,9 +363,20 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 			tr.mark(ClosureValue(cf.cl))
 		}
 		tr.mark(cf.errFunc)
+		tr.mark(cf.closeErr)
+		tr.mark(cf.nativeFn)
 		if cf.varargTab != nil {
 			tr.mark(TableValue(cf.varargTab))
 		}
+	}
+	tr.mark(th.errObj)
+	tr.mark(th.lastErrNative)
+	tr.mark(th.hook)
+	if th.caller != nil {
+		tr.mark(ThreadValue(th.caller))
+	}
+	for _, yv := range th.yieldVals {
+		tr.mark(yv)
 	}
 	// Clear stale frame slots above nframe so dead closures/errFuncs/tables are never pinned.
 	if th.nframe < len(th.frames) {
@@ -584,6 +595,8 @@ func (tr *gcTracer) clearByKeys(tables []*Table) {
 			for i := range nodes {
 				nd := &nodes[i]
 				if nd.used && !nd.dead && !nd.val.IsNil() && !tr.isMarked(nd.key) {
+					// Key is provably unreachable; clear both key and val so Go's GC reclaims the key immediately.
+					nd.key = NilValue()
 					nd.val = NilValue()
 					nd.dead = true
 					h.live--

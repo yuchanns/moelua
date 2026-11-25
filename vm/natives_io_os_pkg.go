@@ -636,6 +636,31 @@ func shellCommand(cmdStr string) *exec.Cmd {
 	return exec.Command("/bin/sh", "-c", cmdStr)
 }
 
+func (s *State) inheritedStdStreams(cmd *exec.Cmd) {
+	cmd.Stdin = os.Stdin
+	if s.out != nil {
+		cmd.Stdout = s.out
+	} else {
+		cmd.Stdout = os.Stdout
+	}
+	if s.errOut != nil {
+		cmd.Stderr = s.errOut
+	} else {
+		cmd.Stderr = os.Stderr
+	}
+}
+
+func execResult(s *State, err error) []Value {
+	if err == nil {
+		return []Value{TrueValue(), StringValue(s.intern.Intern("exit")), IntValue(0)}
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		kind, code := execExitInfo(ee)
+		return []Value{NilValue(), StringValue(s.intern.Intern(kind)), IntValue(code)}
+	}
+	return []Value{NilValue(), StringValue(s.intern.Intern("exit")), IntValue(1)}
+}
+
 func nativeIOPopen(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsString() {
 		return nil, fmt.Errorf("bad argument #1 to 'io.popen' (string expected)")
@@ -645,6 +670,7 @@ func nativeIOPopen(s *State, args []Value) ([]Value, error) {
 		mode = FormatValue(args[1])
 	}
 	cmd := shellCommand(args[0].AsString().S)
+	s.inheritedStdStreams(cmd)
 	var f *os.File
 	var err error
 	if mode == "w" {
@@ -702,7 +728,12 @@ func nativeFileClose(s *State, args []Value) ([]Value, error) {
 	if lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
-	if err := lf.closeFile(); err != nil {
+	isPipe := lf.cmd != nil
+	err := lf.closeFile()
+	if isPipe {
+		return execResult(s, err), nil
+	}
+	if err != nil {
 		return ioFail(s, err), nil
 	}
 	return []Value{TrueValue()}, nil
@@ -751,24 +782,36 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 	if err := lf.flushWriter(); err != nil {
 		return ioFail(s, err), nil
 	}
-	sz := 4096
+	sz := int64(4096)
 	if len(args) >= 3 && !args[2].IsNil() {
 		if v, ok := args[2].ToInt(); ok && v > 0 {
-			sz = int(v)
+			sz = v
 		}
 	}
-	switch args[1].AsString().S {
+	const maxSetVBufSize = int64(1 << 28)
+	mode := args[1].AsString().S
+	switch mode {
 	case "no":
 		lf.bufMode = bufModeNo
 		lf.w = nil
-	case "full":
-		lf.bufMode = bufModeFull
-		lf.w = bufio.NewWriterSize(lf.f, sz)
-	case "line":
-		lf.bufMode = bufModeLine
-		lf.w = bufio.NewWriterSize(lf.f, sz)
+	case "full", "line":
+		if sz > maxSetVBufSize {
+			if s.memLimit > 0 {
+				return nil, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+			}
+			return nil, fmt.Errorf("bad argument #3 to 'setvbuf' (buffer size too large)")
+		}
+		if err := s.checkMemAndAccount(sz); err != nil {
+			return nil, err
+		}
+		if mode == "full" {
+			lf.bufMode = bufModeFull
+		} else {
+			lf.bufMode = bufModeLine
+		}
+		lf.w = bufio.NewWriterSize(lf.f, int(sz))
 	default:
-		return nil, fmt.Errorf("bad argument #2 to 'setvbuf' (invalid option '%s')", args[1].AsString().S)
+		return nil, fmt.Errorf("bad argument #2 to 'setvbuf' (invalid option '%s')", mode)
 	}
 	if lf.inner != nil {
 		lf.inner.mu.Lock()
@@ -1494,14 +1537,8 @@ func nativeOSExecute(s *State, args []Value) ([]Value, error) {
 		return []Value{TrueValue()}, nil
 	}
 	cmd := shellCommand(FormatValue(args[0]))
-	err := cmd.Run()
-	if err == nil {
-		return []Value{TrueValue(), StringValue(s.intern.Intern("exit")), IntValue(0)}, nil
-	}
-	if ee, ok := err.(*exec.ExitError); ok {
-		return []Value{NilValue(), StringValue(s.intern.Intern("exit")), IntValue(int64(ee.ExitCode()))}, nil
-	}
-	return []Value{NilValue(), StringValue(s.intern.Intern("exit")), IntValue(1)}, nil
+	s.inheritedStdStreams(cmd)
+	return execResult(s, cmd.Run()), nil
 }
 
 func nativeOSExit(s *State, args []Value) ([]Value, error) {

@@ -85,7 +85,7 @@ func TestGeneratedInterpFresh(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("interpgen failed: %v\n%s", err, out)
 	}
-	for _, name := range []string{"interp_run_regcheck.go", "interp_run_hooked.go"} {
+	for _, name := range []string{"interp_run_regcheck.go", "interp_run_hooked.go", "interp_run_hooked_regcheck.go"} {
 		want, err := os.ReadFile(filepath.Join(tmp, name))
 		if err != nil {
 			t.Fatal(err)

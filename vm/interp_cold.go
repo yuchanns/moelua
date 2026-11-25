@@ -340,16 +340,80 @@ func (s *State) completeFinishOp(th *Thread, cf *callFrame, entryDepth int) (boo
 	return true, nil
 }
 
-// pushMetamethodFrame pushes a yieldable metamethod call onto th.frames (ZERO Go recursion when closure!).
+// pushMetamethodFrame pushes a yieldable metamethod call onto th.frames (ZERO Go recursion!).
+// Supports Lua closures, native functions (including coroutine.yield), and callable tables (__call chains).
 // Returns (true, nil) if a Lua closure frame was pushed (caller must goto reloadFrame),
 // or (false, nil) if completed inline via native function.
 func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []Value, fk finishKind, reg uint8, flag bool) (bool, error) {
-	if tm.IsClosure() {
-		cf := &th.frames[ev.ci]
-		slot := cf.base + int(cf.cl.bp.proto.MaxStackSize)
-		if th.top > slot {
-			slot = th.top
+	var extraDepth uint8
+	if !tm.IsClosure() && !tm.IsNative() {
+		cur := tm
+		curArgs := args
+		for depth := 1; depth <= 15; depth++ {
+			callTM := s.getTMByObj(cur, TMCall)
+			if callTM.IsNil() {
+				if depth == 1 {
+					// Decorate non-callable metamethod error with "(metamethod '<name>')" per Lua 5.5 (errors.lua:175-182).
+					cf := &th.frames[ev.ci]
+					p := cf.cl.bp.proto
+					ipc := cf.pc - 1
+					if ipc >= 0 && ipc < len(p.Code) {
+						w := p.Code[ipc]
+						mm := ""
+						switch w.Op() {
+						case bytecode.OP_MMBIN, bytecode.OP_MMBINI, bytecode.OP_MMBINK:
+							t := TM(w.C())
+							if t < tmCount {
+								mm = strings.TrimPrefix(tmNames[t], "__")
+							}
+						case bytecode.OP_LT, bytecode.OP_LTI, bytecode.OP_GTI:
+							mm = "lt"
+						case bytecode.OP_LE, bytecode.OP_LEI, bytecode.OP_GEI:
+							if fk == finishCondNot {
+								mm = "lt"
+							} else {
+								mm = "le"
+							}
+						case bytecode.OP_EQ:
+							mm = "eq"
+						case bytecode.OP_LEN:
+							mm = "len"
+						case bytecode.OP_UNM:
+							mm = "unm"
+						case bytecode.OP_BNOT:
+							mm = "bnot"
+						case bytecode.OP_CONCAT:
+							mm = "concat"
+						}
+						if mm != "" {
+							return false, fmt.Errorf("attempt to call a %s value (metamethod '%s')", cur.TypeName(), mm)
+						}
+					}
+				}
+				return false, fmt.Errorf("attempt to call a %s value", cur.TypeName())
+			}
+			nextArgs := make([]Value, 1+len(curArgs))
+			nextArgs[0] = cur
+			copy(nextArgs[1:], curArgs)
+			curArgs = nextArgs
+			cur = callTM
+			extraDepth = uint8(depth)
+			if cur.IsClosure() || cur.IsNative() {
+				break
+			}
 		}
+		if !cur.IsClosure() && !cur.IsNative() {
+			return false, fmt.Errorf("'__call' chain too long")
+		}
+		tm = cur
+		args = curArgs
+	}
+	cf := &th.frames[ev.ci]
+	slot := cf.base + int(cf.cl.bp.proto.MaxStackSize)
+	if th.top > slot {
+		slot = th.top
+	}
+	if tm.IsClosure() {
 		if err := th.ensureStack(slot + 1 + len(args) + 8); err != nil {
 			return false, err
 		}
@@ -362,55 +426,34 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 		cf.finish = fk
 		cf.finishReg = reg
 		cf.finishFlag = flag
-		if err := th.pushLuaFrame(tm.AsClosure(), slot, len(args), 1); err != nil {
+		cl := tm.AsClosure()
+		if err := th.pushLuaFrame(cl, slot, len(args), 1); err != nil {
 			cf.finish = finishNone
 			return false, err
 		}
-		if herr := s.fireLuaCallHook(th, tm.AsClosure(), len(args)); herr != nil {
+		th.frames[th.nframe-1].extraArgs = extraDepth
+		if herr := s.fireLuaCallHook(th, cl, len(args)); herr != nil {
 			return false, herr
 		}
 		return true, nil
 	}
-	// Native or callable table fallback
-	if !tm.IsNative() && s.getTMByObj(tm, TMCall).IsNil() {
-		// Decorate non-callable metamethod error with "(metamethod '<name>')" per Lua 5.5 (errors.lua:175-182).
-		cf := &th.frames[ev.ci]
-		p := cf.cl.bp.proto
-		ipc := cf.pc - 1
-		if ipc >= 0 && ipc < len(p.Code) {
-			w := p.Code[ipc]
-			mm := ""
-			switch w.Op() {
-			case bytecode.OP_MMBIN, bytecode.OP_MMBINI, bytecode.OP_MMBINK:
-				t := TM(w.C())
-				if t < tmCount {
-					mm = strings.TrimPrefix(tmNames[t], "__")
-				}
-			case bytecode.OP_LT, bytecode.OP_LTI, bytecode.OP_GTI:
-				mm = "lt"
-			case bytecode.OP_LE, bytecode.OP_LEI, bytecode.OP_GEI:
-				if fk == finishCondNot {
-					mm = "lt"
-				} else {
-					mm = "le"
-				}
-			case bytecode.OP_EQ:
-				mm = "eq"
-			case bytecode.OP_LEN:
-				mm = "len"
-			case bytecode.OP_UNM:
-				mm = "unm"
-			case bytecode.OP_BNOT:
-				mm = "bnot"
-			case bytecode.OP_CONCAT:
-				mm = "concat"
-			}
-			if mm != "" {
-				return false, fmt.Errorf("attempt to call a %s value (metamethod '%s')", tm.TypeName(), mm)
-			}
-		}
+	// Yieldable native metamethod invocation (supports coroutine.yield as a metamethod!).
+	if err := th.ensureStack(slot + 1 + len(args) + 8); err != nil {
+		return false, err
 	}
-	res, err := s.callOnThread(th, tm, args)
+	th.top = slot
+	res, err := tm.AsNative().callMulti(s, args)
+	cf = &th.frames[ev.ci]
+	if errors.Is(err, errYieldSentinel) {
+		cf.dirty = true
+		cf.oldTop = slot
+		cf.finish = fk
+		cf.finishReg = reg
+		cf.finishFlag = flag
+		th.yieldDst = slot
+		th.yieldNRes = 1
+		return false, errYieldSentinel
+	}
 	if err != nil {
 		return false, err
 	}
@@ -418,7 +461,6 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 	if len(res) > 0 {
 		v = res[0]
 	}
-	cf := &th.frames[ev.ci]
 	switch fk {
 	case finishSetReg:
 		th.stack[ev.base+int(reg)] = v
@@ -1418,9 +1460,37 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 		if tm.IsNil() {
 			return false, fmt.Errorf("attempt to call a nil value (metamethod 'close')")
 		}
-		ncloseArgs := 1
+		var cargs []Value
 		if cf.closeHasErr {
-			ncloseArgs = 2
+			cargs = []Value{obj, cf.closeErr}
+		} else {
+			cargs = []Value{obj}
+		}
+		var extraDepth uint8
+		if !tm.IsClosure() && !tm.IsNative() {
+			curTM := tm
+			for depth := 1; depth <= 15; depth++ {
+				callTM := s.getTMByObj(curTM, TMCall)
+				if callTM.IsNil() {
+					if depth == 1 {
+						return false, fmt.Errorf("attempt to call a %s value (metamethod 'close')", curTM.TypeName())
+					}
+					return false, fmt.Errorf("attempt to call a %s value", curTM.TypeName())
+				}
+				nextArgs := make([]Value, 1+len(cargs))
+				nextArgs[0] = curTM
+				copy(nextArgs[1:], cargs)
+				cargs = nextArgs
+				curTM = callTM
+				extraDepth = uint8(depth)
+				if curTM.IsClosure() || curTM.IsNative() {
+					break
+				}
+			}
+			if !curTM.IsClosure() && !curTM.IsNative() {
+				return false, fmt.Errorf("'__call' chain too long")
+			}
+			tm = curTM
 		}
 		slotBase := cf.base
 		if cf.cl != nil {
@@ -1439,53 +1509,43 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 			if th.top > slot {
 				slot = th.top
 			}
-			if err := th.ensureStack(slot + 4); err != nil {
+			if err := th.ensureStack(slot + 1 + len(cargs) + 4); err != nil {
 				return false, err
 			}
 			th.stack[slot] = tm
-			th.stack[slot+1] = obj
-			if ncloseArgs == 2 {
-				th.stack[slot+2] = cf.closeErr
+			for i, ca := range cargs {
+				th.stack[slot+1+i] = ca
 			}
 			cf.dirty = true
 			cf.oldTop = slot
 			cf.finish = finishClose
 			cl := tm.AsClosure()
-			if err := th.pushLuaFrame(cl, slot, ncloseArgs, 0); err != nil {
+			if err := th.pushLuaFrame(cl, slot, len(cargs), 0); err != nil {
 				cf.finish = finishNone
 				return false, err
 			}
-			if herr := s.fireLuaCallHook(th, cl, ncloseArgs); herr != nil {
+			th.frames[th.nframe-1].extraArgs = extraDepth
+			if herr := s.fireLuaCallHook(th, cl, len(cargs)); herr != nil {
 				return false, herr
 			}
 			return false, nil
 		}
-		var cargs []Value
-		if ncloseArgs == 2 {
-			cargs = []Value{obj, cf.closeErr}
-		} else {
-			cargs = []Value{obj}
-		}
-		if tm.IsNative() {
-			_, err := tm.AsNative().callMulti(s, cargs)
-			if errors.Is(err, errYieldSentinel) {
-				slot := slotBase
-				if th.top > slot {
-					slot = th.top
-				}
-				cf.dirty = true
-				cf.oldTop = slot
-				cf.finish = finishClose
-				th.yieldDst = slot
-				th.yieldNRes = 0
-				return false, errYieldSentinel
+		cfIdx := th.nframe - 1
+		_, err := tm.AsNative().callMulti(s, cargs)
+		cf = &th.frames[cfIdx]
+		if errors.Is(err, errYieldSentinel) {
+			slot := slotBase
+			if th.top > slot {
+				slot = th.top
 			}
-			if err != nil {
-				return false, err
-			}
-			continue
+			cf.dirty = true
+			cf.oldTop = slot
+			cf.finish = finishClose
+			th.yieldDst = slot
+			th.yieldNRes = 0
+			return false, errYieldSentinel
 		}
-		if _, err := s.callOnThread(th, tm, cargs); err != nil {
+		if err != nil {
 			return false, err
 		}
 	}
@@ -2936,33 +2996,77 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			}
 			return false, fmt.Errorf("attempt to concatenate a %s value", bad.TypeName())
 		}
-		if tm.IsClosure() {
-			slot := cf.base + int(cf.cl.bp.proto.MaxStackSize)
-			if th.top > slot {
-				slot = th.top
+		cargs := []Value{lhs, rhs}
+		var extraDepth uint8
+		if !tm.IsClosure() && !tm.IsNative() {
+			curTM := tm
+			for depth := 1; depth <= 15; depth++ {
+				callTM := s.getTMByObj(curTM, TMCall)
+				if callTM.IsNil() {
+					if depth == 1 {
+						return false, fmt.Errorf("attempt to call a %s value (metamethod 'concat')", curTM.TypeName())
+					}
+					return false, fmt.Errorf("attempt to call a %s value", curTM.TypeName())
+				}
+				nextArgs := make([]Value, 1+len(cargs))
+				nextArgs[0] = curTM
+				copy(nextArgs[1:], cargs)
+				cargs = nextArgs
+				curTM = callTM
+				extraDepth = uint8(depth)
+				if curTM.IsClosure() || curTM.IsNative() {
+					break
+				}
 			}
-			if err := th.ensureStack(slot + 4); err != nil {
+			if !curTM.IsClosure() && !curTM.IsNative() {
+				return false, fmt.Errorf("'__call' chain too long")
+			}
+			tm = curTM
+		}
+		slot := cf.base + int(cf.cl.bp.proto.MaxStackSize)
+		if th.top > slot {
+			slot = th.top
+		}
+		if tm.IsClosure() {
+			if err := th.ensureStack(slot + 1 + len(cargs) + 8); err != nil {
 				return false, err
 			}
 			th.stack[slot] = tm
-			th.stack[slot+1] = lhs
-			th.stack[slot+2] = rhs
+			for i, ca := range cargs {
+				th.stack[slot+1+i] = ca
+			}
 			cf.dirty = true
 			cf.oldTop = slot
 			cf.finish = finishConcat
 			cf.concatStart = start
 			cf.concatIdx = cur - 1
 			cl := tm.AsClosure()
-			if err := th.pushLuaFrame(cl, slot, 2, 1); err != nil {
+			if err := th.pushLuaFrame(cl, slot, len(cargs), 1); err != nil {
 				cf.finish = finishNone
 				return false, err
 			}
-			if herr := s.fireLuaCallHook(th, cl, 2); herr != nil {
+			th.frames[th.nframe-1].extraArgs = extraDepth
+			if herr := s.fireLuaCallHook(th, cl, len(cargs)); herr != nil {
 				return false, herr
 			}
 			return true, nil
 		}
-		res, err := s.callOnThread(th, tm, []Value{lhs, rhs})
+		if err := th.ensureStack(slot + 4); err != nil {
+			return false, err
+		}
+		cfIdx := th.nframe - 1
+		res, err := tm.AsNative().callMulti(s, cargs)
+		cf = &th.frames[cfIdx]
+		if errors.Is(err, errYieldSentinel) {
+			cf.dirty = true
+			cf.oldTop = slot
+			cf.finish = finishConcat
+			cf.concatStart = start
+			cf.concatIdx = cur - 1
+			th.yieldDst = slot
+			th.yieldNRes = 1
+			return false, errYieldSentinel
+		}
 		if err != nil {
 			return false, err
 		}
