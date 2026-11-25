@@ -368,4 +368,18 @@ func TestCLIFlagsREPLAndStdinParity(t *testing.T) {
 			t.Fatalf("expected '(error object is a table value)' with stack traceback, got stderr=%q", stderr2)
 		}
 	})
+
+	// 17. msgh looks up __tostring via rawget on the error object's metatable (matching luaL_getmetafield).
+	t.Run("msgh_rawgets_tostring_metamethod", func(t *testing.T) {
+		_, stderr, err := run("", "", nil, "-E", "-e", `local mt = setmetatable({}, {__index = function() error("unexpected metatable lookup") end}); error(setmetatable({}, mt))`)
+		if err == nil {
+			t.Fatalf("expected error exit")
+		}
+		if strings.Contains(stderr, "unexpected metatable lookup") {
+			t.Fatalf("msgh erroneously invoked metatable __index: stderr=%q", stderr)
+		}
+		if !strings.Contains(stderr, "(error object is a table value)") || !strings.Contains(stderr, "stack traceback:") {
+			t.Fatalf("expected original table error with traceback, got stderr=%q", stderr)
+		}
+	})
 }

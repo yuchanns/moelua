@@ -860,3 +860,23 @@ func TestDynamicGoFuncsCollectableInWeakTables(t *testing.T) {
 		t.Fatalf("weak table collection test failed: %v", err)
 	}
 }
+
+func TestNewTableMemoryLimitEnforcement(t *testing.T) {
+	s := moelua.New(moelua.WithMemoryLimit(65536))
+	defer s.Close()
+
+	if tbl := s.NewTable(0, 100000); tbl != nil {
+		t.Fatalf("expected nil from NewTable(0, 100000) under 64KiB memory limit")
+	}
+	if tbl, err := s.TryNewTable(0, 100000); tbl != nil || err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected memory error from TryNewTable(0, 100000), got tbl=%v err=%v", tbl, err)
+	}
+	before := s.MemoryUsage()
+	tbl, err := s.TryNewTable(0, 200)
+	if err != nil || tbl == nil {
+		t.Fatalf("expected TryNewTable(0, 200) to succeed, got tbl=%v err=%v", tbl, err)
+	}
+	if after := s.MemoryUsage(); after <= before {
+		t.Fatalf("expected MemoryUsage to increase after TryNewTable(0, 200): before=%d after=%d", before, after)
+	}
+}

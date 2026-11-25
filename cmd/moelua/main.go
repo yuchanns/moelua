@@ -155,7 +155,7 @@ func armInterruptHandler(s *vm.State) func() {
 }
 
 const cliRunnerSrc = `
-local _xpcall, _getmt, _tb, _type, _tostring = xpcall, debug.getmetatable, debug.traceback, type, tostring
+local _xpcall, _getmt, _rawget, _tb, _type, _tostring = xpcall, debug.getmetatable, rawget, debug.traceback, type, tostring
 local function invokeToString(tm, err)
 	local r = tm(err)
 	return r
@@ -166,7 +166,7 @@ local function msgh(err)
 		return _tb(_tostring(err), 2)
 	end
 	local mt = _getmt(err)
-	local tm = mt and mt.__tostring
+	local tm = _type(mt) == "table" and _rawget(mt, "__tostring") or nil
 	if tm ~= nil then
 		local r = invokeToString(tm, err)
 		local rt = _type(r)

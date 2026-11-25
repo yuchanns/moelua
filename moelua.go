@@ -620,11 +620,28 @@ func (t *Table) ready() bool {
 }
 
 // NewTable allocates a new Lua table with optional sequence/record capacity hints.
+// Returns nil if the State is closed or if allocating the requested capacity would
+// exceed the configured memory limit (use TryNewTable to inspect allocation errors).
 func (s *State) NewTable(nseq, nrec int) *Table {
-	if !s.ready() {
+	t, err := s.TryNewTable(nseq, nrec)
+	if err != nil {
 		return nil
 	}
-	return &Table{state: s, raw: s.vm.NewTable(nseq, nrec)}
+	return t
+}
+
+// TryNewTable allocates a new Lua table after checking and accounting for its requested
+// storage against the State's memory limit, returning an error if the State is closed or
+// allocation exceeds the limit.
+func (s *State) TryNewTable(nseq, nrec int) (*Table, error) {
+	if !s.ready() {
+		return nil, ErrStateClosed
+	}
+	raw, err := s.vm.TryNewTable(nseq, nrec)
+	if err != nil {
+		return nil, err
+	}
+	return &Table{state: s, raw: raw}, nil
 }
 
 // TableOf wraps a Lua table Value into a *Table helper (returns nil if v is not a table or s is closed).
