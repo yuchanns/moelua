@@ -1120,6 +1120,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				return s.catchSlow(th, ev, false, err)
 			}
 			th.stack[funcIdx+1] = rv
+			if end := funcIdx + 2; th.top < end {
+				th.top = end
+			}
 			th.frames[th.nframe] = callFrame{
 				kind:      frameNative,
 				base:      funcIdx + 1,
@@ -1156,6 +1159,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 						hookErr = serr
 					} else {
 						copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
+						if end := funcIdx + 1 + len(res); th.top < end {
+							th.top = end
+						}
 						th.frames[th.nframe-1].ftransfer = 1
 						th.frames[th.nframe-1].ntransfer = uint16(len(res))
 						hookErr = s.fireHook(th, "return", NilValue())
@@ -1176,6 +1182,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					hookErr = serr
 				} else {
 					copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
+					if end := funcIdx + 1 + len(res); th.top < end {
+						th.top = end
+					}
 					th.frames[th.nframe] = callFrame{
 						kind:      frameNative,
 						base:      funcIdx + 1,
@@ -1277,12 +1286,13 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 	return s.catchSlow(th, ev, false, fmt.Errorf("'__call' chain too long"))
 }
 
-func isFlatProtectedTarget(v Value) bool {
-	return v.IsClosure() || v.IsNative()
+func isFlatProtectedTarget(_ Value) bool {
+	return true
 }
 
-// pushProtectedCall pushes a framePCall/frameXPCall boundary frame + target Lua closure or native
-// (including nested pcall/xpcall and yieldable coroutine.yield!) directly onto th.frames.
+// pushProtectedCall pushes a framePCall/frameXPCall boundary frame + target Lua closure,
+// callable table (__call chain), or native (including nested pcall/xpcall and coroutine.yield!)
+// directly onto th.frames so protected calls remain yieldable without a Go C-call boundary.
 func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP bool) (bool, error) {
 	// Enforce Lua 5.5 LUAI_MAXCCALLS (200) across nested pcall/xpcall frames (calls.lua:162).
 	pcalls := 0
@@ -1335,6 +1345,48 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 		dirty:    true,
 	}
 	th.nframe++
+	var extraDepth uint8
+	if !targetVal.IsClosure() && !targetVal.IsNative() {
+		cur := targetVal
+		var prepended []Value
+		for depth := 1; depth <= 15; depth++ {
+			tm := s.getTMByObj(cur, TMCall)
+			if tm.IsNil() {
+				err := fmt.Errorf("attempt to call a %s value", cur.TypeName())
+				if s.handleError(th, 0, err) {
+					return true, nil
+				}
+				return false, err
+			}
+			prepended = append(prepended, cur)
+			cur = tm
+			extraDepth = uint8(depth)
+			if cur.IsClosure() || cur.IsNative() {
+				break
+			}
+		}
+		if !cur.IsClosure() && !cur.IsNative() {
+			err := fmt.Errorf("'__call' chain too long")
+			if s.handleError(th, 0, err) {
+				return true, nil
+			}
+			return false, err
+		}
+		k := len(prepended)
+		if err := th.ensureStack(calleeIdx + 1 + k + calleeArgs + 8); err != nil {
+			if s.handleError(th, 0, err) {
+				return true, nil
+			}
+			return false, err
+		}
+		copy(th.stack[calleeIdx+1+k:calleeIdx+1+k+calleeArgs], th.stack[calleeIdx+1:calleeIdx+1+calleeArgs])
+		for i := range k {
+			th.stack[calleeIdx+1+i] = prepended[k-1-i]
+		}
+		th.stack[calleeIdx] = cur
+		targetVal = cur
+		calleeArgs += k
+	}
 	if targetVal.IsNative() {
 		nf := targetVal.AsNative()
 		intr := nf.Intrinsic
@@ -1390,6 +1442,7 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 		th.nframe--
 		return false, err
 	}
+	th.frames[th.nframe-1].extraArgs = extraDepth
 	if herr := s.fireLuaCallHook(th, cl, calleeArgs); herr != nil {
 		if s.handleError(th, 0, herr) {
 			return true, nil
@@ -1780,11 +1833,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			nseq += ev.insns.at(pc).Ax() * (bytecode.MaxArgvC + 1)
 		}
 		pc++
-		estBytes := int64(64 + nseq*16 + nrec*32)
-		if s.memLimit > 0 {
-			if err := s.checkMem(estBytes); err != nil {
-				return coldContinue, pc, err
-			}
+		estBytes := tablePreallocBytes(int64(nseq), int64(nrec))
+		if err := s.checkMem(estBytes); err != nil {
+			return coldContinue, pc, err
 		}
 		regs[a] = TableValue(s.NewTable(nseq, nrec))
 		if s.gc.tier1 {
@@ -2933,6 +2984,26 @@ func (s *State) lessThan(a, b Value) (bool, error) {
 		return false, err
 	}
 	return len(res) > 0 && !res[0].IsFalsy(), nil
+}
+
+func (s *State) equalValues(a, b Value) (bool, error) {
+	if RawEqual(a, b) {
+		return true, nil
+	}
+	if (a.IsTable() && b.IsTable()) || (a.IsUserdata() && b.IsUserdata()) {
+		tm := s.getTMByObj(a, TMEq)
+		if tm.IsNil() {
+			tm = s.getTMByObj(b, TMEq)
+		}
+		if !tm.IsNil() {
+			res, err := s.Call(tm, a, b)
+			if err != nil {
+				return false, err
+			}
+			return len(res) > 0 && !res[0].IsFalsy(), nil
+		}
+	}
+	return false, nil
 }
 
 func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, error) {

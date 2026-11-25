@@ -943,12 +943,17 @@ func nativeTableCreate(s *State, args []Value) ([]Value, error) {
 	if nrec > (1<<26) || nseq > (1<<28) {
 		return nil, fmt.Errorf("table overflow")
 	}
-	estBytes := int64(96) + nseq*16 + nrec*32
-	if err := s.checkMem(estBytes); err != nil {
+	actualBytes := tablePreallocBytes(nseq, nrec)
+	checkBytes := actualBytes
+	if OptimizeEnabled && nseq > 0 {
+		// Enforce requested sequence capacity up front (matching lua_createtable) even when arrHint is lazy.
+		checkBytes += nseq * 16
+	}
+	if err := s.checkMem(checkBytes); err != nil {
 		return nil, err
 	}
 	t := s.NewTable(int(nseq), int(nrec))
-	s.gc.allocBytes += estBytes
+	s.gc.allocBytes += checkBytes
 	return []Value{TableValue(t)}, nil
 }
 
@@ -1309,7 +1314,15 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 		}
 		rawFast := src.IsTable() && src.AsTable().meta == nil && dst.IsTable() && dst.AsTable().meta == nil
 		cancelFn := s.nativeCancelFunc()
-		if tpos > f && tpos <= e && RawEqual(src, dst) {
+		reverse := false
+		if tpos > f && tpos <= e {
+			eq, err := s.equalValues(src, dst)
+			if err != nil {
+				return nil, err
+			}
+			reverse = eq
+		}
+		if reverse {
 			for i := n - 1; i >= 0; i-- {
 				if cancelFn != nil && ((n-1-i)&1023) == 0 {
 					if err := cancelFn(); err != nil {

@@ -107,6 +107,42 @@ func (t *Table) setArrVal(vs []Value) {
 	t.arrKind = arrGeneric
 }
 
+func hashCapFor(nrec int64) int64 {
+	if nrec <= 0 {
+		return 0
+	}
+	sz := int64(4)
+	need := nrec * 2
+	for sz < need {
+		if sz > (1 << 30) {
+			return sz
+		}
+		sz <<= 1
+	}
+	return sz
+}
+
+// tablePreallocBytes returns the exact backing-store bytes allocated by NewTable(nseq, nrec).
+func tablePreallocBytes(nseq, nrec int64) int64 {
+	const structBytes = int64(96)
+	var arrBytes, recBytes int64
+	if OptimizeEnabled {
+		if nrec > int64(len(Table{}.inlineSlots)) && nrec <= maxShapeProps {
+			recBytes = nrec * 16
+		} else if nrec > maxShapeProps {
+			recBytes = hashCapFor(nrec) * 40
+		}
+	} else {
+		if nseq > 0 {
+			arrBytes = nseq * 16
+		}
+		if nrec > 0 {
+			recBytes = hashCapFor(nrec) * 40
+		}
+	}
+	return structBytes + arrBytes + recBytes
+}
+
 // NewTable allocates a Lua table with sequence/record capacity hints.
 func (s *State) NewTable(nseq, nrec int) *Table {
 	t := &Table{}

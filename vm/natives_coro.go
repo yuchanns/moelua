@@ -173,7 +173,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 		}
 		if fn.IsNative() {
 			nf := fn.AsNative()
-			if nf.Intrinsic == intrPCall && len(args) >= 1 && args[0].IsClosure() {
+			if nf.Intrinsic == intrPCall && len(args) >= 1 && isFlatProtectedTarget(args[0]) {
 				if err := co.ensureStack(len(args) + 8); err != nil {
 					co.status = ThreadDead
 					ev := errorToLuaValue(s, err)
@@ -195,7 +195,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				goto runCoro
 			}
-			if nf.Intrinsic == intrXPCall && len(args) >= 2 && args[0].IsClosure() && args[1].IsFunction() {
+			if nf.Intrinsic == intrXPCall && len(args) >= 2 && isFlatProtectedTarget(args[0]) && args[1].IsFunction() {
 				if err := co.ensureStack(len(args) + 8); err != nil {
 					co.status = ThreadDead
 					ev := errorToLuaValue(s, err)

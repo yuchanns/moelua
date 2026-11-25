@@ -1878,6 +1878,28 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 			errs.WriteString(res[0].AsString().S)
 		}
 	}
+	// Root extra (loader data) on the active thread stack across the loader call and
+	// package.loaded registration so GC cannot prematurely finalize it before return.
+	th := s.cur
+	savedTop := th.top
+	baseTop := savedTop
+	for fi := range th.nframe {
+		cf := &th.frames[fi]
+		if cf.cl != nil {
+			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+				baseTop = end
+			}
+		}
+	}
+	if err := th.ensureStack(baseTop + 4); err != nil {
+		return nil, err
+	}
+	th.stack[baseTop] = extra
+	th.top = baseTop + 1
+	defer func() {
+		th.stack[baseTop] = NilValue()
+		th.top = savedTop
+	}()
 	res, err := s.Call(loader, StringValue(key), extra)
 	if err != nil {
 		return nil, err

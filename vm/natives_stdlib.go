@@ -267,7 +267,9 @@ func nativeStringPack(s *State, args []Value) ([]Value, error) {
 		case a.IsString():
 			pargs[i] = luastdlib.PackStringVal(a.AsString().S)
 		default:
-			pargs[i] = luastdlib.PackStringVal(FormatValue(a))
+			// Preserve an invalid PackKind so PackWithLimits rejects unsupported values iff consumed,
+			// without rejecting unused trailing arguments.
+			pargs[i] = luastdlib.PackValue{Kind: ^luastdlib.PackKind(0)}
 		}
 	}
 	var checkSize func(int64) error
