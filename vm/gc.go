@@ -217,12 +217,75 @@ type gcTracer struct {
 	preserveFrames bool // true when triggered mid-opcode (e.g. checkMem) where s.cur.top may be stale
 	countStrings   bool // true when s.memLimit > 0 so live strings are counted accurately in liveBytes
 	seenStrings    map[*LuaString]struct{}
+	seenProtos     map[*boundProto]struct{}
 	gray           []Value
 	weakVals       []*Table // __mode="v"
 	ephemerons     []*Table // __mode="k"
 	allWeaks       []*Table // __mode="kv"
 	liveOpenUpvals []*Upvalue
 	liveBytes      int64
+}
+
+func (tr *gcTracer) markBoundProto(bp *boundProto) {
+	if bp == nil {
+		return
+	}
+	if _, ok := tr.seenProtos[bp]; ok {
+		return
+	}
+	if tr.seenProtos == nil {
+		tr.seenProtos = make(map[*boundProto]struct{}, 32)
+	}
+	tr.seenProtos[bp] = struct{}{}
+	tr.liveBytes += protoOwnBytes(bp.proto, len(bp.ic) > 0)
+	if tr.countStrings {
+		for _, ls := range bp.strConsts {
+			if ls != nil {
+				tr.mark(StringValue(ls))
+			}
+		}
+	}
+	for _, sub := range bp.sub {
+		tr.markBoundProto(sub)
+	}
+}
+
+func (tr *gcTracer) markRoots() {
+	s := tr.s
+	tr.mark(TableValue(s.env))
+	if s.registry != nil {
+		tr.mark(TableValue(s.registry))
+	}
+	for _, mt := range s.typeMetas {
+		if mt != nil {
+			tr.mark(TableValue(mt))
+		}
+	}
+	if s.stringMeta != nil {
+		tr.mark(TableValue(s.stringMeta))
+	}
+	if s.fileMeta != nil {
+		tr.mark(TableValue(s.fileMeta))
+	}
+	if !s.stdinInput.IsNil() {
+		tr.mark(s.stdinInput)
+	}
+	if !s.defaultInput.IsNil() {
+		tr.mark(s.defaultInput)
+	}
+	if !s.defaultOutput.IsNil() {
+		tr.mark(s.defaultOutput)
+	}
+	tr.mark(ThreadValue(s.mainThread))
+	if s.cur != nil && s.cur != s.mainThread {
+		tr.mark(ThreadValue(s.cur))
+	}
+	for _, v := range s.gc.pinnedRefs {
+		tr.mark(v)
+	}
+	for _, v := range s.gc.toBeFnz {
+		tr.mark(v)
+	}
 }
 
 func (tr *gcTracer) isMarked(v Value) bool {
@@ -293,9 +356,7 @@ func (tr *gcTracer) mark(v Value) {
 		}
 		c.gcMark = tr.epoch
 		tr.liveBytes += 64 + int64(len(c.upvals)*24)
-		if tr.countStrings && c.bp != nil {
-			tr.liveBytes += int64(len(c.bp.consts)*16 + len(c.bp.ic)*64)
-		}
+		tr.markBoundProto(c.bp)
 		tr.gray = append(tr.gray, v)
 	case v.IsNative():
 		nf := v.AsNative()
@@ -314,6 +375,9 @@ func (tr *gcTracer) mark(v Value) {
 		}
 		u.gcMark = tr.epoch
 		tr.liveBytes += 64 + int64(len(u.UValues)*16)
+		if lf, ok := u.Data.(*luaFile); ok {
+			tr.liveBytes += lf.memBytes()
+		}
 		tr.gray = append(tr.gray, v)
 	case v.IsThread():
 		th := v.AsThread()
@@ -676,17 +740,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 			s.gc.epoch = 1
 		}
 		tr := &gcTracer{s: s, epoch: s.gc.epoch, preserveFrames: preserveFrames, countStrings: countStr}
-		tr.mark(TableValue(s.env))
-		if s.registry != nil {
-			tr.mark(TableValue(s.registry))
-		}
-		tr.mark(ThreadValue(s.mainThread))
-		if s.cur != nil && s.cur != s.mainThread {
-			tr.mark(ThreadValue(s.cur))
-		}
-		for _, v := range s.gc.pinnedRefs {
-			tr.mark(v)
-		}
+		tr.markRoots()
 		tr.propagateAll()
 		s.intern.Prune()
 		s.shapes.Prune()
@@ -702,40 +756,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	tr := &gcTracer{s: s, epoch: s.gc.epoch, preserveFrames: preserveFrames, countStrings: countStr}
 
 	// Mark all VM roots.
-	tr.mark(TableValue(s.env))
-	if s.registry != nil {
-		tr.mark(TableValue(s.registry))
-	}
-	for _, mt := range s.typeMetas {
-		if mt != nil {
-			tr.mark(TableValue(mt))
-		}
-	}
-	if s.stringMeta != nil {
-		tr.mark(TableValue(s.stringMeta))
-	}
-	if s.fileMeta != nil {
-		tr.mark(TableValue(s.fileMeta))
-	}
-	if !s.stdinInput.IsNil() {
-		tr.mark(s.stdinInput)
-	}
-	if !s.defaultInput.IsNil() {
-		tr.mark(s.defaultInput)
-	}
-	if !s.defaultOutput.IsNil() {
-		tr.mark(s.defaultOutput)
-	}
-	tr.mark(ThreadValue(s.mainThread))
-	if s.cur != nil && s.cur != s.mainThread {
-		tr.mark(ThreadValue(s.cur))
-	}
-	for _, v := range s.gc.pinnedRefs {
-		tr.mark(v)
-	}
-	for _, v := range s.gc.toBeFnz {
-		tr.mark(v)
-	}
+	tr.markRoots()
 	tr.propagateAll()
 
 	// Step 1: Converge ephemerons before clearing weak values.

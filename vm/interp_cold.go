@@ -2356,24 +2356,10 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		if tm.IsNil() {
 			tm = s.getTMByObj(rb, TMLe)
 		}
-		if !tm.IsNil() {
-			pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, rb}, finishCondJump, 0, w.K())
-			if err != nil {
-				return coldContinue, pc, err
-			}
-			if pushed {
-				return coldReload, 0, nil
-			}
-			return coldContinue, th.frames[ev.ci].pc, nil
-		}
-		tm = s.getTMByObj(ra, TMLt)
-		if tm.IsNil() {
-			tm = s.getTMByObj(rb, TMLt)
-		}
 		if tm.IsNil() {
 			return coldContinue, pc, s.compareError(ra, rb)
 		}
-		pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{rb, ra}, finishCondNot, 0, w.K())
+		pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, rb}, finishCondJump, 0, w.K())
 		if err != nil {
 			return coldContinue, pc, err
 		}
@@ -2388,82 +2374,33 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		if w.C() != 0 {
 			im = FloatValue(float64(w.SB()))
 		}
+		var p1, p2 Value
+		var event TM
 		switch op {
 		case bytecode.OP_LTI:
-			tm := s.getTMByObj(ra, TMLt)
-			if tm.IsNil() {
-				return coldContinue, pc, fmt.Errorf("attempt to compare %s with number", ra.TypeName())
-			}
-			pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, im}, finishCondJump, 0, w.K())
-			if err != nil {
-				return coldContinue, pc, err
-			}
-			if pushed {
-				return coldReload, 0, nil
-			}
-			return coldContinue, th.frames[ev.ci].pc, nil
+			p1, p2, event = ra, im, TMLt
 		case bytecode.OP_LEI:
-			tm := s.getTMByObj(ra, TMLe)
-			if !tm.IsNil() {
-				pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, im}, finishCondJump, 0, w.K())
-				if err != nil {
-					return coldContinue, pc, err
-				}
-				if pushed {
-					return coldReload, 0, nil
-				}
-				return coldContinue, th.frames[ev.ci].pc, nil
-			}
-			tm = s.getTMByObj(ra, TMLt)
-			if tm.IsNil() {
-				return coldContinue, pc, fmt.Errorf("attempt to compare %s with number", ra.TypeName())
-			}
-			pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{im, ra}, finishCondNot, 0, w.K())
-			if err != nil {
-				return coldContinue, pc, err
-			}
-			if pushed {
-				return coldReload, 0, nil
-			}
-			return coldContinue, th.frames[ev.ci].pc, nil
+			p1, p2, event = ra, im, TMLe
 		case bytecode.OP_GTI:
-			tm := s.getTMByObj(ra, TMLt)
-			if tm.IsNil() {
-				return coldContinue, pc, fmt.Errorf("attempt to compare number with %s", ra.TypeName())
-			}
-			pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{im, ra}, finishCondJump, 0, w.K())
-			if err != nil {
-				return coldContinue, pc, err
-			}
-			if pushed {
-				return coldReload, 0, nil
-			}
-			return coldContinue, th.frames[ev.ci].pc, nil
+			p1, p2, event = im, ra, TMLt
 		case bytecode.OP_GEI:
-			tm := s.getTMByObj(ra, TMLe)
-			if !tm.IsNil() {
-				pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{im, ra}, finishCondJump, 0, w.K())
-				if err != nil {
-					return coldContinue, pc, err
-				}
-				if pushed {
-					return coldReload, 0, nil
-				}
-				return coldContinue, th.frames[ev.ci].pc, nil
-			}
-			tm = s.getTMByObj(ra, TMLt)
-			if tm.IsNil() {
-				return coldContinue, pc, fmt.Errorf("attempt to compare number with %s", ra.TypeName())
-			}
-			pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{ra, im}, finishCondNot, 0, w.K())
-			if err != nil {
-				return coldContinue, pc, err
-			}
-			if pushed {
-				return coldReload, 0, nil
-			}
-			return coldContinue, th.frames[ev.ci].pc, nil
+			p1, p2, event = im, ra, TMLe
 		}
+		tm := s.getTMByObj(p1, event)
+		if tm.IsNil() {
+			tm = s.getTMByObj(p2, event)
+		}
+		if tm.IsNil() {
+			return coldContinue, pc, s.compareError(p1, p2)
+		}
+		pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{p1, p2}, finishCondJump, 0, w.K())
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if pushed {
+			return coldReload, 0, nil
+		}
+		return coldContinue, th.frames[ev.ci].pc, nil
 
 	case bytecode.OP_TAILCALL:
 		b := int(uint8(w >> bytecode.PosB))
@@ -2791,6 +2728,15 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		bx := w.Bx()
 		sub := ev.bp.proto.Protos[bx]
 		sbp := ev.bp.sub[bx]
+		estBytes := int64(64 + len(sub.Upvalues)*24)
+		if sbp == nil && (s.memLimit > 0 || s.gc.tier1) {
+			estBytes += protoTreeBytes(sub, OptimizeEnabled)
+		}
+		if s.memLimit > 0 {
+			if err := s.checkMem(estBytes); err != nil {
+				return coldContinue, pc, err
+			}
+		}
 		if sbp == nil {
 			sbp = s.bindProto(sub)
 			ev.bp.sub[bx] = sbp
@@ -2804,12 +2750,6 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				cl.upvals[i] = th.findOrCreateUpval(ev.base + int(ud.Idx))
 			} else {
 				cl.upvals[i] = ev.cl.upvals[ud.Idx]
-			}
-		}
-		estBytes := int64(48 + len(sub.Upvalues)*16)
-		if s.memLimit > 0 {
-			if err := s.checkMem(estBytes); err != nil {
-				return coldContinue, pc, err
 			}
 		}
 		regs[a] = ClosureValue(cl)
@@ -2975,7 +2915,6 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 	default:
 		return coldContinue, pc, fmt.Errorf("unimplemented opcode %s (%d) at pc %d", bytecode.OpNames[op], op, ipc)
 	}
-	return coldContinue, pc, nil
 }
 
 func varInfo(p *bytecode.Proto, pc, reg int) string {

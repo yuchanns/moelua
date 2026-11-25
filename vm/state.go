@@ -470,8 +470,74 @@ func (s *State) bindProtoWithCache(p *bytecode.Proto, longStrs map[string]*LuaSt
 	return bp
 }
 
+// protoOwnBytes estimates the VM-owned retained storage for one Proto and its
+// boundProto wrapper (excluding child protos and interned string payloads).
+func protoOwnBytes(p *bytecode.Proto, withIC bool) int64 {
+	if p == nil {
+		return 0
+	}
+	n := int64(256) // Proto + boundProto headers
+	n += int64(len(p.Source))
+	n += int64(len(p.Code)) * 4        // []Instruction (uint32)
+	n += int64(len(p.Consts)) * 48     // []Constant + boundProto.consts + strConsts
+	n += int64(len(p.Upvalues)) * 24   // []UpvalDesc
+	for _, uv := range p.Upvalues {
+		n += int64(len(uv.Name))
+	}
+	n += int64(len(p.Protos)) * 16     // []*Proto + []*boundProto
+	n += int64(len(p.LineInfo))        // []int8
+	n += int64(len(p.AbsLineInfo)) * 8 // []AbsLineInfo
+	n += int64(len(p.LocVars)) * 24    // []LocVar
+	for _, lv := range p.LocVars {
+		n += int64(len(lv.Name))
+	}
+	n += int64(len(p.ICSlot)) * 4 // []int32
+	if withIC && p.ICCount > 0 {
+		n += int64(p.ICCount) * 64 // []ICEntry
+	}
+	return n
+}
+
+// protoTreeBytes estimates the total retained storage for a Proto tree,
+// deduplicating string constant payloads within the tree.
+func protoTreeBytes(p *bytecode.Proto, withIC bool) int64 {
+	if p == nil {
+		return 0
+	}
+	var seen map[string]struct{}
+	var walk func(cur *bytecode.Proto) int64
+	walk = func(cur *bytecode.Proto) int64 {
+		total := protoOwnBytes(cur, withIC)
+		for _, c := range cur.Consts {
+			if c.Kind == bytecode.ConstString {
+				if seen == nil {
+					seen = make(map[string]struct{}, 16)
+				}
+				if _, ok := seen[c.Str]; !ok {
+					seen[c.Str] = struct{}{}
+					total += 48 + int64(len(c.Str))
+				}
+			}
+		}
+		for _, sub := range cur.Protos {
+			total += walk(sub)
+		}
+		return total
+	}
+	return walk(p)
+}
+
 // Load instantiates an immutable verified *bytecode.Proto as a top-level Closure with _ENV as upvalue 0.
 func (s *State) Load(p *bytecode.Proto) (*Closure, error) {
+	var chunkBytes int64
+	if s.memLimit > 0 || s.gc.tier1 {
+		chunkBytes = int64(64+len(p.Upvalues)*24) + protoTreeBytes(p, OptimizeEnabled)
+		if s.memLimit > 0 {
+			if err := s.checkMem(chunkBytes); err != nil {
+				return nil, err
+			}
+		}
+	}
 	bp := s.bindProtoWithCache(p, make(map[string]*LuaString))
 	cl := &Closure{
 		bp:     bp,
@@ -482,6 +548,9 @@ func (s *State) Load(p *bytecode.Proto) (*Closure, error) {
 		for i := 1; i < len(cl.upvals); i++ {
 			cl.upvals[i] = &Upvalue{closed: NilValue()}
 		}
+	}
+	if chunkBytes > 0 {
+		s.gc.allocBytes += chunkBytes
 	}
 	return cl, nil
 }

@@ -66,6 +66,7 @@ func (fi *fileInner) flushAndClose() error {
 	var ferr error
 	if fi.w != nil {
 		ferr = fi.w.Flush()
+		fi.w = nil
 	}
 	err := fi.f.Close()
 	if err == nil {
@@ -93,6 +94,20 @@ type luaFile struct {
 	cmd     *exec.Cmd
 	closed  bool
 	isStd   bool
+}
+
+func (lf *luaFile) memBytes() int64 {
+	if lf == nil || lf.closed {
+		return 0
+	}
+	n := int64(64)
+	if lf.w != nil {
+		n += int64(lf.w.Size())
+	}
+	if lf.r != nil {
+		n += int64(lf.r.Size())
+	}
+	return n
 }
 
 func (lf *luaFile) reader() *bufio.Reader {
@@ -138,21 +153,27 @@ func (lf *luaFile) closeFile() error {
 		return fmt.Errorf("cannot close standard file")
 	}
 	lf.closed = true
+	var err error
 	if lf.inner != nil {
+		lf.inner.mu.Lock()
 		lf.inner.w = lf.w
-		return lf.inner.flushAndClose()
-	}
-	ferr := lf.flushWriter()
-	err := lf.f.Close()
-	if err == nil {
-		err = ferr
-	}
-	if lf.cmd != nil {
-		werr := lf.cmd.Wait()
+		lf.inner.mu.Unlock()
+		err = lf.inner.flushAndClose()
+	} else {
+		ferr := lf.flushWriter()
+		err = lf.f.Close()
 		if err == nil {
-			err = werr
+			err = ferr
+		}
+		if lf.cmd != nil {
+			werr := lf.cmd.Wait()
+			if err == nil {
+				err = werr
+			}
 		}
 	}
+	lf.w = nil
+	lf.r = nil
 	return err
 }
 
@@ -450,6 +471,25 @@ func (s *State) newFileUD(lf *luaFile) Value {
 	return v
 }
 
+func (s *State) tryNewFileUD(lf *luaFile) (Value, error) {
+	if s.memLimit > 0 || s.gc.tier1 {
+		if err := s.checkMemAndAccount(64 + lf.memBytes()); err != nil {
+			if !lf.isStd {
+				if lf.f != nil {
+					_ = lf.f.Close()
+				}
+				if lf.cmd != nil {
+					_ = lf.cmd.Wait()
+				}
+				lf.w = nil
+				lf.r = nil
+			}
+			return NilValue(), err
+		}
+	}
+	return s.newFileUD(lf), nil
+}
+
 func (s *State) compactWeakFiles() {
 	if len(s.gc.weakFiles) == 0 {
 		return
@@ -583,7 +623,11 @@ func nativeIOOpen(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return ioFail(s, err), nil
 	}
-	return []Value{s.newFileUD(lf)}, nil
+	ud, err := s.tryNewFileUD(lf)
+	if err != nil {
+		return nil, err
+	}
+	return []Value{ud}, nil
 }
 
 func nativeIOClose(s *State, args []Value) ([]Value, error) {
@@ -603,7 +647,11 @@ func nativeIOInput(s *State, args []Value) ([]Value, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cannot open file '%s' (%v)", args[0].AsString().S, err)
 		}
-		s.defaultInput = s.newFileUD(lf)
+		ud, err := s.tryNewFileUD(lf)
+		if err != nil {
+			return nil, err
+		}
+		s.defaultInput = ud
 		return []Value{s.defaultInput}, nil
 	}
 	if _, ok := asLuaFile(args[0]); !ok {
@@ -622,7 +670,11 @@ func nativeIOOutput(s *State, args []Value) ([]Value, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cannot open file '%s' (%v)", args[0].AsString().S, err)
 		}
-		s.defaultOutput = s.newFileUD(lf)
+		ud, err := s.tryNewFileUD(lf)
+		if err != nil {
+			return nil, err
+		}
+		s.defaultOutput = ud
 		return []Value{s.defaultOutput}, nil
 	}
 	if _, ok := asLuaFile(args[0]); !ok {
@@ -662,7 +714,11 @@ func nativeIOTmpfile(s *State, _ []Value) ([]Value, error) {
 		return ioFail(s, err), nil
 	}
 	_ = os.Remove(f.Name())
-	return []Value{s.newFileUD(&luaFile{f: f})}, nil
+	ud, err := s.tryNewFileUD(&luaFile{f: f})
+	if err != nil {
+		return nil, err
+	}
+	return []Value{ud}, nil
 }
 
 func nativeIOType(s *State, args []Value) ([]Value, error) {
@@ -750,7 +806,11 @@ func nativeIOPopen(s *State, args []Value) ([]Value, error) {
 		_ = pw.Close()
 		f = pr
 	}
-	return []Value{s.newFileUD(&luaFile{f: f, cmd: cmd})}, nil
+	ud, err := s.tryNewFileUD(&luaFile{f: f, cmd: cmd})
+	if err != nil {
+		return nil, err
+	}
+	return []Value{ud}, nil
 }
 
 func nativeFileToString(s *State, args []Value) ([]Value, error) {
@@ -778,8 +838,16 @@ func nativeFileClose(s *State, args []Value) ([]Value, error) {
 	if lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
+	freed := lf.memBytes()
 	isPipe := lf.cmd != nil
 	err := lf.closeFile()
+	if (s.memLimit > 0 || s.gc.tier1) && freed > 0 {
+		if s.gc.allocBytes > freed {
+			s.gc.allocBytes -= freed
+		} else {
+			s.gc.allocBytes = 0
+		}
+	}
 	if isPipe {
 		return execResult(s, err), nil
 	}
@@ -798,7 +866,15 @@ func nativeFileGCClose(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to '__gc' (FILE* expected, got %s)", s.objTypeName(args[0]))
 	}
 	if !lf.closed && !lf.isStd {
+		freed := lf.memBytes()
 		_ = lf.closeFile()
+		if (s.memLimit > 0 || s.gc.tier1) && freed > 0 {
+			if s.gc.allocBytes > freed {
+				s.gc.allocBytes -= freed
+			} else {
+				s.gc.allocBytes = 0
+			}
+		}
 	}
 	return nil, nil
 }
@@ -839,11 +915,22 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 		}
 	}
 	const maxSetVBufSize = int64(1 << 28)
+	oldSz := int64(0)
+	if lf.w != nil {
+		oldSz = int64(lf.w.Size())
+	}
 	mode := args[1].AsString().S
 	switch mode {
 	case "no":
 		lf.bufMode = bufModeNo
 		lf.w = nil
+		if (s.memLimit > 0 || s.gc.tier1) && oldSz > 0 {
+			if s.gc.allocBytes > oldSz {
+				s.gc.allocBytes -= oldSz
+			} else {
+				s.gc.allocBytes = 0
+			}
+		}
 	case "full", "line":
 		if sz > maxSetVBufSize {
 			if s.memLimit > 0 {
@@ -851,15 +938,27 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 			}
 			return nil, fmt.Errorf("bad argument #3 to 'setvbuf' (buffer size too large)")
 		}
-		if err := s.checkMemAndAccount(sz); err != nil {
-			return nil, err
+		delta := sz - oldSz
+		if delta > 0 {
+			if err := s.checkMemAndAccount(delta); err != nil {
+				return nil, err
+			}
 		}
 		if mode == "full" {
 			lf.bufMode = bufModeFull
 		} else {
 			lf.bufMode = bufModeLine
 		}
+		lf.w = nil
 		lf.w = bufio.NewWriterSize(lf.f, int(sz))
+		if (s.memLimit > 0 || s.gc.tier1) && delta < 0 {
+			freed := -delta
+			if s.gc.allocBytes > freed {
+				s.gc.allocBytes -= freed
+			} else {
+				s.gc.allocBytes = 0
+			}
+		}
 	default:
 		return nil, fmt.Errorf("bad argument #2 to 'setvbuf' (invalid option '%s')", mode)
 	}
@@ -1280,6 +1379,12 @@ func nativeFileRead(s *State, args []Value) ([]Value, error) {
 	if lf.w != nil && lf.w.Buffered() > 0 {
 		_ = lf.flushWriter()
 	}
+	if lf.r == nil && (s.memLimit > 0 || s.gc.tier1) {
+		if err := s.checkMemAndAccount(4096); err != nil {
+			return nil, err
+		}
+		lf.r = bufio.NewReader(lf.f)
+	}
 	fmts := args[1:]
 	if len(fmts) == 0 {
 		v, _, err := readOneItem(s, lf, StringValue(s.intern.Intern("l")))
@@ -1316,25 +1421,32 @@ func nativeFileWrite(s *State, args []Value) ([]Value, error) {
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
+	var totalBytes int64
 	for _, a := range args[1:] {
 		if !a.IsString() && !a.IsNumber() {
 			return nil, fmt.Errorf("bad argument to 'write' (string expected)")
 		}
 		str := FormatValue(a)
 		if lf.w != nil {
-			if _, err := lf.w.WriteString(str); err != nil {
+			n, err := lf.w.WriteString(str)
+			totalBytes += int64(n)
+			if err != nil {
+				written := max(int64(0), totalBytes-int64(lf.w.Buffered()))
 				lf.w.Reset(lf.f)
-				return ioFail(s, err), nil
+				return append(ioFail(s, err), IntValue(written)), nil
 			}
 			if lf.bufMode == bufModeLine && strings.ContainsRune(str, '\n') {
 				if err := lf.w.Flush(); err != nil {
+					written := max(int64(0), totalBytes-int64(lf.w.Buffered()))
 					lf.w.Reset(lf.f)
-					return ioFail(s, err), nil
+					return append(ioFail(s, err), IntValue(written)), nil
 				}
 			}
 		} else {
-			if _, err := lf.f.WriteString(str); err != nil {
-				return ioFail(s, err), nil
+			n, err := lf.f.WriteString(str)
+			totalBytes += int64(n)
+			if err != nil {
+				return append(ioFail(s, err), IntValue(totalBytes)), nil
 			}
 		}
 	}
@@ -1411,7 +1523,11 @@ func nativeIOLines(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot open file '%s' (%v)", FormatValue(args[0]), err)
 	}
-	return makeLinesIter(s, s.newFileUD(lf), args[1:], true), nil
+	ud, err := s.tryNewFileUD(lf)
+	if err != nil {
+		return nil, err
+	}
+	return makeLinesIter(s, ud, args[1:], true), nil
 }
 
 // --- os library ---
@@ -1716,8 +1832,15 @@ func nativeOSTmpName(s *State, _ []Value) ([]Value, error) {
 		return nil, err
 	}
 	name := f.Name()
-	_ = f.Close()
-	_ = os.Remove(name)
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return nil, err
+	}
+	// On POSIX systems, Lua 5.5's os.tmpname (mkstemp + close) keeps the created
+	// file present to reserve the pathname until the caller removes it.
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(name)
+	}
 	return []Value{StringValue(s.intern.Intern(name))}, nil
 }
 
