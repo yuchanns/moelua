@@ -339,6 +339,26 @@ func (s *State) hasInterruptControl() bool {
 	return s.intrFlag != nil || s.ctx != nil || s.insnLimit > 0
 }
 
+func (s *State) checkNativeCancelStep() error {
+	if s.abortErr != nil {
+		return s.abortErr
+	}
+	if s.insnLimit > 0 {
+		s.insnCount += 1024
+		if s.insnCount > s.insnLimit {
+			s.abortErr = ErrInstructionLimit
+			return ErrInstructionLimit
+		}
+	}
+	if s.ctx != nil {
+		if err := s.ctx.Err(); err != nil {
+			s.abortErr = err
+			return err
+		}
+	}
+	return nil
+}
+
 // nativeCancelFunc returns nil when no Go context or instruction budget is active (zero allocation),
 // or a cooperative callback polled during potentially long-running native operations
 // (such as string pattern backtracking). CLI SIGINT (intrFlag) intentionally follows PUC-Rio
@@ -347,24 +367,18 @@ func (s *State) nativeCancelFunc() func() error {
 	if s.ctx == nil && s.insnLimit <= 0 {
 		return nil
 	}
+	return s.checkNativeCancelStep
+}
+
+// dynamicNativeCancelFunc returns a cooperative cancellation callback that consults the State's
+// current context and instruction limit on every poll (used by long-lived iterators such as
+// string.gmatch so limits attached after iterator creation are still enforced).
+func (s *State) dynamicNativeCancelFunc() func() error {
 	return func() error {
-		if s.abortErr != nil {
-			return s.abortErr
+		if s.ctx == nil && s.insnLimit <= 0 && s.abortErr == nil {
+			return nil
 		}
-		if s.insnLimit > 0 {
-			s.insnCount += 1024
-			if s.insnCount > s.insnLimit {
-				s.abortErr = ErrInstructionLimit
-				return ErrInstructionLimit
-			}
-		}
-		if s.ctx != nil {
-			if err := s.ctx.Err(); err != nil {
-				s.abortErr = err
-				return err
-			}
-		}
-		return nil
+		return s.checkNativeCancelStep()
 	}
 }
 
@@ -788,15 +802,37 @@ func (s *State) GetGlobalMM(name string) (Value, error) {
 	return s.finishGet(TableValue(s.env), StringValue(key))
 }
 
+// TryIntern interns or wraps str as a *LuaString after checking and accounting for newly
+// allocated string storage against the State's memory limit.
+func (s *State) TryIntern(str string) (*LuaString, error) {
+	if ls, ok := s.intern.lookupExistingShort(str); ok {
+		return ls, nil
+	}
+	if s.memLimit > 0 || s.gc.tier1 {
+		if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
+			return nil, err
+		}
+	}
+	return s.intern.Intern(str), nil
+}
+
 // SetGlobalMM assigns a global in `_G`, honoring `_G`'s `__newindex` metamethod
 // (matching PUC-Rio `lua_setglobal`).
 func (s *State) SetGlobalMM(name string, val Value) error {
-	keyStr := s.intern.Intern(name)
-	if !s.env.RawGetStr(keyStr).IsNil() || s.env.meta == nil || s.getTM(s.env.meta, TMNewIndex).IsNil() {
-		s.env.RawSetStr(s, keyStr, val)
-		return s.ConsumeMemErr()
+	return s.tableSetStr(TableValue(s.env), s.intern.Intern(name), val)
+}
+
+// tableSetStr assigns keyStr = val on a Lua table honoring `__newindex` metamethods
+// (matching PUC-Rio `lua_setfield`).
+func (s *State) tableSetStr(tblVal Value, keyStr *LuaString, val Value) error {
+	if tblVal.IsTable() {
+		t := tblVal.AsTable()
+		if !t.RawGetStr(keyStr).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+			t.RawSetStr(s, keyStr, val)
+			return s.ConsumeMemErr()
+		}
 	}
-	cur := TableValue(s.env)
+	cur := tblVal
 	key := StringValue(keyStr)
 	for loop := range 2000 {
 		var tm Value

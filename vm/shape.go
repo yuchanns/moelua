@@ -135,7 +135,23 @@ func (sr *shapeRegistry) maybePrune() {
 	}
 }
 
-func (sr *shapeRegistry) Root(meta *Table) *Shape {
+// shapeNodeBytes estimates the retained Go heap storage of a single non-frozen Shape node
+// (excluding parent chain and interned key strings, which are counted separately).
+func shapeNodeBytes(sh *Shape) int64 {
+	if sh == nil || sh.frozen {
+		return 0
+	}
+	n := int64(192)
+	if sh.index != nil {
+		n += 48 + int64(len(sh.index))*32
+	}
+	if sh.transMap != nil {
+		n += 48 + int64(len(sh.transMap))*32
+	}
+	return n
+}
+
+func (sr *shapeRegistry) Root(s *State, meta *Table) *Shape {
 	if meta == nil {
 		return sr.root
 	}
@@ -147,6 +163,12 @@ func (sr *shapeRegistry) Root(meta *Table) *Shape {
 			return sh
 		}
 	}
+	if s != nil && (s.memLimit > 0 || s.gc.tier1) {
+		if err := s.checkMemAndAccount(192); err != nil {
+			s.memExceeded = true
+			return nil
+		}
+	}
 	sr.nextID++
 	sh := &Shape{id: sr.nextID, slot: -1, meta: meta}
 	sr.metaRoots[wk] = weak.Make(sh)
@@ -154,10 +176,10 @@ func (sr *shapeRegistry) Root(meta *Table) *Shape {
 	return sh
 }
 
-// Transition returns the child shape adding key k (assumed absent from sh), or nil if maxShapeProps exceeded.
-func (sr *shapeRegistry) Transition(sh *Shape, k *LuaString) *Shape {
+// Transition returns the child shape adding key k (assumed absent from sh), or (nil, nil) if maxShapeProps exceeded.
+func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString) (*Shape, error) {
 	if sh.length >= maxShapeProps {
-		return nil
+		return nil, nil
 	}
 	wk := weak.Make(k)
 	if sh.frozen {
@@ -165,11 +187,20 @@ func (sr *shapeRegistry) Transition(sh *Shape, k *LuaString) *Shape {
 		if sr.frozenTrans != nil {
 			if wp, ok := sr.frozenTrans[fk]; ok {
 				if child := wp.Value(); child != nil {
-					return child
+					return child, nil
 				}
 			}
 		} else {
 			sr.frozenTrans = make(map[weakFrozenTransKey]weak.Pointer[Shape], 8)
+		}
+		if s != nil && (s.memLimit > 0 || s.gc.tier1) {
+			est := int64(192)
+			if sh.length+1 > 8 {
+				est += 48 + int64(sh.length+1)*32
+			}
+			if err := s.checkMemAndAccount(est); err != nil {
+				return nil, err
+			}
 		}
 		sr.nextID++
 		child := &Shape{
@@ -189,14 +220,14 @@ func (sr *shapeRegistry) Transition(sh *Shape, k *LuaString) *Shape {
 		}
 		sr.frozenTrans[fk] = weak.Make(child)
 		sr.maybePrune()
-		return child
+		return child, nil
 	}
 	freeSmall := -1
 	for i := range int(sh.nTrans) {
 		st := sh.transSmall[i]
 		if st.key == wk {
 			if child := st.child.Value(); child != nil {
-				return child
+				return child, nil
 			}
 			freeSmall = i
 		} else if freeSmall < 0 && (st.key.Value() == nil || st.child.Value() == nil) {
@@ -206,8 +237,24 @@ func (sr *shapeRegistry) Transition(sh *Shape, k *LuaString) *Shape {
 	if sh.transMap != nil {
 		if wp, ok := sh.transMap[wk]; ok {
 			if child := wp.Value(); child != nil {
-				return child
+				return child, nil
 			}
+		}
+	}
+	if s != nil && (s.memLimit > 0 || s.gc.tier1) {
+		est := int64(192)
+		if sh.length+1 > 8 {
+			est += 48 + int64(sh.length+1)*32
+		}
+		if freeSmall < 0 && sh.nTrans >= 4 {
+			if sh.transMap == nil {
+				est += 48 + 8*32
+			} else {
+				est += 32
+			}
+		}
+		if err := s.checkMemAndAccount(est); err != nil {
+			return nil, err
 		}
 	}
 	sr.nextID++
@@ -241,19 +288,22 @@ func (sr *shapeRegistry) Transition(sh *Shape, k *LuaString) *Shape {
 			pruneShapeTransMap(sh)
 		}
 	}
-	return child
+	return child, nil
 }
 
 // WithMeta returns a shape having the exact same ordered keys as sh, but with metatable meta.
-func (sr *shapeRegistry) WithMeta(sh *Shape, meta *Table) *Shape {
+func (sr *shapeRegistry) WithMeta(s *State, sh *Shape, meta *Table) *Shape {
 	if sh == nil {
-		return sr.Root(meta)
+		return sr.Root(s, meta)
 	}
 	if sh.meta == meta {
 		return sh
 	}
 	if sh.length == 0 {
-		return sr.Root(meta)
+		if r := sr.Root(s, meta); r != nil {
+			return r
+		}
+		return sh
 	}
 	var wm weak.Pointer[Table]
 	if meta != nil {
@@ -269,10 +319,23 @@ func (sr *shapeRegistry) WithMeta(sh *Shape, meta *Table) *Shape {
 	} else {
 		sr.metaTrans = make(map[weakMetaTransKey]weak.Pointer[Shape], 16)
 	}
-	cur := sr.Root(meta)
+	cur := sr.Root(s, meta)
+	if cur == nil {
+		return sh
+	}
 	keys := sh.Keys()
 	for _, k := range keys {
-		cur = sr.Transition(cur, k)
+		next, err := sr.Transition(s, cur, k)
+		if err != nil {
+			if s != nil {
+				s.memExceeded = true
+			}
+			return sh
+		}
+		if next == nil {
+			return sh
+		}
+		cur = next
 	}
 	sr.metaTrans[key] = weak.Make(cur)
 	sr.maybePrune()

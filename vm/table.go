@@ -238,7 +238,7 @@ func (s *State) SetMetatable(t, mt *Table) {
 	t.tmFlags = 0
 	if OptimizeEnabled {
 		if t.shape != nil {
-			t.shape = s.shapes.WithMeta(t.shape, mt)
+			t.shape = s.shapes.WithMeta(s, t.shape, mt)
 		}
 		if t.isProto() {
 			s.protoEpoch++
@@ -514,7 +514,12 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 			if val.IsNil() {
 				return
 			}
-			if next := s.shapes.Transition(t.shape, k); next != nil {
+			next, serr := s.shapes.Transition(s, t.shape, k)
+			if serr != nil {
+				s.memExceeded = true
+				return
+			}
+			if next != nil {
 				if s.memLimit > 0 && len(t.slots) == cap(t.slots) {
 					if err := s.checkMemAndAccount(int64(max(cap(t.slots), 4)) * 16); err != nil {
 						s.memExceeded = true

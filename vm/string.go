@@ -185,6 +185,27 @@ func (ls *LuaString) hash() uint32 {
 	return h
 }
 
+// lookupExistingShort returns an already-interned short *LuaString if present (without allocating).
+func (si *stringInterner) lookupExistingShort(s string) (*LuaString, bool) {
+	if len(s) > maxShortStringLen {
+		return nil, false
+	}
+	if si.frozen != nil {
+		if ls, ok := si.frozen[s]; ok {
+			return ls, true
+		}
+	}
+	if si.short != nil {
+		h := hashString(s, si.seed)
+		for _, wp := range si.short[h] {
+			if ls := wp.Value(); ls != nil && ls.S == s {
+				return ls, true
+			}
+		}
+	}
+	return nil, false
+}
+
 // Intern returns a canonical *LuaString for short strings (<= 40 bytes) or allocates a long string
 // with lazy hashing (matching PUC-Rio Lua 5.5).
 func (si *stringInterner) Intern(s string) *LuaString {

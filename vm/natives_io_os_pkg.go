@@ -1555,9 +1555,21 @@ func nativeOSTime(s *State, args []Value) ([]Value, error) {
 	if !args[0].IsTable() {
 		return nil, fmt.Errorf("bad argument #1 to 'os.time' (table expected)")
 	}
-	t := args[0].AsTable()
+	tblVal := args[0]
+	t := tblVal.AsTable()
+	readField := func(name string) (Value, error) {
+		k := s.intern.Intern(name)
+		v := t.RawGetStr(k)
+		if v.IsNil() && t.meta != nil {
+			return s.finishGet(tblVal, StringValue(k))
+		}
+		return v, nil
+	}
 	getField := func(name string, def int, req bool, delta int64) (int, error) {
-		v := t.RawGetStr(s.intern.Intern(name))
+		v, err := readField(name)
+		if err != nil {
+			return 0, err
+		}
 		if v.IsNil() {
 			if req {
 				return 0, fmt.Errorf("field '%s' missing in date table", name)
@@ -1597,18 +1609,31 @@ func nativeOSTime(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	isdstVal := t.RawGetStr(s.intern.Intern("isdst"))
+	isdstVal, err := readField("isdst")
+	if err != nil {
+		return nil, err
+	}
 	tm := resolveLocalDateTime(year, month, day, hour, min, sec, !isdstVal.IsNil(), !isdstVal.IsFalsy())
-	// Normalize fields back into table per Lua 5.5 spec.
-	t.RawSetStr(s, s.intern.Intern("year"), IntValue(int64(tm.Year())))
-	t.RawSetStr(s, s.intern.Intern("month"), IntValue(int64(tm.Month())))
-	t.RawSetStr(s, s.intern.Intern("day"), IntValue(int64(tm.Day())))
-	t.RawSetStr(s, s.intern.Intern("hour"), IntValue(int64(tm.Hour())))
-	t.RawSetStr(s, s.intern.Intern("min"), IntValue(int64(tm.Minute())))
-	t.RawSetStr(s, s.intern.Intern("sec"), IntValue(int64(tm.Second())))
-	t.RawSetStr(s, s.intern.Intern("wday"), IntValue(int64(tm.Weekday())+1))
-	t.RawSetStr(s, s.intern.Intern("yday"), IntValue(int64(tm.YearDay())))
-	t.RawSetStr(s, s.intern.Intern("isdst"), BoolValue(tm.IsDST()))
+	// Normalize fields back into table per Lua 5.5 loslib.c:setallfields (honoring __newindex).
+	normFields := [9]struct {
+		name string
+		val  Value
+	}{
+		{"year", IntValue(int64(tm.Year()))},
+		{"month", IntValue(int64(tm.Month()))},
+		{"day", IntValue(int64(tm.Day()))},
+		{"hour", IntValue(int64(tm.Hour()))},
+		{"min", IntValue(int64(tm.Minute()))},
+		{"sec", IntValue(int64(tm.Second()))},
+		{"yday", IntValue(int64(tm.YearDay()))},
+		{"wday", IntValue(int64(tm.Weekday()) + 1)},
+		{"isdst", BoolValue(tm.IsDST())},
+	}
+	for _, nf := range normFields {
+		if err := s.tableSetStr(tblVal, s.intern.Intern(nf.name), nf.val); err != nil {
+			return nil, err
+		}
+	}
 	return []Value{IntValue(tm.Unix())}, nil
 }
 
@@ -1755,12 +1780,28 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 			sb.WriteString(fmt.Sprintf("%04d", tm.Year()))
 		case 'y':
 			sb.WriteString(fmt.Sprintf("%02d", tm.Year()%100))
+		case 'C':
+			sb.WriteString(fmt.Sprintf("%02d", tm.Year()/100))
 		case 'm':
 			sb.WriteString(fmt.Sprintf("%02d", tm.Month()))
 		case 'd':
 			sb.WriteString(fmt.Sprintf("%02d", tm.Day()))
+		case 'e':
+			sb.WriteString(fmt.Sprintf("%2d", tm.Day()))
 		case 'H':
 			sb.WriteString(fmt.Sprintf("%02d", tm.Hour()))
+		case 'I':
+			h12 := tm.Hour() % 12
+			if h12 == 0 {
+				h12 = 12
+			}
+			sb.WriteString(fmt.Sprintf("%02d", h12))
+		case 'p':
+			if tm.Hour() < 12 {
+				sb.WriteString("AM")
+			} else {
+				sb.WriteString("PM")
+			}
 		case 'M':
 			sb.WriteString(fmt.Sprintf("%02d", tm.Minute()))
 		case 'S':
@@ -1775,14 +1816,44 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 			sb.WriteString(tm.Format("January"))
 		case 'c':
 			sb.WriteString(tm.Format("Mon Jan _2 15:04:05 2006"))
-		case 'x':
+		case 'D', 'x':
 			sb.WriteString(tm.Format("01/02/06"))
-		case 'X':
+		case 'F':
+			sb.WriteString(fmt.Sprintf("%04d-%02d-%02d", tm.Year(), tm.Month(), tm.Day()))
+		case 'r':
+			sb.WriteString(tm.Format("03:04:05 PM"))
+		case 'R':
+			sb.WriteString(fmt.Sprintf("%02d:%02d", tm.Hour(), tm.Minute()))
+		case 'T', 'X':
 			sb.WriteString(tm.Format("15:04:05"))
 		case 'j':
 			sb.WriteString(fmt.Sprintf("%03d", tm.YearDay()))
 		case 'w':
 			sb.WriteString(fmt.Sprintf("%d", tm.Weekday()))
+		case 'u':
+			u := int(tm.Weekday())
+			if u == 0 {
+				u = 7
+			}
+			sb.WriteString(fmt.Sprintf("%d", u))
+		case 'U':
+			sb.WriteString(fmt.Sprintf("%02d", (tm.YearDay()-1+7-int(tm.Weekday()))/7))
+		case 'W':
+			monWday := (int(tm.Weekday()) + 6) % 7
+			sb.WriteString(fmt.Sprintf("%02d", (tm.YearDay()-1+7-monWday)/7))
+		case 'g':
+			isoY, _ := tm.ISOWeek()
+			sb.WriteString(fmt.Sprintf("%02d", isoY%100))
+		case 'G':
+			isoY, _ := tm.ISOWeek()
+			sb.WriteString(fmt.Sprintf("%04d", isoY))
+		case 'V':
+			_, isoW := tm.ISOWeek()
+			sb.WriteString(fmt.Sprintf("%02d", isoW))
+		case 'n':
+			sb.WriteByte('\n')
+		case 't':
+			sb.WriteByte('\t')
 		case 'Z':
 			zone, _ := tm.Zone()
 			sb.WriteString(zone)

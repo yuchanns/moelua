@@ -212,8 +212,16 @@ func (s *State) toStringValue(v Value) (string, error) {
 		}
 		return "", fmt.Errorf("'__tostring' must return a string")
 	}
+	// Per Lua 5.5 lauxlib.c:luaL_tolstring, numbers, strings, booleans, and nil always
+	// format as their primitive representation even if their metatable defines __name.
+	if v.IsNumber() || v.IsString() || v.IsBool() || v.IsNil() {
+		return FormatValue(v), nil
+	}
 	if mt := s.getMetatableOf(v); mt != nil {
 		if nm := mt.RawGetStr(s.intern.Intern("__name")); nm.IsString() {
+			if v.IsLightUD() {
+				return fmt.Sprintf("%s: %p", nm.AsString().S, v.AsLightUD()), nil
+			}
 			return fmt.Sprintf("%s: %p", nm.AsString().S, v.ptr), nil
 		}
 	}
@@ -443,12 +451,18 @@ func nativeSetMetatable(s *State, args []Value) ([]Value, error) {
 	}
 	if args[1].IsNil() {
 		s.SetMetatable(t, nil)
+		if err := s.ConsumeMemErr(); err != nil {
+			return nil, err
+		}
 		return []Value{args[0]}, nil
 	}
 	if !args[1].IsTable() {
 		return nil, fmt.Errorf("bad argument #2 to 'setmetatable' (nil or table expected)")
 	}
 	s.SetMetatable(t, args[1].AsTable())
+	if err := s.ConsumeMemErr(); err != nil {
+		return nil, err
+	}
 	return []Value{args[0]}, nil
 }
 
@@ -489,7 +503,13 @@ func nativePairs(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'pairs'")
 	}
 	if tm := s.getTMByObj(args[0], TMPairs); !tm.IsNil() {
-		return s.Call(tm, args[0])
+		res, err := s.Call(tm, args[0])
+		if err != nil {
+			return nil, err
+		}
+		out := []Value{NilValue(), NilValue(), NilValue(), NilValue()}
+		copy(out, res)
+		return out, nil
 	}
 	return []Value{NativeValue(s.builtinNext), args[0], NilValue(), NilValue()}, nil
 }
@@ -1910,7 +1930,11 @@ func nativeStringSub(s *State, args []Value) ([]Value, error) {
 	if err := s.checkMemAndAccount((j - i + 1) + 48); err != nil {
 		return nil, err
 	}
-	return []Value{StringValue(s.intern.Intern(str[i-1 : j]))}, nil
+	sub := str[i-1 : j]
+	if len(sub) > maxShortStringLen && len(sub) < len(str) {
+		sub = strings.Clone(sub)
+	}
+	return []Value{StringValue(s.intern.Intern(sub))}, nil
 }
 
 func nativeStringRep(s *State, args []Value) ([]Value, error) {

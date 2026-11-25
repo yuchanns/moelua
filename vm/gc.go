@@ -219,12 +219,36 @@ type gcTracer struct {
 	countStrings   bool // true when s.memLimit > 0 so live strings are counted accurately in liveBytes
 	seenStrings    map[*LuaString]struct{}
 	seenProtos     map[*boundProto]struct{}
+	seenShapes     map[*Shape]struct{}
 	gray           []Value
 	weakVals       []*Table // __mode="v"
 	ephemerons     []*Table // __mode="k"
 	allWeaks       []*Table // __mode="kv"
 	liveOpenUpvals []*Upvalue
 	liveBytes      int64
+}
+
+func (tr *gcTracer) markShape(sh *Shape) {
+	root := tr.s.shapes.root
+	for cur := sh; cur != nil && !cur.frozen; cur = cur.parent {
+		if _, ok := tr.seenShapes[cur]; ok {
+			return
+		}
+		if tr.seenShapes == nil {
+			tr.seenShapes = make(map[*Shape]struct{}, 32)
+		}
+		tr.seenShapes[cur] = struct{}{}
+		if cur == root {
+			if cur.transMap != nil {
+				tr.liveBytes += 48 + int64(len(cur.transMap))*32
+			}
+			continue
+		}
+		tr.liveBytes += shapeNodeBytes(cur)
+		if tr.countStrings && cur.key != nil {
+			tr.mark(StringValue(cur.key))
+		}
+	}
 }
 
 func (tr *gcTracer) markBoundProto(bp *boundProto) {
@@ -347,6 +371,9 @@ func (tr *gcTracer) mark(v Value) {
 		}
 		if c := cap(t.slots); c > len(t.inlineSlots) {
 			slotBytes = int64(c) * 16
+		}
+		if t.shape != nil {
+			tr.markShape(t.shape)
 		}
 		tr.liveBytes += 96 + slotBytes + nodeBytes + arrBytes
 		tr.gray = append(tr.gray, v)

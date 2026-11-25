@@ -47,6 +47,7 @@ const (
 	finishConcat              // resume multi-operand OP_CONCAT loop
 	finishTForCall            // resume OP_TFORCALL -> OP_TFORLOOP
 	finishClose               // resume closing remaining TBC vars after __close returns
+	finishPairs               // normalize __pairs return arity to exactly 4 values
 )
 
 // callFrame is one frame on a Thread's flat stackful call stack.

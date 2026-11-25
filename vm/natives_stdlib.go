@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/internal/luastdlib"
@@ -44,11 +45,20 @@ func checkStringArg(args []Value, idx int, fnName string) (string, error) {
 	return "", fmt.Errorf("bad argument #%d to '%s' (string expected, got %s)", idx+1, fnName, v.TypeName())
 }
 
-func captureToValue(s *State, c luastdlib.CaptureVal) Value {
+func captureToValue(s *State, c luastdlib.CaptureVal, srcLen int) (Value, error) {
 	if c.IsPos {
-		return IntValue(c.Pos)
+		return IntValue(c.Pos), nil
 	}
-	return StringValue(s.intern.Intern(c.Str))
+	str := c.Str
+	if len(str) > maxShortStringLen && len(str) < srcLen {
+		str = strings.Clone(str)
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
+			return NilValue(), err
+		}
+	}
+	return StringValue(s.intern.Intern(str)), nil
 }
 
 func nativeStringFind(s *State, args []Value) ([]Value, error) {
@@ -80,7 +90,11 @@ func nativeStringFind(s *State, args []Value) ([]Value, error) {
 	out[0] = IntValue(int64(start))
 	out[1] = IntValue(int64(end))
 	for i, c := range caps {
-		out[2+i] = captureToValue(s, c)
+		cv, cerr := captureToValue(s, c, len(str))
+		if cerr != nil {
+			return nil, cerr
+		}
+		out[2+i] = cv
 	}
 	return out, nil
 }
@@ -111,7 +125,11 @@ func nativeStringMatch(s *State, args []Value) ([]Value, error) {
 	}
 	out := make([]Value, len(caps))
 	for i, c := range caps {
-		out[i] = captureToValue(s, c)
+		cv, cerr := captureToValue(s, c, len(str))
+		if cerr != nil {
+			return nil, cerr
+		}
+		out[i] = cv
 	}
 	return out, nil
 }
@@ -133,7 +151,7 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 		}
 		initPos = int(iv)
 	}
-	it := luastdlib.GMatchWithCancel(str, pat, initPos, s.nativeCancelFunc())
+	it := luastdlib.GMatchWithCancel(str, pat, initPos, s.dynamicNativeCancelFunc())
 	fn := &NativeFunc{
 		Name:        "gmatch_iter",
 		NumUpvals:   3,
@@ -148,7 +166,11 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 			}
 			out := make([]Value, len(caps))
 			for i, c := range caps {
-				out[i] = captureToValue(s, c)
+				cv, cerr := captureToValue(s, c, len(str))
+				if cerr != nil {
+					return nil, cerr
+				}
+				out[i] = cv
 			}
 			return out, nil
 		},
@@ -198,7 +220,10 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 		replaced = count > 0
 	case repl.IsTable():
 		outStr, count, err = luastdlib.GSubTableWithLimits(str, pat, func(key luastdlib.CaptureVal) (string, bool, error) {
-			kv := captureToValue(s, key)
+			kv, kerr := captureToValue(s, key, len(str))
+			if kerr != nil {
+				return "", false, kerr
+			}
 			var val Value
 			t := repl.AsTable()
 			val = t.RawGet(kv)
@@ -222,7 +247,11 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 		outStr, count, err = luastdlib.GSubWithLimits(str, pat, func(caps []luastdlib.CaptureVal) (string, bool, error) {
 			cargs := make([]Value, len(caps))
 			for i, c := range caps {
-				cargs[i] = captureToValue(s, c)
+				cv, cerr := captureToValue(s, c, len(str))
+				if cerr != nil {
+					return "", false, cerr
+				}
+				cargs[i] = cv
 			}
 			res, cerr := s.Call(repl, cargs...)
 			if cerr != nil {

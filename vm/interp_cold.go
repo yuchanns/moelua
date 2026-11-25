@@ -336,6 +336,23 @@ func (s *State) completeFinishOp(th *Thread, cf *callFrame, entryDepth int) (boo
 		return true, nil
 	case finishClose:
 		return s.resumeCloseTBC(th, cf, entryDepth)
+	case finishPairs:
+		if cf.closeRetN < 0 {
+			th.top = retSlot + 4
+		} else if cf.closeRetN > 4 {
+			if err := th.ensureStack(retSlot + cf.closeRetN + 4); err != nil {
+				return false, err
+			}
+			fillNil(th.stack[retSlot+4 : retSlot+cf.closeRetN])
+			end := retSlot + cf.closeRetN
+			if cf.cl != nil {
+				if fe := cf.base + int(cf.cl.bp.proto.MaxStackSize); fe > end {
+					end = fe
+				}
+			}
+			th.top = end
+		}
+		return true, nil
 	}
 	return true, nil
 }
@@ -719,7 +736,11 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					s.activateTier1()
 				}
 				oldShape := t.shape
-				if next := s.shapes.Transition(oldShape, key); next != nil {
+				next, serr := s.shapes.Transition(s, oldShape, key)
+				if serr != nil {
+					return s.catchSlow(th, ev, false, serr)
+				}
+				if next != nil {
 					if s.memLimit > 0 && len(t.slots) == cap(t.slots) {
 						if err := s.checkMemAndAccount(int64(max(cap(t.slots), 4)) * 16); err != nil {
 							return s.catchSlow(th, ev, false, err)
@@ -1034,7 +1055,20 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				if tm := s.getTMByObj(th.stack[funcIdx+1], TMPairs); !tm.IsNil() && tm.IsClosure() {
 					th.stack[funcIdx] = tm
 					cl := tm.AsClosure()
-					if err := th.pushLuaFrame(cl, funcIdx, 1, nresults); err != nil {
+					callNRes := nresults
+					needFinish := nresults < 0 || nresults > 4
+					if needFinish {
+						callNRes = 4
+						caller := &th.frames[ev.ci]
+						caller.dirty = true
+						caller.finish = finishPairs
+						caller.oldTop = funcIdx
+						caller.closeRetN = nresults
+					}
+					if err := th.pushLuaFrame(cl, funcIdx, 1, callNRes); err != nil {
+						if needFinish {
+							th.frames[ev.ci].finish = finishNone
+						}
 						return s.catchSlow(th, ev, false, err)
 					}
 					if herr := s.fireLuaCallHook(th, cl, 1); herr != nil {
