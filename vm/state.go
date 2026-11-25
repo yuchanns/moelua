@@ -395,6 +395,12 @@ func (s *State) FormatError(err error) string {
 // GlobalEnv returns _G / _ENV.
 func (s *State) GlobalEnv() *Table { return s.env }
 
+// Registry returns the State's Lua registry table (LUA_REGISTRYINDEX).
+func (s *State) Registry() *Table { return s.registry }
+
+// PreloadTable returns the State's package.preload table.
+func (s *State) PreloadTable() *Table { return s.preloadTbl }
+
 // Intern interns a Go string into this State's string table.
 func (s *State) Intern(str string) *LuaString { return s.intern.Intern(str) }
 
@@ -674,6 +680,13 @@ func (s *State) setMetatableOf(v Value, mt *Table) {
 		s.protoEpoch++
 	}
 }
+
+// GetMetatableOf returns the metatable of v (table, userdata, string, or type metatable), or nil.
+func (s *State) GetMetatableOf(v Value) *Table { return s.getMetatableOf(v) }
+
+// SetMetatableOf sets the metatable of v (table, userdata, string, or type metatable)
+// and updates finalizer/prototype tracking. Passing nil clears the metatable.
+func (s *State) SetMetatableOf(v Value, mt *Table) { s.setMetatableOf(v, mt) }
 
 func (s *State) getTMByObj(v Value, tm TM) Value {
 	return s.getTM(s.getMetatableOf(v), tm)

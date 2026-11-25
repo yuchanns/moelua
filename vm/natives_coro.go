@@ -18,6 +18,104 @@ func (s *State) initCoroLib() {
 	s.SetGlobal("coroutine", TableValue(coro))
 }
 
+// NewThread creates a new suspended coroutine ready to run fn (matching coroutine.create).
+func (s *State) NewThread(fn Value) (*Thread, error) {
+	if !fn.IsFunction() {
+		return nil, fmt.Errorf("bad argument #1 to 'NewThread' (function expected)")
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMemAndAccount(512 + 128*16); err != nil {
+			return nil, err
+		}
+	}
+	co := newThread(s, 128)
+	co.stack[0] = fn
+	co.top = 1
+	return co, nil
+}
+
+// Resume resumes co with args. It returns (results, yielded, err):
+//   - yielded == true, err == nil: co suspended via coroutine.yield(results...)
+//   - yielded == false, err == nil: co returned normally with results
+//   - err != nil: co errored (LuaError) or aborted via uncatchable cancellation/limit.
+func (s *State) Resume(co *Thread, args ...Value) ([]Value, bool, error) {
+	if co == nil {
+		return nil, false, fmt.Errorf("cannot resume nil thread")
+	}
+	if co.state != s {
+		return nil, false, fmt.Errorf("cannot resume thread belonging to another State")
+	}
+	if s.nCcalls == 0 {
+		s.abortErr = nil
+	}
+	ok, res, uerr := s.resumeThread(co, args)
+	if uerr == nil && s.abortErr != nil {
+		uerr = s.abortErr
+	}
+	if s.nCcalls == 0 {
+		s.abortErr = nil
+	}
+	if uerr != nil {
+		return nil, false, uerr
+	}
+	if !ok {
+		if len(res) > 0 {
+			return nil, false, &LuaError{Val: res[0]}
+		}
+		return nil, false, fmt.Errorf("coroutine error")
+	}
+	return res, co.status == ThreadSuspended, nil
+}
+
+// CloseThread closes a suspended or dead coroutine, running all pending <close>
+// metamethods (matching coroutine.close).
+func (s *State) CloseThread(co *Thread) error {
+	if co == nil {
+		return fmt.Errorf("cannot close nil thread")
+	}
+	if co.state != s {
+		return fmt.Errorf("cannot close thread belonging to another State")
+	}
+	if co.closing {
+		return nil
+	}
+	switch co.StatusString() {
+	case "normal":
+		return fmt.Errorf("cannot close a normal coroutine")
+	case "running":
+		if co == s.mainThread {
+			return fmt.Errorf("cannot close main thread")
+		}
+		return fmt.Errorf("cannot close a running coroutine from Go")
+	case "dead", "suspended":
+		if s.nCcalls == 0 {
+			s.abortErr = nil
+		}
+		co.closing = true
+		hasInitErr := co.status == ThreadDead && !co.errObj.IsNil()
+		errVal := co.errObj
+		errVal, hasErr, _ := co.closeAllSync(0, errVal, hasInitErr)
+		co.closing = false
+		co.status = ThreadDead
+		co.nframe = 0
+		co.top = 0
+		co.stack[0] = NilValue()
+		co.errObj = NilValue()
+		if uerr := s.abortErr; uerr != nil {
+			if s.nCcalls == 0 {
+				s.abortErr = nil
+			}
+			return uerr
+		}
+		if hasErr {
+			return &LuaError{Val: errVal}
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
 func nativeCoroCreate(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsFunction() {
 		return nil, fmt.Errorf("bad argument #1 to 'create' (function expected)")
@@ -425,6 +523,9 @@ func nativeCoroClose(s *State, args []Value) ([]Value, error) {
 		co.top = 0
 		co.stack[0] = NilValue()
 		co.errObj = NilValue()
+		if s.abortErr != nil {
+			return nil, s.abortErr
+		}
 		if hasErr {
 			return []Value{FalseValue(), errVal}, nil
 		}

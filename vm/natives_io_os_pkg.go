@@ -108,12 +108,22 @@ func (lf *luaFile) flushWriter() error {
 			return nil
 		}
 		if lf.w != nil {
-			return lf.w.Flush()
+			err := lf.w.Flush()
+			if err != nil {
+				// Clear sticky bufio.Writer error so subsequent writes/close match C stdio
+				// (e.g., files.lua:474-479 writing to /dev/full after a failed flush).
+				lf.w.Reset(lf.f)
+			}
+			return err
 		}
 		return nil
 	}
 	if lf.w != nil {
-		return lf.w.Flush()
+		err := lf.w.Flush()
+		if err != nil {
+			lf.w.Reset(lf.f)
+		}
+		return err
 	}
 	return nil
 }
@@ -494,7 +504,13 @@ func openFileWithMode(filename, mode string) (*luaFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &luaFile{f: f}, nil
+	lf := &luaFile{f: f}
+	if m != "r" {
+		// Match C stdio default full buffering (_IOFBF) for writable files.
+		lf.bufMode = bufModeFull
+		lf.w = bufio.NewWriterSize(f, 4096)
+	}
+	return lf, nil
 }
 
 func nativeIOOpen(s *State, args []Value) ([]Value, error) {
@@ -989,6 +1005,9 @@ func nativeFileRead(s *State, args []Value) ([]Value, error) {
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
+	if lf.w != nil && lf.w.Buffered() > 0 {
+		_ = lf.flushWriter()
+	}
 	fmts := args[1:]
 	if len(fmts) == 0 {
 		v, _, err := readOneItem(s, lf, StringValue(s.intern.Intern("l")))
@@ -1029,10 +1048,12 @@ func nativeFileWrite(s *State, args []Value) ([]Value, error) {
 		str := FormatValue(a)
 		if lf.w != nil {
 			if _, err := lf.w.WriteString(str); err != nil {
+				lf.w.Reset(lf.f)
 				return ioFail(s, err), nil
 			}
 			if lf.bufMode == bufModeLine && strings.ContainsRune(str, '\n') {
 				if err := lf.w.Flush(); err != nil {
+					lf.w.Reset(lf.f)
 					return ioFail(s, err), nil
 				}
 			}

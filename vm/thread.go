@@ -372,6 +372,14 @@ func (th *Thread) IsYieldable() bool {
 	return th.nny == 0
 }
 
+// Status returns the current ThreadStatus of th.
+func (th *Thread) Status() ThreadStatus {
+	if th == nil {
+		return ThreadDead
+	}
+	return th.status
+}
+
 // StatusString returns the Lua 5.5 coroutine.status(co) string.
 func (th *Thread) StatusString() string {
 	if th == th.state.cur {
