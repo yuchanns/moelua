@@ -251,6 +251,10 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 		chunkName = str
 	} else if args[0].IsFunction() {
 		var buf bytes.Buffer
+		var readerBytes int64
+		defer func() {
+			s.gc.tempBytes -= readerBytes
+		}()
 		for {
 			res, err := s.Call(args[0])
 			if err != nil {
@@ -269,7 +273,16 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 			if piece == "" {
 				break
 			}
+			pieceLen := int64(len(piece))
+			if err := s.checkMem(pieceLen); err != nil {
+				return []Value{NilValue(), errorToLuaValue(s, err)}, nil
+			}
+			if readerBytes+pieceLen > (1 << 30) {
+				return []Value{NilValue(), StringValue(s.intern.Intern("not enough memory"))}, nil
+			}
 			buf.WriteString(piece)
+			readerBytes += pieceLen
+			s.gc.tempBytes += pieceLen
 		}
 		data = buf.Bytes()
 	} else {
@@ -329,13 +342,17 @@ func nativeLoadFile(s *State, args []Value) ([]Value, error) {
 	var err error
 	chunkName := "=stdin"
 	if len(args) == 0 || args[0].IsNil() {
-		data, err = io.ReadAll(os.Stdin)
+		data, err = s.ReadAllStdin()
 	} else {
 		fname := FormatValue(args[0])
 		chunkName = "@" + fname
 		data, err = os.ReadFile(fname)
 	}
 	if err != nil {
+		var le *LuaError
+		if errors.As(err, &le) {
+			return []Value{NilValue(), le.Val}, nil
+		}
 		return []Value{NilValue(), StringValue(s.intern.Intern(fmt.Sprintf("cannot open %s", err.Error())))}, nil
 	}
 	// Strip UTF-8 BOM and initial '#' comment line per Lua 5.5 lauxlib.c:luaL_loadfilex (files.lua:571,595).
@@ -882,7 +899,33 @@ func (s *State) ReadStdinLine() (string, error) {
 // `-e` / `LUA_INIT` stdin reads instead of bypassing them.
 func (s *State) ReadAllStdin() ([]byte, error) {
 	if lf, ok := asLuaFile(s.stdinInput); ok && !lf.closed && lf.f != nil {
-		return io.ReadAll(lf.reader())
+		if s.memLimit <= 0 {
+			return io.ReadAll(lf.reader())
+		}
+		r := lf.reader()
+		var buf bytes.Buffer
+		var readBytes int64
+		defer func() {
+			s.gc.tempBytes -= readBytes
+		}()
+		var tmp [4096]byte
+		for {
+			n, err := r.Read(tmp[:])
+			if n > 0 {
+				if merr := s.checkMem(int64(n)); merr != nil {
+					return nil, merr
+				}
+				buf.Write(tmp[:n])
+				readBytes += int64(n)
+				s.gc.tempBytes += int64(n)
+			}
+			if err == io.EOF {
+				return buf.Bytes(), nil
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	return nil, nil
 }
@@ -1360,7 +1403,8 @@ func nativeOSTime(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	tm := time.Date(year, time.Month(month), day, hour, min, sec, 0, time.Local)
+	isdstVal := t.RawGetStr(s.intern.Intern("isdst"))
+	tm := resolveLocalDateTime(year, month, day, hour, min, sec, !isdstVal.IsNil(), !isdstVal.IsFalsy())
 	// Normalize fields back into table per Lua 5.5 spec.
 	t.RawSetStr(s, s.intern.Intern("year"), IntValue(int64(tm.Year())))
 	t.RawSetStr(s, s.intern.Intern("month"), IntValue(int64(tm.Month())))
@@ -1372,6 +1416,84 @@ func nativeOSTime(s *State, args []Value) ([]Value, error) {
 	t.RawSetStr(s, s.intern.Intern("yday"), IntValue(int64(tm.YearDay())))
 	t.RawSetStr(s, s.intern.Intern("isdst"), BoolValue(tm.IsDST()))
 	return []Value{IntValue(tm.Unix())}, nil
+}
+
+// resolveLocalDateTime mirrors POSIX mktime's tm_isdst handling in pure Go:
+// when hasDST is false (isdst == nil), time.Date auto-detects; when hasDST is true,
+// the wall-clock fields are interpreted using the nearest local zone offset whose
+// DST status matches wantDST (disambiguating autumn folds and normalizing mismatches).
+func resolveLocalDateTime(year, month, day, hour, min, sec int, hasDST, wantDST bool) time.Time {
+	base := time.Date(year, time.Month(month), day, hour, min, sec, 0, time.Local)
+	if !hasDST {
+		return base
+	}
+	off, ok := findLocalOffsetForDST(base, wantDST)
+	if !ok {
+		return base
+	}
+	wallUTC := time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC)
+	return time.Unix(wallUTC.Unix()-int64(off), 0).In(time.Local)
+}
+
+func findLocalOffsetForDST(base time.Time, wantDST bool) (int, bool) {
+	if base.IsDST() == wantDST {
+		_, off := base.Zone()
+		return off, true
+	}
+	start, end := base.ZoneBounds()
+	var fwdOff, bwdOff int
+	var fwdDist, bwdDist time.Duration
+	fwdOK, bwdOK := false, false
+
+	cur := end
+	for range 2 {
+		if cur.IsZero() {
+			break
+		}
+		probe := cur.In(time.Local)
+		if probe.IsDST() == wantDST {
+			_, fwdOff = probe.Zone()
+			fwdDist = probe.Sub(base)
+			if fwdDist < 0 {
+				fwdDist = -fwdDist
+			}
+			fwdOK = true
+			break
+		}
+		_, cur = probe.ZoneBounds()
+	}
+
+	cur = start
+	for range 2 {
+		if cur.IsZero() {
+			break
+		}
+		probe := cur.Add(-time.Second).In(time.Local)
+		if probe.IsDST() == wantDST {
+			_, bwdOff = probe.Zone()
+			bwdDist = base.Sub(probe)
+			if bwdDist < 0 {
+				bwdDist = -bwdDist
+			}
+			bwdOK = true
+			break
+		}
+		cur, _ = probe.ZoneBounds()
+	}
+
+	if fwdOK && bwdOK {
+		if fwdDist <= bwdDist {
+			return fwdOff, true
+		}
+		return bwdOff, true
+	}
+	if fwdOK {
+		return fwdOff, true
+	}
+	if bwdOK {
+		return bwdOff, true
+	}
+	return 0, false
 }
 
 func nativeOSDiffTime(_ *State, args []Value) ([]Value, error) {

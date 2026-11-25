@@ -245,7 +245,7 @@ func (s *State) SetMemoryLimit(limit int64) {
 
 // MemoryUsage returns the current VM-accounted memory usage in bytes.
 func (s *State) MemoryUsage() int64 {
-	return s.gc.allocBytes
+	return s.gc.allocBytes + s.gc.tempBytes
 }
 
 // ConsumeMemErr returns and clears a pending deferred memory-limit error from table mutation.
@@ -265,11 +265,11 @@ func (s *State) checkMem(delta int64) error {
 	if delta < 0 || delta > hardSingleAllocLimit {
 		return &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
 	}
-	if s.memLimit > 0 && s.gc.allocBytes+delta > s.memLimit {
+	if s.memLimit > 0 && s.gc.allocBytes+s.gc.tempBytes+delta > s.memLimit {
 		if !s.gc.inGCTM {
 			s.collectEmergency()
 		}
-		if s.gc.allocBytes+delta > s.memLimit {
+		if s.gc.allocBytes+s.gc.tempBytes+delta > s.memLimit {
 			return &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
 		}
 	}

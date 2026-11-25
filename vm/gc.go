@@ -40,6 +40,7 @@ type gcState struct {
 	closing       bool // true once State.Close() has begun (new __gc objects registered during close are ignored)
 	mode          gcMode
 	allocBytes    int64 // logical VM-accounted bytes for collectgarbage("count")
+	tempBytes     int64 // transient Go-side buffer bytes (e.g. load(reader)) held across calls
 	lastLiveBytes int64 // live bytes measured at end of last full trace (proportional Tier 1 pacing)
 	debt          int64
 	params      [6]int // minormul, majorminor, minormajor, pause, stepmul, stepsize

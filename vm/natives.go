@@ -1390,12 +1390,44 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 			return nil, err
 		}
 	}
-	out := make([]Value, n)
 	rawFast := args[0].IsTable() && args[0].AsTable().meta == nil
-	var t *Table
 	if rawFast {
-		t = args[0].AsTable()
+		out := make([]Value, n)
+		t := args[0].AsTable()
+		cancelFn := s.nativeCancelFunc()
+		for k := 0; k < n; k++ {
+			if cancelFn != nil && (k&1023) == 0 {
+				if err := cancelFn(); err != nil {
+					return nil, err
+				}
+			}
+			out[k] = t.RawGetInt(i + int64(k))
+		}
+		return out, nil
 	}
+	// Root accumulated results on the active thread stack across __index calls so GC
+	// cannot prematurely finalize or clear values already unpacked in earlier iterations.
+	th := s.cur
+	savedTop := th.top
+	baseTop := savedTop
+	for fi := range th.nframe {
+		cf := &th.frames[fi]
+		if cf.cl != nil {
+			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+				baseTop = end
+			}
+		}
+	}
+	if err := th.ensureStack(baseTop + n + 4); err != nil {
+		return nil, err
+	}
+	written := 0
+	defer func() {
+		if written > 0 {
+			fillNil(th.stack[baseTop : baseTop+written])
+		}
+		th.top = savedTop
+	}()
 	cancelFn := s.nativeCancelFunc()
 	for k := 0; k < n; k++ {
 		if cancelFn != nil && (k&1023) == 0 {
@@ -1403,16 +1435,17 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 				return nil, err
 			}
 		}
-		if rawFast {
-			out[k] = t.RawGetInt(i + int64(k))
-		} else {
-			v, err := s.tableGetInt(args[0], i+int64(k))
-			if err != nil {
-				return nil, err
-			}
-			out[k] = v
+		th.top = baseTop + k
+		v, err := s.tableGetInt(args[0], i+int64(k))
+		if err != nil {
+			return nil, err
 		}
+		th.stack[baseTop+k] = v
+		written = k + 1
+		th.top = baseTop + written
 	}
+	out := make([]Value, n)
+	copy(out, th.stack[baseTop:baseTop+n])
 	return out, nil
 }
 
