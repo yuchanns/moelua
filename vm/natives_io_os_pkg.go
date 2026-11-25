@@ -2258,7 +2258,15 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 		sb.WriteString(chunk)
 		return nil
 	}
+	cancelFn := s.nativeCancelFunc()
+	var steps int64
 	for i := 0; i < len(fmtStr); i++ {
+		steps++
+		if cancelFn != nil && (steps&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
 		if fmtStr[i] != '%' {
 			if err := writeByte(fmtStr[i]); err != nil {
 				return nil, err

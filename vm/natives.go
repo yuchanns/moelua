@@ -1114,7 +1114,15 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 		if !ok || pos < 1 || pos > e {
 			return nil, fmt.Errorf("bad argument #2 to 'insert' (position out of bounds)")
 		}
+		cancelFn := s.nativeCancelFunc()
+		var steps int64
 		for i := e; i > pos; i-- {
+			steps++
+			if cancelFn != nil && (steps&1023) == 0 {
+				if err := cancelFn(); err != nil {
+					return nil, err
+				}
+			}
 			t.RawSetInt(s, i, t.RawGetInt(i-1))
 			if err := s.ConsumeMemErr(); err != nil {
 				return nil, err
@@ -1136,8 +1144,10 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #2 to 'insert' (position out of bounds)")
 	}
 	cancelFn := s.nativeCancelFunc()
+	var steps int64
 	for i := e; i > pos; i-- {
-		if cancelFn != nil && ((e-i)&1023) == 0 {
+		steps++
+		if cancelFn != nil && (steps&1023) == 0 {
 			if err := cancelFn(); err != nil {
 				return nil, err
 			}
@@ -1173,8 +1183,10 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #2 to 'remove' (position out of bounds)")
 		}
 		res := t.RawGetInt(pos)
+		var steps int64
 		for ; pos < size; pos++ {
-			if cancelFn != nil && (pos&1023) == 0 {
+			steps++
+			if cancelFn != nil && (steps&1023) == 0 {
 				if err := cancelFn(); err != nil {
 					return nil, err
 				}
@@ -1231,8 +1243,10 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 		th.stack[baseTop] = NilValue()
 		th.top = savedTop
 	}()
+	var steps int64
 	for ; pos < size; pos++ {
-		if cancelFn != nil && (pos&1023) == 0 {
+		steps++
+		if cancelFn != nil && (steps&1023) == 0 {
 			if err := cancelFn(); err != nil {
 				return nil, err
 			}
@@ -1429,8 +1443,14 @@ func nativeTablePack(s *State, args []Value) ([]Value, error) {
 			return nil, err
 		}
 	}
+	cancelFn := s.nativeCancelFunc()
 	t := s.NewTable(len(args), 1)
 	for i, a := range args {
+		if cancelFn != nil && ((i+1)&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
 		t.RawSetInt(s, int64(i+1), a)
 		if err := s.ConsumeMemErr(); err != nil {
 			return nil, err
@@ -1985,14 +2005,55 @@ func nativeStringByte(s *State, args []Value) ([]Value, error) {
 			return nil, err
 		}
 	}
-	out := make([]Value, count)
+	cancelFn := s.nativeCancelFunc()
+	if cancelFn == nil {
+		out := make([]Value, count)
+		for k := i; k <= j; k++ {
+			out[k-i] = IntValue(int64(str[k-1]))
+		}
+		return out, nil
+	}
+	out := make([]Value, 0, min(count, 1024))
+	var steps int64
 	for k := i; k <= j; k++ {
-		out[k-i] = IntValue(int64(str[k-1]))
+		steps++
+		if (steps & 1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, IntValue(int64(str[k-1])))
 	}
 	return out, nil
 }
 
 func nativeStringChar(s *State, args []Value) ([]Value, error) {
+	cancelFn := s.nativeCancelFunc()
+	if cancelFn != nil {
+		if s.memLimit > 0 {
+			if err := s.checkMem(int64(len(args)) + 48); err != nil {
+				return nil, err
+			}
+		}
+		buf := make([]byte, 0, min(len(args), 1024))
+		for i, a := range args {
+			if ((i + 1) & 1023) == 0 {
+				if err := cancelFn(); err != nil {
+					return nil, err
+				}
+			}
+			v, ok := a.CoerceInt()
+			if !ok || v < 0 || v > 255 {
+				return nil, fmt.Errorf("bad argument #%d to 'char' (value out of range)", i+1)
+			}
+			buf = append(buf, byte(v))
+		}
+		ls, err := s.TryIntern(string(buf))
+		if err != nil {
+			return nil, err
+		}
+		return []Value{StringValue(ls)}, nil
+	}
 	if err := s.checkMemAndAccount(int64(len(args)) + 48); err != nil {
 		return nil, err
 	}
@@ -2133,11 +2194,107 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 	const maxRepSize = 1 << 28 // 256 MiB guard against int overflow / OOM
 	l := int64(len(str))
 	ls := int64(len(sep))
+	if l == 0 && ls == 0 {
+		return []Value{StringValue(s.intern.Intern(""))}, nil
+	}
+	cancelFn := s.nativeCancelFunc()
 	if l+ls > 0 {
 		if n > maxRepSize || (l > 0 && n > maxRepSize/l) || (ls > 0 && n-1 > maxRepSize/ls) || n*l+(n-1)*ls > maxRepSize {
 			return nil, fmt.Errorf("resulting string too large")
 		}
 		totalBytes := n*l + (n-1)*ls
+		if cancelFn != nil {
+			if s.memLimit > 0 {
+				if err := s.checkMem(totalBytes + 48); err != nil {
+					return nil, err
+				}
+			}
+			const repPollBytes = 262144
+			if totalBytes <= repPollBytes {
+				if s.ctx != nil {
+					if err := s.ctx.Err(); err != nil {
+						s.abortErr = err
+						return nil, err
+					}
+				}
+				var out string
+				if sep == "" {
+					out = strings.Repeat(str, int(n))
+				} else {
+					var sb strings.Builder
+					sb.Grow(int(totalBytes))
+					for i := int64(0); i < n; i++ {
+						if i > 0 {
+							sb.WriteString(sep)
+						}
+						sb.WriteString(str)
+					}
+					out = sb.String()
+				}
+				interned, err := s.TryIntern(out)
+				if err != nil {
+					return nil, err
+				}
+				return []Value{StringValue(interned)}, nil
+			}
+			var sb strings.Builder
+			var work int64
+			writeChunk := func(chunk string) error {
+				if len(chunk) == 0 {
+					return nil
+				}
+				for off := 0; off < len(chunk); {
+					rem := repPollBytes - int(work&(repPollBytes-1))
+					end := min(off+rem, len(chunk))
+					sb.WriteString(chunk[off:end])
+					work += int64(end - off)
+					off = end
+					if (work & (repPollBytes - 1)) == 0 {
+						if err := cancelFn(); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			}
+			if sep == "" {
+				unit := str
+				unitCount := int64(1)
+				for int64(len(unit))*2 <= repPollBytes && unitCount*2 <= n {
+					unit += unit
+					unitCount *= 2
+				}
+				remCount := n
+				for remCount >= unitCount {
+					if err := writeChunk(unit); err != nil {
+						return nil, err
+					}
+					remCount -= unitCount
+				}
+				for remCount > 0 {
+					if err := writeChunk(str); err != nil {
+						return nil, err
+					}
+					remCount--
+				}
+			} else {
+				for i := int64(0); i < n; i++ {
+					if i > 0 {
+						if err := writeChunk(sep); err != nil {
+							return nil, err
+						}
+					}
+					if err := writeChunk(str); err != nil {
+						return nil, err
+					}
+				}
+			}
+			interned, err := s.TryIntern(sb.String())
+			if err != nil {
+				return nil, err
+			}
+			return []Value{StringValue(interned)}, nil
+		}
 		if err := s.checkMemAndAccount(totalBytes + 48); err != nil {
 			return nil, err
 		}
@@ -2161,6 +2318,27 @@ func nativeStringReverse(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'reverse' (string expected)")
 	}
 	str := FormatValue(args[0])
+	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
+		if s.memLimit > 0 {
+			if err := s.checkMem(int64(len(str)) + 48); err != nil {
+				return nil, err
+			}
+		}
+		b := make([]byte, 0, min(len(str), 65536))
+		for i := len(str) - 1; i >= 0; i-- {
+			b = append(b, str[i])
+			if (len(b) & 65535) == 0 {
+				if err := cancelFn(); err != nil {
+					return nil, err
+				}
+			}
+		}
+		ls, err := s.TryIntern(string(b))
+		if err != nil {
+			return nil, err
+		}
+		return []Value{StringValue(ls)}, nil
+	}
 	if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
 		return nil, err
 	}
@@ -2177,6 +2355,31 @@ func nativeStringLower(s *State, args []Value) ([]Value, error) {
 	}
 	// ASCII-only tolower matching C locale (Lua 5.5 default locale)
 	str := FormatValue(args[0])
+	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
+		if s.memLimit > 0 {
+			if err := s.checkMem(int64(len(str)) + 48); err != nil {
+				return nil, err
+			}
+		}
+		b := make([]byte, 0, min(len(str), 65536))
+		for i := 0; i < len(str); i++ {
+			c := str[i]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			b = append(b, c)
+			if ((i + 1) & 65535) == 0 {
+				if err := cancelFn(); err != nil {
+					return nil, err
+				}
+			}
+		}
+		ls, err := s.TryIntern(string(b))
+		if err != nil {
+			return nil, err
+		}
+		return []Value{StringValue(ls)}, nil
+	}
 	if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
 		return nil, err
 	}
@@ -2194,6 +2397,31 @@ func nativeStringUpper(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'upper' (string expected)")
 	}
 	str := FormatValue(args[0])
+	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
+		if s.memLimit > 0 {
+			if err := s.checkMem(int64(len(str)) + 48); err != nil {
+				return nil, err
+			}
+		}
+		b := make([]byte, 0, min(len(str), 65536))
+		for i := 0; i < len(str); i++ {
+			c := str[i]
+			if c >= 'a' && c <= 'z' {
+				c -= 'a' - 'A'
+			}
+			b = append(b, c)
+			if ((i + 1) & 65535) == 0 {
+				if err := cancelFn(); err != nil {
+					return nil, err
+				}
+			}
+		}
+		ls, err := s.TryIntern(string(b))
+		if err != nil {
+			return nil, err
+		}
+		return []Value{StringValue(ls)}, nil
+	}
 	if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
 		return nil, err
 	}
