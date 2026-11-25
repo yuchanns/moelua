@@ -4863,3 +4863,307 @@ func TestCodexReviewRound21VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound22VMRegressions(t *testing.T) {
+	// 1. string.packsize / pack / unpack / format honor instruction limits and context timeouts
+	// even on formats with no-output options (spaces, endianness, %%, literals).
+	t.Run("packsize_pack_unpack_format_honor_execution_controls", func(t *testing.T) {
+		bigSpaces := strings.Repeat(" ", 1024*1024)
+		bigPct := strings.Repeat("%%", 512*1024)
+		bigLit := strings.Repeat("x", 1024*1024)
+		cases := []struct {
+			name string
+			fn   func(s *State) (Value, []Value)
+		}{
+			{
+				name: "string.packsize_spaces",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("packsize")),
+						[]Value{StringValue(s.Intern(bigSpaces))}
+				},
+			},
+			{
+				name: "string.pack_spaces",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("pack")),
+						[]Value{StringValue(s.Intern(bigSpaces))}
+				},
+			},
+			{
+				name: "string.unpack_spaces",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("unpack")),
+						[]Value{StringValue(s.Intern(bigSpaces)), StringValue(s.Intern(""))}
+				},
+			},
+			{
+				name: "string.format_percent",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("format")),
+						[]Value{StringValue(s.Intern(bigPct))}
+				},
+			},
+			{
+				name: "string.format_literal",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("format")),
+						[]Value{StringValue(s.Intern(bigLit))}
+				},
+			},
+		}
+		for _, tc := range cases {
+			s := NewState()
+			defer s.Close()
+			fn, args := tc.fn(s)
+			s.SetInstructionLimit(100)
+			_, err := s.Call(fn, args...)
+			if !errors.Is(err, ErrInstructionLimit) {
+				t.Fatalf("%s expected ErrInstructionLimit, got %v", tc.name, err)
+			}
+			if s.InstructionsExecuted() <= 100 {
+				t.Fatalf("%s expected InstructionsExecuted > 100, got %d", tc.name, s.InstructionsExecuted())
+			}
+
+			s.SetInstructionLimit(0)
+			s.ResetInstructionCount()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+			defer cancel()
+			time.Sleep(time.Millisecond)
+			s.SetContext(ctx)
+			_, err = s.Call(fn, args...)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%s expected context.DeadlineExceeded, got %v", tc.name, err)
+			}
+		}
+	})
+
+	// 2 & 3. coroutine.close() inside load readers, Lua debug hooks (including inside pcall),
+	// __gc finalizers, and coroutine.create(coroutine.close) terminates the coroutine cleanly.
+	t.Run("self_close_through_load_reader_debug_hook_gc_and_native_coro", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			-- (a) load() reader calling coroutine.close() on first chunk
+			local log1 = {}
+			local co1 = coroutine.create(function()
+				local g <close> = setmetatable({}, { __close = function() log1[#log1 + 1] = "closed" end })
+				local f, err = load(function() coroutine.close() end)
+				log1[#log1 + 1] = "continued:" .. tostring(f) .. ":" .. tostring(err)
+				return "bad"
+			end)
+			local ok1, r1 = coroutine.resume(co1)
+			assert(ok1 == true and r1 == nil, "co1 resume got " .. tostring(ok1) .. "," .. tostring(r1))
+			assert(coroutine.status(co1) == "dead")
+			assert(table.concat(log1, ",") == "closed", "co1 log=" .. table.concat(log1, ","))
+
+			-- (b) load() reader calling coroutine.close() on second chunk
+			local co1b = coroutine.create(function()
+				local n = 0
+				local f, err = load(function()
+					n = n + 1
+					if n == 1 then return "return " end
+					coroutine.close()
+				end)
+				return "bad", f, err
+			end)
+			local ok1b, r1b = coroutine.resume(co1b)
+			assert(ok1b == true and r1b == nil, "co1b resume got " .. tostring(ok1b) .. "," .. tostring(r1b))
+			assert(coroutine.status(co1b) == "dead")
+
+			-- (c) Lua debug line hook inside pcall calling coroutine.close()
+			local log2 = {}
+			local co2 = coroutine.create(function()
+				local outer <close> = setmetatable({}, { __close = function() log2[#log2 + 1] = "outer" end })
+				local ok, err = pcall(function()
+					local inner <close> = setmetatable({}, { __close = function() log2[#log2 + 1] = "inner" end })
+					debug.sethook(function()
+						debug.sethook()
+						coroutine.close()
+					end, "l")
+					local x = 1
+					return x
+				end)
+				log2[#log2 + 1] = "after:" .. tostring(ok) .. ":" .. tostring(err)
+				return "bad"
+			end)
+			local ok2, r2 = coroutine.resume(co2)
+			assert(ok2 == true and r2 == nil, "co2 resume got " .. tostring(ok2) .. "," .. tostring(r2))
+			assert(coroutine.status(co2) == "dead")
+			assert(table.concat(log2, ",") == "inner,outer", "co2 log=" .. table.concat(log2, ","))
+
+			-- (d) coroutine.create(coroutine.close)
+			local co3 = coroutine.create(coroutine.close)
+			local ok3, r3 = coroutine.resume(co3)
+			assert(ok3 == true and r3 == nil, "co3 resume got " .. tostring(ok3) .. "," .. tostring(r3))
+			assert(coroutine.status(co3) == "dead")
+
+			-- (e) __gc finalizer calling coroutine.close()
+			local co4 = coroutine.create(function()
+				local x = setmetatable({}, { __gc = function() coroutine.close() end })
+				x = nil
+				collectgarbage("collect")
+				return "bad"
+			end)
+			local ok4, r4 = coroutine.resume(co4)
+			assert(ok4 == true and r4 == nil, "co4 resume got " .. tostring(ok4) .. "," .. tostring(r4))
+			assert(coroutine.status(co4) == "dead")
+
+			return "ok"
+		`), "=self_close_paths")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("self-close paths failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. Failed SetMetatable shape allocation leaves t.meta and t.shape unchanged and caches consistent.
+	t.Run("setmetatable_shape_allocation_failure_keeps_cache_consistent", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+
+		clSetup, err := s.LoadChunk([]byte(`
+			t = { a = 1 }
+			mt = { __index = { x = 42 } }
+			function getWarmed(tbl)
+				return tbl.x
+			end
+			-- Warm inline cache for absent field t.x on plain table shape.
+			assert(getWarmed(t) == nil)
+			assert(getWarmed(t) == nil)
+		`), "=setup_mt_oom")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(clSetup); err != nil {
+			t.Fatal(err)
+		}
+
+		clFail, err := s.LoadChunk([]byte(`return pcall(setmetatable, t, mt)`), "=fail_mt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Pin memory limit tightly below current usage + shape allocation cost.
+		s.CollectFull()
+		s.SetMemoryLimit(s.MemoryUsage() + 1)
+
+		res, err := s.Call(clFail)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Restore ample budget before assertions and fresh chunk compilation.
+		s.SetMemoryLimit(0)
+
+		if OptimizeEnabled {
+			if len(res) < 2 || res[0].IsTrue() || !strings.Contains(FormatValue(res[1]), "not enough memory") {
+				t.Fatalf("expected setmetatable OOM in optimized mode, got %v", res)
+			}
+			clCheckConsistent, err := s.LoadChunk([]byte(`
+				assert(getmetatable(t) == nil, "failed setmetatable must not mutate t.meta")
+				local freshGetter = load("return function(tbl) return tbl.x end")()
+				assert(getWarmed(t) == nil, "warmed getter expected nil after failed setmetatable")
+				assert(freshGetter(t) == nil, "fresh getter expected nil after failed setmetatable")
+				-- Now apply metatable with ample budget and verify both caches agree.
+				assert(setmetatable(t, mt) == t)
+				assert(getWarmed(t) == 42, "warmed getter expected 42 after succeeding setmetatable")
+				assert(freshGetter(t) == 42, "fresh getter expected 42 after succeeding setmetatable")
+				return "ok"
+			`), "=check_mt_consistent")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r, err := s.Call(clCheckConsistent); err != nil || len(r) != 1 || r[0].AsString().S != "ok" {
+				t.Fatalf("cache consistency check failed: res=%v err=%v", r, err)
+			}
+		}
+
+		// Also verify debug.setmetatable checks ConsumeMemErr on shape OOM.
+		clSetup2, err := s.LoadChunk([]byte(`t2 = { b = 2 }; mt2 = { __index = { y = 99 } }`), "=setup_dbg_mt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(clSetup2); err != nil {
+			t.Fatal(err)
+		}
+		clDbgFail, err := s.LoadChunk([]byte(`return pcall(debug.setmetatable, t2, mt2)`), "=fail_dbg_mt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.CollectFull()
+		s.SetMemoryLimit(s.MemoryUsage() + 1)
+		res2, err := s.Call(clDbgFail)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(0)
+		if OptimizeEnabled {
+			if len(res2) < 2 || res2[0].IsTrue() || !strings.Contains(FormatValue(res2[1]), "not enough memory") {
+				t.Fatalf("expected debug.setmetatable OOM in optimized mode, got %v", res2)
+			}
+		}
+	})
+
+	// 5. Draining finalizers clears dequeued entries from toBeFnz backing storage so Go GC
+	// can reclaim finalized object graphs promptly.
+	t.Run("drain_finalizers_clears_backing_array_for_reclamation", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(131072)
+
+		mt := s.NewTable(0, 1)
+		mt.RawSetStr(s, s.Intern("__gc"), NativeValue(&NativeFunc{
+			Name: "noop_gc",
+			Fn:   func(_ *State, _ []Value) ([]Value, error) { return nil, nil },
+		}))
+		s.SetGlobal("mt", TableValue(mt))
+
+		// First finalize 100 empty tables to establish a large toBeFnz backing array.
+		for range 100 {
+			tbl := s.NewTable(0, 0)
+			s.SetMetatable(tbl, mt)
+			_ = s.ConsumeMemErr()
+		}
+		s.CollectFull()
+
+		// Separately finalize 8 tables containing fresh 32 KiB strings and keep only weak pointers.
+		var weakTables []weak.Pointer[Table]
+		for i := range 8 {
+			tbl := s.NewTable(0, 1)
+			payload := strings.Repeat(string(byte('A'+i)), 32768)
+			ls, err := s.TryIntern(payload)
+			if err != nil {
+				t.Fatalf("TryIntern #%d failed: %v", i, err)
+			}
+			tbl.RawSetStr(s, s.Intern("data"), StringValue(ls))
+			if err := s.ConsumeMemErr(); err != nil {
+				t.Fatalf("RawSetStr #%d failed: %v", i, err)
+			}
+			s.SetMetatable(tbl, mt)
+			if err := s.ConsumeMemErr(); err != nil {
+				t.Fatalf("SetMetatable #%d failed: %v", i, err)
+			}
+			weakTables = append(weakTables, weak.Make(tbl))
+			tbl = nil
+			s.CollectFull()
+			s.CollectFull()
+		}
+
+		if len(s.gc.toBeFnz) != 0 || cap(s.gc.toBeFnz) != 0 {
+			t.Fatalf("expected toBeFnz to be cleared after drain, got len=%d cap=%d", len(s.gc.toBeFnz), cap(s.gc.toBeFnz))
+		}
+		// Trigger Go GC so cleared finalized tables are reclaimed.
+		for range 3 {
+			runtime.GC()
+		}
+		alive := 0
+		for _, wp := range weakTables {
+			if wp.Value() != nil {
+				alive++
+			}
+		}
+		if alive != 0 {
+			t.Fatalf("expected all 8 finalized tables to be reclaimed by Go GC, %d still pinned", alive)
+		}
+	})
+}
