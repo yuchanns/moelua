@@ -400,6 +400,35 @@ func (s *State) completeFinishOp(th *Thread, cf *callFrame, entryDepth int) (boo
 			th.top = end
 		}
 		return true, nil
+	case finishTailReturn:
+		nres := max(0, th.top-retSlot)
+		if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
+			cf.dirty = true
+			cf.ftransfer = uint16(retSlot - cf.base + 1)
+			cf.ntransfer = uint16(nres)
+			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+				return false, herr
+			}
+			cf = &th.frames[th.nframe-1]
+		}
+		var out []Value
+		if nres > 0 {
+			out = make([]Value, nres)
+			copy(out, th.stack[retSlot:retSlot+nres])
+		}
+		funcIdx := cf.funcIdx
+		want := cf.nresults
+		if err := th.placeResults(funcIdx, out, want); err != nil {
+			return false, err
+		}
+		th.nframe--
+		if s.gc.tier1 {
+			s.gcCheckDebt(th.top)
+			if s.abortErr != nil {
+				return false, s.abortErr
+			}
+		}
+		return false, nil
 	}
 	return true, nil
 }
@@ -507,7 +536,7 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 	}
 	th.stack[slot] = tm
 	copy(th.stack[slot+1:slot+1+len(args)], args)
-	res, hooked, err := s.callNativeHooked(th, tm, slot, len(args), extraDepth, maxFrames+128)
+	res, _, err := s.callNativeHooked(th, tm, slot, len(args), extraDepth, maxFrames+128)
 	cf = &th.frames[ev.ci]
 	if errors.Is(err, errYieldSentinel) {
 		cf.dirty = true
@@ -517,7 +546,8 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 		cf.finishFlag = flag
 		th.yieldDst = slot
 		th.yieldNRes = 1
-		th.yieldedNative = hooked
+		th.yieldedNative = true
+		th.yieldNativeFn = tm
 		return false, errYieldSentinel
 	}
 	th.top = slot
@@ -1202,6 +1232,8 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				if err == errYieldSentinel || errors.Is(err, errYieldSentinel) {
 					th.yieldDst = funcIdx
 					th.yieldNRes = nresults
+					th.yieldedNative = true
+					th.yieldNativeFn = fn
 					return false, errYieldSentinel
 				}
 				if !errors.Is(err, errCoroCloseSelf) {
@@ -1312,7 +1344,8 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			if err == errYieldSentinel || errors.Is(err, errYieldSentinel) {
 				th.yieldDst = funcIdx
 				th.yieldNRes = nresults
-				th.yieldedNative = hookedNative
+				th.yieldedNative = true
+				th.yieldNativeFn = fn
 				return false, errYieldSentinel
 			}
 			if !errors.Is(err, errCoroCloseSelf) {
@@ -1377,12 +1410,13 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			return true, nil
 		}
 		if fn.IsNative() {
-			res, hooked, err := s.callNativeHooked(th, fn, funcIdx, nargs, uint8(depth), maxFrames+128)
+			res, _, err := s.callNativeHooked(th, fn, funcIdx, nargs, uint8(depth), maxFrames+128)
 			if err != nil {
 				if errors.Is(err, errYieldSentinel) {
 					th.yieldDst = funcIdx
 					th.yieldNRes = nresults
-					th.yieldedNative = hooked
+					th.yieldedNative = true
+					th.yieldNativeFn = fn
 					return false, errYieldSentinel
 				}
 				if !errors.Is(err, errCoroCloseSelf) {
@@ -1683,11 +1717,12 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 			return true, nil
 		}
 		// General native inside pcall/xpcall (e.g. xpcall(coroutine.yield, msgh) in coroutine.lua:568!):
-		res, hookedNative, err := s.callNativeHooked(th, targetVal, calleeIdx, calleeArgs, extraDepth, frameLimit)
+		res, _, err := s.callNativeHooked(th, targetVal, calleeIdx, calleeArgs, extraDepth, frameLimit)
 		if errors.Is(err, errYieldSentinel) {
 			th.yieldDst = calleeIdx
 			th.yieldNRes = -1
-			th.yieldedNative = hookedNative
+			th.yieldedNative = true
+			th.yieldNativeFn = targetVal
 			return false, errYieldSentinel
 		}
 		if err != nil {
@@ -1755,12 +1790,13 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 	th.stack[fnIdx+1] = th.stack[base+int(a)+1] // state
 	th.stack[fnIdx] = fn                        // iterator fn
 	if fn.IsNative() {
-		res, hooked, err := s.callNativeHooked(th, fn, fnIdx, 2, 0, maxFrames+128)
+		res, _, err := s.callNativeHooked(th, fn, fnIdx, 2, 0, maxFrames+128)
 		if err != nil {
 			if errors.Is(err, errYieldSentinel) {
 				th.yieldDst = fnIdx
 				th.yieldNRes = c
-				th.yieldedNative = hooked
+				th.yieldedNative = true
+				th.yieldNativeFn = fn
 				return false, errYieldSentinel
 			}
 			if !errors.Is(err, errCoroCloseSelf) {
@@ -1880,7 +1916,7 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 		th.stack[slot] = tm
 		copy(th.stack[slot+1:slot+1+len(cargs)], cargs)
 		cfIdx := th.nframe - 1
-		_, hooked, err := s.callNativeHooked(th, tm, slot, len(cargs), extraDepth, maxFrames+128)
+		_, _, err := s.callNativeHooked(th, tm, slot, len(cargs), extraDepth, maxFrames+128)
 		cf = &th.frames[cfIdx]
 		if errors.Is(err, errYieldSentinel) {
 			cf.dirty = true
@@ -1888,7 +1924,8 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 			cf.finish = finishClose
 			th.yieldDst = slot
 			th.yieldNRes = 0
-			th.yieldedNative = hooked
+			th.yieldedNative = true
+			th.yieldNativeFn = tm
 			return false, errYieldSentinel
 		}
 		th.top = slot
@@ -2937,9 +2974,24 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			}
 		}
 		if errors.Is(err, errYieldSentinel) {
-			th.nframe--
-			th.yieldDst = funcIdx
-			th.yieldNRes = nres
+			// Keep the caller Lua frame alive across the yielding C tail call (matching Lua 5.5
+			// lvm.c OP_TAILCALL + luaD_pretailcall) so debug.getinfo sees the caller while
+			// suspended and resume fires both the native return hook and the caller's return hook.
+			callerCF := &th.frames[ev.ci]
+			callerCF.pc = pc
+			callerCF.dirty = true
+			th.yieldDst = srcStart
+			th.yieldNRes = -1
+			th.yieldedNative = true
+			th.yieldNativeFn = fn
+			nextIsMatchingRet := pc < len(ev.bp.proto.Code) &&
+				ev.bp.proto.Code[pc].Op() == bytecode.OP_RETURN &&
+				ev.bp.proto.Code[pc].A() == int(a) &&
+				ev.bp.proto.Code[pc].B() == 0
+			if !nextIsMatchingRet {
+				callerCF.finish = finishTailReturn
+				callerCF.oldTop = srcStart
+			}
 			return coldContinue, pc, errYieldSentinel
 		}
 		if err != nil {
@@ -3527,7 +3579,7 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 		th.stack[slot] = tm
 		copy(th.stack[slot+1:slot+1+len(cargs)], cargs)
 		cfIdx := th.nframe - 1
-		res, hooked, err := s.callNativeHooked(th, tm, slot, len(cargs), extraDepth, maxFrames+128)
+		res, _, err := s.callNativeHooked(th, tm, slot, len(cargs), extraDepth, maxFrames+128)
 		cf = &th.frames[cfIdx]
 		if errors.Is(err, errYieldSentinel) {
 			cf.dirty = true
@@ -3537,7 +3589,8 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			cf.concatIdx = cur - 1
 			th.yieldDst = slot
 			th.yieldNRes = 1
-			th.yieldedNative = hooked
+			th.yieldedNative = true
+			th.yieldNativeFn = tm
 			return false, errYieldSentinel
 		}
 		th.top = slot

@@ -28,11 +28,13 @@ import (
 
 type gcFinalEntry struct {
 	obj Value // *Table or *Userdata
+	seq uint64
 }
 
 type gcWeakFileEntry struct {
-	u  weak.Pointer[Userdata]
-	fi *fileInner
+	u   weak.Pointer[Userdata]
+	fi  *fileInner
+	seq uint64
 }
 
 type gcMode uint8
@@ -56,7 +58,9 @@ type gcState struct {
 	debt          int64
 	params        [6]byte // encoded via luaGCParamCode: minormul, majorminor, minormajor, pause, stepmul, stepsize
 
-	// Objects marked for finalization at setmetatable time (registration order; scanned in reverse LIFO).
+	// Shared monotonic sequence for strict LIFO finalizer order across tables, userdata, and files.
+	finalSeq uint64
+	// Objects marked for finalization at setmetatable time (ascending seq; merged in reverse LIFO).
 	finalizable []gcFinalEntry
 	// Weakly-tracked standard file userdata so Go GC + runtime.AddCleanup reclaims discarded
 	// handles automatically in Tier 0, while explicit collectgarbage()/Close() closes live ones.
@@ -144,6 +148,25 @@ func (s *State) gcAddDebt(bytes int64) {
 	s.gc.debt += bytes
 }
 
+func (s *State) gcDebtThreshold() int64 {
+	pause := luaGCParamApply(s.gc.params[gcParamPause], 100)
+	threshold := int64(65536)
+	if pause > 100 {
+		if prop := s.gc.lastLiveBytes * (pause - 100) / 100; prop > threshold {
+			threshold = prop
+		}
+	}
+	return threshold
+}
+
+// gcNeedsCheck reports whether gcCheckDebt would trigger a Tier-1 collection or drain finalizers.
+func (s *State) gcNeedsCheck() bool {
+	if !s.gc.tier1 || !s.gc.running || s.gc.inGCTM {
+		return false
+	}
+	return s.gc.debt >= s.gcDebtThreshold() || len(s.gc.toBeFnz) > 0
+}
+
 // gcCheckDebt triggers an automatic Tier 1 GC cycle (or drains pending finalizers)
 // when accumulated allocation debt reaches the pause threshold.
 // liveTop matches PUC-Rio lvm.c's checkGC(L, ra+1): only stack[0..liveTop) is live
@@ -152,14 +175,7 @@ func (s *State) gcCheckDebt(liveTop int) {
 	if !s.gc.tier1 || !s.gc.running || s.gc.inGCTM {
 		return
 	}
-	pause := luaGCParamApply(s.gc.params[gcParamPause], 100)
-	threshold := int64(65536)
-	if pause > 100 {
-		if prop := s.gc.lastLiveBytes * (pause - 100) / 100; prop > threshold {
-			threshold = prop
-		}
-	}
-	if s.gc.debt >= threshold {
+	if s.gc.debt >= s.gcDebtThreshold() {
 		s.gc.debt = 0
 		if s.cur != nil && liveTop > 0 {
 			savedTop := s.cur.top
@@ -217,7 +233,8 @@ func (s *State) registerFinalizable(obj Value, mt *Table) {
 		}
 		if t.flags&tblFlagGCInFnz == 0 {
 			t.flags |= tblFlagGCInFnz
-			s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: obj})
+			s.gc.finalSeq++
+			s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: obj, seq: s.gc.finalSeq})
 		}
 	case obj.IsUserdata():
 		u := obj.AsUserdata()
@@ -229,7 +246,8 @@ func (s *State) registerFinalizable(obj Value, mt *Table) {
 		}
 		if !u.gcInFnz {
 			u.gcInFnz = true
-			s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: obj})
+			s.gc.finalSeq++
+			s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: obj, seq: s.gc.finalSeq})
 		}
 	}
 }
@@ -676,6 +694,8 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 		tr.mark(ce)
 	}
 	tr.mark(th.errObj)
+	tr.mark(th.lastErrNative)
+	tr.mark(th.yieldNativeFn)
 	tr.mark(th.hook)
 	if th.caller != nil {
 		tr.mark(ThreadValue(th.caller))
@@ -1237,13 +1257,41 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	tr.clearByValues(tr.weakVals)
 	tr.clearByValues(tr.allWeaks)
 
-	// Step 3: separateToBeFnz in STRICT REVERSE (LIFO) registration order!
-	// Use a separate slice for kept entries so reverse traversal never overwrites
-	// earlier unvisited entries in s.gc.finalizable.
+	// Step 3: separateToBeFnz in STRICT REVERSE (LIFO) registration order across tables,
+	// userdata, and file handles using the shared monotonic registration sequence!
 	var kept []gcFinalEntry
+	var keptFiles []gcWeakFileEntry
 	var newlySep []Value
-	for i := len(s.gc.finalizable) - 1; i >= 0; i-- {
-		obj := s.gc.finalizable[i].obj
+	fi := len(s.gc.finalizable) - 1
+	wi := len(s.gc.weakFiles) - 1
+	for fi >= 0 || wi >= 0 {
+		if wi >= 0 && (fi < 0 || s.gc.weakFiles[wi].seq > s.gc.finalizable[fi].seq) {
+			wf := s.gc.weakFiles[wi]
+			wi--
+			u := wf.u.Value()
+			if u == nil {
+				// Go GC already collected the userdata; ensure flush+close completes synchronously now.
+				if wf.fi != nil {
+					_ = wf.fi.flushAndClose()
+				}
+				continue
+			}
+			if u.gcInFnz || u.gcFnzed {
+				continue
+			}
+			obj := UserdataValue(u)
+			if !tr.isMarked(obj) {
+				u.gcFnzed = true
+				u.gcPending = true
+				newlySep = append(newlySep, obj)
+			} else {
+				keptFiles = append(keptFiles, wf)
+			}
+			continue
+		}
+		entry := s.gc.finalizable[fi]
+		fi--
+		obj := entry.obj
 		if !tr.isMarked(obj) {
 			// Mark as finalized + pending so it won't fire twice or re-register before running.
 			switch {
@@ -1258,40 +1306,17 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 			}
 			newlySep = append(newlySep, obj)
 		} else {
-			kept = append(kept, s.gc.finalizable[i])
+			kept = append(kept, entry)
 		}
 	}
-	// Restore original registration order in kept (since we iterated backwards).
+	// Restore ascending registration order in kept and keptFiles (since we merged backwards).
 	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
 		kept[i], kept[j] = kept[j], kept[i]
-	}
-	s.gc.finalizable = kept
-	var keptFiles []gcWeakFileEntry
-	for i := len(s.gc.weakFiles) - 1; i >= 0; i-- {
-		wf := s.gc.weakFiles[i]
-		u := wf.u.Value()
-		if u == nil {
-			// Go GC already collected the userdata; ensure flush+close completes synchronously now.
-			if wf.fi != nil {
-				_ = wf.fi.flushAndClose()
-			}
-			continue
-		}
-		if u.gcInFnz || u.gcFnzed {
-			continue
-		}
-		obj := UserdataValue(u)
-		if !tr.isMarked(obj) {
-			u.gcFnzed = true
-			u.gcPending = true
-			newlySep = append(newlySep, obj)
-		} else {
-			keptFiles = append(keptFiles, wf)
-		}
 	}
 	for i, j := 0, len(keptFiles)-1; i < j; i, j = i+1, j-1 {
 		keptFiles[i], keptFiles[j] = keptFiles[j], keptFiles[i]
 	}
+	s.gc.finalizable = kept
 	s.gc.weakFiles = keptFiles
 	s.gc.toBeFnz = append(s.gc.toBeFnz, newlySep...)
 
@@ -1436,9 +1461,30 @@ func (s *State) Close() {
 			s.mainThread.nny--
 		}
 		s.gc.closing = true
-		// Reverse all remaining finalizable objects into toBeFnz (LIFO).
-		for i := len(s.gc.finalizable) - 1; i >= 0; i-- {
-			obj := s.gc.finalizable[i].obj
+		// Merge all remaining finalizable objects and file handles into toBeFnz in strict LIFO order.
+		fi := len(s.gc.finalizable) - 1
+		wi := len(s.gc.weakFiles) - 1
+		for fi >= 0 || wi >= 0 {
+			if wi >= 0 && (fi < 0 || s.gc.weakFiles[wi].seq > s.gc.finalizable[fi].seq) {
+				wf := s.gc.weakFiles[wi]
+				wi--
+				u := wf.u.Value()
+				if u == nil {
+					if wf.fi != nil {
+						_ = wf.fi.flushAndClose()
+					}
+					continue
+				}
+				if u.gcInFnz || u.gcFnzed {
+					continue
+				}
+				u.gcFnzed = true
+				u.gcPending = true
+				s.gc.toBeFnz = append(s.gc.toBeFnz, UserdataValue(u))
+				continue
+			}
+			obj := s.gc.finalizable[fi].obj
+			fi--
 			switch {
 			case obj.IsTable():
 				t := obj.AsTable()
@@ -1452,22 +1498,6 @@ func (s *State) Close() {
 			s.gc.toBeFnz = append(s.gc.toBeFnz, obj)
 		}
 		s.gc.finalizable = nil
-		for i := len(s.gc.weakFiles) - 1; i >= 0; i-- {
-			wf := s.gc.weakFiles[i]
-			u := wf.u.Value()
-			if u == nil {
-				if wf.fi != nil {
-					_ = wf.fi.flushAndClose()
-				}
-				continue
-			}
-			if u.gcInFnz || u.gcFnzed {
-				continue
-			}
-			u.gcFnzed = true
-			u.gcPending = true
-			s.gc.toBeFnz = append(s.gc.toBeFnz, UserdataValue(u))
-		}
 		s.gc.weakFiles = nil
 	}
 	if s.gc.inGCTM {

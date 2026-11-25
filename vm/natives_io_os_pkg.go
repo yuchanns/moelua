@@ -909,7 +909,8 @@ func (s *State) newFileUD(lf *luaFile) Value {
 		s.openFiles = append(s.openFiles, fi)
 		// Track weakly so Go GC + runtime.AddCleanup automatically reclaims discarded
 		// descriptors in Tier 0, while explicit collectgarbage()/Close() still runs __gc.
-		s.gc.weakFiles = append(s.gc.weakFiles, gcWeakFileEntry{u: weak.Make(u), fi: fi})
+		s.gc.finalSeq++
+		s.gc.weakFiles = append(s.gc.weakFiles, gcWeakFileEntry{u: weak.Make(u), fi: fi, seq: s.gc.finalSeq})
 		if len(s.gc.weakFiles)&63 == 0 {
 			s.compactWeakFiles()
 			s.compactOpenFiles()

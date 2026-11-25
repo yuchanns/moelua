@@ -55,10 +55,13 @@ func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error
 	if pc == 0 && len(p.Code) > 0 && p.Code[0].Op() == bytecode.OP_VARARGPREP {
 		return nil
 	}
-	cf := &th.frames[ev.ci]
-	cf.dirty = true
-	cf.atCurrentPC = true
-	defer func() { cf.atCurrentPC = false }()
+	th.frames[ev.ci].dirty = true
+	th.frames[ev.ci].atCurrentPC = true
+	defer func() {
+		if ev.ci < len(th.frames) {
+			th.frames[ev.ci].atCurrentPC = false
+		}
+	}()
 	if th.hookMask&HookMaskCount != 0 {
 		th.hookCount--
 		if th.hookCount <= 0 {
@@ -69,6 +72,7 @@ func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error
 		}
 	}
 	if th.hookMask&HookMaskLine != 0 && ev.bp != nil {
+		cf := &th.frames[ev.ci]
 		line := getFuncLine(p, pc)
 		oldPC := cf.oldPC
 		fire := false

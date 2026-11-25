@@ -673,25 +673,54 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		th.stack[base] = fn
 		copy(th.stack[base+1:base+1+len(args)], args)
 		th.top = base + 1 + len(args)
+		cleanupEnd := base + 1 + len(args)
 		defer func() {
-			if end := min(base+1+len(args), len(th.stack)); base < end {
+			if end := min(cleanupEnd, len(th.stack)); base < end {
 				fillNil(th.stack[base:end])
 			}
 			th.top = savedTop
 		}()
+		var (
+			res []Value
+			err error
+		)
 		if th.hookMask == 0 || th.inHook || th.suppressHook {
-			res, err := fn.AsNative().callMulti(s, th.stack[base+1:base+1+len(args)])
-			if err == nil && s.gc.tier1 {
-				s.gcCheckDebt(th.top)
-				if s.abortErr != nil {
-					return nil, s.abortErr
-				}
-			}
-			return res, err
+			res, err = fn.AsNative().callMulti(s, th.stack[base+1:base+1+len(args)])
+		} else {
+			res, _, err = s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
 		}
-		res, _, err := s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
-		if err == nil && s.gc.tier1 {
-			s.gcCheckDebt(th.top)
+		if err == nil && s.gcNeedsCheck() {
+			// Root all native return values before running Tier-1 GC / finalizers so
+			// newly created values in res cannot be collected before State.Call returns.
+			if len(res) > 0 {
+				if serr := th.ensureStack(base + len(res) + 4); serr == nil {
+					copy(th.stack[base:base+len(res)], res)
+					if end := base + len(res); end > cleanupEnd {
+						cleanupEnd = end
+					}
+					if base+len(res) < cleanupEnd {
+						fillNil(th.stack[base+len(res) : cleanupEnd])
+					}
+					th.top = base + len(res)
+					s.gcCheckDebt(th.top)
+				} else {
+					// Stack growth hit memLimit: pin res transiently via Ref handles.
+					fillNil(th.stack[base:cleanupEnd])
+					th.top = base
+					refs := make([]int, len(res))
+					for i, v := range res {
+						refs[i] = s.Ref(v)
+					}
+					s.gcCheckDebt(th.top)
+					for _, id := range refs {
+						s.Unref(id)
+					}
+				}
+			} else {
+				fillNil(th.stack[base:cleanupEnd])
+				th.top = base
+				s.gcCheckDebt(th.top)
+			}
 			if s.abortErr != nil {
 				return nil, s.abortErr
 			}

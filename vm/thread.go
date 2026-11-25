@@ -48,6 +48,7 @@ const (
 	finishTForCall            // resume OP_TFORCALL -> OP_TFORLOOP
 	finishClose               // resume closing remaining TBC vars after __close returns
 	finishPairs               // normalize __pairs return arity to exactly 4 values
+	finishTailReturn          // finish OP_TAILCALL native yield when next insn is not matching OP_RETURN
 )
 
 // callFrame is one frame on a Thread's flat stackful call stack.
@@ -117,7 +118,8 @@ type Thread struct {
 	yieldVals     []Value
 	yieldDst      int
 	yieldNRes     int
-	yieldedNative bool // true if suspended inside a native call (for HookMaskRet on resume)
+	yieldedNative bool  // true if suspended inside a native call (for HookMaskRet on resume)
+	yieldNativeFn Value // yielded native callee (for HookMaskRet frameNative on resume)
 
 	// Debug hooks (zero overhead in fast run() when hookMask == 0!).
 	hook          Value

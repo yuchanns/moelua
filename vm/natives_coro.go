@@ -103,6 +103,8 @@ func (s *State) CloseThread(co *Thread) error {
 		co.top = 0
 		co.stack[0] = NilValue()
 		co.errObj = NilValue()
+		co.yieldedNative = false
+		co.yieldNativeFn = NilValue()
 		if uerr := s.abortErr; uerr != nil {
 			if s.nCcalls == 0 {
 				s.abortErr = nil
@@ -278,12 +280,13 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			}
 			co.stack[0] = fn
 			copy(co.stack[1:1+len(args)], args)
-			res, hooked, err := s.callNativeHooked(co, fn, 0, len(args), 0, maxFrames+128)
+			res, _, err := s.callNativeHooked(co, fn, 0, len(args), 0, maxFrames+128)
 			if errors.Is(err, errYieldSentinel) {
 				co.status = ThreadSuspended
 				co.yieldDst = 0
 				co.yieldNRes = -1 // MULTRET: resume args become coroutine return values
-				co.yieldedNative = hooked
+				co.yieldedNative = true
+				co.yieldNativeFn = fn
 				out := co.yieldVals
 				co.yieldVals = nil
 				return true, out, nil
@@ -352,6 +355,76 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 	} else if co.status == ThreadSuspended {
 		// Resuming a yielded coroutine: deliver resume args as the results of coroutine.yield(...)!
 		co.status = ThreadOK
+		yieldedNative := co.yieldedNative
+		yieldNativeFn := co.yieldNativeFn
+		co.yieldedNative = false
+		co.yieldNativeFn = NilValue()
+		if yieldedNative && co.hookMask&HookMaskRet != 0 && !co.inHook && !co.suppressHook {
+			dst := co.yieldDst
+			var herr error
+			if ferr := co.ensureFrameCap(co.nframe+1, maxFrames+128); ferr != nil {
+				herr = ferr
+			} else if serr := co.ensureStack(dst + 1 + len(args) + 4); serr != nil {
+				herr = serr
+			} else {
+				if !yieldNativeFn.IsNil() {
+					co.stack[dst] = yieldNativeFn
+				}
+				if len(args) > 0 {
+					copy(co.stack[dst+1:dst+1+len(args)], args)
+				}
+				if end := dst + 1 + len(args); co.top < end {
+					co.top = end
+				}
+				co.frames[co.nframe] = callFrame{
+					kind:      frameNative,
+					base:      dst + 1,
+					funcIdx:   dst,
+					nativeFn:  yieldNativeFn,
+					ftransfer: 1,
+					ntransfer: uint16(len(args)),
+					dirty:     true,
+				}
+				co.nframe++
+				herr = s.fireHook(co, "return", NilValue())
+				if herr == nil && len(args) > 0 {
+					updated := make([]Value, len(args))
+					copy(updated, co.stack[dst+1:dst+1+len(args)])
+					args = updated
+				}
+				co.nframe--
+				if len(args) > 0 {
+					fillNil(co.stack[dst+1 : dst+1+len(args)])
+				}
+				if co.yieldNRes == 0 {
+					co.stack[dst] = NilValue()
+				}
+			}
+			if herr != nil {
+				if errors.Is(herr, errCoroCloseSelf) {
+					return s.finishCoroCloseSelf(co)
+				}
+				if isUncatchableErr(herr) {
+					co.status = ThreadDead
+					return false, nil, herr
+				}
+				if !s.handleError(co, 0, herr) {
+					if errors.Is(s.abortErr, errCoroCloseSelf) {
+						return s.finishCoroCloseSelf(co)
+					}
+					if isUncatchableErr(s.abortErr) {
+						uerr := s.abortErr
+						co.status = ThreadDead
+						return false, nil, uerr
+					}
+					co.status = ThreadDead
+					ev := s.runtimeErrorToValue(co, herr)
+					co.errObj = ev
+					return false, []Value{ev}, nil
+				}
+				goto runCoro
+			}
+		}
 		if err := co.placeResults(co.yieldDst, args, co.yieldNRes); err != nil {
 			if !s.handleError(co, 0, err) {
 				if errors.Is(s.abortErr, errCoroCloseSelf) {
@@ -367,34 +440,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
-		}
-		if co.yieldedNative {
-			co.yieldedNative = false
-			if co.hookMask&HookMaskRet != 0 && !co.inHook && !co.suppressHook {
-				if herr := s.fireHook(co, "return", NilValue()); herr != nil {
-					if errors.Is(herr, errCoroCloseSelf) {
-						return s.finishCoroCloseSelf(co)
-					}
-					if isUncatchableErr(herr) {
-						co.status = ThreadDead
-						return false, nil, herr
-					}
-					if !s.handleError(co, 0, herr) {
-						if errors.Is(s.abortErr, errCoroCloseSelf) {
-							return s.finishCoroCloseSelf(co)
-						}
-						if isUncatchableErr(s.abortErr) {
-							uerr := s.abortErr
-							co.status = ThreadDead
-							return false, nil, uerr
-						}
-						co.status = ThreadDead
-						ev := s.runtimeErrorToValue(co, herr)
-						co.errObj = ev
-						return false, []Value{ev}, nil
-					}
-				}
-			}
+			goto runCoro
 		}
 		// If yielded from a native metamethod/TBC __close (e.g. func2close(coroutine.yield)), complete continuation!
 		for co.nframe > 0 && co.frames[co.nframe-1].finish != finishNone {
@@ -501,6 +547,8 @@ func (s *State) finishCoroCloseSelf(co *Thread) (bool, []Value, error) {
 	co.nframe = 0
 	co.top = 0
 	co.stack[0] = NilValue()
+	co.yieldedNative = false
+	co.yieldNativeFn = NilValue()
 	if hasErr {
 		co.errObj = errVal
 		return false, []Value{errVal}, nil
@@ -619,6 +667,8 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 					co.top = 0
 					co.stack[0] = NilValue()
 					co.errObj = NilValue()
+					co.yieldedNative = false
+					co.yieldNativeFn = NilValue()
 				}
 				// Match Lua 5.5 lcorolib.c:luaB_auxwrap: prepend caller location to string error objects.
 				if errVal.IsString() {
@@ -669,6 +719,8 @@ func nativeCoroClose(s *State, args []Value) ([]Value, error) {
 		co.top = 0
 		co.stack[0] = NilValue()
 		co.errObj = NilValue()
+		co.yieldedNative = false
+		co.yieldNativeFn = NilValue()
 		if s.abortErr != nil {
 			return nil, s.abortErr
 		}
