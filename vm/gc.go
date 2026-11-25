@@ -624,7 +624,7 @@ func (tr *gcTracer) mark(v Value) {
 		}
 		u.gcMark = tr.epoch
 		tr.unlockEphemDeps(unsafe.Pointer(u))
-		tr.liveBytes += 64 + int64(len(u.UValues)*16)
+		tr.liveBytes += 64 + int64((len(u.UValues)+len(u.gcRefs))*16)
 		if lf, ok := u.Data.(*luaFile); ok {
 			tr.liveBytes += lf.memBytes()
 		}
@@ -679,6 +679,9 @@ func (tr *gcTracer) propagateAll() {
 			}
 			for _, uv := range u.UValues {
 				tr.mark(uv)
+			}
+			for _, rv := range u.gcRefs {
+				tr.mark(rv)
 			}
 		case v.IsThread():
 			tr.traverseThread(v.AsThread())

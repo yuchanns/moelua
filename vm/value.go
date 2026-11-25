@@ -70,6 +70,7 @@ type Userdata struct {
 	Data      any
 	Meta      *Table
 	UValues   []Value
+	gcRefs    []Value // internal GC-traced references (invisible to debug.getuservalue/setuservalue)
 	gcMark    uint64
 	gcFnzed   bool
 	gcInFnz   bool

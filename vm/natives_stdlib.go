@@ -220,12 +220,15 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 		pat = ls.S
 	}
 	if s.memLimit > 0 || s.gc.tier1 {
-		if err := s.checkMemAndAccount(48 + 3*16 + 64); err != nil {
+		if err := s.checkMemAndAccount(48 + 3*16 + 64 + 2*16); err != nil {
 			return nil, err
 		}
 	}
 	it := luastdlib.GMatchWithCancel(str, pat, initPos, s.dynamicNativeCancelFunc())
-	stateUD := UserdataValue(&Userdata{Data: it})
+	// Trace subject and pattern through immutable internal gcRefs so extracting upvalue #3
+	// via debug.getupvalue(iter, 3) still accounts for both retained strings under memLimit
+	// without exposing or allowing mutation via debug.getuservalue/setuservalue.
+	stateUD := UserdataValue(&Userdata{Data: it, gcRefs: []Value{strVal, patVal}})
 	fn := &NativeFunc{
 		Name:        "gmatch_iter",
 		NumUpvals:   3,

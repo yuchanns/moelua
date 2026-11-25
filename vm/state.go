@@ -310,6 +310,36 @@ func (s *State) checkMemAndAccount(delta int64) error {
 	return nil
 }
 
+// checkMemAndAccountWithRoots behaves like checkMemAndAccount, temporarily rooting up to three
+// live Values across emergency GC when allocation pressure triggers a recount (so host-held
+// keys/values/tables not yet linked into _G are never under-counted or collected).
+func (s *State) checkMemAndAccountWithRoots(delta int64, r1, r2, r3 Value) error {
+	if s.memLimit > 0 && s.gc.allocBytes+s.gc.tempBytes+delta > s.memLimit {
+		var id1, id2, id3 int
+		if !r1.IsNil() {
+			id1 = s.Ref(r1)
+		}
+		if !r2.IsNil() {
+			id2 = s.Ref(r2)
+		}
+		if !r3.IsNil() {
+			id3 = s.Ref(r3)
+		}
+		err := s.checkMemAndAccount(delta)
+		if id1 != 0 {
+			s.Unref(id1)
+		}
+		if id2 != 0 {
+			s.Unref(id2)
+		}
+		if id3 != 0 {
+			s.Unref(id3)
+		}
+		return err
+	}
+	return s.checkMemAndAccount(delta)
+}
+
 // SetCompiler registers a source-to-bytecode compiler for load()/loadfile()/dofile()/require().
 func (s *State) SetCompiler(fn CompileFunc) {
 	s.compilerFn = fn
@@ -448,14 +478,28 @@ func (s *State) PreloadTable() *Table { return s.preloadTbl }
 // Intern interns a Go string into this State's string table.
 func (s *State) Intern(str string) *LuaString { return s.intern.Intern(str) }
 
+// LookupString looks up str without populating the short-string intern cache.
+// For short strings (<= 40 bytes) not yet interned in this State, returns (nil, false).
+// For long strings (> 40 bytes), returns a transient *LuaString wrapper suitable for table lookup.
+func (s *State) LookupString(str string) (*LuaString, bool) {
+	if len(str) <= maxShortStringLen {
+		return s.intern.lookupExistingShort(str)
+	}
+	return &LuaString{S: str, Short: false}, true
+}
+
 // SetGlobal installs a global variable in _ENV.
 func (s *State) SetGlobal(name string, v Value) {
 	s.env.RawSetStr(s, s.intern.Intern(name), v)
 }
 
-// GetGlobal retrieves a global variable from _ENV.
+// GetGlobal retrieves a global variable from _ENV without interning unseen short names.
 func (s *State) GetGlobal(name string) Value {
-	return s.env.RawGetStr(s.intern.Intern(name))
+	ls, ok := s.LookupString(name)
+	if !ok {
+		return NilValue()
+	}
+	return s.env.RawGetStr(ls)
 }
 
 func (s *State) bindProto(p *bytecode.Proto) *boundProto {

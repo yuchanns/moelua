@@ -280,18 +280,24 @@ func (t *Table) initHash(n int) {
 	h.dictGen++
 }
 
-func (t *Table) checkHashMem(s *State) error {
+func (t *Table) checkHashMem(s *State, key, val Value) error {
 	if s.memLimit <= 0 {
 		return nil
 	}
-	var curLen, curCnt int
-	if t.hash != nil {
-		curLen = len(t.hash.nodes)
-		curCnt = int(t.hash.count)
+	if t.hash == nil || len(t.hash.nodes) == 0 {
+		// Match initHash(4) which allocates hashCapFor(4) == 8 nodes.
+		return s.checkMemAndAccountWithRoots(hashCapFor(4)*40, TableValue(t), key, val)
 	}
+	curLen := len(t.hash.nodes)
+	curCnt := int(t.hash.count)
 	if (curCnt+1)*10 >= curLen*7 {
 		growSz := max(curLen*2, 4)
-		return s.checkMemAndAccount(int64(growSz-curLen) * 40)
+		if int(t.hash.live)*4 < curLen && curLen >= 8 {
+			growSz = curLen
+		}
+		if growSz > curLen {
+			return s.checkMemAndAccountWithRoots(int64(growSz-curLen)*40, TableValue(t), key, val)
+		}
 	}
 	return nil
 }
@@ -474,7 +480,7 @@ func (t *Table) hashSetChecked(s *State, key, val Value) (int, error) {
 		t.hash.nodes[slot].val = val
 		return slot, nil
 	}
-	if err := t.checkHashMem(s); err != nil {
+	if err := t.checkHashMem(s, key, val); err != nil {
 		return -1, err
 	}
 	if t.hash == nil || len(t.hash.nodes) == 0 {
@@ -504,7 +510,7 @@ func (t *Table) demoteToDict(s *State) bool {
 		}
 		delta := hashBytes - oldSlotBytes
 		if delta > 0 {
-			if err := s.checkMemAndAccount(delta); err != nil {
+			if err := s.checkMemAndAccountWithRoots(delta, TableValue(t), NilValue(), NilValue()); err != nil {
 				s.memExceeded = true
 				return false
 			}
@@ -585,7 +591,7 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 			}
 			if next != nil {
 				if s.memLimit > 0 && len(t.slots) == cap(t.slots) {
-					if err := s.checkMemAndAccount(int64(max(cap(t.slots), 4)) * 16); err != nil {
+					if err := s.checkMemAndAccountWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(k), val); err != nil {
 						s.memExceeded = true
 						return
 					}
