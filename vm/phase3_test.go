@@ -1380,3 +1380,128 @@ func TestCodexReviewRound5VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound6VMRegressions(t *testing.T) {
+	// 1. Calling string arithmetic metamethods (including __unm) with no arguments raises a Lua error, not a Go panic.
+	t.Run("string_unm_missing_arg_no_panic", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local mt = getmetatable("")
+			for _, mm in ipairs({"__unm", "__add", "__sub", "__mul", "__div", "__idiv", "__mod", "__pow"}) do
+				local ok, e = pcall(mt[mm])
+				assert(not ok and type(e) == "string", mm .. " expected Lua error, got " .. tostring(ok) .. " " .. tostring(e))
+			end
+			assert(mt.__unm("42") == -42)
+			return "ok"
+		`), "=str_unm_guard")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. table.sort roots buffered elements across __index, comparator, and __newindex GC cycles.
+	t.Run("table_sort_roots_elements_across_callbacks", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local fin = 0
+			local written = {}
+			local proxy = setmetatable({}, {
+				__len = function() return 3 end,
+				__index = function(_, i)
+					if i == 1 then
+						return setmetatable({ v = 30 }, { __gc = function() fin = fin + 1 end })
+					elseif i == 2 then
+						collectgarbage("collect")
+						return setmetatable({ v = 10 }, { __gc = function() fin = fin + 1 end })
+					else
+						collectgarbage("collect")
+						return setmetatable({ v = 20 }, { __gc = function() fin = fin + 1 end })
+					end
+				end,
+				__newindex = function(_, i, v)
+					collectgarbage("collect")
+					written[i] = v
+				end,
+			})
+			table.sort(proxy, function(a, b)
+				collectgarbage("collect")
+				return a.v < b.v
+			end)
+			assert(fin == 0, "buffered sort elements were finalized prematurely: fin=" .. fin)
+			assert(#written == 3 and written[1].v == 10 and written[2].v == 20 and written[3].v == 30)
+			return "ok"
+		`), "=sort_gc_root")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. Optimized ipairs fast path nil-fills extra loop variables beyond (i, v) on every iteration.
+	t.Run("ipairs_fast_path_nil_fills_extra_vars", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local seen = {}
+			for i, v, w, x in ipairs({10, 20, 30}) do
+				assert(w == nil, "iter " .. i .. ": expected w == nil, got " .. tostring(w))
+				assert(x == nil, "iter " .. i .. ": expected x == nil, got " .. tostring(x))
+				seen[i] = v
+				w = 99
+				x = 88
+			end
+			assert(#seen == 3 and seen[1] == 10 and seen[2] == 20 and seen[3] == 30)
+			return "ok"
+		`), "=ipairs_extra_nil")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. Discarded file handles are reclaimed automatically by Go GC + runtime.AddCleanup in Tier 0.
+	t.Run("discarded_file_handles_reclaimed_in_tier0", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			for i = 1, 200 do
+				assert(io.tmpfile())
+			end
+			return "ok"
+		`), "=tier0_file_gc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		if s.gc.tier1 {
+			t.Fatalf("opening standard files must not activate Tier 1 GC")
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			runtime.GC()
+			s.compactOpenFiles()
+			if len(s.openFiles) == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("expected discarded tmpfiles to be closed automatically by Go GC, still open: %d", len(s.openFiles))
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		s.compactWeakFiles()
+		if len(s.gc.weakFiles) != 0 {
+			t.Fatalf("expected weakFiles compacted to 0, got %d", len(s.gc.weakFiles))
+		}
+	})
+}
