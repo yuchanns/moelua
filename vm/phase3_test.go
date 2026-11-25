@@ -3073,3 +3073,128 @@ func TestCodexReviewRound13VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound14VMRegressions(t *testing.T) {
+	// 1. string.unpack clones long extracted substrings instead of pinning large input buffers.
+	t.Run("string_unpack_clones_backing_storage", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local kept = {}
+			for i = 1, 300 do
+				local big = string.rep(string.char(65 + (i % 26)), 32768)
+				local v = string.unpack("c41", big)
+				kept[i] = v
+				big = nil
+				collectgarbage("collect")
+			end
+			_G._kept_unpacked = kept
+			return #kept
+		`), "=unpack_clone")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 1 || res[0].Int() != 300 {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		runtime.GC()
+		runtime.GC()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		// Without cloning, 300 * 32 KiB = 9.8 MB would remain pinned on the Go heap.
+		if after.HeapAlloc > before.HeapAlloc+2*1024*1024 {
+			t.Fatalf("string.unpack pinned source allocations: before=%d after=%d delta=%d",
+				before.HeapAlloc, after.HeapAlloc, after.HeapAlloc-before.HeapAlloc)
+		}
+	})
+
+	// 2. string.format enforces memory limits incrementally before growing large output buffers.
+	t.Run("string_format_enforces_memlimit_during_formatting", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local chunk = string.rep("a", 16384)
+			local args = {}
+			for i = 1, 200 do args[i] = chunk end
+
+			local fmtS = string.rep("%s", 200)
+			local ok1, err1 = pcall(string.format, fmtS, table.unpack(args))
+			assert(not ok1 and string.find(tostring(err1), "not enough memory", 1, true),
+				"expected OOM on %s format, got ok=" .. tostring(ok1) .. " err=" .. tostring(err1))
+
+			local fmtQ = string.rep("%q", 200)
+			local ok2, err2 = pcall(string.format, fmtQ, table.unpack(args))
+			assert(not ok2 and string.find(tostring(err2), "not enough memory", 1, true),
+				"expected OOM on %q format, got ok=" .. tostring(ok2) .. " err=" .. tostring(err2))
+			return "ok"
+		`), "=format_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		runtime.ReadMemStats(&after)
+		// Without incremental checks, formatting 200 * 16 KiB allocated ~17 MB+ before returning OOM.
+		if delta := after.TotalAlloc - before.TotalAlloc; delta > 4*1024*1024 {
+			t.Fatalf("string.format allocated too much before enforcing memLimit: delta=%d", delta)
+		}
+	})
+
+	// 3. Numeric for loops decide integer vs float mode before coercing string init/step operands.
+	t.Run("numeric_for_selects_integer_loop_before_string_coercion", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local got = {}
+			for i = "1", "1" do got[#got + 1] = math.type(i) .. ":" .. tostring(i) end
+			for i = 1, 1, "1" do got[#got + 1] = math.type(i) .. ":" .. tostring(i) end
+			for i = "1", 2, 1 do got[#got + 1] = math.type(i) .. ":" .. tostring(i) end
+			for i = 1, "2", 1 do got[#got + 1] = math.type(i) .. ":" .. tostring(i) end
+			for i = 1, "2.5", 1 do got[#got + 1] = math.type(i) .. ":" .. tostring(i) end
+			for i = 1, 2.0, 1 do got[#got + 1] = math.type(i) .. ":" .. tostring(i) end
+			local expected = "float:1.0,float:1.0,float:1.0,float:2.0,integer:1,integer:2,integer:1,integer:2,integer:1,integer:2"
+			assert(table.concat(got, ",") == expected, "unexpected for loop subtypes: " .. table.concat(got, ","))
+			return "ok"
+		`), "=forprep_str_coercion")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. os.exit and os.execute reject invalid arguments with catchable Lua errors before exiting/executing.
+	t.Run("os_exit_and_execute_reject_invalid_arguments", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local ok1, e1 = pcall(os.exit, "invalid")
+			assert(not ok1 and string.find(tostring(e1), "number expected", 1, true), "got " .. tostring(ok1) .. "," .. tostring(e1))
+			local ok2, e2 = pcall(os.exit, 1.5)
+			assert(not ok2 and string.find(tostring(e2), "no integer representation", 1, true), "got " .. tostring(ok2) .. "," .. tostring(e2))
+			local ok3, e3 = pcall(os.exit, "1.5")
+			assert(not ok3 and string.find(tostring(e3), "no integer representation", 1, true), "got " .. tostring(ok3) .. "," .. tostring(e3))
+			local ok4, e4 = pcall(os.exit, {})
+			assert(not ok4 and string.find(tostring(e4), "number expected", 1, true), "got " .. tostring(ok4) .. "," .. tostring(e4))
+			local ok5, e5 = pcall(os.execute, {})
+			assert(not ok5 and string.find(tostring(e5), "string expected", 1, true), "got " .. tostring(ok5) .. "," .. tostring(e5))
+			return "ok"
+		`), "=os_exit_invalid")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+}
