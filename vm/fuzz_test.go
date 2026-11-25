@@ -274,4 +274,21 @@ func TestFuzzStateSandboxGuards(t *testing.T) {
 	if _, err := s4.Call(cl4); err != nil {
 		t.Fatalf("fuzz print discard check failed: %v", err)
 	}
+
+	// 5. Memory limit bounds string.pack allocations in fuzz state (exercising runHooked under moeluaregcheck too).
+	s5, err := newBoundedFuzzState(2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s5.Close()
+	cl5, err := s5.LoadChunk([]byte(`
+		local ok, err = pcall(string.pack, "c1073741824", "")
+		assert(not ok and tostring(err):find("not enough memory", 1, true), tostring(err))
+	`), "=fuzz_pack_mem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s5.Call(cl5); err != nil {
+		t.Fatalf("fuzz string.pack memory limit check failed: %v", err)
+	}
 }

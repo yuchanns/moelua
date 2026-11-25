@@ -1,8 +1,10 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -869,6 +871,348 @@ func TestCodexReviewRound3VMRegressions(t *testing.T) {
 			}
 			if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
 				t.Fatalf("Call failed: res=%v err=%v", res, err)
+			}
+		})
+	}
+}
+
+func TestCodexReviewRound4VMRegressions(t *testing.T) {
+	// 1. file:setvbuf bounds buffer allocations against State memory limits.
+	t.Run("setvbuf_memory_limit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(256 * 1024)
+		cl, err := s.LoadChunk([]byte(`
+			local f = assert(io.tmpfile())
+			local ok1, e1 = pcall(f.setvbuf, f, "full", 1073741824)
+			assert(not ok1 and tostring(e1):find("not enough memory", 1, true), tostring(e1))
+			local ok2, e2 = pcall(f.setvbuf, f, "line", 512 * 1024)
+			assert(not ok2 and tostring(e2):find("not enough memory", 1, true), tostring(e2))
+			assert(f:setvbuf("full", 1024))
+			f:close()
+			return "ok"
+		`), "=setvbuf_mem")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. string.pack bounds output allocations against State memory limits.
+	t.Run("string_pack_memory_limit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(256 * 1024)
+		cl, err := s.LoadChunk([]byte(`
+			local ok1, e1 = pcall(string.pack, "c1073741824", "")
+			assert(not ok1 and tostring(e1):find("not enough memory", 1, true), tostring(e1))
+			local ok2, e2 = pcall(string.pack, "c524288", "")
+			assert(not ok2 and tostring(e2):find("not enough memory", 1, true), tostring(e2))
+			assert(string.pack("c4", "ab") == "ab\0\0")
+			return "ok"
+		`), "=pack_mem")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. Weak-key table tombstones clear nd.key so Go GC immediately reclaims collected keys.
+	t.Run("weak_key_tombstone_reclaimed", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		wt := s.NewTable(0, 4)
+		mt := s.NewTable(0, 1)
+		mt.RawSetStr(s, s.intern.Intern("__mode"), StringValue(s.intern.Intern("k")))
+		s.SetMetatable(wt, mt)
+		s.SetGlobal("wt", TableValue(wt))
+
+		var wk weak.Pointer[Table]
+		func() {
+			k := s.NewTable(0, 1)
+			k.RawSetStr(s, s.intern.Intern("tag"), StringValue(s.intern.Intern("ephemeral")))
+			wk = weak.Make(k)
+			_ = wt.RawSet(s, TableValue(k), IntValue(42))
+		}()
+
+		s.CollectFull()
+		for range 5 {
+			runtime.GC()
+		}
+		if wk.Value() != nil {
+			t.Fatalf("weak-key table tombstone retained collected key after CollectGarbage + runtime.GC")
+		}
+	})
+
+	// 4. Ordinary shape transitions use weak pointers so transient shapes are Go-GC reclaimable.
+	t.Run("weak_shape_transitions_reclaimed", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		var wRootChild, wNestedChild weak.Pointer[Shape]
+		parent := s.NewTable(0, 2)
+		parent.RawSetStr(s, s.intern.Intern("base"), IntValue(1))
+		func() {
+			for i := range 20 {
+				tmp := s.NewTable(0, 2)
+				k := s.intern.Intern(fmt.Sprintf("transient_root_%d", i))
+				tmp.RawSetStr(s, k, IntValue(int64(i)))
+				if i == 0 {
+					wRootChild = weak.Make(tmp.shape)
+				}
+				tmp2 := s.NewTable(0, 2)
+				tmp2.RawSetStr(s, s.intern.Intern("base"), IntValue(1))
+				k2 := s.intern.Intern(fmt.Sprintf("transient_nested_%d", i))
+				tmp2.RawSetStr(s, k2, IntValue(int64(i)))
+				if i == 0 {
+					wNestedChild = weak.Make(tmp2.shape)
+				}
+			}
+		}()
+		for range 5 {
+			runtime.GC()
+		}
+		s.shapes.Prune()
+		if wRootChild.Value() != nil {
+			t.Fatalf("root shape retained transient child shape")
+		}
+		if wNestedChild.Value() != nil {
+			t.Fatalf("non-root shape retained transient child shape")
+		}
+		_ = parent
+	})
+
+	// 5. next(t, k) normalizes integral float keys in hash tables (e.g. -1.0 -> -1).
+	t.Run("next_integral_float_hash_key", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local t = { [-1] = "a", [-2] = "b" }
+			local k1, v1 = next(t, -1.0)
+			local k2, v2 = next(t, -2.0)
+			assert((k1 == -2 and v1 == "b" and k2 == nil) or (k2 == -1 and v2 == "a" and k1 == nil),
+				string.format("unexpected next results: (%s,%s) (%s,%s)", tostring(k1), tostring(v1), tostring(k2), tostring(v2)))
+			local t2 = { [0] = "z", [1] = "one" }
+			local nk, nv = next(t2, 0.0)
+			assert(nk == nil or nk == 1)
+			local nk2, nv2 = next(t2, 1.0)
+			assert(nk2 == 0 and nv2 == "z", tostring(nk2) .. "," .. tostring(nv2))
+			return "ok"
+		`), "=next_float_key")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 6. debug.getlocal/setlocal guard MinInt64 overflow and restrict negative indices to PF_VAHID.
+	t.Run("debug_local_mininteger_and_vatab", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function testMinInt(...)
+				local n1, v1 = debug.getlocal(1, math.mininteger)
+				assert(n1 == nil and v1 == nil)
+				local n2 = debug.setlocal(1, math.mininteger, 99)
+				assert(n2 == nil)
+				local n3, v3 = debug.getlocal(1, -1)
+				assert(n3 == "(vararg)" and v3 == 10)
+				assert(debug.setlocal(1, -1, 77) == "(vararg)")
+				local n4, v4 = debug.getlocal(1, -1)
+				assert(n4 == "(vararg)" and v4 == 77)
+			end
+			testMinInt(10, 20)
+
+			local function testVatabCaller()
+				local sentinel = "untouched"
+				-- Escaping vararg table compiles to PF_VATAB (matching PUC-Rio ldebug.c:findvararg):
+				-- both getlocal(1,-1) and setlocal(1,-1,...) return nil and never touch caller locals.
+				local function innerEscaped(...v)
+					local t = v
+					local gn, gv = debug.getlocal(1, -1)
+					assert(gn == nil and gv == nil, "PF_VATAB getlocal(-1) must return nil")
+					local sn = debug.setlocal(1, -1, "corrupted")
+					assert(sn == nil, "PF_VATAB setlocal(-1) must return nil")
+					assert(t[1] == "arg1" and t.n == 2)
+				end
+				innerEscaped("arg1", "arg2")
+				assert(sentinel == "untouched", "caller local corrupted: " .. tostring(sentinel))
+
+				-- Non-escaping named vararg compiles to PF_VAHID: negative indices inspect/mutate hidden varargs.
+				local function innerHidden(...v)
+					local gn, gv = debug.getlocal(1, -1)
+					assert(gn == "(vararg)" and gv == "arg1")
+					assert(debug.setlocal(1, -1, "updated") == "(vararg)")
+					assert(v[1] == "updated" and v.n == 2)
+				end
+				innerHidden("arg1", "arg2")
+			end
+			testVatabCaller()
+			return "ok"
+		`), "=debug_vararg_guard")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 7. Yielding through native metamethods (coroutine.yield) and callable-table metamethods.
+	t.Run("yieldable_native_and_callable_table_metamethods", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			-- Native coroutine.yield as __add, __lt, __concat, and __close
+			local a = setmetatable({ v = 10 }, {
+				__add = coroutine.yield,
+				__lt = coroutine.yield,
+				__concat = coroutine.yield,
+				__close = coroutine.yield,
+			})
+			local co1 = coroutine.create(function()
+				local x = a + 5
+				local cmp = (a < a) and "lt" or "ge"
+				local cat = a .. "tail"
+				do
+					local c <close> = a
+				end
+				return x, cmp, cat
+			end)
+			local ok, y1, y2 = coroutine.resume(co1)
+			assert(ok and y1 == a and y2 == 5)
+			local ok2, y3, y4 = coroutine.resume(co1, 15)
+			assert(ok2 and y3 == a and y4 == a)
+			local ok3, y5, y6 = coroutine.resume(co1, true)
+			assert(ok3 and y5 == a and y6 == "tail")
+			local ok4, y7 = coroutine.resume(co1, "joined")
+			assert(ok4 and y7 == a)
+			local ok5, r1, r2, r3 = coroutine.resume(co1)
+			assert(ok5 and r1 == 15 and r2 == "lt" and r3 == "joined",
+				string.format("%s %s %s %s", tostring(ok5), tostring(r1), tostring(r2), tostring(r3)))
+
+			-- Callable-table metamethods yielding across __add, __concat, and __close
+			local addCallable = setmetatable({}, {
+				__call = function(self, lhs, rhs)
+					return coroutine.yield("add", lhs.v + rhs)
+				end,
+			})
+			local catCallable = setmetatable({}, {
+				__call = function(self, lhs, rhs)
+					return coroutine.yield("cat", tostring(lhs.v) .. rhs)
+				end,
+			})
+			local closeCallable = setmetatable({}, {
+				__call = function(self, obj)
+					return coroutine.yield("close", obj.v)
+				end,
+			})
+			local b = setmetatable({ v = 20 }, {
+				__add = addCallable,
+				__concat = catCallable,
+				__close = closeCallable,
+			})
+			local co2 = coroutine.create(function()
+				local s1 = b + 2
+				local s2 = b .. "!"
+				do
+					local c <close> = b
+				end
+				return s1, s2
+			end)
+			local c1, k1, v1 = coroutine.resume(co2)
+			assert(c1 and k1 == "add" and v1 == 22)
+			local c2, k2, v2 = coroutine.resume(co2, 220)
+			assert(c2 and k2 == "cat" and v2 == "20!")
+			local c3, k3, v3 = coroutine.resume(co2, "20!!")
+			assert(c3 and k3 == "close" and v3 == 20)
+			local c4, out1, out2 = coroutine.resume(co2)
+			assert(c4 and out1 == 220 and out2 == "20!!")
+			return "ok"
+		`), "=yieldable_mm")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 8. GC marks cf.closeErr on suspended coroutines while unwinding TBC __close.
+	t.Run("gc_marks_closeErr_while_suspended", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local wv = setmetatable({}, { __mode = "v" })
+			local co = coroutine.create(function()
+				return pcall(function()
+					local x <close> = setmetatable({}, {
+						__close = function()
+							coroutine.yield("closing")
+						end,
+					})
+					local errObj = { msg = "alive" }
+					wv.e = errObj
+					error(errObj)
+				end)
+			end)
+			local ok1, tag = coroutine.resume(co)
+			assert(ok1 and tag == "closing")
+			collectgarbage("collect")
+			assert(wv.e ~= nil and wv.e.msg == "alive", "closeErr was prematurely collected")
+			local ok2, pok, perr = coroutine.resume(co)
+			assert(ok2 and not pok and type(perr) == "table" and perr.msg == "alive")
+			return "ok"
+		`), "=gc_closeerr")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 9. os.execute/io.popen inherit State stdio streams and pipe:close() returns exit status tuple.
+	if runtime.GOOS != "windows" {
+		t.Run("os_execute_and_io_popen_stdio_and_close_status", func(t *testing.T) {
+			s := NewState()
+			defer s.Close()
+			var outBuf bytes.Buffer
+			s.SetOutput(&outBuf)
+			cl, err := s.LoadChunk([]byte(`
+				local ok, why, code = os.execute("printf exec_ok")
+				assert(ok == true and why == "exit" and code == 0,
+					string.format("%s %s %s", tostring(ok), tostring(why), tostring(code)))
+
+				local p1 = assert(io.popen("exit 7", "r"))
+				local pok, pwhy, pcode = p1:close()
+				assert(pok == nil and pwhy == "exit" and pcode == 7,
+					string.format("%s %s %s", tostring(pok), tostring(pwhy), tostring(pcode)))
+
+				local p2 = assert(io.popen("printf pipe_read", "r"))
+				local data = p2:read("a")
+				local pok2, pwhy2, pcode2 = p2:close()
+				assert(data == "pipe_read" and pok2 == true and pwhy2 == "exit" and pcode2 == 0)
+
+				local p3 = assert(io.popen("cat", "w"))
+				assert(p3:write("|pipe_write"))
+				local pok3, pwhy3, pcode3 = p3:close()
+				assert(pok3 == true and pwhy3 == "exit" and pcode3 == 0)
+				return "ok"
+			`), "=exec_popen_status")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+				t.Fatalf("Call failed: res=%v err=%v", res, err)
+			}
+			if got := outBuf.String(); got != "exec_ok|pipe_write" {
+				t.Fatalf("expected captured stdout 'exec_ok|pipe_write', got %q", got)
 			}
 		})
 	}
