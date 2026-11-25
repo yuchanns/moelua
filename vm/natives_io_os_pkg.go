@@ -421,6 +421,7 @@ func (s *State) newFileUD(lf *luaFile) Value {
 		runtime.AddCleanup(lf, cleanupFileInner, fi)
 		s.openFiles = append(s.openFiles, fi)
 		// Register for explicit collectgarbage() finalization WITHOUT activating automatic Tier 1 debt triggers!
+		u.gcInFnz = true
 		s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: v})
 	}
 	return v
@@ -778,6 +779,9 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeFileSeek(s *State, args []Value) ([]Value, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("bad argument #1 to 'seek' (FILE* expected, got no value)")
+	}
 	lf, ok := asLuaFile(args[0])
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
@@ -806,17 +810,17 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #2 to 'seek' (number expected)")
 		}
 	}
-	if lf.r != nil {
+	seekOffset := offset
+	if lf.r != nil && whence == io.SeekCurrent {
 		// Adjust underlying file position for buffered reader before seeking.
-		if whence == io.SeekCurrent {
-			offset -= int64(lf.r.Buffered())
-		}
-		lf.r = nil
+		seekOffset -= int64(lf.r.Buffered())
 	}
-	pos, err := lf.f.Seek(offset, whence)
+	pos, err := lf.f.Seek(seekOffset, whence)
 	if err != nil {
 		return ioFail(s, err), nil
 	}
+	// Only discard buffered input after the underlying seek succeeds.
+	lf.r = nil
 	return []Value{IntValue(pos)}, nil
 }
 
@@ -1102,6 +1106,9 @@ func readLuaNumber(s *State, r *bufio.Reader) (Value, bool, error) {
 }
 
 func nativeFileRead(s *State, args []Value) ([]Value, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("bad argument #1 to 'read' (FILE* expected, got no value)")
+	}
 	lf, ok := asLuaFile(args[0])
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
@@ -1138,6 +1145,9 @@ func nativeFileRead(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeFileWrite(s *State, args []Value) ([]Value, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("bad argument #1 to 'write' (FILE* expected, got no value)")
+	}
 	lf, ok := asLuaFile(args[0])
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
@@ -1206,6 +1216,9 @@ func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) []Valu
 }
 
 func nativeFileLines(s *State, args []Value) ([]Value, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("bad argument #1 to 'lines' (FILE* expected, got no value)")
+	}
 	lf, ok := asLuaFile(args[0])
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
@@ -1319,8 +1332,20 @@ func nativeOSTime(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeOSDiffTime(_ *State, args []Value) ([]Value, error) {
-	t2, _ := args[0].ToFloat()
-	t1, _ := args[1].ToFloat()
+	if len(args) < 1 {
+		return nil, fmt.Errorf("bad argument #1 to 'difftime' (number expected, got no value)")
+	}
+	t2, ok := args[0].ToFloat()
+	if !ok {
+		return nil, fmt.Errorf("bad argument #1 to 'difftime' (number expected, got %s)", args[0].TypeName())
+	}
+	if len(args) < 2 {
+		return nil, fmt.Errorf("bad argument #2 to 'difftime' (number expected, got no value)")
+	}
+	t1, ok := args[1].ToFloat()
+	if !ok {
+		return nil, fmt.Errorf("bad argument #2 to 'difftime' (number expected, got %s)", args[1].TypeName())
+	}
 	return []Value{FloatValue(t2 - t1)}, nil
 }
 
@@ -1536,6 +1561,9 @@ func (s *State) initPackageLib() {
 }
 
 func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
+	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
+		return nil, fmt.Errorf("bad argument #1 to 'searcher_preload' (string expected)")
+	}
 	name := FormatValue(args[0])
 	v := s.preloadTbl.RawGetStr(s.intern.Intern(name))
 	if v.IsNil() {
@@ -1545,6 +1573,9 @@ func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeSearcherLua(s *State, args []Value) ([]Value, error) {
+	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
+		return nil, fmt.Errorf("bad argument #1 to 'searcher_lua' (string expected)")
+	}
 	name := FormatValue(args[0])
 	pathVal := s.pkgTbl.RawGetStr(s.intern.Intern("path"))
 	if !pathVal.IsString() {
@@ -1565,6 +1596,9 @@ func nativeSearcherLua(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeSearcherC(s *State, args []Value) ([]Value, error) {
+	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
+		return nil, fmt.Errorf("bad argument #1 to 'searcher_C' (string expected)")
+	}
 	name := FormatValue(args[0])
 	cpathVal := s.pkgTbl.RawGetStr(s.intern.Intern("cpath"))
 	if !cpathVal.IsString() {

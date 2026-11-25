@@ -144,7 +144,10 @@ func (s *State) registerFinalizable(obj Value, mt *Table) {
 		if u.gcFnzed {
 			u.gcFnzed = false
 		}
-		s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: obj})
+		if !u.gcInFnz {
+			u.gcInFnz = true
+			s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: obj})
+		}
 	}
 }
 
@@ -654,6 +657,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		}
 		tr.propagateAll()
 		s.intern.Prune()
+		s.shapes.Prune()
 		s.gc.allocBytes = tr.liveBytes
 		s.gc.lastLiveBytes = tr.liveBytes
 		return
@@ -723,7 +727,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 				t := obj.AsTable()
 				t.flags = (t.flags | tblFlagGCFnzed) &^ tblFlagGCInFnz
 			case obj.IsUserdata():
-				obj.AsUserdata().gcFnzed = true
+				u := obj.AsUserdata()
+				u.gcFnzed = true
+				u.gcInFnz = false
 			}
 			newlySep = append(newlySep, obj)
 		} else {
@@ -763,6 +769,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	}
 
 	s.intern.Prune()
+	s.shapes.Prune()
 	s.gc.allocBytes = tr.liveBytes
 	s.gc.lastLiveBytes = tr.liveBytes
 	s.gc.debt = 0
@@ -843,7 +850,9 @@ func (s *State) Close() {
 				t := obj.AsTable()
 				t.flags = (t.flags | tblFlagGCFnzed) &^ tblFlagGCInFnz
 			case obj.IsUserdata():
-				obj.AsUserdata().gcFnzed = true
+				u := obj.AsUserdata()
+				u.gcFnzed = true
+				u.gcInFnz = false
 			}
 			s.gc.toBeFnz = append(s.gc.toBeFnz, obj)
 		}

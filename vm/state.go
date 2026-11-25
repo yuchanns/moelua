@@ -702,6 +702,59 @@ func (s *State) TableLen(v Value) (int64, error) { return s.tableLen(v) }
 // TableGetInt evaluates `v[i]` (honoring `__index` metamethods).
 func (s *State) TableGetInt(v Value, i int64) (Value, error) { return s.tableGetInt(v, i) }
 
+// GetGlobalMM retrieves a global from `_G`, honoring `_G`'s `__index` metamethod
+// (matching PUC-Rio `lua_getglobal`).
+func (s *State) GetGlobalMM(name string) (Value, error) {
+	key := s.intern.Intern(name)
+	v := s.env.RawGetStr(key)
+	if !v.IsNil() || s.env.meta == nil {
+		return v, nil
+	}
+	return s.finishGet(TableValue(s.env), StringValue(key))
+}
+
+// SetGlobalMM assigns a global in `_G`, honoring `_G`'s `__newindex` metamethod
+// (matching PUC-Rio `lua_setglobal`).
+func (s *State) SetGlobalMM(name string, val Value) error {
+	keyStr := s.intern.Intern(name)
+	if !s.env.RawGetStr(keyStr).IsNil() || s.env.meta == nil || s.getTM(s.env.meta, TMNewIndex).IsNil() {
+		s.env.RawSetStr(s, keyStr, val)
+		return s.ConsumeMemErr()
+	}
+	cur := TableValue(s.env)
+	key := StringValue(keyStr)
+	for loop := range 2000 {
+		var tm Value
+		if cur.IsTable() {
+			t := cur.AsTable()
+			if loop > 0 && !t.RawGet(key).IsNil() {
+				if err := t.RawSet(s, key, val); err != nil {
+					return err
+				}
+				return s.ConsumeMemErr()
+			}
+			tm = s.getTM(t.meta, TMNewIndex)
+			if tm.IsNil() {
+				if err := t.RawSet(s, key, val); err != nil {
+					return err
+				}
+				return s.ConsumeMemErr()
+			}
+		} else {
+			tm = s.getTMByObj(cur, TMNewIndex)
+			if tm.IsNil() {
+				return fmt.Errorf("attempt to index a %s value", cur.TypeName())
+			}
+		}
+		if tm.IsFunction() || !tm.IsTable() {
+			_, err := s.Call(tm, cur, key, val)
+			return err
+		}
+		cur = tm
+	}
+	return fmt.Errorf("'__newindex' chain too long; possible loop")
+}
+
 func (s *State) getTMByObj(v Value, tm TM) Value {
 	return s.getTM(s.getMetatableOf(v), tm)
 }

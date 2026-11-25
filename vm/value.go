@@ -68,6 +68,7 @@ type Userdata struct {
 	UValues []Value
 	gcMark  uint64
 	gcFnzed bool
+	gcInFnz bool
 }
 
 // LuaError wraps any Lua Value raised via error(v) so pcall/xpcall preserve non-string errors verbatim.

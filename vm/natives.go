@@ -1077,7 +1077,13 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 	if !ok || pos < 1 || pos > e {
 		return nil, fmt.Errorf("bad argument #2 to 'insert' (position out of bounds)")
 	}
+	cancelFn := s.nativeCancelFunc()
 	for i := e; i > pos; i-- {
+		if cancelFn != nil && ((e-i)&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
 		v, err := s.tableGetInt(args[0], i-1)
 		if err != nil {
 			return nil, err
@@ -1093,6 +1099,7 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'remove' (table expected)")
 	}
+	cancelFn := s.nativeCancelFunc()
 	if args[0].IsTable() && args[0].AsTable().meta == nil {
 		t := args[0].AsTable()
 		size := t.Len()
@@ -1110,6 +1117,11 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 		res := t.RawGetInt(pos)
 		if pos <= size {
 			for i := pos; i < size; i++ {
+				if cancelFn != nil && ((i-pos)&1023) == 0 {
+					if err := cancelFn(); err != nil {
+						return nil, err
+					}
+				}
 				t.RawSetInt(s, i, t.RawGetInt(i+1))
 			}
 			t.RawSetInt(s, size, NilValue())
@@ -1137,6 +1149,11 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 	}
 	if pos <= size {
 		for i := pos; i < size; i++ {
+			if cancelFn != nil && ((i-pos)&1023) == 0 {
+				if err := cancelFn(); err != nil {
+					return nil, err
+				}
+			}
 			v, err := s.tableGetInt(args[0], i+1)
 			if err != nil {
 				return nil, err
@@ -1191,7 +1208,15 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 	if rawFast {
 		t = args[0].AsTable()
 	}
+	cancelFn := s.nativeCancelFunc()
+	var iterCount int64
 	for k := i; k <= j; k++ {
+		if cancelFn != nil && (iterCount&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
+		iterCount++
 		if k > i && sep != "" {
 			sb.WriteString(sep)
 		}
@@ -1255,8 +1280,14 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("destination wrap around")
 		}
 		rawFast := src.IsTable() && src.AsTable().meta == nil && dst.IsTable() && dst.AsTable().meta == nil
+		cancelFn := s.nativeCancelFunc()
 		if tpos > f && tpos <= e && RawEqual(src, dst) {
 			for i := n - 1; i >= 0; i-- {
+				if cancelFn != nil && ((n-1-i)&1023) == 0 {
+					if err := cancelFn(); err != nil {
+						return nil, err
+					}
+				}
 				if rawFast {
 					dst.AsTable().RawSetInt(s, tpos+i, src.AsTable().RawGetInt(f+i))
 					if err := s.ConsumeMemErr(); err != nil {
@@ -1274,6 +1305,11 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 			}
 		} else {
 			for i := int64(0); i < n; i++ {
+				if cancelFn != nil && (i&1023) == 0 {
+					if err := cancelFn(); err != nil {
+						return nil, err
+					}
+				}
 				if rawFast {
 					dst.AsTable().RawSetInt(s, tpos+i, src.AsTable().RawGetInt(f+i))
 					if err := s.ConsumeMemErr(); err != nil {
@@ -1360,7 +1396,13 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 	if rawFast {
 		t = args[0].AsTable()
 	}
+	cancelFn := s.nativeCancelFunc()
 	for k := 0; k < n; k++ {
+		if cancelFn != nil && (k&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
 		if rawFast {
 			out[k] = t.RawGetInt(i + int64(k))
 		} else {

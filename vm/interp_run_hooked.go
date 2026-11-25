@@ -411,7 +411,7 @@ reloadFrame:
 				idx := uint64(rb.Int() - 1)
 				n := uint64(t.arrLen)
 				if t.flags&tblFlagIsProto == 0 {
-					canAppend := idx == n && n < uint64(t.arrCap) && t.hash == nil
+					canAppend := idx == n && n < uint64(t.arrCap) && t.hash == nil && t.meta == nil
 					if OptimizeEnabled {
 						if t.arrKind == arrInt && val.IsInt() {
 							if canAppend {
@@ -443,7 +443,7 @@ reloadFrame:
 						}
 					}
 					if !OptimizeEnabled || t.arrKind == arrGeneric {
-						if OptimizeEnabled && canAppend && !val.IsNil() && t.meta == nil {
+						if OptimizeEnabled && canAppend && !val.IsNil() {
 							t.arrLen = uint32(n + 1)
 							n++
 						}

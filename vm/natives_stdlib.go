@@ -343,24 +343,45 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 	}
 	fargs := make([]luastdlib.FormatArg, len(args)-1)
 	for i, a := range args[1:] {
+		val := a
+		lazyToStr := func() (string, error) {
+			return s.toStringValue(val)
+		}
+		hasToStrTM := !s.getTMByObj(a, TMToString).IsNil()
 		switch {
 		case a.IsNil():
-			fargs[i] = luastdlib.NilArg()
-		case a.IsBool():
-			fargs[i] = luastdlib.BoolArg(a.IsTrue())
-		case a.IsInt():
-			fargs[i] = luastdlib.IntArg(a.Int())
-		case a.IsFloat():
-			fargs[i] = luastdlib.FloatArg(a.Float())
-		case a.IsString():
-			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgString, Str: a.AsString().S, Ptr: uintptr(a.ptr)}
-		default:
-			// Support __tostring and __name for %s, and pointer address for %p.
-			str, terr := s.toStringValue(a)
-			if terr != nil {
-				return nil, terr
+			fa := luastdlib.NilArg()
+			if hasToStrTM {
+				fa.ToString = lazyToStr
 			}
-			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgPointer, Str: str, Ptr: uintptr(a.ptr)}
+			fargs[i] = fa
+		case a.IsBool():
+			fa := luastdlib.BoolArg(a.IsTrue())
+			if hasToStrTM {
+				fa.ToString = lazyToStr
+			}
+			fargs[i] = fa
+		case a.IsInt():
+			fa := luastdlib.IntArg(a.Int())
+			if hasToStrTM {
+				fa.ToString = lazyToStr
+			}
+			fargs[i] = fa
+		case a.IsFloat():
+			fa := luastdlib.FloatArg(a.Float())
+			if hasToStrTM {
+				fa.ToString = lazyToStr
+			}
+			fargs[i] = fa
+		case a.IsString():
+			fa := luastdlib.FormatArg{Kind: luastdlib.ArgString, Str: a.AsString().S, Ptr: uintptr(a.ptr)}
+			if hasToStrTM {
+				fa.ToString = lazyToStr
+			}
+			fargs[i] = fa
+		default:
+			// Defer __tostring / __name evaluation until a %s conversion actually consumes this argument.
+			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgPointer, Ptr: uintptr(a.ptr), ToString: lazyToStr}
 		}
 	}
 	res, err := luastdlib.Format(fmtStr, fargs)

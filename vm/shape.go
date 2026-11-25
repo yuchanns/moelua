@@ -1,5 +1,7 @@
 package vm
 
+import "weak"
+
 const maxShapeProps = 64
 
 // Shape represents a hidden class for record-like Lua tables (per State).
@@ -66,18 +68,21 @@ type frozenTransKey struct {
 
 type shapeRegistry struct {
 	nextID    uint32
-	rootShape Shape             // embedded per-State root shape (meta == nil) -> zero extra alloc
-	root      *Shape            // points to &rootShape
-	metaRoots map[*Table]*Shape // lazily allocated root shapes per metatable
-	// metaTrans caches (shape, newMeta) -> shape with same keys and newMeta.
-	metaTrans map[metaTransKey]*Shape
+	rootShape Shape // embedded per-State root shape (meta == nil) -> zero extra alloc
+	root      *Shape
+	// metaRoots weakly caches root shapes per metatable so unreachable metatables are collected by Go's GC.
+	metaRoots map[weak.Pointer[Table]]weak.Pointer[Shape]
+	// metaTrans weakly caches (shape, newMeta) -> shape with same keys and newMeta.
+	metaTrans map[weakMetaTransKey]weak.Pointer[Shape]
 	// frozenTrans caches transitions out of read-only frozen stdlib shapes without mutating them.
 	frozenTrans map[frozenTransKey]*Shape
+	metaInserts uint32
 }
 
-type metaTransKey struct {
-	shape *Shape
-	meta  *Table
+type weakMetaTransKey struct {
+	shape   weak.Pointer[Shape]
+	meta    weak.Pointer[Table]
+	hasMeta bool
 }
 
 func (sr *shapeRegistry) init(nextID uint32) {
@@ -92,18 +97,43 @@ func newShapeRegistry() shapeRegistry {
 	return sr
 }
 
+// Prune removes dead weak entries from metaRoots and metaTrans.
+func (sr *shapeRegistry) Prune() {
+	for k, v := range sr.metaRoots {
+		if k.Value() == nil || v.Value() == nil {
+			delete(sr.metaRoots, k)
+		}
+	}
+	for k, v := range sr.metaTrans {
+		if k.shape.Value() == nil || (k.hasMeta && k.meta.Value() == nil) || v.Value() == nil {
+			delete(sr.metaTrans, k)
+		}
+	}
+}
+
+func (sr *shapeRegistry) maybePrune() {
+	sr.metaInserts++
+	if sr.metaInserts&255 == 0 {
+		sr.Prune()
+	}
+}
+
 func (sr *shapeRegistry) Root(meta *Table) *Shape {
 	if meta == nil {
 		return sr.root
 	}
+	wk := weak.Make(meta)
 	if sr.metaRoots == nil {
-		sr.metaRoots = make(map[*Table]*Shape, 16)
-	} else if sh, ok := sr.metaRoots[meta]; ok {
-		return sh
+		sr.metaRoots = make(map[weak.Pointer[Table]]weak.Pointer[Shape], 16)
+	} else if wp, ok := sr.metaRoots[wk]; ok {
+		if sh := wp.Value(); sh != nil {
+			return sh
+		}
 	}
 	sr.nextID++
 	sh := &Shape{id: sr.nextID, slot: -1, meta: meta}
-	sr.metaRoots[meta] = sh
+	sr.metaRoots[wk] = weak.Make(sh)
+	sr.maybePrune()
 	return sh
 }
 
@@ -189,20 +219,27 @@ func (sr *shapeRegistry) WithMeta(sh *Shape, meta *Table) *Shape {
 	if sh.length == 0 {
 		return sr.Root(meta)
 	}
-	key := metaTransKey{shape: sh, meta: meta}
+	var wm weak.Pointer[Table]
+	if meta != nil {
+		wm = weak.Make(meta)
+	}
+	key := weakMetaTransKey{shape: weak.Make(sh), meta: wm, hasMeta: meta != nil}
 	if sr.metaTrans != nil {
-		if cached, ok := sr.metaTrans[key]; ok {
-			return cached
+		if wp, ok := sr.metaTrans[key]; ok {
+			if cached := wp.Value(); cached != nil {
+				return cached
+			}
 		}
 	} else {
-		sr.metaTrans = make(map[metaTransKey]*Shape, 16)
+		sr.metaTrans = make(map[weakMetaTransKey]weak.Pointer[Shape], 16)
 	}
 	cur := sr.Root(meta)
 	keys := sh.Keys()
 	for _, k := range keys {
 		cur = sr.Transition(cur, k)
 	}
-	sr.metaTrans[key] = cur
+	sr.metaTrans[key] = weak.Make(cur)
+	sr.maybePrune()
 	return cur
 }
 
