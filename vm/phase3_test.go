@@ -6652,3 +6652,51 @@ func TestCodexReviewRound30VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound31VMRegressions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "big.txt")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{'x'}, 32<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"a", "l", "L", "n33554432"} {
+		t.Run("bulk_read_"+format+"_polls_execution_controls", func(t *testing.T) {
+			s := NewState()
+			defer s.Close()
+			cl, err := s.LoadChunk([]byte(`local f = assert(io.open(...)); return f, f.read`), "=bulk_read")
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := s.Call(cl, StringValue(s.intern.Intern(path)))
+			if err != nil || len(res) != 2 {
+				t.Fatalf("res=%v err=%v", res, err)
+			}
+			var arg Value
+			if format[0] == 'n' {
+				arg = IntValue(32 << 20)
+			} else {
+				arg = StringValue(s.intern.Intern(format))
+			}
+			s.SetInstructionLimit(100)
+			_, err = s.Call(res[1], res[0], arg)
+			if !errors.Is(err, ErrInstructionLimit) {
+				t.Fatalf("file:read(%s) over 32MiB ignored instruction limit: err=%v", format, err)
+			}
+		})
+	}
+	t.Run("short_line_reads_not_charged", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "lines.txt")
+		if err := os.WriteFile(p, bytes.Repeat([]byte("abc\n"), 2000), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		s := NewState()
+		defer s.Close()
+		s.SetInstructionLimit(1 << 20)
+		cl, err := s.LoadChunk([]byte(`local n = 0; for l in io.lines(...) do n = n + 1 end; return n`), "=short_lines")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl, StringValue(s.intern.Intern(p))); err != nil || len(res) != 1 || res[0].Int() != 2000 {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+}
