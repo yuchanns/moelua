@@ -180,6 +180,12 @@ func nativeStringMatch(s *State, args []Value) ([]Value, error) {
 	return s.capturesToValuesRooted(caps, len(str))
 }
 
+// gmatchState is the Go payload of the gmatch iterator's state userdata (upvalue #3).
+type gmatchState struct {
+	it     *luastdlib.GMatchIter
+	srcLen int
+}
+
 func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 	str, err := checkStringArg(args, 0, "gmatch")
 	if err != nil {
@@ -228,22 +234,32 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 	// Trace subject and pattern through immutable internal gcRefs so extracting upvalue #3
 	// via debug.getupvalue(iter, 3) still accounts for both retained strings under memLimit
 	// without exposing or allowing mutation via debug.getuservalue/setuservalue.
-	stateUD := UserdataValue(&Userdata{Data: it, gcRefs: []Value{strVal, patVal}})
+	stateUD := UserdataValue(&Userdata{Data: &gmatchState{it: it, srcLen: len(str)}, gcRefs: []Value{strVal, patVal}})
 	fn := &NativeFunc{
 		Name:        "gmatch_iter",
 		NumUpvals:   3,
 		Collectable: true,
 		upvals:      []Value{strVal, patVal, stateUD},
-		Fn: func(s *State, _ []Value) ([]Value, error) {
-			caps, ok, err := it.Next()
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				return nil, nil
-			}
-			return s.capturesToValuesRooted(caps, len(str))
-		},
+	}
+	// Retrieve the iterator state exclusively from the live upvalue #3 (like lstrlib.c:gmatch_aux's
+	// lua_upvalueindex(3)) instead of capturing it in the Go closure, so replacing the upvalues via
+	// debug.setupvalue makes the retained subject/pattern unreachable and collectable/accounted.
+	fn.Fn = func(s *State, _ []Value) ([]Value, error) {
+		var gs *gmatchState
+		if len(fn.upvals) > 2 && fn.upvals[2].IsUserdata() {
+			gs, _ = fn.upvals[2].AsUserdata().Data.(*gmatchState)
+		}
+		if gs == nil {
+			return nil, fmt.Errorf("bad gmatch iterator state")
+		}
+		caps, ok, err := gs.it.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, nil
+		}
+		return s.capturesToValuesRooted(caps, gs.srcLen)
 	}
 	return []Value{NativeValue(fn)}, nil
 }

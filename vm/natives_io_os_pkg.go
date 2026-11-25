@@ -1750,9 +1750,16 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 
 // readLuaNumber implements exact PUC-Rio Lua 5.5 liolib.c:read_number state machine.
 func readLuaNumber(s *State, r *bufio.Reader) (Value, bool, error) {
-	// Skip leading whitespace.
+	// Skip leading whitespace, polling execution controls so long whitespace prefixes
+	// cannot bypass context deadlines or instruction limits.
 	var cur byte
-	for {
+	cancelFn := s.nativeCancelFunc()
+	for skipped := 0; ; skipped++ {
+		if cancelFn != nil && skipped&4095 == 4095 {
+			if err := cancelFn(); err != nil {
+				return NilValue(), false, err
+			}
+		}
 		b, err := r.ReadByte()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
