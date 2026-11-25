@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const selfCPUSupported = true
+
 func getSelfCPU() (time.Duration, bool) {
 	var ru syscall.Rusage
 	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {

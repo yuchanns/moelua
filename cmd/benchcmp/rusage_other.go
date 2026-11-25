@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const selfCPUSupported = false
+
 func getSelfCPU() (time.Duration, bool) {
 	return 0, false
 }

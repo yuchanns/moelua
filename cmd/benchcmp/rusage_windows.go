@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const selfCPUSupported = true
+
 func filetimeDuration(ft syscall.Filetime) time.Duration {
 	ticks := uint64(ft.HighDateTime)<<32 | uint64(ft.LowDateTime)
 	return time.Duration(ticks) * 100

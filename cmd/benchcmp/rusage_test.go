@@ -7,8 +7,7 @@ import (
 
 func TestGetSelfCPU(t *testing.T) {
 	cpu0, ok := getSelfCPU()
-	switch runtime.GOOS {
-	case "linux", "darwin", "freebsd", "netbsd", "openbsd", "windows":
+	if selfCPUSupported {
 		if !ok {
 			t.Fatalf("getSelfCPU() unavailable on %s", runtime.GOOS)
 		}
@@ -27,9 +26,9 @@ func TestGetSelfCPU(t *testing.T) {
 		if cpu1 < cpu0 {
 			t.Fatalf("getSelfCPU() regressed: %v -> %v", cpu0, cpu1)
 		}
-	default:
-		if ok {
-			t.Fatalf("expected getSelfCPU() unavailable on %s", runtime.GOOS)
-		}
+		return
+	}
+	if ok {
+		t.Fatalf("expected getSelfCPU() unavailable on %s", runtime.GOOS)
 	}
 }
