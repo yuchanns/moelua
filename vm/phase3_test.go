@@ -2,6 +2,10 @@ package vm
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -313,4 +317,191 @@ func TestTablePairsClearLastAndHashArrayMigration(t *testing.T) {
 	if len(res) != 1 || res[0].AsString().S != "ok" {
 		t.Fatalf("unexpected res: %v", res)
 	}
+}
+
+func TestCodexReviewVMRegressions(t *testing.T) {
+	// 1. Reverse finalizer compaction: older object dead while newer stays live.
+	t.Run("finalizer_reverse_compaction", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local fired = {}
+			local mt = { __gc = function(o) fired[#fired+1] = o.id end }
+			local a = setmetatable({ id = "a" }, mt)
+			local b = setmetatable({ id = "b" }, mt)
+			local c = setmetatable({ id = "c" }, mt)
+			a = nil
+			collectgarbage("collect")
+			assert(#fired == 1 and fired[1] == "a", "expected only a to finalize, got " .. table.concat(fired, ","))
+			b = nil
+			c = nil
+			collectgarbage("collect")
+			assert(#fired == 3 and fired[2] == "c" and fired[3] == "b", "expected LIFO c then b, got " .. table.concat(fired, ","))
+			return "ok"
+		`), "=gc_reverse")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. Math builtins must return catchable Lua errors (never Go panics) on missing args.
+	t.Run("math_missing_args_no_panic", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local cases = {
+				function() return math.ult() end,
+				function() return math.ult(1) end,
+				function() return math.fmod() end,
+				function() return math.fmod(1) end,
+				function() return math.fmod("bad", 2) end,
+				function() return math.frexp() end,
+				function() return math.ldexp() end,
+				function() return math.ldexp(1) end,
+			}
+			for i, fn in ipairs(cases) do
+				local ok = pcall(fn)
+				assert(not ok, "case " .. i .. " should have errored")
+			end
+			return "ok"
+		`), "=math_args")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. Unbiased wide-range math.random(math.mininteger, 1 << 62).
+	t.Run("math_random_unbiased_wide_range", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			math.randomseed(1, 2)
+			local threshold = -(1 << 62)
+			local low = 0
+			local N = 20000
+			for i = 1, N do
+				local v = math.random(math.mininteger, 1 << 62)
+				if v < threshold then low = low + 1 end
+			end
+			-- Exact probability is 1/3 (~6667/20000); biased % would give ~10000/20000.
+			assert(low > 5500 and low < 7800, "unexpected low count: " .. low)
+			return low
+		`), "=rand_bias")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(cl); err != nil {
+			t.Fatalf("Call failed: %v", err)
+		}
+	})
+
+	// 4. Return hook error propagation across OP_RETURN0, OP_RETURN1, and native returns.
+	t.Run("return_hook_error_propagation", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function f1() return 42 end
+			local function f0() end
+			debug.sethook(function()
+				local info = debug.getinfo(2, "f")
+				if info and (info.func == f1 or info.func == f0) then
+					error("ret-hook-boom")
+				end
+			end, "r")
+			local ok1, err1 = pcall(f1)
+			local ok0, err0 = pcall(f0)
+			debug.sethook()
+			assert(not ok1 and tostring(err1):find("ret-hook-boom", 1, true), "OP_RETURN1 hook err lost: " .. tostring(err1))
+			assert(not ok0 and tostring(err0):find("ret-hook-boom", 1, true), "OP_RETURN0 hook err lost: " .. tostring(err0))
+			return "ok"
+		`), "=rethook_err")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 5. coroutine.create(coroutine.yield) preserves resume args as return values.
+	t.Run("coroutine_create_yield_entry", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local co = coroutine.create(coroutine.yield)
+			local ok1, a1 = coroutine.resume(co, "first")
+			assert(ok1 and a1 == "first")
+			local ok2, b1, b2 = coroutine.resume(co, "second", 3)
+			assert(ok2 and b1 == "second" and b2 == 3)
+			assert(coroutine.status(co) == "dead")
+			return "ok"
+		`), "=coro_yield_entry")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 6. State.SetMemoryLimit enforced on io file reads (numeric, line, and read-all).
+	t.Run("io_read_memory_limit", func(t *testing.T) {
+		tmp := filepath.Join(t.TempDir(), "big.txt")
+		if err := os.WriteFile(tmp, []byte(strings.Repeat("x", 512*1024)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(256 * 1024)
+		s.SetGlobal("BIG_PATH", StringValue(s.Intern(tmp)))
+		cl, err := s.LoadChunk([]byte(`
+			local f = assert(io.open(BIG_PATH, "rb"))
+			local ok1, e1 = pcall(function() return f:read(400000) end)
+			assert(not ok1 and tostring(e1):find("not enough memory", 1, true), "numeric read bypassed memLimit: " .. tostring(e1))
+			f:seek("set", 0)
+			local ok2, e2 = pcall(function() return f:read("a") end)
+			assert(not ok2 and tostring(e2):find("not enough memory", 1, true), "read('a') bypassed memLimit: " .. tostring(e2))
+			f:seek("set", 0)
+			local ok3, e3 = pcall(function() return f:read("l") end)
+			assert(not ok3 and tostring(e3):find("not enough memory", 1, true), "read('l') bypassed memLimit: " .. tostring(e3))
+			f:close()
+			return "ok"
+		`), "=io_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 7. Short string interner reclaims unreachable short strings cleanly.
+	t.Run("short_string_reclamation", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			for i = 1, 5000 do
+				local tmp = "ephemeral_" .. tostring(i)
+			end
+		`), "=short_str_gc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(cl); err != nil {
+			t.Fatalf("Call failed: %v", err)
+		}
+		for range 3 {
+			runtime.GC()
+		}
+		live := s.intern.Prune()
+		if live > 1000 {
+			t.Fatalf("expected unreachable ephemeral short strings to be reclaimed, still have %d live", live)
+		}
+	})
 }

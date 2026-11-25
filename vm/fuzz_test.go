@@ -2,7 +2,6 @@ package vm_test
 
 import (
 	"bytes"
-	"fmt"
 	"testing"
 
 	"github.com/yuchanns/moelua/bytecode"
@@ -11,29 +10,32 @@ import (
 )
 
 func newBoundedFuzzState(stepLimit int) (*vm.State, error) {
-	s := vm.NewState()
+	s := vm.NewStateNoEnv()
 	var sink bytes.Buffer
 	s.SetOutput(&sink)
 	s.SetErrOutput(&sink)
-	// Restrict OS/IO side effects during fuzzing while keeping all pure Lua/VM/stdlib APIs live.
+	// Restrict OS/IO/filesystem side effects across globals, package.loaded, and package.searchers.
 	s.SetGlobal("io", vm.NilValue())
 	s.SetGlobal("os", vm.NilValue())
 	s.SetGlobal("dofile", vm.NilValue())
 	s.SetGlobal("loadfile", vm.NilValue())
-	// Install an instruction-budget hook so infinite loops in mutated bytecode/source terminate cleanly.
-	setup, err := compiler.Compile("=fuzzguard", fmt.Sprintf(
-		`debug.sethook(function() error("fuzz_step_limit") end, "", %d)`, stepLimit,
-	))
-	if err != nil {
-		return nil, err
+	if pkgVal := s.GetGlobal("package"); pkgVal.IsTable() {
+		pkg := pkgVal.AsTable()
+		if loadedVal := pkg.RawGetStr(s.Intern("loaded")); loadedVal.IsTable() {
+			loaded := loadedVal.AsTable()
+			loaded.RawSetStr(s, s.Intern("io"), vm.NilValue())
+			loaded.RawSetStr(s, s.Intern("os"), vm.NilValue())
+		}
+		if searchersVal := pkg.RawGetStr(s.Intern("searchers")); searchersVal.IsTable() {
+			// Keep only searcher_preload (slot 1); drop filesystem/C searchers.
+			searchers := searchersVal.AsTable()
+			searchers.RawSetInt(s, 2, vm.NilValue())
+			searchers.RawSetInt(s, 3, vm.NilValue())
+		}
 	}
-	cl, err := s.Load(setup)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := s.Call(vm.ClosureValue(cl)); err != nil {
-		return nil, err
-	}
+	// Enforce uncatchable instruction and memory limits so fuzz inputs cannot hang or OOM.
+	s.SetMemoryLimit(2 * 1024 * 1024)
+	s.SetInstructionLimit(int64(stepLimit))
 	return s, nil
 }
 
@@ -198,7 +200,6 @@ func FuzzStructuredProto(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		s.SetMemoryLimit(2 * 1024 * 1024)
 		defer s.Close()
 		cl, err := s.Load(p)
 		if err != nil {
@@ -206,4 +207,55 @@ func FuzzStructuredProto(f *testing.F) {
 		}
 		_, _ = s.Call(vm.ClosureValue(cl))
 	})
+}
+
+func TestFuzzStateSandboxGuards(t *testing.T) {
+	// 1. debug.sethook() cannot disable the fuzz instruction budget.
+	s, err := newBoundedFuzzState(2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	cl, err := s.LoadChunk([]byte(`debug.sethook(); while true do end`), "=fuzz_loop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(cl); err == nil {
+		t.Fatalf("expected instruction limit error")
+	}
+
+	// 2. require('os') and package.loaded.io are removed from fuzz state.
+	s2, err := newBoundedFuzzState(2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	cl2, err := s2.LoadChunk([]byte(`
+		assert(package.loaded.os == nil and package.loaded.io == nil)
+		local ok = pcall(require, "os")
+		assert(not ok, "require('os') should fail in fuzz state")
+	`), "=fuzz_pkg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.Call(cl2); err != nil {
+		t.Fatalf("fuzz package isolation check failed: %v", err)
+	}
+
+	// 3. Memory limit bounds string.rep allocations in fuzz state.
+	s3, err := newBoundedFuzzState(2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3.Close()
+	cl3, err := s3.LoadChunk([]byte(`
+		local ok, err = pcall(function() return string.rep("x", 10 * 1024 * 1024) end)
+		assert(not ok and tostring(err):find("not enough memory", 1, true), tostring(err))
+	`), "=fuzz_mem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s3.Call(cl3); err != nil {
+		t.Fatalf("fuzz memory limit check failed: %v", err)
+	}
 }
