@@ -4,7 +4,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -22,7 +21,6 @@ type cliFlags struct {
 	hasE    bool
 	hasI    bool
 	hasV    bool
-	hasW    bool
 	hasNoE  bool // -E
 	script  int  // index in os.Args of first script/non-option arg (0 if none)
 	badOpt  string
@@ -59,7 +57,6 @@ func collectArgs(argv []string) cliFlags {
 				f.badOpt = arg
 				return f
 			}
-			f.hasW = true
 		case 'i':
 			if len(arg) > 2 {
 				f.badOpt = arg
@@ -83,7 +80,6 @@ func collectArgs(argv []string) cliFlags {
 				}
 			}
 		case 'l':
-			f.hasE = true
 			if len(arg) == 2 {
 				i++
 				if i >= len(argv) {
@@ -119,10 +115,8 @@ func printUsage(progName, badOpt, needArg string) {
 }
 
 func createArgTable(s *vm.State, argv []string, script int) {
-	if script == 0 {
-		script = len(argv)
-	}
-	argTbl := s.NewTable(max(0, len(argv)-script), script)
+	narg := max(0, len(argv)-(script+1))
+	argTbl := s.NewTable(narg, script+1)
 	for i := 0; i < len(argv); i++ {
 		argTbl.RawSetInt(s, int64(i-script), vm.StringValue(s.Intern(argv[i])))
 	}
@@ -248,11 +242,11 @@ func (c *cliState) doChunkString(progName, chunkName, src string) bool {
 	return ok
 }
 
-func (c *cliState) doChunkFile(progName, path string, passArgs bool) bool {
+func (c *cliState) doChunkFile(progName, path string, literalFile, passArgs bool) bool {
 	var data []byte
 	var err error
 	chunkName := "=stdin"
-	if path == "" || path == "-" {
+	if path == "" || (path == "-" && !literalFile) {
 		data, err = io.ReadAll(os.Stdin)
 	} else {
 		chunkName = "@" + path
@@ -291,6 +285,9 @@ func (c *cliState) doLibrary(progName, spec string) bool {
 	if eq := strings.IndexByte(spec, '='); eq >= 0 {
 		globName = spec[:eq]
 		modName = spec[eq+1:]
+	} else if dash := strings.IndexByte(globName, '-'); dash >= 0 {
+		// Lua 5.5 lua.c:dolibrary: strip version suffix after '-' from implicit global name.
+		globName = globName[:dash]
 	}
 	reqFn := c.s.GetGlobal("require")
 	res, ok := c.doCall(progName, reqFn, vm.StringValue(c.s.Intern(modName)))
@@ -314,7 +311,7 @@ func (c *cliState) handleLuaInit(progName string) bool {
 		return true
 	}
 	if strings.HasPrefix(val, "@") {
-		return c.doChunkFile(progName, val[1:], false)
+		return c.doChunkFile(progName, val[1:], true, false)
 	}
 	return c.doChunkString(progName, "="+name, val)
 }
@@ -329,6 +326,8 @@ func (c *cliState) runArgs(progName string, argv []string, n int) bool {
 			break
 		}
 		switch arg[1] {
+		case 'W':
+			c.s.SetWarnings(true)
 		case 'e':
 			chunk := arg[2:]
 			if chunk == "" {
@@ -402,10 +401,9 @@ func (c *cliState) doREPL(progName string, noEnv bool) {
 			fmt.Fprintf(os.Stderr, "%s: warning: unable to load readline library '%s'\n", progName, rl)
 		}
 	}
-	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Fprint(os.Stdout, getPrompt(s, true))
-		line, err := reader.ReadString('\n')
+		line, err := s.ReadStdinLine()
 		if err != nil && line == "" {
 			fmt.Fprintln(os.Stdout)
 			return
@@ -426,7 +424,7 @@ func (c *cliState) doREPL(progName string, noEnv bool) {
 					break
 				}
 				fmt.Fprint(os.Stdout, getPrompt(s, false))
-				more, rerr := reader.ReadString('\n')
+				more, rerr := s.ReadStdinLine()
 				if rerr != nil && more == "" {
 					break
 				}
@@ -450,14 +448,6 @@ func (c *cliState) doREPL(progName string, noEnv bool) {
 	}
 }
 
-func isStdinTerminal() bool {
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
-}
-
 func main() {
 	argv := os.Args
 	progName := "moelua"
@@ -474,9 +464,6 @@ func main() {
 	c := newCLIState(flags.hasNoE)
 	s := c.s
 
-	if flags.hasW {
-		s.SetWarnings(true)
-	}
 	if flags.hasV {
 		fmt.Fprintln(os.Stdout, luaReleaseBanner)
 	}
@@ -500,7 +487,8 @@ func main() {
 	}
 
 	if flags.script > 0 {
-		if !c.doChunkFile(progName, argv[flags.script], true) {
+		literalFile := flags.script > 1 && argv[flags.script-1] == "--"
+		if !c.doChunkFile(progName, argv[flags.script], literalFile, true) {
 			s.Close()
 			os.Exit(1)
 		}
@@ -513,7 +501,7 @@ func main() {
 			fmt.Fprintln(os.Stdout, luaReleaseBanner)
 			c.doREPL(progName, flags.hasNoE)
 		} else {
-			if !c.doChunkFile(progName, "-", false) {
+			if !c.doChunkFile(progName, "-", false, false) {
 				s.Close()
 				os.Exit(1)
 			}
