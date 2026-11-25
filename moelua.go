@@ -236,10 +236,18 @@ func (s *State) Preload(name string, loader GoFunc) error {
 		return ErrStateClosed
 	}
 	v := vm.NilValue()
+	var ls *vm.LuaString
 	if loader != nil {
+		var err error
+		ls, err = s.vm.TryIntern(name)
+		if err != nil {
+			return err
+		}
 		v = s.NewFunc(name, loader)
+	} else {
+		ls = s.vm.Intern(name)
 	}
-	s.vm.PreloadTable().RawSetStr(s.vm, s.vm.Intern(name), v)
+	s.vm.PreloadTable().RawSetStr(s.vm, ls, v)
 	return s.vm.ConsumeMemErr()
 }
 
@@ -413,9 +421,12 @@ func (s *State) TryNewMetatable(name string) (*Table, bool, error) {
 		return nil, false, ErrStateClosed
 	}
 	reg := s.vm.Registry()
-	key := s.vm.Intern(name)
-	if existing := reg.RawGetStr(key); existing.IsTable() {
+	if existing := reg.RawGetStr(s.vm.Intern(name)); existing.IsTable() {
 		return &Table{state: s, raw: existing.AsTable()}, false, nil
+	}
+	key, err := s.vm.TryIntern(name)
+	if err != nil {
+		return nil, false, err
 	}
 	mt, err := s.vm.TryNewTable(0, 4)
 	if err != nil {
@@ -550,7 +561,7 @@ func (s *State) RegisterFunc(name string, fn GoFunc) {
 	if !s.ready() || fn == nil {
 		return
 	}
-	s.vm.SetGlobal(name, s.NewFunc(name, fn))
+	s.SetGlobal(name, s.NewFunc(name, fn))
 }
 
 // RegisterFunc1 installs a zero-allocation single-return GoFunc1 as a global variable in _G.
@@ -558,14 +569,34 @@ func (s *State) RegisterFunc1(name string, fn GoFunc1) {
 	if !s.ready() || fn == nil {
 		return
 	}
-	s.vm.SetGlobal(name, s.NewFunc1(name, fn))
+	s.SetGlobal(name, s.NewFunc1(name, fn))
+}
+
+// TrySetGlobal sets a global variable in _G after checking and accounting for the key string
+// and any table growth against the State's memory limit.
+func (s *State) TrySetGlobal(name string, v Value) error {
+	if !s.ready() {
+		return ErrStateClosed
+	}
+	var ls *vm.LuaString
+	if v.IsNil() {
+		ls = s.vm.Intern(name)
+	} else {
+		var err error
+		ls, err = s.vm.TryIntern(name)
+		if err != nil {
+			return err
+		}
+	}
+	s.vm.GlobalEnv().RawSetStr(s.vm, ls, v)
+	return s.vm.ConsumeMemErr()
 }
 
 // SetGlobal sets a global variable in _G.
+// If the State is closed or allocating the key/storage exceeds the configured memory limit,
+// the assignment is skipped without leaving an unconsumed VM memory error (use TrySetGlobal to inspect errors).
 func (s *State) SetGlobal(name string, v Value) {
-	if s.ready() {
-		s.vm.SetGlobal(name, v)
-	}
+	_ = s.TrySetGlobal(name, v)
 }
 
 // GetGlobal retrieves a global variable from _G.
@@ -767,7 +798,17 @@ func (t *Table) SetString(key string, val Value) error {
 	if !t.ready() {
 		return ErrStateClosed
 	}
-	t.raw.RawSetStr(t.state.vm, t.state.vm.Intern(key), val)
+	var ls *vm.LuaString
+	if val.IsNil() {
+		ls = t.state.vm.Intern(key)
+	} else {
+		var err error
+		ls, err = t.state.vm.TryIntern(key)
+		if err != nil {
+			return err
+		}
+	}
+	t.raw.RawSetStr(t.state.vm, ls, val)
 	return t.state.vm.ConsumeMemErr()
 }
 

@@ -944,3 +944,51 @@ func TestNewMetatableMemoryLimitEnforcement(t *testing.T) {
 		t.Fatalf("subsequent Lua execution failed after NewMetatable OOM: res=%v err=%v", res, err)
 	}
 }
+
+func TestTableSetStringMemoryLimitEnforcement(t *testing.T) {
+	s := moelua.New(moelua.WithMemoryLimit(131072))
+	defer s.Close()
+
+	tbl, err := s.TryNewTable(0, 0)
+	if err != nil {
+		t.Fatalf("TryNewTable failed: %v", err)
+	}
+	if err := s.TrySetGlobal("host_tbl", tbl.Value()); err != nil {
+		t.Fatalf("TrySetGlobal failed: %v", err)
+	}
+
+	hugeKey := strings.Repeat("k", 1_000_000)
+
+	// Table.SetString must reject oversized string keys before mutating the table.
+	if err := tbl.SetString(hugeKey, moelua.Int(1)); err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected memory error from Table.SetString(1MB), got %v", err)
+	}
+	if !tbl.GetString(hugeKey).IsNil() {
+		t.Fatalf("Table.SetString mutated table despite OOM")
+	}
+
+	// State.TrySetGlobal / Preload / TryNewMetatable must also enforce key string budgets.
+	if err := s.TrySetGlobal(hugeKey, moelua.Int(1)); err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected memory error from TrySetGlobal(1MB), got %v", err)
+	}
+	if err := s.Preload(hugeKey, func(*moelua.State, []moelua.Value) ([]moelua.Value, error) { return nil, nil }); err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected memory error from Preload(1MB), got %v", err)
+	}
+	if mt, created, err := s.TryNewMetatable(hugeKey); mt != nil || created || err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected memory error from TryNewMetatable(1MB), got mt=%v created=%v err=%v", mt, created, err)
+	}
+
+	// Keys within budget must be accounted in MemoryUsage() and remain readable from Lua.
+	before := s.MemoryUsage()
+	mediumKey := strings.Repeat("m", 8192)
+	if err := tbl.SetString(mediumKey, moelua.Int(42)); err != nil {
+		t.Fatalf("expected 8KiB key within budget to succeed, got %v", err)
+	}
+	if after := s.MemoryUsage(); after < before+8192 {
+		t.Fatalf("expected MemoryUsage to account for 8KiB key: before=%d after=%d", before, after)
+	}
+	res, err := s.DoString(`local n = 0; for k, v in pairs(host_tbl) do n = n + #k + v end; return n`)
+	if err != nil || len(res) != 1 || res[0].Int() != 8192+42 {
+		t.Fatalf("unexpected Lua readback: res=%v err=%v", res, err)
+	}
+}
