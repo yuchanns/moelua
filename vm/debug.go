@@ -6,7 +6,6 @@ import (
 	"math"
 	"os"
 	"strings"
-	"unsafe"
 
 	"github.com/yuchanns/moelua/bytecode"
 )
@@ -1062,7 +1061,7 @@ func nativeDebugSetUpvalue(s *State, args []Value) ([]Value, error) {
 	return []Value{StringValue(s.intern.Intern(name))}, nil
 }
 
-func nativeDebugUpvalueID(_ *State, args []Value) ([]Value, error) {
+func nativeDebugUpvalueID(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad arguments to 'upvalueid'")
 	}
@@ -1076,10 +1075,32 @@ func nativeDebugUpvalueID(_ *State, args []Value) ([]Value, error) {
 		if idx < 1 || int(idx) > n {
 			return []Value{NilValue()}, nil
 		}
-		if int(idx)-1 < len(nf.upvals) {
-			return []Value{LightUDValue(unsafe.Pointer(&nf.upvals[idx-1]))}, nil
+		i := int(idx) - 1
+		if nf.Collectable {
+			if len(nf.upvalIDs) < n {
+				grown := make([]uint64, n)
+				copy(grown, nf.upvalIDs)
+				nf.upvalIDs = grown
+			}
+			if nf.upvalIDs[i] == 0 {
+				nf.upvalIDs[i] = globalUpvalTokenID.Add(1)
+			}
+			return []Value{LightUDTokenValue(nf.upvalIDs[i])}, nil
 		}
-		return []Value{LightUDValue(unsafe.Pointer(uintptr(unsafe.Pointer(nf)) + uintptr(idx)))}, nil
+		if s.immUpvalTokens == nil {
+			s.immUpvalTokens = make(map[*NativeFunc][]uint64)
+		}
+		ids := s.immUpvalTokens[nf]
+		if len(ids) < n {
+			grown := make([]uint64, n)
+			copy(grown, ids)
+			ids = grown
+			s.immUpvalTokens[nf] = ids
+		}
+		if ids[i] == 0 {
+			ids[i] = globalUpvalTokenID.Add(1)
+		}
+		return []Value{LightUDTokenValue(ids[i])}, nil
 	}
 	if !args[0].IsClosure() {
 		return []Value{NilValue()}, nil
@@ -1088,7 +1109,7 @@ func nativeDebugUpvalueID(_ *State, args []Value) ([]Value, error) {
 	if idx < 1 || int(idx) > len(cl.upvals) {
 		return []Value{NilValue()}, nil
 	}
-	return []Value{LightUDValue(upvaluePtr(cl.upvals[idx-1]))}, nil
+	return []Value{LightUDTokenValue(cl.upvals[idx-1].tokenID())}, nil
 }
 
 func nativeDebugUpvalueJoin(s *State, args []Value) ([]Value, error) {

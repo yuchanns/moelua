@@ -36,18 +36,20 @@ const (
 
 // Non-zero-size static sentinel array in .noptrbss (never aliases runtime.zerobase).
 // Layout: [0]=nil, [1]=false, [2]=true, [3]=altScalar (float in intnil, int in floatnil),
-// [4]=nullLightUD (distinct nonnumeric sentinel so LightUDValue(nil) stays LUA_TLIGHTUSERDATA).
+// [4]=nullLightUD (distinct nonnumeric sentinel so LightUDValue(nil) stays LUA_TLIGHTUSERDATA),
+// [5]=tokenLightUD (non-owning identity token for debug.upvalueid; bits stores unique uint64 ID).
 // Keeping [0]=nil and [1]=false adjacent makes IsFalsy a single SUB+CMP:
 //   uintptr(v.ptr) - tagBase < 16
-var scalarTags [5]uint64
+var scalarTags [6]uint64
 
 var (
-	tagNil         = unsafe.Pointer(&scalarTags[0])
-	tagFalse       = unsafe.Pointer(&scalarTags[1])
-	tagTrue        = unsafe.Pointer(&scalarTags[2])
-	tagAlt         = unsafe.Pointer(&scalarTags[3])
-	tagNullLightUD = unsafe.Pointer(&scalarTags[4])
-	tagBase        = uintptr(unsafe.Pointer(&scalarTags[0]))
+	tagNil          = unsafe.Pointer(&scalarTags[0])
+	tagFalse        = unsafe.Pointer(&scalarTags[1])
+	tagTrue         = unsafe.Pointer(&scalarTags[2])
+	tagAlt          = unsafe.Pointer(&scalarTags[3])
+	tagNullLightUD  = unsafe.Pointer(&scalarTags[4])
+	tagTokenLightUD = unsafe.Pointer(&scalarTags[5])
+	tagBase         = uintptr(unsafe.Pointer(&scalarTags[0]))
 )
 
 // Quiet-NaN-spaced heap object kind tags stored in Value.bits when ptr is a Go heap pointer.
@@ -106,6 +108,12 @@ func LightUDValue(p unsafe.Pointer) Value {
 	return Value{ptr: p, bits: kindLightUD}
 }
 
+// LightUDTokenValue constructs a non-owning light userdata identified by an opaque uint64 token
+// without pinning any Go heap pointer (used by debug.upvalueid).
+func LightUDTokenValue(id uint64) Value {
+	return Value{ptr: tagTokenLightUD, bits: id}
+}
+
 func (v Value) IsNil() bool   { return v.ptr == tagNil }
 func (v Value) IsFalse() bool { return v.ptr == tagFalse }
 func (v Value) IsTrue() bool  { return v.ptr == tagTrue }
@@ -126,7 +134,9 @@ func (v Value) IsClosure() bool  { return v.bits == kindClosure && v.ptr != nil 
 func (v Value) IsNative() bool   { return v.bits == kindNative && v.ptr != nil && v.ptr != tagAlt }
 func (v Value) IsThread() bool   { return v.bits == kindThread && v.ptr != nil && v.ptr != tagAlt }
 func (v Value) IsUserdata() bool { return v.bits == kindUserdata && v.ptr != nil && v.ptr != tagAlt }
-func (v Value) IsLightUD() bool  { return v.bits == kindLightUD && v.ptr != nil && v.ptr != tagAlt }
+func (v Value) IsLightUD() bool {
+	return v.ptr == tagTokenLightUD || (v.bits == kindLightUD && v.ptr != nil && v.ptr != tagAlt)
+}
 func (v Value) IsFunction() bool { return v.IsClosure() || v.IsNative() }
 
 func (v Value) AsString() *LuaString  { return (*LuaString)(v.ptr) }
@@ -136,10 +146,17 @@ func (v Value) AsNative() *NativeFunc { return (*NativeFunc)(v.ptr) }
 func (v Value) AsThread() *Thread     { return (*Thread)(v.ptr) }
 func (v Value) AsUserdata() *Userdata { return (*Userdata)(v.ptr) }
 func (v Value) AsLightUD() unsafe.Pointer {
-	if v.ptr == tagNullLightUD {
+	if v.ptr == tagNullLightUD || v.ptr == tagTokenLightUD {
 		return nil
 	}
 	return v.ptr
+}
+
+func (v Value) formatLightUDAddr() string {
+	if v.ptr == tagTokenLightUD {
+		return fmt.Sprintf("0x%x", v.bits)
+	}
+	return fmt.Sprintf("%p", v.AsLightUD())
 }
 
 func (v *Value) SetNil() {
@@ -521,7 +538,7 @@ func FormatValue(v Value) string {
 	case v.IsThread():
 		return fmt.Sprintf("thread: %p", v.AsThread())
 	case v.IsLightUD():
-		return fmt.Sprintf("userdata: %p", v.AsLightUD())
+		return "userdata: " + v.formatLightUDAddr()
 	default:
 		return fmt.Sprintf("userdata: %p", v.ptr)
 	}

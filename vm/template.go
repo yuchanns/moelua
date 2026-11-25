@@ -439,6 +439,8 @@ func cloneFromStdTemplate(noEnv bool) *State {
 	s.pkgTbl = &a.tables[tmpl.pkgIdx]
 	s.loadedTbl = &a.tables[tmpl.loadedIdx]
 	s.preloadTbl = &a.tables[tmpl.preloadIdx]
+	s.coallocTables = a.tables[:len(tmpl.tables)]
+	s.coallocHashes = a.hashes[:len(tmpl.tables)]
 	s.typeMetas[4] = s.stringMeta
 	s.stdinInput = stdinVal
 	s.defaultInput = stdinVal

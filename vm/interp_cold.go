@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/yuchanns/moelua/bytecode"
-	"github.com/yuchanns/moelua/internal/luastdlib"
 )
 
 type coldAction uint8
@@ -797,6 +796,9 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 				if !t.slots[slot].IsNil() || noNewIdx {
 					if key == s.intern.tms[TMMode] || key == s.intern.tms[TMGC] {
 						s.activateTier1()
+						if key == s.intern.tms[TMGC] && t == s.fileMeta {
+							s.promoteFileFinalizers()
+						}
 					}
 					t.slots[slot] = val
 					if t.tmFlags != 0 {
@@ -820,6 +822,9 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 				}
 				if key == s.intern.tms[TMGC] || key == s.intern.tms[TMMode] {
 					s.activateTier1()
+					if key == s.intern.tms[TMGC] && t == s.fileMeta {
+						s.promoteFileFinalizers()
+					}
 				}
 				oldShape := t.shape
 				next, serr := s.shapes.Transition(s, oldShape, key)
@@ -1993,18 +1998,21 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 	return true, nil
 }
 
-func strToNumForLoop(v Value) Value {
+func (s *State) strToNumForLoop(v Value) (Value, error) {
 	if !v.IsString() {
-		return v
+		return v, nil
 	}
-	str := v.AsString().S
-	if i, ok := luastdlib.StrToInt(str); ok {
-		return IntValue(i)
+	iv, fv, isInt, ok, err := s.strToNum(v.AsString().S)
+	if err != nil {
+		return NilValue(), err
 	}
-	if f, ok := luastdlib.StrToFloat(str); ok {
-		return FloatValue(f)
+	if !ok {
+		return v, nil
 	}
-	return v
+	if isInt {
+		return IntValue(iv), nil
+	}
+	return FloatValue(fv), nil
 }
 
 //go:noinline
@@ -2016,7 +2024,10 @@ func (s *State) forPrepSlow(regs *[256]Value, a uint8) (bool, error) {
 		if step == 0 {
 			return false, fmt.Errorf("'for' step is zero")
 		}
-		plim := strToNumForLoop(origLim)
+		plim, err := s.strToNumForLoop(origLim)
+		if err != nil {
+			return false, err
+		}
 		var lim int64
 		var ok bool
 		if plim.IsInt() {
@@ -2067,7 +2078,18 @@ func (s *State) forPrepSlow(regs *[256]Value, a uint8) (bool, error) {
 		regs[a+2].SetInt(initV)
 		return false, nil
 	}
-	plim, pstep, pinit := strToNumForLoop(origLim), strToNumForLoop(origStep), strToNumForLoop(origInit)
+	plim, err := s.strToNumForLoop(origLim)
+	if err != nil {
+		return false, err
+	}
+	pstep, err := s.strToNumForLoop(origStep)
+	if err != nil {
+		return false, err
+	}
+	pinit, err := s.strToNumForLoop(origInit)
+	if err != nil {
+		return false, err
+	}
 	lim, ok := plim.ToFloat()
 	if !ok {
 		return false, fmt.Errorf("bad 'for' limit (number expected, got %s)", s.objTypeName(plim))

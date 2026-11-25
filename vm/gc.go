@@ -32,9 +32,17 @@ type gcFinalEntry struct {
 }
 
 type gcWeakFileEntry struct {
-	u   weak.Pointer[Userdata]
-	fi  *fileInner
-	seq uint64
+	u      weak.Pointer[Userdata]
+	strong *Userdata // non-nil when fileMeta.__gc was customized so Go GC cannot drop the userdata before VM __gc runs
+	fi     *fileInner
+	seq    uint64
+}
+
+func (wf gcWeakFileEntry) userdata() *Userdata {
+	if wf.strong != nil {
+		return wf.strong
+	}
+	return wf.u.Value()
 }
 
 type gcMode uint8
@@ -60,6 +68,8 @@ type gcState struct {
 
 	// Shared monotonic sequence for strict LIFO finalizer order across tables, userdata, and files.
 	finalSeq uint64
+	// True once Lua has written fileMeta.__gc; retains open file userdata strongly until VM __gc runs.
+	customFileGC bool
 	// Objects marked for finalization at setmetatable time (ascending seq; merged in reverse LIFO).
 	finalizable []gcFinalEntry
 	// Weakly-tracked standard file userdata so Go GC + runtime.AddCleanup reclaims discarded
@@ -209,6 +219,56 @@ func (s *State) gcRecordAlloc(bytes int64, liveTop int) {
 // activateTier1 flips this State into deterministic Tier 1 GC semantics.
 func (s *State) activateTier1() {
 	s.gc.tier1 = true
+}
+
+// promoteFileFinalizers switches open file userdata tracking from weak-only to strong retention
+// once Lua customizes fileMeta.__gc, ensuring Go GC cannot discard userdata before VM __gc runs.
+func (s *State) promoteFileFinalizers() {
+	s.activateTier1()
+	if s.gc.customFileGC {
+		return
+	}
+	s.gc.customFileGC = true
+	for i := range s.gc.weakFiles {
+		wf := &s.gc.weakFiles[i]
+		if wf.strong == nil {
+			if u := wf.u.Value(); u != nil && !u.gcInFnz && !u.gcFnzed {
+				wf.strong = u
+			}
+		}
+	}
+}
+
+// sweepCoallocTables clears outgoing Go references from unreachable stdlib tables/hashes
+// embedded in stateAlloc so Go GC can reclaim values stored in removed stdlib tables
+// (including values written in-place into shared template slabs).
+func (s *State) sweepCoallocTables(epoch uint64) {
+	for i := range s.coallocTables {
+		t := &s.coallocTables[i]
+		if t.gcMark == epoch {
+			continue
+		}
+		if len(t.slots) > 0 {
+			clear(t.slots)
+		}
+		if t.arrPtr != nil && t.arrKind == arrGeneric && t.arrCap > 0 {
+			clear(unsafe.Slice((*Value)(t.arrPtr), t.arrCap))
+		}
+		if t.hash != nil {
+			if len(t.hash.nodes) > 0 {
+				clear(t.hash.nodes)
+			}
+			*t.hash = tableHash{}
+		}
+		*t = Table{}
+		if i < len(s.coallocHashes) {
+			h := &s.coallocHashes[i]
+			if len(h.nodes) > 0 {
+				clear(h.nodes)
+			}
+			*h = tableHash{}
+		}
+	}
 }
 
 // registerFinalizable records obj (Table or Userdata) for __gc finalization in LIFO order
@@ -1191,7 +1251,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 				}
 			}
 			for _, wf := range s.gc.weakFiles {
-				if u := wf.u.Value(); u != nil && !u.gcFnzed {
+				if u := wf.userdata(); u != nil && !u.gcFnzed {
 					obj := UserdataValue(u)
 					if !tr.isMarked(obj) {
 						tr.mark(obj)
@@ -1220,6 +1280,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 				uv.next = nil
 			}
 		}
+		s.sweepCoallocTables(tr.epoch)
 		s.intern.Prune()
 		s.shapes.Prune()
 		s.gc.allocBytes = tr.liveBytes
@@ -1268,7 +1329,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		if wi >= 0 && (fi < 0 || s.gc.weakFiles[wi].seq > s.gc.finalizable[fi].seq) {
 			wf := s.gc.weakFiles[wi]
 			wi--
-			u := wf.u.Value()
+			u := wf.userdata()
 			if u == nil {
 				// Go GC already collected the userdata; ensure flush+close completes synchronously now.
 				if wf.fi != nil {
@@ -1360,6 +1421,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		}
 	}
 
+	s.sweepCoallocTables(tr.epoch)
 	s.intern.Prune()
 	s.shapes.Prune()
 	s.gc.allocBytes = tr.liveBytes
@@ -1468,7 +1530,7 @@ func (s *State) Close() {
 			if wi >= 0 && (fi < 0 || s.gc.weakFiles[wi].seq > s.gc.finalizable[fi].seq) {
 				wf := s.gc.weakFiles[wi]
 				wi--
-				u := wf.u.Value()
+				u := wf.userdata()
 				if u == nil {
 					if wf.fi != nil {
 						_ = wf.fi.flushAndClose()

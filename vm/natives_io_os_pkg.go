@@ -873,6 +873,7 @@ func (s *State) initIOLib() {
 	s.registerFunc(fileMT, "__close", intrNone, nativeFileGCClose)
 	s.registerFunc(fileMT, "__gc", intrNone, nativeFileGCClose)
 	s.fileMeta = fileMT
+	fileMT.markProto(s)
 
 	stdinUD := s.newFileUD(&luaFile{f: os.Stdin, isStd: true})
 	stdoutUD := s.newFileUD(&luaFile{f: os.Stdout, isStd: true})
@@ -909,8 +910,14 @@ func (s *State) newFileUD(lf *luaFile) Value {
 		s.openFiles = append(s.openFiles, fi)
 		// Track weakly so Go GC + runtime.AddCleanup automatically reclaims discarded
 		// descriptors in Tier 0, while explicit collectgarbage()/Close() still runs __gc.
+		// Once fileMeta.__gc is customized, retain u strongly so Go GC cannot drop it
+		// before the VM invokes the custom Lua finalizer.
 		s.gc.finalSeq++
-		s.gc.weakFiles = append(s.gc.weakFiles, gcWeakFileEntry{u: weak.Make(u), fi: fi, seq: s.gc.finalSeq})
+		entry := gcWeakFileEntry{u: weak.Make(u), fi: fi, seq: s.gc.finalSeq}
+		if s.gc.customFileGC {
+			entry.strong = u
+		}
+		s.gc.weakFiles = append(s.gc.weakFiles, entry)
 		if len(s.gc.weakFiles)&63 == 0 {
 			s.compactWeakFiles()
 			s.compactOpenFiles()
@@ -944,7 +951,7 @@ func (s *State) compactWeakFiles() {
 	}
 	kept := s.gc.weakFiles[:0]
 	for _, wf := range s.gc.weakFiles {
-		u := wf.u.Value()
+		u := wf.userdata()
 		if u == nil {
 			if wf.fi != nil {
 				_ = wf.fi.flushAndClose()

@@ -8,7 +8,6 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/compiler"
@@ -70,9 +69,10 @@ type NativeFunc struct {
 	FastFn      func(s *State, args []Value) (Value, error) // optional zero-alloc single-return fast path
 	Intrinsic   uint8
 	NumUpvals   uint8   // logical C closure upvalue count (e.g. string.gmatch = 3)
-	Collectable bool    // true for dynamic C closures (coroutine.wrap, gmatch, io.lines, utf8.codes); false for immutable light builtins
-	gcMark      uint64  // Tier 1 GC mark epoch (only mutated when Collectable == true)
-	upvals      []Value // captured C closure upvalues (traced by Tier 1 GC and exposed to debug.getupvalue/setupvalue)
+	Collectable bool     // true for dynamic C closures (coroutine.wrap, gmatch, io.lines, utf8.codes); false for immutable light builtins
+	gcMark      uint64   // Tier 1 GC mark epoch (only mutated when Collectable == true)
+	upvals      []Value  // captured C closure upvalues (traced by Tier 1 GC and exposed to debug.getupvalue/setupvalue)
+	upvalIDs    []uint64 // lazily assigned non-owning debug.upvalueid tokens
 }
 
 func (nf *NativeFunc) callMulti(s *State, args []Value) ([]Value, error) {
@@ -93,9 +93,17 @@ type Upvalue struct {
 	next     *Upvalue // linked list of open upvalues sorted descending by stackIdx
 	closed   Value
 	stackIdx int
+	id       uint64 // lazily assigned non-owning debug.upvalueid token
 }
 
-func upvaluePtr(u *Upvalue) unsafe.Pointer { return unsafe.Pointer(u) }
+var globalUpvalTokenID atomic.Uint64
+
+func (u *Upvalue) tokenID() uint64 {
+	if u.id == 0 {
+		u.id = globalUpvalTokenID.Add(1)
+	}
+	return u.id
+}
 
 func (u *Upvalue) Get() Value {
 	if ow := u.owner; ow != nil {
@@ -174,6 +182,9 @@ type State struct {
 	defaultInput      Value
 	defaultOutput     Value
 	openFiles         []*fileInner // open non-std file handles flushed on os.exit / closed LIFO on State.Close (does NOT pin *luaFile)
+	coallocTables     []Table      // views into stateAlloc.tables swept on GC when unreachable
+	coallocHashes     []tableHash  // views into stateAlloc.hashes swept on GC when unreachable
+	immUpvalTokens    map[*NativeFunc][]uint64 // lazy debug.upvalueid tokens for shared non-collectable builtins
 
 	// Two-Tier GC controller (Tier 0 = 0 overhead, Tier 1 = deterministic Lua 5.5 semantics).
 	gc gcState

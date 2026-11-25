@@ -15,7 +15,6 @@ import (
 	"unsafe"
 
 	"github.com/yuchanns/moelua/bytecode"
-	"github.com/yuchanns/moelua/internal/luastdlib"
 )
 
 func (s *State) registerFunc(tbl *Table, name string, intr uint8, fn func(*State, []Value) ([]Value, error)) *NativeFunc {
@@ -125,26 +124,35 @@ func (s *State) initStdlib() {
 // initStringArithMetamethods installs Lua 5.4/5.5 string-to-number arithmetic metamethods
 // on the string metatable (stateless so they are safe in the frozen stdlib template).
 func (s *State) initStringArithMetamethods(mt *Table) {
-	strToNum := func(st *State, v Value) (Value, bool) {
+	strToNum := func(st *State, v Value) (Value, bool, error) {
 		if v.IsNumber() {
-			return v, true
+			return v, true, nil
 		}
 		if !v.IsString() {
-			return NilValue(), false
+			return NilValue(), false, nil
 		}
 		res, err := nativeToNumber(st, []Value{v})
-		if err != nil || len(res) == 0 || res[0].IsNil() {
-			return NilValue(), false
+		if err != nil {
+			return NilValue(), false, err
 		}
-		return res[0], true
+		if len(res) == 0 || res[0].IsNil() {
+			return NilValue(), false, nil
+		}
+		return res[0], true, nil
 	}
 	binArith := func(tm TM, op string, iop func(int64, int64) (int64, error), fop func(float64, float64) float64, floatOnly bool) func(*State, []Value) ([]Value, error) {
 		return func(st *State, args []Value) ([]Value, error) {
 			if len(args) < 2 {
 				return nil, fmt.Errorf("attempt to %s", op)
 			}
-			n1, ok1 := strToNum(st, args[0])
-			n2, ok2 := strToNum(st, args[1])
+			n1, ok1, err1 := strToNum(st, args[0])
+			if err1 != nil {
+				return nil, err1
+			}
+			n2, ok2, err2 := strToNum(st, args[1])
+			if err2 != nil {
+				return nil, err2
+			}
 			if !ok1 || !ok2 {
 				// Per Lua 5.5 lstrlib.c:trymt — if the 2nd operand is NOT a string and has the metamethod, call it!
 				if !args[1].IsString() {
@@ -161,8 +169,8 @@ func (s *State) initStringArithMetamethods(mt *Table) {
 				}
 				return []Value{IntValue(r)}, nil
 			}
-			f1, _ := n1.CoerceFloat()
-			f2, _ := n2.CoerceFloat()
+			f1, _ := n1.ToFloat()
+			f2, _ := n2.ToFloat()
 			return []Value{FloatValue(fop(f1, f2))}, nil
 		}
 	}
@@ -177,7 +185,10 @@ func (s *State) initStringArithMetamethods(mt *Table) {
 		if len(args) < 1 {
 			return nil, fmt.Errorf("attempt to negate a 'nil' value")
 		}
-		n, ok := strToNum(st, args[0])
+		n, ok, err := strToNum(st, args[0])
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			return nil, fmt.Errorf("attempt to negate a '%s' value", args[0].TypeName())
 		}
@@ -222,7 +233,7 @@ func (s *State) toStringValue(v Value) (string, error) {
 	if mt := s.getMetatableOf(v); mt != nil {
 		if nm := mt.RawGetStr(s.intern.Intern("__name")); nm.IsString() {
 			if v.IsLightUD() {
-				return fmt.Sprintf("%s: %p", nm.AsString().S, v.AsLightUD()), nil
+				return fmt.Sprintf("%s: %s", nm.AsString().S, v.formatLightUDAddr()), nil
 			}
 			return fmt.Sprintf("%s: %p", nm.AsString().S, v.ptr), nil
 		}
@@ -388,7 +399,10 @@ func nativeToNumber(s *State, args []Value) ([]Value, error) {
 		if !v.IsString() {
 			return []Value{NilValue()}, nil
 		}
-		iv, fv, isInt, ok := luastdlib.StrToNum(v.AsString().S)
+		iv, fv, isInt, ok, err := s.strToNum(v.AsString().S)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			return []Value{NilValue()}, nil
 		}
@@ -411,7 +425,10 @@ func nativeToNumber(s *State, args []Value) ([]Value, error) {
 	if base < 2 || base > 36 {
 		return nil, fmt.Errorf("bad argument #2 to 'tonumber' (base out of range)")
 	}
-	iv, ok := luastdlib.StrToIntBase(v.AsString().S, int(base))
+	iv, ok, err := s.strToIntBase(v.AsString().S, int(base))
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return []Value{NilValue()}, nil
 	}
@@ -881,20 +898,23 @@ func nativeMathMax(s *State, args []Value) ([]Value, error) {
 	return []Value{best}, nil
 }
 
-func nativeMathToInteger(_ *State, args []Value) ([]Value, error) {
+func nativeMathToInteger(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'tointeger' (value expected)")
 	}
-	if i, ok := args[0].CoerceInt(); ok {
+	if i, ok := args[0].ToInt(); ok {
 		return []Value{IntValue(i)}, nil
 	}
 	if args[0].IsString() {
-		str := args[0].AsString().S
-		if i, ok := luastdlib.StrToInt(str); ok {
-			return []Value{IntValue(i)}, nil
+		iv, fv, isInt, ok, err := s.strToNum(args[0].AsString().S)
+		if err != nil {
+			return nil, err
 		}
-		if f, ok := luastdlib.StrToFloat(str); ok {
-			if i, ok := FloatToIntExact(f); ok {
+		if ok {
+			if isInt {
+				return []Value{IntValue(iv)}, nil
+			}
+			if i, ok := FloatToIntExact(fv); ok {
 				return []Value{IntValue(i)}, nil
 			}
 		}

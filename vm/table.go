@@ -344,6 +344,11 @@ func hashValue(v Value) uint32 {
 			return 1
 		}
 		return 2
+	case v.ptr == tagTokenLightUD:
+		x := v.bits
+		x ^= x >> 33
+		x *= 0xff51afd7ed558ccd
+		return uint32(x ^ (x >> 33))
 	default:
 		p := uint64(uintptr(v.ptr))
 		p ^= p >> 33
@@ -548,6 +553,9 @@ func (t *Table) RawGetStr(k *LuaString) Value {
 func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 	if k == s.intern.tms[TMGC] || k == s.intern.tms[TMMode] {
 		s.activateTier1()
+		if k == s.intern.tms[TMGC] && t == s.fileMeta {
+			s.promoteFileFinalizers()
+		}
 	}
 	if t.isProto() {
 		s.protoEpoch++
