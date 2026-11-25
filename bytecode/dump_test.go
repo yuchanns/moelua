@@ -315,3 +315,79 @@ func TestDumpExtremeIntConstantsAndDedup(t *testing.T) {
 		t.Fatalf("unexpected output (stripped): %q", out)
 	}
 }
+
+func TestVerifyMMBinPredecessorAndTForCallScratch(t *testing.T) {
+	mkABC := func(op bytecode.OpCode, a, b, c uint32) bytecode.Instruction {
+		return bytecode.Instruction(op) |
+			(bytecode.Instruction(a) << bytecode.PosA) |
+			(bytecode.Instruction(b) << bytecode.PosB) |
+			(bytecode.Instruction(c) << bytecode.PosC)
+	}
+	mkABx := func(op bytecode.OpCode, a, bx uint32) bytecode.Instruction {
+		return bytecode.Instruction(op) |
+			(bytecode.Instruction(a) << bytecode.PosA) |
+			(bytecode.Instruction(bx) << bytecode.PosBx)
+	}
+
+	// Reject MMBIN* preceded by non-matching opcodes.
+	badMMBin := []struct {
+		name string
+		code []bytecode.Instruction
+	}{
+		{
+			name: "move_then_mmbin",
+			code: []bytecode.Instruction{
+				mkABC(bytecode.OP_MOVE, 0, 1, 0),
+				mkABC(bytecode.OP_MMBIN, 0, 1, 6),
+				mkABC(bytecode.OP_RETURN0, 0, 0, 0),
+			},
+		},
+		{
+			name: "move_then_mmbini",
+			code: []bytecode.Instruction{
+				mkABC(bytecode.OP_MOVE, 0, 1, 0),
+				mkABC(bytecode.OP_MMBINI, 0, 1, 6),
+				mkABC(bytecode.OP_RETURN0, 0, 0, 0),
+			},
+		},
+		{
+			name: "move_then_mmbink",
+			code: []bytecode.Instruction{
+				mkABC(bytecode.OP_MOVE, 0, 1, 0),
+				mkABC(bytecode.OP_MMBINK, 0, 0, 6),
+				mkABC(bytecode.OP_RETURN0, 0, 0, 0),
+			},
+		},
+	}
+	for _, tc := range badMMBin {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &bytecode.Proto{
+				Source:       "=bad_mmbin",
+				MaxStackSize: 2,
+				Code:         tc.code,
+				Consts:       []bytecode.Constant{{Kind: bytecode.ConstInt, Int: 1}},
+			}
+			if err := bytecode.Verify(p); err == nil {
+				t.Fatalf("expected Verify to reject %s", tc.name)
+			}
+		})
+	}
+
+	// Reject TFORCALL A=0 C=1 with MaxStackSize=4 (scratch R[A+3..A+5] requires MaxStackSize >= 6).
+	badTFor := &bytecode.Proto{
+		Source:       "=bad_tforcall",
+		MaxStackSize: 4,
+		Code: []bytecode.Instruction{
+			mkABC(bytecode.OP_TFORCALL, 0, 0, 1),
+			mkABx(bytecode.OP_TFORLOOP, 0, 1),
+			mkABC(bytecode.OP_RETURN0, 0, 0, 0),
+		},
+	}
+	if err := bytecode.Verify(badTFor); err == nil {
+		t.Fatalf("expected Verify to reject TFORCALL A=0 C=1 with MaxStackSize=4")
+	}
+	badTFor.MaxStackSize = 6
+	if err := bytecode.Verify(badTFor); err != nil {
+		t.Fatalf("expected Verify to accept TFORCALL A=0 C=1 with MaxStackSize=6, got %v", err)
+	}
+}

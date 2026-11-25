@@ -304,6 +304,29 @@ func verifyDepth(p *Proto, depth int) error {
 			if pc == 0 || isExtraArg[pc-1] {
 				return fmt.Errorf("verify: pc %d %s has no preceding op", pc, OpNames[op])
 			}
+			prevOp := p.Code[pc-1].Op()
+			switch op {
+			case OP_MMBIN:
+				switch prevOp {
+				case OP_ADD, OP_SUB, OP_MUL, OP_MOD, OP_POW, OP_DIV, OP_IDIV,
+					OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR:
+				default:
+					return fmt.Errorf("verify: pc %d MMBIN preceded by invalid op %s", pc, OpNames[prevOp])
+				}
+			case OP_MMBINI:
+				switch prevOp {
+				case OP_ADDI, OP_SHRI, OP_SHLI:
+				default:
+					return fmt.Errorf("verify: pc %d MMBINI preceded by invalid op %s", pc, OpNames[prevOp])
+				}
+			case OP_MMBINK:
+				switch prevOp {
+				case OP_ADDK, OP_SUBK, OP_MULK, OP_MODK, OP_POWK, OP_DIVK, OP_IDIVK,
+					OP_BANDK, OP_BORK, OP_BXORK:
+				default:
+					return fmt.Errorf("verify: pc %d MMBINK preceded by invalid op %s", pc, OpNames[prevOp])
+				}
+			}
 			if err := checkReg(pc, op, "A", inst.A()); err != nil {
 				return err
 			}
@@ -355,7 +378,9 @@ func verifyDepth(p *Proto, depth int) error {
 				return fmt.Errorf("verify: pc %d TFORPREP target %d is not matching TFORCALL", pc, target)
 			}
 		case OP_TFORCALL:
-			if inst.A()+3 >= maxStack || (inst.C() > 0 && inst.A()+2+inst.C() >= maxStack) {
+			// Lua 5.5 TFORCALL copies iterator+args into R[A+3..A+5] before invoking,
+			// then writes C results starting at R[A+3].
+			if inst.A()+5 >= maxStack || (inst.C() > 0 && inst.A()+2+inst.C() >= maxStack) {
 				return fmt.Errorf("verify: pc %d TFORCALL A=%d C=%d out of maxstack %d", pc, inst.A(), inst.C(), maxStack)
 			}
 			if pc+1 >= n || p.Code[pc+1].Op() != OP_TFORLOOP {
