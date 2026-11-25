@@ -3539,12 +3539,15 @@ func TestStreamingLoadAndDump(t *testing.T) {
 			t.Fatalf("UndumpReader round-trip mismatch")
 		}
 
-		// Truncated stream declaring an enormous instruction count must fail cleanly without OOM.
-		corrupt := append([]byte(nil), wantBytes[:39]...) // valid header + root nup + proto header up to ncode
-		// Append varint encoding of 1<<28 (268,435,456 instructions = 1 GiB) and truncate immediately!
-		corrupt = append(corrupt, 0x81, 0x80, 0x80, 0x80, 0x00)
-		if _, err := bytecode.UndumpReader(bytes.NewReader(corrupt)); err == nil {
-			t.Fatalf("expected truncated chunk error on corrupted huge ncode stream")
+		// Truncated stream declaring an enormous instruction count must pass header verification,
+		// decode ncode = 1<<28, and fail cleanly on the truncated instruction stream without OOM.
+		// Header is 40 bytes + 1 byte root nup + 5 bytes root proto metadata (lineDefined=0,
+		// lastLineDefined=0, numParams, flag, maxStackSize) = 46 bytes up to ncode.
+		corrupt := append([]byte(nil), wantBytes[:46]...)
+		// Append varint encoding of 1<<28 (268,435,456 instructions = 1 GiB) + 1 byte align-to-4 pad.
+		corrupt = append(corrupt, 0x81, 0x80, 0x80, 0x80, 0x00, 0x00)
+		if _, err := bytecode.UndumpReader(bytes.NewReader(corrupt)); err == nil || !strings.Contains(err.Error(), "truncated chunk reading 268435456 instructions") {
+			t.Fatalf("expected truncated instruction stream error on huge ncode, got %v", err)
 		}
 	})
 
@@ -3918,6 +3921,221 @@ func TestCodexReviewRound16VMRegressions(t *testing.T) {
 		}
 		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
 			t.Fatalf("os.difftime precision failed: res=%v err=%v", res, err)
+		}
+	})
+}
+
+func TestCodexReviewRound17VMRegressions(t *testing.T) {
+	// 1. Multi-format file:read roots accumulated strings on stack across subsequent reads.
+	t.Run("file_read_roots_accumulated_results_under_memlimit", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "big.bin")
+		// 512 KiB of data so reading 16 x 32 KiB exceeds the 128 KiB memory limit.
+		if err := os.WriteFile(path, bytes.Repeat([]byte("A"), 512*1024), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(fmt.Sprintf(`
+			local f = assert(io.open(%q, "rb"))
+			local a, b = f:read(4, 4)
+			assert(a == "AAAA" and b == "AAAA")
+			local fmts = {}
+			for i = 1, 16 do fmts[i] = 32768 end
+			local ok, err = pcall(function()
+				return f:read(table.unpack(fmts))
+			end)
+			f:close()
+			assert(not ok and string.find(tostring(err), "not enough memory", 1, true),
+				"expected OOM on multi-format file:read, got " .. tostring(ok) .. "," .. tostring(err))
+			return "ok"
+		`, path)), "=read_root_oom")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("multi-format file:read rooting failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. string.unpack checks memLimit before allocating unpacked result slices.
+	t.Run("string_unpack_bounds_alloc_before_decoding", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local x, y, nxt = string.unpack("<I2c3", string.pack("<I2c3", 42, "xyz"))
+			assert(x == 42 and y == "xyz" and nxt == 6)
+
+			local big = string.rep("A", 32768)
+			local fmt = string.rep("B", 32768)
+			local ok, err = pcall(string.unpack, fmt, big)
+			assert(not ok and string.find(tostring(err), "not enough memory", 1, true),
+				"expected OOM from string.unpack, got " .. tostring(ok) .. "," .. tostring(err))
+			return "ok"
+		`), "=unpack_prealloc_oom")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res, err := s.Call(cl)
+		runtime.ReadMemStats(&after)
+		if err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("string.unpack OOM failed: res=%v err=%v", res, err)
+		}
+		// Previously allocated ~6.7 MB before failing; zero-alloc pass 1 must stay well under 512 KiB.
+		if delta := after.TotalAlloc - before.TotalAlloc; delta > 524288 {
+			t.Fatalf("string.unpack allocated %d bytes before OOM (expected <= 524288)", delta)
+		}
+	})
+
+	// 3. math.modf returns integer subtype when the integral part fits in lua_Integer (lmathlib.c:155 pushnumint).
+	t.Run("math_modf_lua55_integer_part_parity", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local i1, f1 = math.modf(-0.5)
+			assert(i1 == 0 and math.type(i1) == "integer" and 1/i1 == math.huge and f1 == -0.5 and math.type(f1) == "float")
+			local i2, f2 = math.modf(3.5)
+			assert(i2 == 3 and math.type(i2) == "integer" and f2 == 0.5 and math.type(f2) == "float")
+			local i3, f3 = math.modf(-3.5)
+			assert(i3 == -3 and math.type(i3) == "integer" and f3 == -0.5 and math.type(f3) == "float")
+			local i4, f4 = math.modf(1e20)
+			assert(i4 == 1e20 and math.type(i4) == "float" and f4 == 0.0)
+			local i5, f5 = math.modf(math.huge)
+			assert(i5 == math.huge and math.type(i5) == "float" and f5 == 0.0)
+			return "ok"
+		`), "=modf_parity")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("math.modf parity failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. table.sort numeric fast paths honor instruction limits and context cancellation.
+	t.Run("table_sort_numeric_fastpath_honors_execution_controls", func(t *testing.T) {
+		// Verify correctness of cancelable introsort on both integer and float arrays.
+		sOK := NewState()
+		defer sOK.Close()
+		sOK.SetInstructionLimit(50_000_000)
+		clOK, err := sOK.LoadChunk([]byte(`
+			local ti, tf = {}, {}
+			for i = 1, 2000 do
+				ti[i] = (i * 7919) % 2000
+				tf[i] = ((i * 7919) % 2000) + 0.5
+			end
+			table.sort(ti)
+			table.sort(tf)
+			for i = 2, 2000 do
+				assert(ti[i-1] <= ti[i], "int array unsorted at " .. i)
+				assert(tf[i-1] <= tf[i], "float array unsorted at " .. i)
+			end
+			return "ok"
+		`), "=sort_cancelable_ok")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := sOK.Call(clOK); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("cancelable sort correctness failed: res=%v err=%v", res, err)
+		}
+		if sOK.InstructionsExecuted() <= 0 {
+			t.Fatalf("expected non-zero instructions counted during bounded sort")
+		}
+
+		// Verify instruction limit aborts sorting a large integer array quickly.
+		for _, kind := range []string{"int", "float"} {
+			s := NewState()
+			defer s.Close()
+			tTbl := s.NewTable(100000, 0)
+			for i := int64(1); i <= 100000; i++ {
+				if kind == "int" {
+					tTbl.RawSetInt(s, i, IntValue(100001-i))
+				} else {
+					tTbl.RawSetInt(s, i, FloatValue(float64(100001-i)+0.25))
+				}
+			}
+			s.SetGlobal("arr", TableValue(tTbl))
+			clSort, err := s.LoadChunk([]byte(`table.sort(arr)`), "=sort_abort")
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetInstructionLimit(100)
+			_, err = s.Call(clSort)
+			if !errors.Is(err, ErrInstructionLimit) {
+				t.Fatalf("%s sort expected ErrInstructionLimit, got %v", kind, err)
+			}
+			if s.InstructionsExecuted() <= 100 {
+				t.Fatalf("%s sort expected InstructionsExecuted > 100, got %d", kind, s.InstructionsExecuted())
+			}
+
+			// Verify expired context cancels sort promptly.
+			s.SetInstructionLimit(0)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+			defer cancel()
+			time.Sleep(time.Millisecond)
+			s.SetContext(ctx)
+			_, err = s.Call(clSort)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%s sort expected context.DeadlineExceeded, got %v", kind, err)
+			}
+		}
+	})
+
+	// 5. warn streams directly without building unbounded intermediate strings.
+	t.Run("warn_streams_without_intermediate_allocation", func(t *testing.T) {
+		var buf bytes.Buffer
+		s := NewState()
+		defer s.Close()
+		s.SetErrOutput(&buf)
+		clFmt, err := s.LoadChunk([]byte(`
+			warn("ignored")
+			warn("@on")
+			warn("hello ", 123, "!")
+			warn("@off")
+			warn("ignored2")
+			return "ok"
+		`), "=warn_fmt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(clFmt); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("warn formatting failed: res=%v err=%v", res, err)
+		}
+		if got := buf.String(); got != "Lua warning: hello 123!\n" {
+			t.Fatalf("unexpected warn output: %q", got)
+		}
+
+		// Calling warn with 200 copies of a 256 KiB string (~50 MiB total) must not allocate a 50 MiB buffer.
+		s2 := NewState()
+		defer s2.Close()
+		s2.SetErrOutput(io.Discard)
+		s2.SetGlobal("big", StringValue(s2.Intern(strings.Repeat("x", 256*1024))))
+		clBig, err := s2.LoadChunk([]byte(`
+			local args = {}
+			for i = 1, 200 do args[i] = big end
+			warn(table.unpack(args))
+			warn("@on")
+			warn(table.unpack(args))
+			return "ok"
+		`), "=warn_big")
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res, err := s2.Call(clBig)
+		runtime.ReadMemStats(&after)
+		if err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("warn big failed: res=%v err=%v", res, err)
+		}
+		if delta := after.TotalAlloc - before.TotalAlloc; delta > 2*1024*1024 {
+			t.Fatalf("warn allocated %d bytes for 50 MiB streamed args (expected <= 2 MiB)", delta)
 		}
 	})
 }
