@@ -2307,3 +2307,211 @@ func TestCodexReviewRound10VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound11VMRegressions(t *testing.T) {
+	// 1. Thread call-frame backing arrays are accounted on creation/growth and recounted on GC.
+	t.Run("thread_call_frames_memlimit_recount", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function dive(n)
+				if n == 0 then
+					coroutine.yield("ready")
+					return
+				end
+				return (dive(n - 1))
+			end
+			local kept = {}
+			local failed = false
+			local errMsg = ""
+			for i = 1, 10 do
+				local okCreate, co = pcall(coroutine.create, function() dive(100) end)
+				if not okCreate then
+					failed = true
+					errMsg = tostring(co)
+					break
+				end
+				local okResume, res = coroutine.resume(co)
+				if not okResume then
+					failed = true
+					errMsg = tostring(res)
+					break
+				end
+				kept[i] = co
+				collectgarbage("collect")
+			end
+			local count = #kept
+			kept = nil
+			collectgarbage("collect")
+			assert(failed and count < 10 and string.find(errMsg, "not enough memory", 1, true),
+				"expected OOM retaining depth-100 coroutines, got failed=" .. tostring(failed) .. " count=" .. count .. " err=" .. errMsg)
+			return "ok"
+		`), "=thread_frames_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(262144)
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. require roots the original package.searchers table across searcher callbacks.
+	t.Run("require_roots_searchers_table_across_callbacks", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local finalized = false
+			local orig = setmetatable({}, {
+				__gc = function(self)
+					finalized = true
+					self[2] = nil
+				end,
+			})
+			orig[1] = function()
+				package.searchers = {}
+				collectgarbage("collect")
+				return "miss from 1"
+			end
+			orig[2] = function()
+				return function() return "from_second" end
+			end
+			package.searchers = orig
+			orig = nil
+			local mod = require("rooted_searchers_mod")
+			assert(mod == "from_second", "expected 'from_second', got " .. tostring(mod))
+			assert(not finalized, "original searchers table was finalized prematurely during require")
+			collectgarbage("collect")
+			assert(finalized, "original searchers table should finalize after require returns")
+			return "ok"
+		`), "=require_root_searchers")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. pcall and xpcall dispatch call/return debug hooks for native targets.
+	t.Run("protected_call_dispatches_native_debug_hooks", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local events = {}
+			local function hook(ev)
+				local info = debug.getinfo(2, "f")
+				if info and info.func == math.abs then
+					events[#events + 1] = ev
+					if ev == "call" then
+						debug.setlocal(2, 1, -77)
+					end
+				end
+			end
+			debug.sethook(hook, "cr")
+			local ok1, r1 = pcall(math.abs, -42)
+			debug.sethook()
+			assert(ok1 and r1 == 77, "pcall(math.abs) unexpected result: " .. tostring(ok1) .. "," .. tostring(r1))
+			assert(table.concat(events, ",") == "call,return", "pcall events: " .. table.concat(events, ","))
+
+			events = {}
+			debug.sethook(hook, "cr")
+			local ok2, r2 = xpcall(math.abs, function(e) return e end, -42)
+			debug.sethook()
+			assert(ok2 and r2 == 77, "xpcall(math.abs) unexpected result: " .. tostring(ok2) .. "," .. tostring(r2))
+			assert(table.concat(events, ",") == "call,return", "xpcall events: " .. table.concat(events, ","))
+			return "ok"
+		`), "=pcall_native_hooks")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. math.randomseed() with no args generates fresh seeds and new States start with varying RNG seeds.
+	t.Run("randomseed_no_args_and_fresh_states_vary", func(t *testing.T) {
+		s1 := NewState()
+		defer s1.Close()
+		s2 := NewState()
+		defer s2.Close()
+
+		cl1, err := s1.LoadChunk([]byte(`
+			local init1 = math.random(0)
+			local a1, b1 = math.randomseed()
+			local v1 = math.random(0)
+			local a2, b2 = math.randomseed()
+			local v2 = math.random(0)
+			local a3, b3 = math.randomseed()
+			local v3 = math.random(0)
+			assert(not (a1 == 0 and b1 == 0 and a2 == 0 and b2 == 0), "no-arg randomseed stayed at 0,0")
+			assert(a1 ~= a2 or b1 ~= b2, "successive randomseed() returned identical seeds")
+			assert(v1 ~= v2 or v2 ~= v3, "successive randomseed() produced identical sequences")
+			assert(not pcall(math.randomseed, nil), "math.randomseed(nil) must reject nil")
+
+			-- Explicit seeds remain strictly reproducible.
+			local x1, y1 = math.randomseed(12345, 67890)
+			assert(x1 == 12345 and y1 == 67890)
+			local r1, r2 = math.random(0), math.random(0)
+			math.randomseed(12345, 67890)
+			assert(math.random(0) == r1 and math.random(0) == r2)
+			return init1
+		`), "=randomseed_vary1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res1, err := s1.Call(cl1)
+		if err != nil || len(res1) != 1 {
+			t.Fatalf("s1 Call failed: res=%v err=%v", res1, err)
+		}
+
+		cl2, err := s2.LoadChunk([]byte(`return math.random(0)`), "=randomseed_vary2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res2, err := s2.Call(cl2)
+		if err != nil || len(res2) != 1 {
+			t.Fatalf("s2 Call failed: res=%v err=%v", res2, err)
+		}
+		if res1[0].Int() == res2[0].Int() {
+			t.Fatalf("expected separate fresh States to initialize distinct RNG seeds, both produced %d", res1[0].Int())
+		}
+	})
+
+	// 5. LightUDValue(nil) preserves LUA_TLIGHTUSERDATA type, equality, formatting, and nil round-trip.
+	t.Run("null_light_userdata_preserves_type", func(t *testing.T) {
+		p := LightUDValue(nil)
+		if !p.IsLightUD() || p.IsNumber() || p.IsNil() || p.AsLightUD() != nil {
+			t.Fatalf("LightUDValue(nil) broken: IsLightUD=%v IsNumber=%v IsNil=%v AsLightUD=%v",
+				p.IsLightUD(), p.IsNumber(), p.IsNil(), p.AsLightUD())
+		}
+		s := NewState()
+		defer s.Close()
+		s.SetGlobal("null_p1", p)
+		s.SetGlobal("null_p2", LightUDValue(nil))
+		cl, err := s.LoadChunk([]byte(`
+			local upv = 1
+			local fn = function() return upv end
+			local nonNil = debug.upvalueid(fn, 1)
+
+			assert(type(null_p1) == "userdata", "expected userdata, got " .. type(null_p1))
+			assert(tonumber(null_p1) == nil, "null light userdata must not convert as number")
+			assert(rawequal(null_p1, null_p2) and null_p1 == null_p2)
+			assert(not rawequal(null_p1, 0) and null_p1 ~= 0)
+			assert(not rawequal(null_p1, nil) and null_p1 ~= nil)
+			assert(not rawequal(null_p1, nonNil) and null_p1 ~= nonNil)
+			assert(not pcall(function() return null_p1 + 1 end), "arithmetic on null light userdata must fail")
+			assert(tostring(null_p1) == "userdata: 0x0", "unexpected tostring: " .. tostring(null_p1))
+			local tbl = { [null_p1] = "null", [0] = "zero", [nonNil] = "ptr" }
+			assert(tbl[null_p2] == "null" and tbl[0] == "zero" and tbl[nonNil] == "ptr")
+			return "ok"
+		`), "=null_lightud")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+}
