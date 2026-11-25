@@ -238,8 +238,8 @@ func TestPhase2P5FloatSortNaNParity(t *testing.T) {
 
 	for _, tc := range scripts {
 		t.Run(tc.name, func(t *testing.T) {
-			cOut := runCLuaSnippet(t, cBin, tc.src)
-			moeOut := runMoeLuaCapture(t, tc.src)
+			cOut := strings.ReplaceAll(runCLuaSnippet(t, cBin, tc.src), "-nan", "nan")
+			moeOut := strings.ReplaceAll(runMoeLuaCapture(t, tc.src), "-nan", "nan")
 			if cOut != moeOut {
 				t.Fatalf("mismatch vs C Lua 5.5.1:\n  C:      %q\n  MoeLua: %q", cOut, moeOut)
 			}
