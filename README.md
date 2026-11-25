@@ -19,7 +19,8 @@ A pure-Go (`CGO_ENABLED=0`, zero assembly, zero JIT, Go-GC-backed) **Lua 5.5.1**
     - `WithMemoryLimit(bytes)` per-State VM memory cap with emergency GC recount raising recoverable Lua `"not enough memory"` errors.
     - `WithFS(fsys)` / `AddFS(fsys)` / `AddSearcher` for loading Lua source and `.luac` modules directly from Go `embed.FS` / `io/fs.FS` with path-traversal protection.
     - `RegisterFunc1` / `NewFunc1` (`NativeFunc.FastFn`) zero-allocation single-return Go callbacks (**17.91 ms / 0 per-call allocs** for 1M calls).
-    - `State.Pin(v)` / `Handle.Release()` GC-anchored host references and nil-receiver / post-`Close()` safety guards across `State`, `Table`, `Chunk`, and `Handle`.
+    - `NewMetatable` / `GetMetatable` / `CheckUserdata`, `Table.Next` / `ForEach`, `Preload`, and `NewThread` / `Resume` / `Thread.Status` for full Go host bindings and coroutine orchestration.
+    - `State.Pin(v)` / `Handle.Release()` GC-anchored host references and nil-receiver / post-`Close()` safety guards across `State`, `Table`, `Chunk`, `Thread`, and `Handle`.
   - **Full `debug` Library & Zero-Cost Hooks**: single-source `go generate` (`internal/gen/interpgen`) produces `fast`, `-tags moeluaregcheck`, and `runHooked` dispatch variants from `vm/interp_run.go`.
 - **Complete Pure-Go Standard Library**: `base`, `math`, `table`, `string` (patterns, `format`, `pack`/`unpack`), `utf8` (including Lua 5.5 two-return `utf8.offset`), `coroutine`, `debug`, `io` (buffered `setvbuf`, `runtime.AddCleanup` + `State.Close()`/`os.exit()` flush), `os`, and `package`/`require`.
 - **Standalone CLI (`cmd/moelua`)**: supports `-e`, `-l`, `-i`, `-v`, `-W`, `-E`, `--`, `-`, `LUA_INIT_5_5`/`LUA_INIT`, `LUA_PATH_5_5`/`LUA_PATH`, interactive REPL, and `SIGINT` handling (passes official PUC-Rio `testes/main.lua` excluding C `.so` dynamic loading).
@@ -106,9 +107,9 @@ make test
 
 On Apple M1 Max (`darwin/arm64`, Go 1.27.4, 10-round interleaved ABAB, strict single-core `GOMAXPROCS=1` CPU time vs C Lua 5.5.1 `clang -O2` and `-O3 -mcpu=apple-m1`). Reproduce after `git submodule update --init` with `make bench` (No-PGO) or `make bench-pgo` (disjoint PGO trained solely on official `testes/`):
 
-- **12-benchmark Core VM Geomean**: **0.89×** single-core CPU vs C `-O2` (**0.76×** vs C `-O3 -mcpu=apple-m1` in each paired 10-round ABAB run for both No-PGO and Disjoint-PGO; **0.87×** / **0.74×** in equal-footing subprocess mode)
+- **12-benchmark Core VM Geomean**: **0.89×** single-core CPU vs C `-O2` (**0.75×** vs C `-O3 -mcpu=apple-m1` in each paired 10-round ABAB run for both No-PGO and Disjoint-PGO; **0.87×** / **0.74×** in equal-footing subprocess mode)
 - **Realistic OOP / ECS workloads**: `ecs_stdlib` **1.12×** vs C `-O2` (**1.18×** vs `-O3`; subprocess **1.09×** / **1.12×**), `richards` **1.02×** vs C `-O2` (**0.90×** vs `-O3`; subprocess **1.01×**), `deltablue` **0.98×** vs C `-O2` (**0.94×** vs `-O3`; subprocess **0.89×**)
-- **Core algorithms**: `fib(34)` **0.91×**, `matmul` **0.91×**, `nbody` **0.85×**, `forloop_int` **0.84×**, `spectralnorm` **0.84×**, `sieve` **0.83×**, `fannkuch` **0.83×**, `binarytrees` **0.80×** (Peak RSS **24.7 MiB**), `mandelbrot` **0.79×** vs C `-O2`
+- **Core algorithms**: `fib(34)` **0.91×**, `matmul` **0.91×**, `nbody` **0.85×**, `forloop_int` **0.84×**, `spectralnorm` **0.84×**, `sieve` **0.83×**, `fannkuch` **0.83×**, `binarytrees` **0.80×** (Peak RSS **24.7 MiB**), `mandelbrot` **0.78×** vs C `-O2`
 - **Stdlib typed-array sort (`sort_int`, reported separately)**: **3.62×** vs C `-O2` (**3.35×** vs `-O3`)
 - **Embedding (`GOMAXPROCS=1`)**: `NewState` **4.46 µs / 4 allocs** (`25,296 B`), Go→Lua call **76.3 ns**, Lua→Go 1M calls **17.91 ms (~17.9 ns/call, 0 allocs/call)** via `RegisterFunc1`/`FastFn` (**34.02 ms / 1 alloc/call** via multi-return `Fn`)
 - **Tier 1 GC proportional pacing overhead**: 12-benchmark geomean **0.88×** vs Tier 0 **0.89×** (`~0.0%–1.7%` across non-allocation-heavy workloads; `+11.8%` on allocation-intensive `binarytrees`)

@@ -73,7 +73,10 @@ func runMoeSubprocOnce(selfBin, chunkPath string, gomax int, tier1 bool) (string
 func runMoeOnce(proto *bytecode.Proto, tier1Proto *bytecode.Proto) (string, timing, error) {
 	runtime.GC()
 	var buf bytes.Buffer
-	cpu0 := getSelfCPU()
+	cpu0, ok := getSelfCPU()
+	if !ok {
+		return "", timing{}, fmt.Errorf("in-process CPU accounting is unavailable on %s; re-run with -subproc", runtime.GOOS)
+	}
 	t0 := time.Now()
 	s := vm.NewState()
 	s.SetOutput(&buf)
@@ -94,8 +97,11 @@ func runMoeOnce(proto *bytecode.Proto, tier1Proto *bytecode.Proto) (string, timi
 		return "", timing{}, err
 	}
 	wall := time.Since(t0)
-	cpu := getSelfCPU() - cpu0
-	return strings.TrimSpace(buf.String()), timing{wall: wall, cpu: cpu}, nil
+	cpu1, ok := getSelfCPU()
+	if !ok {
+		return "", timing{}, fmt.Errorf("in-process CPU accounting failed on %s", runtime.GOOS)
+	}
+	return strings.TrimSpace(buf.String()), timing{wall: wall, cpu: cpu1 - cpu0}, nil
 }
 
 func percentileDur(sorted []time.Duration, p float64) time.Duration {

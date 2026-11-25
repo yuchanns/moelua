@@ -15,7 +15,7 @@
   - **70 / 70** constant-folding and codegen edge cases (`-0.0`, `NaN`, `mininteger // -1`, division/modulo by zero, bitwise shifts, `global <const> *`, `<close>`, named/hidden varargs, and 60 synthesized operator combinations)
 
 ### 1B. Official PUC-Rio Lua 5.5.1 Runtime `testes/` (`_U = true` + `big.lua` + `main.lua`)
-- **Portable `_U=true` suite (`TestOfficialLua55Testes`)**: **25 / 26** files pass end-to-end (`bitwise`, `literals`, `tpack`, `utf8`, `pm`, `vararg`, `math`, `sort`, `constructs`, `goto`, `closure`, `strings`, `attrib`, `events`, `nextvar`, `calls`, `locals`, `coroutine`, `errors`, `db`, `gc`, `gengc`, `cstack`, `verybig`, and `big.lua`), plus **`files.lua` partial parity on macOS identical to official C `lua55_o2`** (unmodified `files.lua` passes lines 1–473 and hits macOS `/dev/full` permission failure at line 474 identically to C; omitting only the 6-line `/dev/full` block passes lines 483–1004).
+- **Portable `_U=true` suite (`TestOfficialLua55Testes`)**: **26 / 26** unmodified files pass end-to-end on Linux (including full `files.lua` with `/dev/full`); on macOS, **25 / 26** pass unmodified (`bitwise`, `literals`, `tpack`, `utf8`, `pm`, `vararg`, `math`, `sort`, `constructs`, `goto`, `closure`, `strings`, `attrib`, `events`, `nextvar`, `calls`, `locals`, `coroutine`, `errors`, `db`, `gc`, `gengc`, `cstack`, `verybig`, and `big.lua`), plus `files.lua` matches official C `lua55_o2` identically (unmodified `files.lua` passes lines 1–473 and hits macOS `/dev/full` permission failure at line 474 identically to C; omitting only the 6-line `/dev/full` block passes lines 483–1004).
 - **Standalone CLI (`cmd/moelua`, `TestOfficialMainLuaCLI`)**: passes official PUC-Rio `testes/main.lua` end-to-end (omitting only the 4-line C `.so` `dlopen` test, out of scope for `CGO_ENABLED=0`), including `-e`, `-l`, `-i`, `-v`, `-W`, `-E`, `--`, `-`, BOM/shebang handling, `LUA_INIT_5_5`/`LUA_PATH_5_5`, `;;` path expansion, `arg` table, `debug.debug()`, interactive REPL with `_PROMPT` metamethods, `os.exit` `<close>`/`__gc` ordering, and `SIGINT` handling.
 - **Hooked dispatch parity (`TestOfficialLua55TestesHooked`)**: 23 / 23 portable files pass inside `(*State).runHooked` with an active count hook.
 - **Differential parity against live C `lua55_o2`**:
@@ -58,7 +58,7 @@
 | `fib(34)` | (a) | 330.5 (±3.1) ms | 295.0 (±2.6) ms | 362.6 (±2.3) ms | 361.6 (±2.8) ms | 0.91× / 0.92× | 0.82× | 1.5 / 5.4 |
 | `forloop_int` (50M) | (a) | 490.5 (±2.7) ms | 385.5 (±2.8) ms | 583.5 (±3.5) ms | 582.4 (±1.8) ms | 0.84× / 0.85× | 0.66× | 1.6 / 5.3 |
 | `sieve` (500×5k) | (a) | 84.3 (±1.9) ms | 71.3 (±1.8) ms | 101.7 (±1.1) ms | 102.0 (±1.4) ms | 0.83× / 0.85× | 0.70× | 2.5 / 8.2 |
-| `mandelbrot` (500) | (a) | 238.2 (±2.4) ms | 191.5 (±3.6) ms | 301.1 (±4.9) ms | 301.6 (±2.2) ms | 0.79× / 0.80× | 0.64× | 1.6 / 5.3 |
+| `mandelbrot` (500) | (a) | 189.2 (±0.6) ms | 144.4 (±0.7) ms | 240.9 (±0.2) ms | 242.1 (±0.8) ms | 0.78× / 0.79× | 0.60× | 1.6 / 5.5 |
 | `fannkuch` (9) | (a) | 124.6 (±0.7) ms | 101.7 (±2.4) ms | 151.6 (±2.0) ms | 150.2 (±2.0) ms | 0.83× / 0.84× | 0.68× | 1.6 / 5.1 |
 | `richards` (20×) | (b) | 537.9 (±22.5) ms | 476.1 (±17.3) ms | 526.6 (±4.5) ms | 527.6 (±2.0) ms | **1.02× / 1.02×** | **0.90×** | 2.1 / 5.7 |
 | `deltablue` (25×) | (b) | 70.0 (±5.5) ms | 66.8 (±4.0) ms | 71.1 (±1.5) ms | 71.3 (±1.2) ms | **0.98× / 1.00×** | **0.94×** | 3.1 / 10.8 |
@@ -67,7 +67,7 @@
 | `ecs_stdlib` | (b) | 71.0 (±1.8) ms | 75.0 (±4.9) ms | 63.8 (±0.9) ms | 63.5 (±0.9) ms | **1.12× / 1.13×** | **1.18×** | 2.1 / 6.0 |
 | `spectralnorm` (400) | (c) | 256.1 (±2.2) ms | 202.8 (±1.5) ms | 309.1 (±3.2) ms | 306.2 (±0.7) ms | 0.84× / 0.84× | 0.66× | 1.6 / 5.4 |
 | `matmul` (160²) | (c) | 96.2 (±0.8) ms | 70.0 (±1.2) ms | 106.8 (±1.1) ms | 105.3 (±0.8) ms | 0.91× / 0.92× | 0.66× | 2.3 / 6.0 |
-| **Core VM Geomean (`n=12`)** | | | | *(Paired No-PGO run: 0.89× / 0.90× vs O2; 0.76× vs O3; 0.75× vs Disjoint-PGO-run O3)* | | **0.89× / 0.90×** | **0.76×** | |
+| **Core VM Geomean (`n=12`)** | | | | *(Paired No-PGO run: 0.89× / 0.90× vs O2; 0.75× vs O3)* | | **0.89× / 0.90×** | **0.75×** | |
 
 ### 3B. Stdlib Algorithmic Fast Path (excluded from VM Geomean)
 
@@ -84,7 +84,7 @@ Includes Go runtime startup and chunk load on every round, matching C's per-roun
 | `fib` | 327.6 (±1.9) ms | 291.9 (±0.8) ms | 364.4 (±1.5) ms | 0.90× / 0.90× | 0.80× | 1.5 / 5.4 |
 | `forloop_int` | 483.8 (±4.1) ms | 379.1 (±2.8) ms | 580.0 (±1.9) ms | 0.83× / 0.84× | 0.65× | 1.6 / 5.5 |
 | `sieve` | 83.7 (±1.6) ms | 69.2 (±0.3) ms | 103.6 (±0.3) ms | 0.81× / 0.82× | 0.67× | 2.4 / 8.2 |
-| `mandelbrot` | 234.2 (±0.5) ms | 187.7 (±1.7) ms | 301.2 (±2.7) ms | 0.78× / 0.78× | 0.62× | 1.6 / 5.5 |
+| `mandelbrot` | 188.0 (±0.2) ms | 143.4 (±0.2) ms | 244.3 (±0.2) ms | 0.77× / 0.77× | 0.59× | 1.5 / 5.5 |
 | `fannkuch` | 122.6 (±0.4) ms | 98.4 (±1.4) ms | 151.3 (±0.5) ms | 0.81× / 0.81× | 0.65× | 1.6 / 5.5 |
 | `richards` | 533.0 (±4.8) ms | 493.9 (±12.3) ms | 526.7 (±1.3) ms | **1.01× / 1.01×** | **0.94×** | 2.1 / 5.8 |
 | `deltablue` | 66.0 (±1.5) ms | 65.9 (±0.3) ms | 74.0 (±1.5) ms | **0.89× / 0.89×** | **0.89×** | 2.2 / 11.1 |

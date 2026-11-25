@@ -9,11 +9,13 @@ import (
 	"time"
 )
 
-func getSelfCPU() time.Duration {
+func getSelfCPU() (time.Duration, bool) {
 	var ru syscall.Rusage
-	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
-	return time.Duration(ru.Utime.Sec+ru.Stime.Sec)*time.Second +
-		time.Duration(ru.Utime.Usec+ru.Stime.Usec)*time.Microsecond
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		return 0, false
+	}
+	return time.Duration(int64(ru.Utime.Sec)+int64(ru.Stime.Sec))*time.Second +
+		time.Duration(int64(ru.Utime.Usec)+int64(ru.Stime.Usec))*time.Microsecond, true
 }
 
 func rusageMaxRSSBytes(ps *os.ProcessState) int64 {

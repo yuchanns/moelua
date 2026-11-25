@@ -14,8 +14,9 @@ local function mandelbrot(size)
       local not_done = true
       local escape = 0
       while not_done and z < 50 do
-        zr = zrzr - zizi + cr
+        local nzr = zrzr - zizi + cr
         zi = 2.0 * zr * zi + ci
+        zr = nzr
         zrzr = zr * zr
         zizi = zi * zi
         if zrzr + zizi > 4.0 then

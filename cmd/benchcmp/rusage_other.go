@@ -1,4 +1,4 @@
-//go:build !unix
+//go:build !unix && !windows
 
 package main
 
@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-func getSelfCPU() time.Duration {
-	return time.Duration(time.Now().UnixNano())
+func getSelfCPU() (time.Duration, bool) {
+	return 0, false
 }
 
 func rusageMaxRSSBytes(_ *os.ProcessState) int64 {
