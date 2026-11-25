@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"testing/fstest"
 	"time"
 	_ "time/tzdata"
 	"weak"
@@ -4321,6 +4322,197 @@ func TestCodexReviewRound18VMRegressions(t *testing.T) {
 		}
 		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
 			t.Fatalf("weak kv dead keys check failed: res=%v err=%v", res, err)
+		}
+	})
+}
+
+func TestCodexReviewRound19VMRegressions(t *testing.T) {
+	// 1. AddFS streams modules through LoadChunkReader so oversized modules fail before full allocation.
+	t.Run("addfs_streams_module_under_memlimit", func(t *testing.T) {
+		fsys := fstest.MapFS{
+			"small.lua": {Data: []byte("return 42\n")},
+			"comments.lua": {Data: []byte(
+				strings.Repeat("-- "+strings.Repeat("c", 1020)+"\n", 512) + "return 77\n",
+			)},
+			"huge.lua": {Data: []byte(`return "` + strings.Repeat("a", 2*1024*1024) + `"`)},
+		}
+		s := NewState()
+		defer s.Close()
+		s.AddFS(fsys)
+		s.SetMemoryLimit(131072)
+
+		clOK, err := s.LoadChunk([]byte(`
+			assert(require("small") == 42)
+			assert(require("comments") == 77)
+			return "ok"
+		`), "=addfs_ok")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(clOK); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("AddFS small/streaming comment modules failed: res=%v err=%v", res, err)
+		}
+
+		clHuge, err := s.LoadChunk([]byte(`
+			local ok, err = pcall(require, "huge")
+			assert(not ok and string.find(tostring(err), "not enough memory", 1, true),
+				"expected OOM requiring huge FS module, got " .. tostring(ok) .. "," .. tostring(err))
+			return "ok"
+		`), "=addfs_huge")
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res, err := s.Call(clHuge)
+		runtime.ReadMemStats(&after)
+		if err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("AddFS huge module OOM check failed: res=%v err=%v", res, err)
+		}
+		// Previously allocated ~2.1 MB via fs.ReadFile; streaming must stay far below 512 KiB.
+		if delta := after.TotalAlloc - before.TotalAlloc; delta > 524288 {
+			t.Fatalf("AddFS huge module allocated %d bytes before OOM (expected <= 524288)", delta)
+		}
+	})
+
+	// 2. Internally retained package table stays rooted when global package and package.loaded.package are cleared.
+	t.Run("package_table_traced_when_globals_cleared", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local finalized = false
+			do
+				local sentinel = setmetatable({ tag = "alive" }, {
+					__gc = function() finalized = true end,
+				})
+				table.insert(package.searchers, 1, function(name)
+					if name == "gc_pkg_root_test" then
+						return function() return sentinel end
+					end
+				end)
+			end
+			package.loaded.package = nil
+			package = nil
+			collectgarbage("collect")
+			collectgarbage("collect")
+			assert(finalized == false, "captured sentinel in package.searchers was prematurely finalized")
+			local mod = require("gc_pkg_root_test")
+			assert(mod.tag == "alive" and finalized == false)
+			return "ok"
+		`), "=pkg_gc_root")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("package GC root check failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. Emergency GC clears unreachable weak-table objects even when collectgarbage("stop") is active,
+	//    and keeps pending-finalizer objects accounted so weak tables cannot bypass memLimit.
+	t.Run("emergency_gc_handles_weak_tables_when_stopped", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(131072)
+		cl, err := s.LoadChunk([]byte(`
+			collectgarbage("stop")
+			local w = setmetatable({}, { __mode = "v" })
+			for i = 1, 100 do
+				w[i] = { string.rep(string.char(65 + (i % 26)), 32768) .. tostring(i) }
+			end
+			local alive = 0
+			for _ in pairs(w) do alive = alive + 1 end
+			assert(alive <= 5, "expected emergency GC to clear dead weak entries, found " .. tostring(alive))
+			return "ok"
+		`), "=emerg_weak_clear")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("emergency weak clear failed: res=%v err=%v", res, err)
+		}
+
+		// With pending __gc finalizers (which cannot run during emergency GC), liveBytes must still count them.
+		s2 := NewState()
+		defer s2.Close()
+		s2.SetMemoryLimit(131072)
+		cl2, err := s2.LoadChunk([]byte(`
+			collectgarbage("stop")
+			local w = setmetatable({}, { __mode = "v" })
+			local mt = { __gc = function() end }
+			local ok, err = pcall(function()
+				for i = 1, 40 do
+					w[i] = setmetatable({ string.rep(string.char(65 + (i % 26)), 32768) .. tostring(i) }, mt)
+				end
+			end)
+			assert(not ok and string.find(tostring(err), "not enough memory", 1, true),
+				"expected OOM when pending-__gc weak values exceed memLimit, got " .. tostring(ok) .. "," .. tostring(err))
+			return "ok"
+		`), "=emerg_weak_fnz_oom")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("emergency weak pending-__gc accounting failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. Catchable errors in resumed coroutine return hooks unwind through enclosing pcall/xpcall.
+	t.Run("coroutine_resumed_return_hook_unwinds_through_pcall_and_xpcall", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local co1 = coroutine.create(function()
+				return pcall(function()
+					coroutine.yield("mid")
+					return "after"
+				end)
+			end)
+			local ok1a, v1a = coroutine.resume(co1)
+			assert(ok1a == true and v1a == "mid")
+			debug.sethook(co1, function()
+				debug.sethook(co1)
+				error("hookfail")
+			end, "r")
+			local ok1b, pok1, perr1 = coroutine.resume(co1)
+			assert(ok1b == true and pok1 == false and string.find(tostring(perr1), "hookfail", 1, true),
+				"pcall resume got: " .. tostring(ok1b) .. "," .. tostring(pok1) .. "," .. tostring(perr1))
+
+			local co2 = coroutine.create(function()
+				return xpcall(function()
+					coroutine.yield("mid2")
+					return "after2"
+				end, function(e) return "MSGH:" .. tostring(e) end)
+			end)
+			local ok2a, v2a = coroutine.resume(co2)
+			assert(ok2a == true and v2a == "mid2")
+			debug.sethook(co2, function()
+				debug.sethook(co2)
+				error("hookfail2")
+			end, "r")
+			local ok2b, pok2, perr2 = coroutine.resume(co2)
+			assert(ok2b == true and pok2 == false and string.find(tostring(perr2), "MSGH:", 1, true) and string.find(tostring(perr2), "hookfail2", 1, true),
+				"xpcall resume got: " .. tostring(ok2b) .. "," .. tostring(pok2) .. "," .. tostring(perr2))
+
+			-- Unprotected coroutine still fails resume and becomes dead.
+			local co3 = coroutine.create(function()
+				coroutine.yield("mid3")
+			end)
+			assert(coroutine.resume(co3))
+			debug.sethook(co3, function()
+				debug.sethook(co3)
+				error("unprotected_hook")
+			end, "r")
+			local ok3, err3 = coroutine.resume(co3)
+			assert(ok3 == false and string.find(tostring(err3), "unprotected_hook", 1, true) and coroutine.status(co3) == "dead")
+			return "ok"
+		`), "=coro_rethook_pcall")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("coroutine resumed return-hook unwind failed: res=%v err=%v", res, err)
 		}
 	})
 }
