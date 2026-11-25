@@ -5944,3 +5944,244 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound26VMRegressions(t *testing.T) {
+	t.Run("native_call_roots_return_values_across_gc_debt", func(t *testing.T) {
+		for _, withHook := range []bool{false, true} {
+			name := "unhooked"
+			if withHook {
+				name = "hooked"
+			}
+			t.Run(name, func(t *testing.T) {
+				s := NewState()
+				defer s.Close()
+				var finalized bool
+				gcFn := NativeValue(&NativeFunc{
+					Name: "mark_gc",
+					Fn: func(_ *State, _ []Value) ([]Value, error) {
+						finalized = true
+						return nil, nil
+					},
+				})
+				mt := s.NewTable(0, 1)
+				mt.RawSetStr(s, s.Intern("__gc"), gcFn)
+				s.SetGlobal("fin_mt", TableValue(mt))
+
+				if withHook {
+					cl, err := s.LoadChunk([]byte(`debug.sethook(function() end, "cr")`), "=hook_setup")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := s.Call(cl); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				maker := NativeValue(&NativeFunc{
+					Name: "make_pair",
+					Fn: func(st *State, _ []Value) ([]Value, error) {
+						tbl := st.NewTable(0, 1)
+						tbl.RawSetStr(st, st.Intern("tag"), StringValue(st.Intern("alive")))
+						st.SetMetatableOf(TableValue(tbl), mt)
+						big, err := st.TryIntern(strings.Repeat("x", 128*1024))
+						if err != nil {
+							return nil, err
+						}
+						return []Value{TableValue(tbl), StringValue(big)}, nil
+					},
+				})
+				res, err := s.Call(maker)
+				if err != nil {
+					t.Fatalf("State.Call(maker) failed: %v", err)
+				}
+				if finalized {
+					t.Fatalf("returned table's __gc ran prematurely before State.Call returned")
+				}
+				if len(res) != 2 || !res[0].IsTable() || !res[1].IsString() || len(res[1].AsString().S) != 128*1024 {
+					t.Fatalf("unexpected native return values: %v", res)
+				}
+				// Now drop references and verify __gc runs on explicit GC.
+				res = nil
+				s.CollectFull()
+				if !finalized {
+					t.Fatalf("expected __gc to run after returned table became unreachable")
+				}
+			})
+		}
+	})
+
+	t.Run("count_hook_frame_growth_clears_at_current_pc", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+local function recurse(n)
+	if n > 0 then
+		local r = recurse(n - 1)
+		return r + 1
+	end
+	return 0
+end
+
+local function probe(depth)
+	debug.sethook(function()
+		debug.sethook()
+		recurse(depth)
+	end, "", 1)
+	local a = 1
+	local b = 2
+	local line = debug.getinfo(1, "l").currentline
+	return line
+end
+
+local l1 = probe(1)
+local l40 = probe(40)
+assert(l1 == l40, "expected identical currentline across frame growth: l1=" .. tostring(l1) .. " l40=" .. tostring(l40))
+
+-- Also verify combined count+line hook keeps accurate oldPC/lines after frame growth.
+local lines = {}
+local firedCount = false
+local function probeLine()
+	debug.sethook(function(ev, l)
+		if ev == "count" and not firedCount then
+			firedCount = true
+			recurse(40)
+		elseif ev == "line" then
+			lines[#lines + 1] = l
+		end
+	end, "l", 1)
+	local x = 10
+	local y = x + 20
+	debug.sethook()
+	return y
+end
+assert(probeLine() == 30 and #lines >= 2)
+return "ok"
+`), "=hook_frame_growth")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("file_and_table_finalizer_lifo_order", func(t *testing.T) {
+		s := NewState()
+		var closeOrder []string
+		s.SetGlobal("record_close", NativeValue(&NativeFunc{
+			Name: "record_close",
+			Fn: func(_ *State, args []Value) ([]Value, error) {
+				closeOrder = append(closeOrder, FormatValue(args[0]))
+				return nil, nil
+			},
+		}))
+		cl, err := s.LoadChunk([]byte(`
+			local log = {}
+			local mt = debug.getmetatable(io.stdout)
+			local orig_gc = mt.__gc
+			local fileTag = "file1"
+			mt.__gc = function(f)
+				log[#log + 1] = fileTag
+				record_close(fileTag)
+				return orig_gc(f)
+			end
+			do
+				local t1 = setmetatable({}, {__gc = function() log[#log + 1] = "t1" end})
+				local f1 = assert(io.tmpfile())
+				local t2 = setmetatable({}, {__gc = function() log[#log + 1] = "t2" end})
+				local _ = t1, f1, t2
+			end
+			collectgarbage("collect")
+			assert(table.concat(log, ",") == "t2,file1,t1", "expected t2,file1,t1, got " .. table.concat(log, ","))
+
+			-- Leave live table + tmpfile + table for State.Close() LIFO verification.
+			fileTag = "file2"
+			_G.keep1 = setmetatable({}, {__gc = function() record_close("t3") end})
+			_G.keepF = assert(io.tmpfile())
+			_G.keep2 = setmetatable({}, {__gc = function() record_close("t4") end})
+			return "ok"
+		`), "=file_table_gc_order")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+		closeOrder = nil
+		s.Close()
+		got := strings.Join(closeOrder, ",")
+		if got != "t4,file2,t3" {
+			t.Fatalf("State.Close finalizer order = %q, want %q", got, "t4,file2,t3")
+		}
+	})
+
+	t.Run("tailcall_yielding_native_preserves_frame_and_return_hooks", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function f()
+				return coroutine.yield(42)
+			end
+			local co = coroutine.create(function()
+				local x = f()
+				return x + 1
+			end)
+			local events = {}
+			debug.sethook(co, function(ev)
+				local info = debug.getinfo(co, 2, "nSf")
+				local tag = info and (info.func == f and "F" or info.func == coroutine.yield and "Y" or "O") or "?"
+				events[#events + 1] = ev .. ":" .. tag
+			end, "cr")
+
+			local ok1, v1 = coroutine.resume(co)
+			assert(ok1 and v1 == 42)
+			local i0 = debug.getinfo(co, 0, "nfS")
+			local i1 = debug.getinfo(co, 1, "nfS")
+			local i2 = debug.getinfo(co, 2, "nfS")
+			assert(i0 and i0.func == coroutine.yield, "level 0 must be coroutine.yield")
+			assert(i1 and i1.func == f, "level 1 must preserve tail-calling Lua frame f")
+			assert(i2 and i2.what == "Lua", "level 2 must be outer coroutine body")
+			assert(table.concat(events, ",") == "call:O,call:F,call:Y", "before=" .. table.concat(events, ","))
+
+			local ok2, v2 = coroutine.resume(co, 99)
+			assert(ok2 and v2 == 100)
+			assert(table.concat(events, ",") == "call:O,call:F,call:Y,return:Y,return:F,return:O", "after=" .. table.concat(events, ","))
+
+			-- Installing a return hook AFTER suspension must still fire return:Y, return:F, return:O on resume.
+			local co2 = coroutine.create(function()
+				local x = f()
+				return x + 2
+			end)
+			assert(coroutine.resume(co2))
+			local late = {}
+			debug.sethook(co2, function(ev)
+				local info = debug.getinfo(co2, 2, "f")
+				local tag = info and (info.func == f and "F" or info.func == coroutine.yield and "Y" or "O") or "?"
+				late[#late + 1] = ev .. ":" .. tag
+			end, "r")
+			local ok3, v3 = coroutine.resume(co2, 10)
+			assert(ok3 and v3 == 12)
+			assert(table.concat(late, ",") == "return:Y,return:F,return:O", "late=" .. table.concat(late, ","))
+
+			-- Error raised inside yield's return hook on resume must propagate cleanly.
+			local co3 = coroutine.create(function()
+				return f()
+			end)
+			assert(coroutine.resume(co3))
+			debug.sethook(co3, function(ev)
+				if ev == "return" then
+					error("hook-boom", 0)
+				end
+			end, "r")
+			local ok4, err4 = coroutine.resume(co3, 7)
+			assert(not ok4 and err4 == "hook-boom", "ok4=" .. tostring(ok4) .. " err4=" .. tostring(err4))
+			return "ok"
+		`), "=tail_yield_hooks")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+}
