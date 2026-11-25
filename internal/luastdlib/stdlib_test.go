@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -1178,7 +1179,7 @@ end
 	for i, fc := range floatCases {
 		got := FormatFloat(fc.v)
 		want := luaMap[fmt.Sprintf("T%d", i)]
-		if got != want {
+		if normalizeNaNOutput(got) != normalizeNaNOutput(want) {
 			t.Errorf("FormatFloat[%d] (%v): got %q, lua55 %q", i, fc.v, got, want)
 		}
 	}
@@ -1194,6 +1195,35 @@ end
 			t.Errorf("StrToIntBase[%d] (%q, %d): got %s, lua55 %s", i, bc.s, bc.base, got, want)
 		}
 	}
+}
+
+func normalizeNaNOutput(s string) string {
+	// x86_64 glibc formats negative-signbit quiet NaN (0.0/0.0) as "-nan"/"-NAN",
+	// whereas arm64/macOS emits "nan"/"NAN". Preserve field width when normalizing.
+	s = strings.ReplaceAll(s, " -NAN", "  NAN")
+	s = strings.ReplaceAll(s, " -nan", "  nan")
+	s = strings.ReplaceAll(s, "-NAN", "NAN")
+	s = strings.ReplaceAll(s, "-nan", "nan")
+	return s
+}
+
+func hexFloatFieldsEqual(a, b string) bool {
+	fa := strings.Split(a, "|")
+	fb := strings.Split(b, "|")
+	if len(fa) != len(fb) {
+		return false
+	}
+	for i := range fa {
+		if !strings.HasPrefix(fa[i], "0x") || !strings.HasPrefix(fb[i], "0x") {
+			return false
+		}
+		va, ea := strconv.ParseFloat(fa[i], 64)
+		vb, eb := strconv.ParseFloat(fb[i], 64)
+		if ea != nil || eb != nil || math.Float64bits(va) != math.Float64bits(vb) {
+			return false
+		}
+	}
+	return true
 }
 
 // =============================================================================
@@ -1321,7 +1351,14 @@ end
 		wantHex := luaMap[fmt.Sprintf("F%d", i)]
 		if gotHex != wantHex {
 			wantBytes, _ := hex.DecodeString(wantHex)
-			t.Errorf("Format[%d] (%q) mismatch:\n  got:   %q\n  lua55: %q", i, tc.fmtStr, got, string(wantBytes))
+			wantStr := string(wantBytes)
+			if normalizeNaNOutput(got) == normalizeNaNOutput(wantStr) {
+				continue
+			}
+			if tc.fmtStr == "%a|%a|%a" && hexFloatFieldsEqual(got, wantStr) {
+				continue
+			}
+			t.Errorf("Format[%d] (%q) mismatch:\n  got:   %q\n  lua55: %q", i, tc.fmtStr, got, wantStr)
 		}
 	}
 
