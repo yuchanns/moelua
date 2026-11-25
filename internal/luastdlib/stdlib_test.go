@@ -1599,3 +1599,27 @@ func TestFormatNaNSignFlags(t *testing.T) {
 		t.Fatalf("Format NaN sign flags:\n  got:  %q\n  want: %q", got, want)
 	}
 }
+
+func TestGSubWithLimitsBoundsOutput(t *testing.T) {
+	limitErr := fmt.Errorf("size limit exceeded")
+	checkSize := func(n int64) error {
+		if n > 2048 {
+			return limitErr
+		}
+		return nil
+	}
+	src := strings.Repeat("x", 1000)
+	if _, _, err := GSubStringWithLimits(src, ".", src, -1, nil, checkSize); err != limitErr {
+		t.Fatalf("GSubStringWithLimits expected limitErr, got %v", err)
+	}
+	if _, _, err := GSubTableWithLimits(src, ".", func(CaptureVal) (string, bool, error) {
+		return src, true, nil
+	}, -1, nil, checkSize); err != limitErr {
+		t.Fatalf("GSubTableWithLimits expected limitErr, got %v", err)
+	}
+	if _, _, err := GSubWithLimits(src, ".", func([]CaptureVal) (string, bool, error) {
+		return src, true, nil
+	}, -1, nil, checkSize); err != limitErr {
+		t.Fatalf("GSubWithLimits expected limitErr, got %v", err)
+	}
+}

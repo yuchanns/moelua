@@ -681,7 +681,11 @@ func GSub(s, pattern string, repl func(captures []CaptureVal) (string, bool, err
 }
 
 func GSubWithCancel(s, pattern string, repl func(captures []CaptureVal) (string, bool, error), maxRepl int, checkCancel func() error) (string, int, error) {
-	return gsubCore(s, pattern, maxRepl, checkCancel, func(ms *matchState, b *strings.Builder, start, end int) (bool, error) {
+	return GSubWithLimits(s, pattern, repl, maxRepl, checkCancel, nil)
+}
+
+func GSubWithLimits(s, pattern string, repl func(captures []CaptureVal) (string, bool, error), maxRepl int, checkCancel func() error, checkSize func(int64) error) (string, int, error) {
+	return gsubCore(s, pattern, maxRepl, checkCancel, checkSize, func(ms *matchState, b *strings.Builder, start, end int) (bool, error) {
 		caps, err := ms.collectCaptures(start, end, true)
 		if err != nil {
 			return false, err
@@ -691,10 +695,14 @@ func GSubWithCancel(s, pattern string, repl func(captures []CaptureVal) (string,
 			return false, err
 		}
 		if !ok {
-			b.WriteString(s[start:end])
+			if err := writeCheckedString(b, s[start:end], checkSize); err != nil {
+				return false, err
+			}
 			return false, nil
 		}
-		b.WriteString(rep)
+		if err := writeCheckedString(b, rep, checkSize); err != nil {
+			return false, err
+		}
 		return true, nil
 	})
 }
@@ -707,8 +715,12 @@ func GSubString(s, pattern, repl string, maxRepl int) (string, int, error) {
 }
 
 func GSubStringWithCancel(s, pattern, repl string, maxRepl int, checkCancel func() error) (string, int, error) {
-	return gsubCore(s, pattern, maxRepl, checkCancel, func(ms *matchState, b *strings.Builder, start, end int) (bool, error) {
-		if err := expandReplTemplate(ms, b, repl, start, end); err != nil {
+	return GSubStringWithLimits(s, pattern, repl, maxRepl, checkCancel, nil)
+}
+
+func GSubStringWithLimits(s, pattern, repl string, maxRepl int, checkCancel func() error, checkSize func(int64) error) (string, int, error) {
+	return gsubCore(s, pattern, maxRepl, checkCancel, checkSize, func(ms *matchState, b *strings.Builder, start, end int) (bool, error) {
+		if err := expandReplTemplate(ms, b, repl, start, end, checkSize); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -724,7 +736,11 @@ func GSubTable(s, pattern string, lookup func(key CaptureVal) (string, bool, err
 }
 
 func GSubTableWithCancel(s, pattern string, lookup func(key CaptureVal) (string, bool, error), maxRepl int, checkCancel func() error) (string, int, error) {
-	return gsubCore(s, pattern, maxRepl, checkCancel, func(ms *matchState, b *strings.Builder, start, end int) (bool, error) {
+	return GSubTableWithLimits(s, pattern, lookup, maxRepl, checkCancel, nil)
+}
+
+func GSubTableWithLimits(s, pattern string, lookup func(key CaptureVal) (string, bool, error), maxRepl int, checkCancel func() error, checkSize func(int64) error) (string, int, error) {
+	return gsubCore(s, pattern, maxRepl, checkCancel, checkSize, func(ms *matchState, b *strings.Builder, start, end int) (bool, error) {
 		key, err := ms.getOneCapture(0, start, end)
 		if err != nil {
 			return false, err
@@ -734,40 +750,73 @@ func GSubTableWithCancel(s, pattern string, lookup func(key CaptureVal) (string,
 			return false, err
 		}
 		if !ok {
-			b.WriteString(s[start:end])
+			if err := writeCheckedString(b, s[start:end], checkSize); err != nil {
+				return false, err
+			}
 			return false, nil
 		}
-		b.WriteString(rep)
+		if err := writeCheckedString(b, rep, checkSize); err != nil {
+			return false, err
+		}
 		return true, nil
 	})
 }
 
-func expandReplTemplate(ms *matchState, b *strings.Builder, news string, s, e int) error {
+func writeCheckedString(b *strings.Builder, str string, checkSize func(int64) error) error {
+	if checkSize != nil && len(str) > 0 {
+		if err := checkSize(int64(b.Len()) + int64(len(str))); err != nil {
+			return err
+		}
+	}
+	b.WriteString(str)
+	return nil
+}
+
+func writeCheckedByte(b *strings.Builder, c byte, checkSize func(int64) error) error {
+	if checkSize != nil {
+		if err := checkSize(int64(b.Len()) + 1); err != nil {
+			return err
+		}
+	}
+	b.WriteByte(c)
+	return nil
+}
+
+func expandReplTemplate(ms *matchState, b *strings.Builder, news string, s, e int, checkSize func(int64) error) error {
 	for len(news) > 0 {
 		idx := strings.IndexByte(news, lEsc)
 		if idx < 0 {
-			b.WriteString(news)
-			return nil
+			return writeCheckedString(b, news, checkSize)
 		}
-		b.WriteString(news[:idx])
+		if err := writeCheckedString(b, news[:idx], checkSize); err != nil {
+			return err
+		}
 		if idx+1 >= len(news) {
 			return errInvalidReplEsc
 		}
 		ch := news[idx+1]
 		switch {
 		case ch == lEsc:
-			b.WriteByte(lEsc)
+			if err := writeCheckedByte(b, lEsc, checkSize); err != nil {
+				return err
+			}
 		case ch == '0':
-			b.WriteString(ms.src[s:e])
+			if err := writeCheckedString(b, ms.src[s:e], checkSize); err != nil {
+				return err
+			}
 		case isDigit(ch):
 			cv, err := ms.getOneCapture(int(ch-'1'), s, e)
 			if err != nil {
 				return err
 			}
 			if cv.IsPos {
-				b.WriteString(strconv.FormatInt(cv.Pos, 10))
+				if err := writeCheckedString(b, strconv.FormatInt(cv.Pos, 10), checkSize); err != nil {
+					return err
+				}
 			} else {
-				b.WriteString(cv.Str)
+				if err := writeCheckedString(b, cv.Str, checkSize); err != nil {
+					return err
+				}
 			}
 		default:
 			return errInvalidReplEsc
@@ -777,7 +826,7 @@ func expandReplTemplate(ms *matchState, b *strings.Builder, news string, s, e in
 	return nil
 }
 
-func gsubCore(s, pattern string, maxRepl int, checkCancel func() error, apply func(ms *matchState, b *strings.Builder, start, end int) (bool, error)) (string, int, error) {
+func gsubCore(s, pattern string, maxRepl int, checkCancel func() error, checkSize func(int64) error, apply func(ms *matchState, b *strings.Builder, start, end int) (bool, error)) (string, int, error) {
 	if maxRepl < 0 {
 		maxRepl = len(s) + 1
 	}
@@ -814,7 +863,9 @@ func gsubCore(s, pattern string, maxRepl int, checkCancel func() error, apply fu
 			src = e
 			lastMatch = e
 		} else if src < len(s) {
-			b.WriteByte(s[src])
+			if err := writeCheckedByte(&b, s[src], checkSize); err != nil {
+				return "", 0, err
+			}
 			src++
 		} else {
 			break
@@ -826,6 +877,8 @@ func gsubCore(s, pattern string, maxRepl int, checkCancel func() error, apply fu
 	if !changed {
 		return s, n, nil
 	}
-	b.WriteString(s[src:])
+	if err := writeCheckedString(&b, s[src:], checkSize); err != nil {
+		return "", 0, err
+	}
 	return b.String(), n, nil
 }
