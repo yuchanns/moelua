@@ -290,7 +290,7 @@ func (r *luaFuncReader) Read(p []byte) (int, error) {
 	res, err := r.s.Call(r.fn)
 	if err != nil {
 		r.eof = true
-		if isUncatchableErr(err) {
+		if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 			return 0, err
 		}
 		return 0, loadReaderLuaErr{val: errorToLuaValue(r.s, err)}
@@ -609,7 +609,7 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 		fn, err = s.loadChunkReader(lr, chunkName, mode, env, hasEnv, false)
 	}
 	if err != nil {
-		if isUncatchableErr(err) {
+		if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 			return nil, err
 		}
 		var rle loadReaderLuaErr
@@ -688,7 +688,7 @@ func nativeLoadFile(s *State, args []Value) ([]Value, error) {
 	}
 	fn, err := s.loadChunkReader(r, chunkName, mode, env, hasEnv, true)
 	if err != nil {
-		if isUncatchableErr(err) {
+		if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 			return nil, err
 		}
 		var le *LuaError
@@ -2790,7 +2790,7 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 		fn, err := s.LoadChunkReader(fileErrReader{r: f}, "@"+cand)
 		_ = f.Close()
 		if err != nil {
-			if isUncatchableErr(err) {
+			if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 				return nil, err
 			}
 			var fre loadFileReadErr

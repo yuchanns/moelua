@@ -286,6 +286,9 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			co.status = ThreadDead
 			co.stack[0] = NilValue()
 			if err != nil {
+				if errors.Is(err, errCoroCloseSelf) || errors.Is(s.abortErr, errCoroCloseSelf) {
+					return s.finishCoroCloseSelf(co)
+				}
 				if isUncatchableErr(err) {
 					return false, nil, err
 				}

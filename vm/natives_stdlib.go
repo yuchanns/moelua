@@ -371,7 +371,7 @@ func nativeStringPack(s *State, args []Value) ([]Value, error) {
 			return s.checkMem(n + 48)
 		}
 	}
-	res, err := luastdlib.PackWithLimits(fmtStr, checkSize, pargs...)
+	res, err := luastdlib.PackWithControls(fmtStr, checkSize, s.nativeCancelFunc(), pargs...)
 	if err != nil {
 		return nil, err
 	}
@@ -403,13 +403,8 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 	cancelFn := s.nativeCancelFunc()
 	var count int64
 	var strBytes int64
-	nextPos, err := luastdlib.UnpackEach(fmtStr, data, initPos, func(pv luastdlib.PackValue) error {
+	nextPos, err := luastdlib.UnpackEachWithCancel(fmtStr, data, initPos, cancelFn, func(pv luastdlib.PackValue) error {
 		count++
-		if cancelFn != nil && (count&1023) == 0 {
-			if err := cancelFn(); err != nil {
-				return err
-			}
-		}
 		if s.memLimit > 0 {
 			checkNow := (count & 63) == 0
 			if pv.Kind == luastdlib.PackString {
@@ -459,7 +454,7 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 			}
 			th.top = savedTop
 		}()
-		_, err = luastdlib.UnpackEach(fmtStr, data, initPos, func(pv luastdlib.PackValue) error {
+		_, err = luastdlib.UnpackEachWithCancel(fmtStr, data, initPos, cancelFn, func(pv luastdlib.PackValue) error {
 			var v Value
 			switch pv.Kind {
 			case luastdlib.PackInt:
@@ -494,7 +489,7 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 	}
 	out := make([]Value, nOut)
 	idx := 0
-	_, err = luastdlib.UnpackEach(fmtStr, data, initPos, func(pv luastdlib.PackValue) error {
+	_, err = luastdlib.UnpackEachWithCancel(fmtStr, data, initPos, cancelFn, func(pv luastdlib.PackValue) error {
 		switch pv.Kind {
 		case luastdlib.PackInt:
 			out[idx] = IntValue(pv.Int)
@@ -521,12 +516,12 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 	return out, nil
 }
 
-func nativeStringPackSize(_ *State, args []Value) ([]Value, error) {
+func nativeStringPackSize(s *State, args []Value) ([]Value, error) {
 	fmtStr, err := checkStringArg(args, 0, "packsize")
 	if err != nil {
 		return nil, err
 	}
-	sz, err := luastdlib.PackSize(fmtStr)
+	sz, err := luastdlib.PackSizeWithCancel(fmtStr, s.nativeCancelFunc())
 	if err != nil {
 		return nil, err
 	}
@@ -587,7 +582,7 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 			return s.checkMem(n + 48)
 		}
 	}
-	res, err := luastdlib.FormatWithLimits(fmtStr, fargs, checkSize)
+	res, err := luastdlib.FormatWithControls(fmtStr, fargs, checkSize, s.nativeCancelFunc())
 	if err != nil {
 		return nil, err
 	}

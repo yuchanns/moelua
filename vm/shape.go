@@ -292,18 +292,23 @@ func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString) (*Shape, 
 }
 
 // WithMeta returns a shape having the exact same ordered keys as sh, but with metatable meta.
-func (sr *shapeRegistry) WithMeta(s *State, sh *Shape, meta *Table) *Shape {
+// Returns (newShape, true) on success, or (sh, false) when memory allocation fails.
+func (sr *shapeRegistry) WithMeta(s *State, sh *Shape, meta *Table) (*Shape, bool) {
 	if sh == nil {
-		return sr.Root(s, meta)
+		r := sr.Root(s, meta)
+		return r, r != nil
 	}
 	if sh.meta == meta {
-		return sh
+		return sh, true
 	}
 	if sh.length == 0 {
 		if r := sr.Root(s, meta); r != nil {
-			return r
+			return r, true
 		}
-		return sh
+		if s != nil {
+			s.memExceeded = true
+		}
+		return sh, false
 	}
 	var wm weak.Pointer[Table]
 	if meta != nil {
@@ -313,7 +318,7 @@ func (sr *shapeRegistry) WithMeta(s *State, sh *Shape, meta *Table) *Shape {
 	if sr.metaTrans != nil {
 		if wp, ok := sr.metaTrans[key]; ok {
 			if cached := wp.Value(); cached != nil {
-				return cached
+				return cached, true
 			}
 		}
 	} else {
@@ -321,7 +326,10 @@ func (sr *shapeRegistry) WithMeta(s *State, sh *Shape, meta *Table) *Shape {
 	}
 	cur := sr.Root(s, meta)
 	if cur == nil {
-		return sh
+		if s != nil {
+			s.memExceeded = true
+		}
+		return sh, false
 	}
 	keys := sh.Keys()
 	for _, k := range keys {
@@ -330,16 +338,19 @@ func (sr *shapeRegistry) WithMeta(s *State, sh *Shape, meta *Table) *Shape {
 			if s != nil {
 				s.memExceeded = true
 			}
-			return sh
+			return sh, false
 		}
 		if next == nil {
-			return sh
+			if s != nil {
+				s.memExceeded = true
+			}
+			return sh, false
 		}
 		cur = next
 	}
 	sr.metaTrans[key] = weak.Make(cur)
 	sr.maybePrune()
-	return cur
+	return cur, true
 }
 
 // icKind identifies what a per-PC inline cache entry caches.

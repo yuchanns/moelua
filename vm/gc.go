@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"unsafe"
@@ -1176,6 +1177,7 @@ func (s *State) drainFinalizers() {
 
 	for len(s.gc.toBeFnz) > 0 {
 		obj := s.gc.toBeFnz[0]
+		s.gc.toBeFnz[0] = Value{}
 		s.gc.toBeFnz = s.gc.toBeFnz[1:]
 		var mt *Table
 		switch {
@@ -1195,13 +1197,14 @@ func (s *State) drainFinalizers() {
 		_, err := s.callOnThread(th, tm, []Value{obj})
 		th.nextFrameFinalizer = false
 		if err != nil {
-			if isUncatchableErr(err) {
+			if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 				s.abortErr = err
 				return
 			}
 			s.emitWarning(fmt.Sprintf("error in __gc metamethod (%s)", err.Error()))
 		}
 	}
+	s.gc.toBeFnz = nil
 }
 
 // Close closes the State: closes remaining mainThread <close> variables, runs ALL remaining
@@ -1262,6 +1265,7 @@ func (s *State) drainFinalizersQueued() {
 	th := s.cur
 	for len(s.gc.toBeFnz) > 0 {
 		obj := s.gc.toBeFnz[0]
+		s.gc.toBeFnz[0] = Value{}
 		s.gc.toBeFnz = s.gc.toBeFnz[1:]
 		var mt *Table
 		switch {
@@ -1281,13 +1285,14 @@ func (s *State) drainFinalizersQueued() {
 		_, err := s.callOnThread(th, tm, []Value{obj})
 		th.nextFrameFinalizer = false
 		if err != nil {
-			if isUncatchableErr(err) {
+			if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 				s.abortErr = err
 				return
 			}
 			s.emitWarning(fmt.Sprintf("error in __gc metamethod (%s)", err.Error()))
 		}
 	}
+	s.gc.toBeFnz = nil
 }
 
 var gcParamNames = map[string]int{
@@ -1330,6 +1335,9 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 	case "step":
 		if s.gc.tier1 {
 			s.CollectFull()
+			if s.abortErr != nil {
+				return nil, s.abortErr
+			}
 		}
 		return []Value{TrueValue()}, nil
 	case "isrunning":

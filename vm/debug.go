@@ -1062,6 +1062,9 @@ func nativeDebugSetMetatable(s *State, args []Value) ([]Value, error) {
 		mt = args[1].AsTable()
 	}
 	s.setMetatableOf(args[0], mt)
+	if err := s.ConsumeMemErr(); err != nil {
+		return nil, err
+	}
 	return []Value{args[0]}, nil
 }
 

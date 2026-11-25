@@ -635,6 +635,12 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 // checkSize(newLen) before growing the output buffer so callers can enforce memory limits
 // before allocating large formatted results.
 func FormatWithLimits(fmtStr string, args []FormatArg, checkSize func(int64) error) (string, error) {
+	return FormatWithControls(fmtStr, args, checkSize, nil)
+}
+
+// FormatWithControls is like FormatWithLimits, additionally polling cancelFn periodically
+// while scanning the format string.
+func FormatWithControls(fmtStr string, args []FormatArg, checkSize func(int64) error, cancelFn func() error) (string, error) {
 	var b strings.Builder
 	checkGrow := func(add int) error {
 		if checkSize == nil || add <= 0 {
@@ -644,11 +650,31 @@ func FormatWithLimits(fmtStr string, args []FormatArg, checkSize func(int64) err
 	}
 	argIdx := 0
 	i := 0
+	var steps int64
 	for i < len(fmtStr) {
+		steps++
+		if cancelFn != nil && (steps&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return "", err
+			}
+		}
 		if fmtStr[i] != lEsc {
 			start := i
-			for i < len(fmtStr) && fmtStr[i] != lEsc {
-				i++
+			if cancelFn == nil {
+				for i < len(fmtStr) && fmtStr[i] != lEsc {
+					i++
+				}
+			} else {
+				const litChunk = 65536
+				limit := min(len(fmtStr), i+litChunk)
+				for i < limit && fmtStr[i] != lEsc {
+					i++
+				}
+				if i == limit && i < len(fmtStr) && fmtStr[i] != lEsc {
+					if err := cancelFn(); err != nil {
+						return "", err
+					}
+				}
 			}
 			if err := checkGrow(i - start); err != nil {
 				return "", err

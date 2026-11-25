@@ -1,6 +1,10 @@
 package vm
 
-import "github.com/yuchanns/moelua/bytecode"
+import (
+	"errors"
+
+	"github.com/yuchanns/moelua/bytecode"
+)
 
 // checkInstructionHook runs count & line debug hooks in runHooked() (never called from fast run()).
 // Returns (reload, err) where reload==true means an error was caught by pcall/xpcall.
@@ -163,6 +167,15 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 			err = s.run(th, entryDepth)
 		}
 		if err != nil {
+			if errors.Is(err, errCoroCloseSelf) {
+				if errors.Is(s.abortErr, errCoroCloseSelf) {
+					s.abortErr = nil
+				}
+				_, _, _ = th.closeAllSync(funcIdx, NilValue(), false)
+				th.nframe = entryDepth
+				th.top = savedTop
+				return errCoroCloseSelf
+			}
 			if isUncatchableErr(err) {
 				s.abortErr = err
 				th.discardTBCAtOrAbove(funcIdx)
@@ -175,6 +188,12 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 			ev, _, _ = th.closeAllSync(funcIdx, ev, true)
 			th.nframe = entryDepth
 			th.top = savedTop
+			if errors.Is(s.abortErr, errCoroCloseSelf) {
+				return errCoroCloseSelf
+			}
+			if isUncatchableErr(s.abortErr) {
+				return s.abortErr
+			}
 			return &LuaError{Val: ev}
 		}
 		th.top = savedTop

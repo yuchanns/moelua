@@ -221,7 +221,18 @@ func fillNil(vs []Value) {
 func (t *Table) Metatable() *Table { return t.meta }
 
 // SetMetatable sets t's metatable, updating Shape (in opt mode), tmFlags, proto flags, and Tier 1 GC.
+// When shape allocation fails under a memory limit, t's metatable and shape remain unchanged so
+// existing inline caches stay consistent with t.meta.
 func (s *State) SetMetatable(t, mt *Table) {
+	var newShape *Shape
+	if OptimizeEnabled && t.shape != nil {
+		var ok bool
+		newShape, ok = s.shapes.WithMeta(s, t.shape, mt)
+		if !ok {
+			s.memExceeded = true
+			return
+		}
+	}
 	if mt != nil {
 		mt.markProto(s)
 		// If mt.__index is a table, mark it as proto too so writes to it bump protoEpoch.
@@ -237,8 +248,8 @@ func (s *State) SetMetatable(t, mt *Table) {
 	t.meta = mt
 	t.tmFlags = 0
 	if OptimizeEnabled {
-		if t.shape != nil {
-			t.shape = s.shapes.WithMeta(s, t.shape, mt)
+		if newShape != nil {
+			t.shape = newShape
 		}
 		if t.isProto() {
 			s.protoEpoch++
