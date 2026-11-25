@@ -743,7 +743,9 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					}
 					return false, nil
 				}
-				t.demoteToDict()
+				if !t.demoteToDict(s) {
+					return s.catchSlow(th, ev, false, s.ConsumeMemErr())
+				}
 				t.RawSetStr(s, key, val)
 				if err := s.ConsumeMemErr(); err != nil {
 					return s.catchSlow(th, ev, false, err)
@@ -2574,11 +2576,90 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			}
 			return coldReload, 0, nil
 		}
-		args := make([]Value, nargs)
-		copy(args, th.stack[srcStart+1:srcStart+1+nargs])
 		nres := cf.nresults
 		th.top = srcStart + 1 + nargs
+		hookedNative := false
+		if th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook {
+			hookedNative = true
+			if th.nframe >= len(th.frames) {
+				nfrm := make([]callFrame, len(th.frames)*2)
+				copy(nfrm, th.frames)
+				th.frames = nfrm
+			}
+			th.frames[th.nframe] = callFrame{
+				kind:      frameNative,
+				base:      srcStart + 1,
+				funcIdx:   srcStart,
+				nativeFn:  fn,
+				ftransfer: 1,
+				ntransfer: uint16(nargs),
+				dirty:     true,
+			}
+			th.nframe++
+			if th.hookMask&HookMaskCall != 0 {
+				if herr := s.fireHook(th, "call", NilValue()); herr != nil {
+					th.nframe--
+					return coldContinue, pc, herr
+				}
+			}
+		}
+		args := make([]Value, nargs)
+		copy(args, th.stack[srcStart+1:srcStart+1+nargs])
 		res, err := nf.callMulti(s, args)
+		if hookedNative || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook) {
+			var hookErr error
+			if hookedNative {
+				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook {
+					if serr := th.ensureStack(srcStart + 1 + len(res) + 4); serr != nil {
+						hookErr = serr
+					} else {
+						copy(th.stack[srcStart+1:srcStart+1+len(res)], res)
+						if end := srcStart + 1 + len(res); th.top < end {
+							th.top = end
+						}
+						th.frames[th.nframe-1].ftransfer = 1
+						th.frames[th.nframe-1].ntransfer = uint16(len(res))
+						hookErr = s.fireHook(th, "return", NilValue())
+						if hookErr == nil && len(res) > 0 {
+							copy(res, th.stack[srcStart+1:srcStart+1+len(res)])
+						}
+					}
+				}
+				th.nframe--
+			} else {
+				if th.nframe >= len(th.frames) {
+					nfrm := make([]callFrame, len(th.frames)*2)
+					copy(nfrm, th.frames)
+					th.frames = nfrm
+				}
+				if serr := th.ensureStack(srcStart + 1 + len(res) + 4); serr != nil {
+					hookErr = serr
+				} else {
+					copy(th.stack[srcStart+1:srcStart+1+len(res)], res)
+					if end := srcStart + 1 + len(res); th.top < end {
+						th.top = end
+					}
+					th.frames[th.nframe] = callFrame{
+						kind:      frameNative,
+						base:      srcStart + 1,
+						funcIdx:   srcStart,
+						nativeFn:  fn,
+						ftransfer: 1,
+						ntransfer: uint16(len(res)),
+						dirty:     true,
+					}
+					th.nframe++
+					hookErr = s.fireHook(th, "return", NilValue())
+					if hookErr == nil && len(res) > 0 {
+						copy(res, th.stack[srcStart+1:srcStart+1+len(res)])
+					}
+					th.nframe--
+				}
+			}
+			if hookErr != nil && err == nil {
+				return coldContinue, pc, hookErr
+			}
+		}
 		if errors.Is(err, errYieldSentinel) {
 			th.nframe--
 			th.yieldDst = funcIdx

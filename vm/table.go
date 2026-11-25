@@ -143,6 +143,33 @@ func tablePreallocBytes(nseq, nrec int64) int64 {
 	return structBytes + arrBytes + recBytes
 }
 
+// TryNewTable allocates a Lua table after enforcing State memory limits and accounting
+// the requested backing capacity. Suitable for host embedding APIs and table.create.
+func (s *State) TryNewTable(nseq, nrec int) (*Table, error) {
+	if nseq < 0 {
+		nseq = 0
+	}
+	if nrec < 0 {
+		nrec = 0
+	}
+	if int64(nrec) > (1<<26) || int64(nseq) > (1<<28) {
+		return nil, fmt.Errorf("table overflow")
+	}
+	actualBytes := tablePreallocBytes(int64(nseq), int64(nrec))
+	checkBytes := actualBytes
+	if OptimizeEnabled && nseq > 0 {
+		checkBytes += int64(nseq) * 16
+	}
+	if err := s.checkMem(checkBytes); err != nil {
+		return nil, err
+	}
+	t := s.NewTable(nseq, nrec)
+	if s.memLimit > 0 || s.gc.tier1 {
+		s.gc.allocBytes += checkBytes
+	}
+	return t, nil
+}
+
 // NewTable allocates a Lua table with sequence/record capacity hints.
 func (s *State) NewTable(nseq, nrec int) *Table {
 	t := &Table{}
@@ -409,14 +436,29 @@ func (t *Table) hashSet(key, val Value) int {
 }
 
 // demoteToDict converts a Shape-mode table into a dict-mode hash table.
-func (t *Table) demoteToDict() {
+// Returns false (setting s.memExceeded) if allocating the hash backing store exceeds s.memLimit.
+func (t *Table) demoteToDict(s *State) bool {
 	if t.shape == nil {
-		return
+		return true
 	}
 	keys := t.shape.Keys()
 	n := len(keys)
 	if n < 4 {
 		n = 4
+	}
+	if s != nil && s.memLimit > 0 {
+		hashBytes := hashCapFor(int64(n)) * 40
+		var oldSlotBytes int64
+		if c := cap(t.slots); c > len(t.inlineSlots) {
+			oldSlotBytes = int64(c) * 16
+		}
+		delta := hashBytes - oldSlotBytes
+		if delta > 0 {
+			if err := s.checkMemAndAccount(delta); err != nil {
+				s.memExceeded = true
+				return false
+			}
+		}
 	}
 	t.initHash(n)
 	for i, k := range keys {
@@ -426,6 +468,7 @@ func (t *Table) demoteToDict() {
 	}
 	t.shape = nil
 	t.slots = nil
+	return true
 }
 
 // RawGetStr looks up a LuaString key (fast path for GETFIELD/SELF/GETTABUP).
@@ -486,7 +529,9 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 		if val.IsNil() {
 			return
 		}
-		t.demoteToDict()
+		if !t.demoteToDict(s) {
+			return
+		}
 	}
 	if err := t.checkHashMem(s); err != nil {
 		s.memExceeded = true
@@ -849,7 +894,9 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 			if val.IsNil() {
 				return
 			}
-			t.demoteToDict()
+			if !t.demoteToDict(s) {
+				return
+			}
 		}
 		if err := t.checkHashMem(s); err != nil {
 			s.memExceeded = true
@@ -966,7 +1013,9 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 			if val.IsNil() {
 				return nil
 			}
-			t.demoteToDict()
+			if !t.demoteToDict(s) {
+				return s.ConsumeMemErr()
+			}
 		}
 		if err := t.checkHashMem(s); err != nil {
 			return err
@@ -983,7 +1032,9 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 			if val.IsNil() {
 				return nil
 			}
-			t.demoteToDict()
+			if !t.demoteToDict(s) {
+				return s.ConsumeMemErr()
+			}
 		}
 		if err := t.checkHashMem(s); err != nil {
 			return err

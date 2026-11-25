@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"weak"
 
@@ -507,7 +508,12 @@ func asLuaFile(v Value) (*luaFile, bool) {
 }
 
 func ioFail(s *State, err error) []Value {
-	return []Value{NilValue(), StringValue(s.intern.Intern(err.Error())), IntValue(1)}
+	code := int64(1)
+	var errno syscall.Errno
+	if errors.As(err, &errno) && errno != 0 {
+		code = int64(errno)
+	}
+	return []Value{NilValue(), StringValue(s.intern.Intern(err.Error())), IntValue(code)}
 }
 
 func isValidIOMode(mode string) bool {
@@ -828,7 +834,7 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 	}
 	sz := int64(4096)
 	if len(args) >= 3 && !args[2].IsNil() {
-		if v, ok := args[2].ToInt(); ok && v > 0 {
+		if v, ok := args[2].CoerceInt(); ok && v > 0 {
 			sz = v
 		}
 	}
@@ -892,7 +898,7 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 	}
 	if len(args) >= 3 && !args[2].IsNil() {
 		var ok bool
-		offset, ok = args[2].ToInt()
+		offset, ok = args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'seek' (number expected)")
 		}
@@ -1442,7 +1448,7 @@ func nativeOSTime(s *State, args []Value) ([]Value, error) {
 			}
 			return def, nil
 		}
-		iv, ok := v.ToInt()
+		iv, ok := v.CoerceInt()
 		if !ok {
 			return 0, fmt.Errorf("field '%s' is not an integer", name)
 		}
@@ -1572,14 +1578,14 @@ func nativeOSDiffTime(_ *State, args []Value) ([]Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("bad argument #1 to 'difftime' (number expected, got no value)")
 	}
-	t2, ok := args[0].ToFloat()
+	t2, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'difftime' (number expected, got %s)", args[0].TypeName())
 	}
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad argument #2 to 'difftime' (number expected, got no value)")
 	}
-	t1, ok := args[1].ToFloat()
+	t1, ok := args[1].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #2 to 'difftime' (number expected, got %s)", args[1].TypeName())
 	}
@@ -1593,7 +1599,7 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 	}
 	tm := time.Now()
 	if len(args) >= 2 && !args[1].IsNil() {
-		sec, ok := args[1].ToInt()
+		sec, ok := args[1].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'os.date'")
 		}
@@ -1740,7 +1746,7 @@ func nativeOSExit(s *State, args []Value) ([]Value, error) {
 	if len(args) >= 1 && !args[0].IsNil() {
 		if args[0].IsFalse() {
 			code = 1
-		} else if i, ok := args[0].ToInt(); ok {
+		} else if i, ok := args[0].CoerceInt(); ok {
 			code = int(i)
 		}
 	}

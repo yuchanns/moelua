@@ -62,7 +62,7 @@ func nativeStringFind(s *State, args []Value) ([]Value, error) {
 	}
 	initPos := 1
 	if len(args) >= 3 && !args[2].IsNil() {
-		iv, ok := args[2].ToInt()
+		iv, ok := args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'find' (number expected)")
 		}
@@ -96,7 +96,7 @@ func nativeStringMatch(s *State, args []Value) ([]Value, error) {
 	}
 	initPos := 1
 	if len(args) >= 3 && !args[2].IsNil() {
-		iv, ok := args[2].ToInt()
+		iv, ok := args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'match' (number expected)")
 		}
@@ -127,7 +127,7 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 	}
 	initPos := 1
 	if len(args) >= 3 && !args[2].IsNil() {
-		iv, ok := args[2].ToInt()
+		iv, ok := args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'gmatch' (number expected)")
 		}
@@ -171,7 +171,7 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 	repl := args[2]
 	maxRepl := -1
 	if len(args) >= 4 && !args[3].IsNil() {
-		iv, ok := args[3].ToInt()
+		iv, ok := args[3].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #4 to 'gsub' (number expected)")
 		}
@@ -300,7 +300,7 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 	initPos := int64(1)
 	if len(args) >= 3 && !args[2].IsNil() {
 		var ok bool
-		initPos, ok = args[2].ToInt()
+		initPos, ok = args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'unpack' (number expected)")
 		}
@@ -407,7 +407,7 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 func nativeUTF8Char(s *State, args []Value) ([]Value, error) {
 	cps := make([]int64, len(args))
 	for i, a := range args {
-		cp, ok := a.ToInt()
+		cp, ok := a.CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #%d to 'utf8.char' (number expected)", i+1)
 		}
@@ -431,7 +431,7 @@ func nativeUTF8Codepoint(s *State, args []Value) ([]Value, error) {
 	i := int64(1)
 	if len(args) >= 2 && !args[1].IsNil() {
 		var ok bool
-		i, ok = args[1].ToInt()
+		i, ok = args[1].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'codepoint'")
 		}
@@ -439,7 +439,7 @@ func nativeUTF8Codepoint(s *State, args []Value) ([]Value, error) {
 	j := i
 	if len(args) >= 3 && !args[2].IsNil() {
 		var ok bool
-		j, ok = args[2].ToInt()
+		j, ok = args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'codepoint'")
 		}
@@ -469,7 +469,7 @@ func nativeUTF8Len(_ *State, args []Value) ([]Value, error) {
 	i := int64(1)
 	if len(args) >= 2 && !args[1].IsNil() {
 		var ok bool
-		i, ok = args[1].ToInt()
+		i, ok = args[1].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'len'")
 		}
@@ -477,7 +477,7 @@ func nativeUTF8Len(_ *State, args []Value) ([]Value, error) {
 	j := int64(-1)
 	if len(args) >= 3 && !args[2].IsNil() {
 		var ok bool
-		j, ok = args[2].ToInt()
+		j, ok = args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'len'")
 		}
@@ -509,7 +509,7 @@ func nativeUTF8Codes(s *State, args []Value) ([]Value, error) {
 			sv, _ := checkStringArg(iargs, 0, "codes")
 			pos := int64(0)
 			if len(iargs) >= 2 && !iargs[1].IsNil() {
-				pos, _ = iargs[1].ToInt()
+				pos, _ = iargs[1].CoerceInt()
 			}
 			nextPos, cp, ok, err := luastdlib.Next(sv, pos, lax)
 			if err != nil {
@@ -533,14 +533,14 @@ func nativeUTF8Offset(_ *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad argument #2 to 'offset' (number expected)")
 	}
-	n, ok := args[1].ToInt()
+	n, ok := args[1].CoerceInt()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #2 to 'offset' (number expected)")
 	}
 	var start, end int64
 	var found bool
 	if len(args) >= 3 && !args[2].IsNil() {
-		i, ok := args[2].ToInt()
+		i, ok := args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'offset' (number expected)")
 		}

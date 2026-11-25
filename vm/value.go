@@ -181,6 +181,44 @@ func (v Value) ToInt() (int64, bool) {
 	return 0, false
 }
 
+// CoerceFloat converts an int, float, or numeric string Value to float64 (matching lua_tonumberx).
+func (v Value) CoerceFloat() (float64, bool) {
+	if v.IsFloat() {
+		return v.Float(), true
+	}
+	if v.IsInt() {
+		return float64(v.Int()), true
+	}
+	if v.IsString() {
+		if i, f, isInt, ok := luastdlib.StrToNum(v.AsString().S); ok {
+			if isInt {
+				return float64(i), true
+			}
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+// CoerceInt converts an int, exact-integer float, or numeric string Value to int64 (matching lua_tointegerx).
+func (v Value) CoerceInt() (int64, bool) {
+	if v.IsInt() {
+		return v.Int(), true
+	}
+	if v.IsFloat() {
+		return FloatToIntExact(v.Float())
+	}
+	if v.IsString() {
+		if i, f, isInt, ok := luastdlib.StrToNum(v.AsString().S); ok {
+			if isInt {
+				return i, true
+			}
+			return FloatToIntExact(f)
+		}
+	}
+	return 0, false
+}
+
 // TypeTag returns the Lua 5.5 numeric type tag (0..8 matching lua.h LUA_T*).
 func (v Value) TypeTag() int {
 	switch {

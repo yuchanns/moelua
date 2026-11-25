@@ -109,6 +109,7 @@ type Thread struct {
 	status        ThreadStatus
 	errObj        Value   // last error object when dead due to error
 	lastErrNative Value   // native function that raised an uncaught error on this thread (for dead-coro traceback)
+	syncCloseErrs []Value // active error objects held across synchronous closeAllSync callbacks (GC-traced)
 	caller        *Thread // resuming parent thread (non-nil while running)
 
 	// Yielded results & resume target slot (transferred directly between threads on yield/resume).
@@ -272,7 +273,11 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 	raised := false
 	prevCur := th.state.cur
 	th.state.cur = th
+	errSlot := len(th.syncCloseErrs)
+	th.syncCloseErrs = append(th.syncCloseErrs, errVal)
 	defer func() {
+		th.syncCloseErrs[errSlot] = NilValue()
+		th.syncCloseErrs = th.syncCloseErrs[:errSlot]
 		th.state.cur = prevCur
 	}()
 	for len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level {
@@ -286,6 +291,7 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 		tm := th.state.getTMByObj(obj, TMClose)
 		if tm.IsNil() {
 			errVal = StringValue(th.state.intern.Intern("attempt to call a nil value (metamethod 'close')"))
+			th.syncCloseErrs[errSlot] = errVal
 			hasErr = true
 			raised = true
 			continue
@@ -307,6 +313,7 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 				return errVal, hasErr, raised
 			}
 			errVal = errorToLuaValue(th.state, err)
+			th.syncCloseErrs[errSlot] = errVal
 			hasErr = true
 			raised = true
 		}

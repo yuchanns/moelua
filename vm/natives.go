@@ -155,8 +155,8 @@ func (s *State) initStringArithMetamethods(mt *Table) {
 				}
 				return []Value{IntValue(r)}, nil
 			}
-			f1, _ := n1.ToFloat()
-			f2, _ := n2.ToFloat()
+			f1, _ := n1.CoerceFloat()
+			f2, _ := n2.CoerceFloat()
 			return []Value{FloatValue(fop(f1, f2))}, nil
 		}
 	}
@@ -265,7 +265,7 @@ func nativeError(s *State, args []Value) ([]Value, error) {
 	}
 	level := 1
 	if len(args) >= 2 && !args[1].IsNil() {
-		if lv, ok := args[1].ToInt(); ok {
+		if lv, ok := args[1].CoerceInt(); ok {
 			level = int(lv)
 		}
 	}
@@ -354,7 +354,7 @@ func nativeToNumber(_ *State, args []Value) ([]Value, error) {
 		}
 		return []Value{FloatValue(fv)}, nil
 	}
-	base, ok := args[1].ToInt()
+	base, ok := args[1].CoerceInt()
 	if !ok || base < 2 || base > 36 {
 		return nil, fmt.Errorf("bad argument #2 to 'tonumber' (base out of range)")
 	}
@@ -375,7 +375,7 @@ func nativeSelect(_ *State, args []Value) ([]Value, error) {
 	if args[0].IsString() && strings.HasPrefix(args[0].AsString().S, "#") {
 		return []Value{IntValue(int64(len(args) - 1))}, nil
 	}
-	idx, ok := args[0].ToInt()
+	idx, ok := args[0].CoerceInt()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'select' (number expected)")
 	}
@@ -494,7 +494,7 @@ func nativeIPairsIter(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad arguments to ipairs iterator")
 	}
-	i, ok := args[1].ToInt()
+	i, ok := args[1].CoerceInt()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #2 to ipairs iterator (integer expected)")
 	}
@@ -539,7 +539,7 @@ func nativeMathFloor(_ *State, args []Value) ([]Value, error) {
 	if args[0].IsInt() {
 		return []Value{args[0]}, nil
 	}
-	f, ok := args[0].ToFloat()
+	f, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'floor' (number expected)")
 	}
@@ -557,7 +557,7 @@ func nativeMathCeil(_ *State, args []Value) ([]Value, error) {
 	if args[0].IsInt() {
 		return []Value{args[0]}, nil
 	}
-	f, ok := args[0].ToFloat()
+	f, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'ceil' (number expected)")
 	}
@@ -579,7 +579,7 @@ func nativeMathAbs(_ *State, args []Value) ([]Value, error) {
 		}
 		return []Value{IntValue(x)}, nil
 	}
-	f, ok := args[0].ToFloat()
+	f, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'abs' (number expected)")
 	}
@@ -590,7 +590,7 @@ func nativeMathSqrt(_ *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'sqrt'")
 	}
-	f, ok := args[0].ToFloat()
+	f, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'sqrt' (number expected)")
 	}
@@ -601,7 +601,7 @@ func nativeMathSin(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'sin' (number expected, got no value)")
 	}
-	f, ok := args[0].ToFloat()
+	f, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'sin' (number expected, got %s)", s.objTypeName(args[0]))
 	}
@@ -612,7 +612,7 @@ func nativeMathCos(_ *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'cos' (number expected, got no value)")
 	}
-	f, ok := args[0].ToFloat()
+	f, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'cos' (number expected, got %s)", args[0].TypeName())
 	}
@@ -624,7 +624,7 @@ func nativeMathUnaryFloat(fn func(float64) float64) func(*State, []Value) ([]Val
 		if len(args) == 0 {
 			return nil, fmt.Errorf("bad argument #1 (number expected, got no value)")
 		}
-		f, ok := args[0].ToFloat()
+		f, ok := args[0].CoerceFloat()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #1 (number expected, got %s)", args[0].TypeName())
 		}
@@ -636,12 +636,12 @@ func nativeMathAtan(_ *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'atan' (number expected, got no value)")
 	}
-	y, ok := args[0].ToFloat()
+	y, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'atan' (number expected, got %s)", args[0].TypeName())
 	}
 	if len(args) >= 2 && !args[1].IsNil() {
-		x, ok := args[1].ToFloat()
+		x, ok := args[1].CoerceFloat()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'atan' (number expected, got %s)", args[1].TypeName())
 		}
@@ -654,12 +654,12 @@ func nativeMathLog(_ *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'log' (number expected, got no value)")
 	}
-	x, ok := args[0].ToFloat()
+	x, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'log' (number expected, got %s)", args[0].TypeName())
 	}
 	if len(args) >= 2 && !args[1].IsNil() {
-		b, ok := args[1].ToFloat()
+		b, ok := args[1].CoerceFloat()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'log'")
 		}
@@ -685,11 +685,11 @@ func nativeMathFmod(_ *State, args []Value) ([]Value, error) {
 		}
 		return []Value{IntValue(args[0].Int() % b)}, nil
 	}
-	x, ok1 := args[0].ToFloat()
+	x, ok1 := args[0].CoerceFloat()
 	if !ok1 {
 		return nil, fmt.Errorf("bad argument #1 to 'fmod' (number expected)")
 	}
-	y, ok2 := args[1].ToFloat()
+	y, ok2 := args[1].CoerceFloat()
 	if !ok2 {
 		return nil, fmt.Errorf("bad argument #2 to 'fmod' (number expected)")
 	}
@@ -703,7 +703,7 @@ func nativeMathModf(_ *State, args []Value) ([]Value, error) {
 	if args[0].IsInt() {
 		return []Value{args[0], FloatValue(0)}, nil
 	}
-	f, ok := args[0].ToFloat()
+	f, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'modf' (number expected)")
 	}
@@ -721,7 +721,7 @@ func nativeMathFrexp(_ *State, args []Value) ([]Value, error) {
 	if len(args) < 1 {
 		return nil, fmt.Errorf("bad argument #1 to 'frexp' (number expected, got no value)")
 	}
-	f, ok := args[0].ToFloat()
+	f, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'frexp' (number expected)")
 	}
@@ -736,11 +736,11 @@ func nativeMathLdexp(_ *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad argument #2 to 'ldexp' (number expected, got no value)")
 	}
-	m, ok := args[0].ToFloat()
+	m, ok := args[0].CoerceFloat()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'ldexp' (number expected)")
 	}
-	e, ok := args[1].ToInt()
+	e, ok := args[1].CoerceInt()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #2 to 'ldexp' (number expected)")
 	}
@@ -785,7 +785,7 @@ func nativeMathToInteger(_ *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'tointeger' (value expected)")
 	}
-	if i, ok := args[0].ToInt(); ok {
+	if i, ok := args[0].CoerceInt(); ok {
 		return []Value{IntValue(i)}, nil
 	}
 	if args[0].IsString() {
@@ -822,11 +822,11 @@ func nativeMathUlt(_ *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad argument #2 to 'ult' (number expected, got no value)")
 	}
-	a, ok1 := args[0].ToInt()
+	a, ok1 := args[0].CoerceInt()
 	if !ok1 {
 		return nil, fmt.Errorf("bad argument #1 to 'ult' (number expected)")
 	}
-	b, ok2 := args[1].ToInt()
+	b, ok2 := args[1].CoerceInt()
 	if !ok2 {
 		return nil, fmt.Errorf("bad argument #2 to 'ult' (number expected)")
 	}
@@ -856,7 +856,7 @@ func nativeMathRandom(s *State, args []Value) ([]Value, error) {
 	}
 	var lo, hi int64
 	if len(args) == 1 {
-		u, ok := args[0].ToInt()
+		u, ok := args[0].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #1 to 'random'")
 		}
@@ -866,8 +866,8 @@ func nativeMathRandom(s *State, args []Value) ([]Value, error) {
 		lo, hi = 1, u
 	} else {
 		var ok1, ok2 bool
-		lo, ok1 = args[0].ToInt()
-		hi, ok2 = args[1].ToInt()
+		lo, ok1 = args[0].CoerceInt()
+		hi, ok2 = args[1].CoerceInt()
 		if !ok1 || !ok2 {
 			return nil, fmt.Errorf("bad arguments to 'random'")
 		}
@@ -896,14 +896,14 @@ func nativeMathRandom(s *State, args []Value) ([]Value, error) {
 func nativeMathRandomSeed(s *State, args []Value) ([]Value, error) {
 	var x, y uint64
 	if len(args) >= 1 && !args[0].IsNil() {
-		v, ok := args[0].ToInt()
+		v, ok := args[0].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #1 to 'randomseed'")
 		}
 		x = uint64(v)
 	}
 	if len(args) >= 2 && !args[1].IsNil() {
-		v, ok := args[1].ToInt()
+		v, ok := args[1].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'randomseed'")
 		}
@@ -923,7 +923,7 @@ func nativeTableCreate(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'create' (number expected, got no value)")
 	}
 	const maxCInt = (1 << 31) - 1
-	nseq, ok := args[0].ToInt()
+	nseq, ok := args[0].CoerceInt()
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'create' (number expected)")
 	}
@@ -932,7 +932,7 @@ func nativeTableCreate(s *State, args []Value) ([]Value, error) {
 	}
 	nrec := int64(0)
 	if len(args) >= 2 && !args[1].IsNil() {
-		nrec, ok = args[1].ToInt()
+		nrec, ok = args[1].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'create' (number expected)")
 		}
@@ -969,7 +969,7 @@ func (s *State) tableLen(v Value) (int64, error) {
 				return 0, err
 			}
 			if len(res) > 0 {
-				if n, ok := res[0].ToInt(); ok {
+				if n, ok := res[0].CoerceInt(); ok {
 					return n, nil
 				}
 			}
@@ -983,7 +983,7 @@ func (s *State) tableLen(v Value) (int64, error) {
 			return 0, err
 		}
 		if len(res) > 0 {
-			if n, ok := res[0].ToInt(); ok {
+			if n, ok := res[0].CoerceInt(); ok {
 				return n, nil
 			}
 		}
@@ -1054,7 +1054,7 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 			t.RawSetInt(s, e, args[1])
 			return nil, s.ConsumeMemErr()
 		}
-		pos, ok := args[1].ToInt()
+		pos, ok := args[1].CoerceInt()
 		if !ok || pos < 1 || pos > e {
 			return nil, fmt.Errorf("bad argument #2 to 'insert' (position out of bounds)")
 		}
@@ -1075,7 +1075,7 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 	if len(args) == 2 {
 		return nil, s.tableSetInt(args[0], e, args[1])
 	}
-	pos, ok := args[1].ToInt()
+	pos, ok := args[1].CoerceInt()
 	if !ok || pos < 1 || pos > e {
 		return nil, fmt.Errorf("bad argument #2 to 'insert' (position out of bounds)")
 	}
@@ -1108,7 +1108,7 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 		pos := size
 		if len(args) >= 2 && !args[1].IsNil() {
 			var ok bool
-			pos, ok = args[1].ToInt()
+			pos, ok = args[1].CoerceInt()
 			if !ok {
 				return nil, fmt.Errorf("bad argument #2 to 'remove' (number expected)")
 			}
@@ -1143,7 +1143,7 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 	pos := size
 	if len(args) >= 2 && !args[1].IsNil() {
 		var ok bool
-		pos, ok = args[1].ToInt()
+		pos, ok = args[1].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'remove' (number expected)")
 		}
@@ -1216,7 +1216,7 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 	i := int64(1)
 	if len(args) >= 3 && !args[2].IsNil() {
 		var ok bool
-		i, ok = args[2].ToInt()
+		i, ok = args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'concat' (number expected)")
 		}
@@ -1224,7 +1224,7 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 	var j int64
 	if len(args) >= 4 && !args[3].IsNil() {
 		var ok bool
-		j, ok = args[3].ToInt()
+		j, ok = args[3].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #4 to 'concat' (number expected)")
 		}
@@ -1291,9 +1291,9 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 	if !src.IsTable() && s.getMetatableOf(src) == nil {
 		return nil, fmt.Errorf("bad argument #1 to 'move' (table expected, got %s)", src.TypeName())
 	}
-	f, ok1 := args[1].ToInt()
-	e, ok2 := args[2].ToInt()
-	tpos, ok3 := args[3].ToInt()
+	f, ok1 := args[1].CoerceInt()
+	e, ok2 := args[2].CoerceInt()
+	tpos, ok3 := args[3].CoerceInt()
 	if !ok1 || !ok2 || !ok3 {
 		return nil, fmt.Errorf("bad arguments to 'move' (number expected)")
 	}
@@ -1398,7 +1398,7 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 	i := int64(1)
 	if len(args) >= 2 && !args[1].IsNil() {
 		var ok bool
-		i, ok = args[1].ToInt()
+		i, ok = args[1].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'unpack' (number expected)")
 		}
@@ -1406,7 +1406,7 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 	var j int64
 	if len(args) >= 3 && !args[2].IsNil() {
 		var ok bool
-		j, ok = args[2].ToInt()
+		j, ok = args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'unpack' (number expected)")
 		}
@@ -1725,7 +1725,7 @@ func nativeStringByte(s *State, args []Value) ([]Value, error) {
 	i := int64(1)
 	if len(args) >= 2 && !args[1].IsNil() {
 		var ok bool
-		i, ok = args[1].ToInt()
+		i, ok = args[1].CoerceInt()
 		if !ok {
 			if args[1].IsFloat() {
 				return nil, s.badArgErr(2, "byte", "number has no integer representation")
@@ -1739,7 +1739,7 @@ func nativeStringByte(s *State, args []Value) ([]Value, error) {
 	j := i
 	if len(args) >= 3 && !args[2].IsNil() {
 		var ok bool
-		j, ok = args[2].ToInt()
+		j, ok = args[2].CoerceInt()
 		if !ok {
 			if args[2].IsFloat() {
 				return nil, s.badArgErr(3, "byte", "number has no integer representation")
@@ -1781,7 +1781,7 @@ func nativeStringChar(s *State, args []Value) ([]Value, error) {
 	}
 	buf := make([]byte, len(args))
 	for i, a := range args {
-		v, ok := a.ToInt()
+		v, ok := a.CoerceInt()
 		if !ok || v < 0 || v > 255 {
 			return nil, fmt.Errorf("bad argument #%d to 'char' (value out of range)", i+1)
 		}
@@ -1839,7 +1839,7 @@ func nativeStringSub(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, s.badArgErr(2, "sub", "number expected, got no value")
 	}
-	i, ok := args[1].ToInt()
+	i, ok := args[1].CoerceInt()
 	if !ok {
 		if args[1].IsFloat() {
 			return nil, s.badArgErr(2, "sub", "number has no integer representation")
@@ -1851,7 +1851,7 @@ func nativeStringSub(s *State, args []Value) ([]Value, error) {
 	}
 	j := n
 	if len(args) >= 3 && !args[2].IsNil() {
-		j, ok = args[2].ToInt()
+		j, ok = args[2].CoerceInt()
 		if !ok {
 			if args[2].IsFloat() {
 				return nil, s.badArgErr(3, "sub", "number has no integer representation")
@@ -1889,7 +1889,7 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 	} else {
 		return nil, fmt.Errorf("bad argument #1 to 'rep' (string expected, got %s)", args[0].TypeName())
 	}
-	n, ok := args[1].ToInt()
+	n, ok := args[1].CoerceInt()
 	if !ok {
 		if args[1].IsFloat() {
 			return nil, fmt.Errorf("bad argument #2 to 'rep' (number has no integer representation)")
@@ -2021,16 +2021,16 @@ func nativeStringFormat(s *State, args []Value) ([]Value, error) {
 		argIdx++
 		switch spec {
 		case 'd', 'i':
-			iv, _ := a.ToInt()
+			iv, _ := a.CoerceInt()
 			sb.WriteString(fmt.Sprintf(strings.ReplaceAll(verb, "i", "d"), iv))
 		case 'u':
-			iv, _ := a.ToInt()
+			iv, _ := a.CoerceInt()
 			sb.WriteString(fmt.Sprintf(strings.ReplaceAll(verb, "u", "d"), uint64(iv)))
 		case 'x', 'X', 'o':
-			iv, _ := a.ToInt()
+			iv, _ := a.CoerceInt()
 			sb.WriteString(fmt.Sprintf(verb, uint64(iv)))
 		case 'f', 'e', 'E', 'g', 'G':
-			fv, _ := a.ToFloat()
+			fv, _ := a.CoerceFloat()
 			sb.WriteString(fmt.Sprintf(verb, fv))
 		case 's':
 			str, err := s.toStringValue(a)
@@ -2039,7 +2039,7 @@ func nativeStringFormat(s *State, args []Value) ([]Value, error) {
 			}
 			sb.WriteString(fmt.Sprintf(verb, str))
 		case 'c':
-			iv, _ := a.ToInt()
+			iv, _ := a.CoerceInt()
 			sb.WriteByte(byte(iv))
 		default:
 			return nil, fmt.Errorf("invalid conversion '%s' to 'format'", verb)
@@ -2049,5 +2049,8 @@ func nativeStringFormat(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeOSClock(s *State, _ []Value) ([]Value, error) {
+	if cpu, ok := processCPUTime(); ok {
+		return []Value{FloatValue(cpu)}, nil
+	}
 	return []Value{FloatValue(time.Since(s.startTime).Seconds())}, nil
 }

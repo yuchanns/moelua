@@ -269,19 +269,22 @@ func (tr *gcTracer) mark(v Value) {
 			return
 		}
 		t.gcMark = tr.epoch
-		var arrBytes, nodeBytes int64
+		var arrBytes, nodeBytes, slotBytes int64
 		switch t.arrKind {
 		case arrInt, arrFloat:
-			arrBytes = int64(t.arrLen) * 8
+			arrBytes = int64(t.arrCap) * 8
 		case arrBool:
-			arrBytes = int64(t.arrLen)
+			arrBytes = int64(t.arrCap)
 		case arrGeneric:
-			arrBytes = int64(t.arrLen) * 16
+			arrBytes = int64(t.arrCap) * 16
 		}
 		if t.hash != nil {
 			nodeBytes = int64(len(t.hash.nodes)) * 40
 		}
-		tr.liveBytes += 96 + int64(len(t.slots)*16) + nodeBytes + arrBytes
+		if c := cap(t.slots); c > len(t.inlineSlots) {
+			slotBytes = int64(c) * 16
+		}
+		tr.liveBytes += 96 + slotBytes + nodeBytes + arrBytes
 		tr.gray = append(tr.gray, v)
 	case v.IsClosure():
 		c := v.AsClosure()
@@ -388,6 +391,9 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 	for _, yv := range th.yieldVals {
 		tr.mark(yv)
 	}
+	for _, ce := range th.syncCloseErrs {
+		tr.mark(ce)
+	}
 	// Clear stale frame slots above nframe so dead closures/errFuncs/tables are never pinned.
 	if th.nframe < len(th.frames) {
 		clear(th.frames[th.nframe:])
@@ -425,6 +431,9 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 	}
 	for _, yv := range th.yieldVals {
 		tr.mark(yv)
+	}
+	for _, ce := range th.syncCloseErrs {
+		tr.mark(ce)
 	}
 	tr.mark(th.errObj)
 	tr.mark(th.hook)
