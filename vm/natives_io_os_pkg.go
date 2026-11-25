@@ -1567,13 +1567,24 @@ type ioReadErr struct{ err error }
 
 func (e ioReadErr) Error() string { return e.err.Error() }
 
+// readBoundedLine reads one line in bufio-sized fragments, checking each fragment against the
+// memory limit (when set) and polling execution controls (context deadline / instruction limit).
 func readBoundedLine(s *State, r *bufio.Reader, keepNL bool) (string, bool, error) {
 	var buf bytes.Buffer
+	cancelFn := s.nativeCancelFunc()
 	for {
+		// Poll only once a line spans multiple fragments so short-line reads are not charged.
+		if cancelFn != nil && buf.Len() > 0 {
+			if cerr := cancelFn(); cerr != nil {
+				return "", false, cerr
+			}
+		}
 		frag, err := r.ReadSlice('\n')
 		if len(frag) > 0 {
-			if merr := s.checkMem(int64(buf.Len()) + int64(len(frag)) + 64); merr != nil {
-				return "", false, merr
+			if s.memLimit > 0 {
+				if merr := s.checkMem(int64(buf.Len()) + int64(len(frag)) + 64); merr != nil {
+					return "", false, merr
+				}
 			}
 			buf.Write(frag)
 		}
@@ -1582,7 +1593,9 @@ func readBoundedLine(s *State, r *bufio.Reader, keepNL bool) (string, bool, erro
 			if !keepNL {
 				line = strings.TrimSuffix(line, "\n")
 			}
-			s.gc.allocBytes += int64(len(line)) + 64
+			if s.memLimit > 0 || s.gc.tier1 {
+				s.gc.allocBytes += int64(len(line)) + 64
+			}
 			return line, true, nil
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {
@@ -1596,27 +1609,41 @@ func readBoundedLine(s *State, r *bufio.Reader, keepNL bool) (string, bool, erro
 			if !keepNL {
 				line = strings.TrimSuffix(line, "\n")
 			}
-			s.gc.allocBytes += int64(len(line)) + 64
+			if s.memLimit > 0 || s.gc.tier1 {
+				s.gc.allocBytes += int64(len(line)) + 64
+			}
 			return line, true, nil
 		}
 		return "", false, ioReadErr{err}
 	}
 }
 
+// readBoundedAll reads to EOF in chunks, checking each chunk against the memory limit (when set)
+// and polling execution controls (context deadline / instruction limit).
 func readBoundedAll(s *State, r *bufio.Reader) (string, error) {
 	var buf bytes.Buffer
-	var chunk [4096]byte
+	var chunk [32768]byte
+	cancelFn := s.nativeCancelFunc()
 	for {
+		if cancelFn != nil && buf.Len() > 0 {
+			if cerr := cancelFn(); cerr != nil {
+				return "", cerr
+			}
+		}
 		n, err := r.Read(chunk[:])
 		if n > 0 {
-			if merr := s.checkMem(int64(buf.Len()) + int64(n) + 64); merr != nil {
-				return "", merr
+			if s.memLimit > 0 {
+				if merr := s.checkMem(int64(buf.Len()) + int64(n) + 64); merr != nil {
+					return "", merr
+				}
 			}
 			buf.Write(chunk[:n])
 		}
 		if err == io.EOF {
 			res := buf.String()
-			s.gc.allocBytes += int64(len(res)) + 64
+			if s.memLimit > 0 || s.gc.tier1 {
+				s.gc.allocBytes += int64(len(res)) + 64
+			}
 			return res, nil
 		}
 		if err != nil {
@@ -1674,7 +1701,13 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		}()
 		var chunk [32768]byte
 		rem := n
+		cancelFn := s.nativeCancelFunc()
 		for rem > 0 {
+			if cancelFn != nil && rem < n {
+				if cerr := cancelFn(); cerr != nil {
+					return NilValue(), false, cerr
+				}
+			}
 			want := min(rem, int64(len(chunk)))
 			got, err := r.Read(chunk[:want])
 			if got > 0 {
@@ -1710,7 +1743,7 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 	}
 	switch spec[0] {
 	case 'l', 'L':
-		if s.memLimit > 0 {
+		if s.memLimit > 0 || s.nativeCancelFunc() != nil {
 			line, ok, err := readBoundedLine(s, r, spec[0] == 'L')
 			if err != nil || !ok {
 				return NilValue(), false, err
@@ -1729,7 +1762,7 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		}
 		return StringValue(s.intern.Intern(line)), true, nil
 	case 'a':
-		if s.memLimit > 0 {
+		if s.memLimit > 0 || s.nativeCancelFunc() != nil {
 			all, err := readBoundedAll(s, r)
 			if err != nil {
 				return NilValue(), false, err
