@@ -5167,3 +5167,188 @@ func TestCodexReviewRound22VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound23VMRegressions(t *testing.T) {
+	// 1. package.searchpath and AddFS searcher enforce memLimit before expanding '?' templates
+	// and honor execution controls on large template lists.
+	t.Run("package_searchpath_and_searchfs_enforce_memory_budget", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.AddFS(fstest.MapFS{"other.lua": &fstest.MapFile{Data: []byte("return 1")}})
+		cl, err := s.LoadChunk([]byte(`
+			local bigName = string.rep("x", 32768)
+			local bigPath = string.rep("?", 1000)
+			local ok1, err1 = pcall(package.searchpath, bigName, bigPath)
+			assert(not ok1 and tostring(err1):find("not enough memory", 1, true),
+				"searchpath should fail OOM, got ok=" .. tostring(ok1) .. " err=" .. tostring(err1))
+
+			local savedPath = package.path
+			package.path = bigPath
+			local ok2, err2 = pcall(require, bigName)
+			package.path = savedPath
+			assert(not ok2 and tostring(err2):find("not enough memory", 1, true),
+				"require with huge path should fail OOM, got ok=" .. tostring(ok2) .. " err=" .. tostring(err2))
+			return "ok"
+		`), "=searchpath_mem")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("searchpath memory budget check failed: res=%v err=%v", res, err)
+		}
+
+		// Also verify execution controls on many ';' templates.
+		s2 := NewState()
+		defer s2.Close()
+		searchPathFn := s2.GetGlobal("package").AsTable().RawGetStr(s2.Intern("searchpath"))
+		manySep := StringValue(s2.Intern(strings.Repeat(";", 200_000)))
+		s2.SetInstructionLimit(100)
+		_, err = s2.Call(searchPathFn, StringValue(s2.Intern("m")), manySep)
+		if !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("package.searchpath expected ErrInstructionLimit, got %v", err)
+		}
+	})
+
+	// 2. Caught error() strings with prepended source locations and debug.traceback() respect memLimit.
+	t.Run("error_location_and_traceback_account_for_memory_budget", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local big = string.rep("E", 32768)
+			local function fail()
+				error(big)
+			end
+			local kept = table.create(100, 0)
+			local sawOOM = false
+			for i = 1, 100 do
+				local ok, e = pcall(fail)
+				assert(not ok)
+				if e == "not enough memory" then
+					sawOOM = true
+					break
+				end
+				kept[i] = e
+			end
+			kept = nil
+			collectgarbage("collect")
+			assert(sawOOM, "expected repeated caught error() strings to hit memLimit")
+
+			local keptTB = table.create(100, 0)
+			local sawTBOOM = false
+			for i = 1, 100 do
+				local ok, tb = pcall(debug.traceback, big)
+				if not ok then
+					sawTBOOM = (tb == "not enough memory")
+					break
+				end
+				keptTB[i] = tb
+			end
+			keptTB = nil
+			collectgarbage("collect")
+			assert(sawTBOOM, "expected repeated debug.traceback() strings to hit memLimit")
+			return "ok"
+		`), "=error_mem")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(163840)
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("error/traceback memory budget check failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. debug.getinfo(2, 'l').currentline inside line hooks honors cf.atCurrentPC.
+	t.Run("hook_currentline_honors_at_current_pc", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local mismatches = {}
+			local count = 0
+			local function target()
+				local a = 1
+				local b = 2
+				local c = a + b
+				return c
+			end
+			debug.sethook(function(ev, line)
+				count = count + 1
+				local info = debug.getinfo(2, "l")
+				if info.currentline ~= line then
+					mismatches[#mismatches + 1] = tostring(line) .. "!=" .. tostring(info.currentline)
+				end
+			end, "l")
+			local out = target()
+			debug.sethook()
+			assert(out == 3 and count >= 4, "expected hook invocations, got count=" .. tostring(count))
+			assert(#mismatches == 0, "hook currentline mismatches: " .. table.concat(mismatches, ", "))
+			return "ok"
+		`), "=hook_currentline")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("hook currentline check failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. debug.getinfo(2, 'f').func returns the active pcall/xpcall function from the frame
+	// even if global pcall/xpcall is removed or overwritten.
+	t.Run("protected_call_frame_retains_callee_identity", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local savedP, savedXP = pcall, xpcall
+			local p, xp = pcall, xpcall
+
+			-- Direct call after clearing globals
+			local ok1, r1 = p(function()
+				pcall = nil
+				local info = debug.getinfo(2, "nf")
+				assert(info.func == p, "pcall frame func mismatch: got " .. tostring(info.func))
+				assert(info.name == "p" and info.namewhat == "local",
+					"pcall frame name mismatch: " .. tostring(info.name) .. "/" .. tostring(info.namewhat))
+				return "p_ok"
+			end)
+			pcall = savedP
+			assert(ok1 and r1 == "p_ok", "pcall check failed: " .. tostring(ok1) .. "," .. tostring(r1))
+
+			local ok2, r2 = xp(function()
+				xpcall = nil
+				local info = debug.getinfo(2, "nf")
+				assert(info.func == xp, "xpcall frame func mismatch: got " .. tostring(info.func))
+				assert(info.name == "xp" and info.namewhat == "local",
+					"xpcall frame name mismatch: " .. tostring(info.name) .. "/" .. tostring(info.namewhat))
+				return "xp_ok"
+			end, function(e) return e end)
+			xpcall = savedXP
+			assert(ok2 and r2 == "xp_ok", "xpcall check failed: " .. tostring(ok2) .. "," .. tostring(r2))
+
+			-- Coroutine created directly with pcall / xpcall
+			local co1 = coroutine.create(p)
+			pcall = nil
+			local cok1, pok1, cres1 = coroutine.resume(co1, function()
+				return debug.getinfo(2, "f").func == p
+			end)
+			pcall = savedP
+			assert(cok1 and pok1 and cres1 == true, "coro pcall func identity failed")
+
+			local co2 = coroutine.create(xp)
+			xpcall = nil
+			local cok2, pok2, cres2 = coroutine.resume(co2, function()
+				return debug.getinfo(2, "f").func == xp
+			end, function(e) return e end)
+			xpcall = savedXP
+			assert(cok2 and pok2 and cres2 == true, "coro xpcall func identity failed")
+			return "ok"
+		`), "=pcall_frame_identity")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("protected call frame identity check failed: res=%v err=%v", res, err)
+		}
+	})
+}
