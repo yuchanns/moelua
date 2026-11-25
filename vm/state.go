@@ -868,6 +868,24 @@ func (s *State) TryAllocNative(nf *NativeFunc) (Value, error) {
 	return NativeValue(nf), nil
 }
 
+// TryNewUserdata allocates a full Lua userdata carrying data with nUValues user values
+// after checking and accounting for its storage against the State's memory limit.
+func (s *State) TryNewUserdata(data any, nUValues int) (Value, error) {
+	if nUValues < 0 {
+		nUValues = 0
+	}
+	if s.memLimit > 0 || s.gc.tier1 {
+		if err := s.checkMemAndAccount(64 + int64(nUValues)*16); err != nil {
+			return NilValue(), err
+		}
+	}
+	u := &Userdata{Data: data}
+	if nUValues > 0 {
+		u.UValues = make([]Value, nUValues)
+	}
+	return UserdataValue(u), nil
+}
+
 // SetGlobalMM assigns a global in `_G`, honoring `_G`'s `__newindex` metamethod
 // (matching PUC-Rio `lua_setglobal`).
 func (s *State) SetGlobalMM(name string, val Value) error {

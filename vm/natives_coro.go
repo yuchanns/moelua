@@ -385,7 +385,10 @@ runCoro:
 		co.yieldVals = nil
 		return true, out, nil
 	}
-	if errors.Is(err, errCoroCloseSelf) {
+	if errors.Is(err, errCoroCloseSelf) || errors.Is(s.abortErr, errCoroCloseSelf) {
+		if errors.Is(s.abortErr, errCoroCloseSelf) {
+			s.abortErr = nil
+		}
 		// Coroutine closed itself via coroutine.close(): run TBC finalizers (non-yieldable) and terminate!
 		co.nny++
 		errVal, hasErr, _ := co.closeAllSync(0, NilValue(), false)

@@ -48,6 +48,9 @@ func (s *State) prepareLuaFrame(th *Thread, entryDepth int) (bool, error) {
 				if s.handleError(th, entryDepth, err) {
 					continue
 				}
+				if s.abortErr != nil {
+					return false, s.abortErr
+				}
 				return false, err
 			}
 			if !cont {
@@ -59,6 +62,9 @@ func (s *State) prepareLuaFrame(th *Thread, entryDepth int) (bool, error) {
 			if err != nil {
 				if s.handleError(th, entryDepth, err) {
 					continue
+				}
+				if s.abortErr != nil {
+					return false, s.abortErr
 				}
 				return false, err
 			}
@@ -136,7 +142,7 @@ func (s *State) callXPCallHandler(th *Thread, msgh Value, errVal Value) (Value, 
 			hres, herr := s.callOnThread(th, msgh, []Value{overflowMsg})
 			s.nCcalls = savedCC
 			if herr != nil {
-				if isUncatchableErr(herr) {
+				if errors.Is(herr, errCoroCloseSelf) || isUncatchableErr(herr) {
 					return NilValue(), herr
 				}
 				return StringValue(s.intern.Intern("error in error handling")), nil
@@ -148,7 +154,7 @@ func (s *State) callXPCallHandler(th *Thread, msgh Value, errVal Value) (Value, 
 		}
 		hres, herr := s.callOnThread(th, msgh, []Value{errVal})
 		if herr != nil {
-			if isUncatchableErr(herr) {
+			if errors.Is(herr, errCoroCloseSelf) || isUncatchableErr(herr) {
 				return NilValue(), herr
 			}
 			// Per Lua 5.5 ldo.c:luaG_errormsg, an error inside msgh re-invokes msgh with the new error (errors.lua:635)!
@@ -248,7 +254,7 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 		cf.closeResume = 2 // finish protected-call error return after all TBC close
 		cont, cerr := s.resumeCloseTBC(th, cf, entryDepth)
 		if cerr != nil {
-			if isUncatchableErr(cerr) {
+			if errors.Is(cerr, errCoroCloseSelf) || isUncatchableErr(cerr) {
 				s.abortErr = cerr
 				return false
 			}
@@ -753,7 +759,7 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 						}
 					}
 					t.shape = next
-					t.slots = append(t.slots, val)
+					t.appendSlot(val)
 					if t.tmFlags != 0 {
 						t.tmFlags = 0
 					}

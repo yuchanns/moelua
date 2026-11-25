@@ -730,6 +730,45 @@ func (tr *gcTracer) clearByKeys(tables []*Table) {
 	}
 }
 
+func (tr *gcTracer) accountWeakStrings() {
+	if !tr.countStrings && !tr.trackDeadStrings {
+		return
+	}
+	markTableStrings := func(tables []*Table) {
+		for _, t := range tables {
+			if t.arrKind == arrGeneric && t.arrLen > 0 {
+				for _, v := range t.arrValSlice() {
+					if v.IsString() {
+						tr.mark(v)
+					}
+				}
+			}
+			for _, v := range t.slots {
+				if v.IsString() {
+					tr.mark(v)
+				}
+			}
+			if t.hash != nil {
+				nodes := t.hash.nodes
+				for i := range nodes {
+					nd := &nodes[i]
+					if nd.used && !nd.dead && !nd.val.IsNil() {
+						if nd.key.IsString() {
+							tr.mark(nd.key)
+						}
+						if nd.val.IsString() {
+							tr.mark(nd.val)
+						}
+					}
+				}
+			}
+		}
+	}
+	markTableStrings(tr.weakVals)
+	markTableStrings(tr.ephemerons)
+	markTableStrings(tr.allWeaks)
+}
+
 // clearDeadHashKeys releases strong Go references held by dead/tombstoned hash keys
 // that are no longer reachable from anywhere in the VM (matching lgc.c:clearkey),
 // while preserving live tombstoned keys (e.g. active pairs() traversal) and hash probe chains.
@@ -938,6 +977,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		}
 		tr.markRoots()
 		tr.propagateAll()
+		tr.accountWeakStrings()
 		s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
 		tr.sweepInlineCaches()
 		s.intern.Prune()
@@ -1040,6 +1080,10 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	// Step 6: clearByValues again on ALL weak-value/all-weak tables (including any resurrected in Step 4, gc.lua:444!).
 	tr.clearByValues(tr.weakVals)
 	tr.clearByValues(tr.allWeaks)
+
+	// Strings are value-like in Lua 5.5 and survive weak clearing; account for surviving strings
+	// in weak table positions before sweeping dead hash keys and updating allocBytes.
+	tr.accountWeakStrings()
 
 	// Release strong Go pointers from unreachable dead/tombstoned hash keys (matching lgc.c:clearkey)
 	// and sweep invalidated/unreachable inline cache entries.

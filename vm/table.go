@@ -468,7 +468,18 @@ func (t *Table) demoteToDict(s *State) bool {
 	}
 	t.shape = nil
 	t.slots = nil
+	t.inlineSlots = [2]Value{NilValue(), NilValue()}
 	return true
+}
+
+// appendSlot appends val to t.slots and clears t.inlineSlots whenever t.slots moves
+// off the inline backing array so obsolete inline values are not retained on the Go heap.
+func (t *Table) appendSlot(val Value) {
+	wasInline := cap(t.slots) <= len(t.inlineSlots)
+	t.slots = append(t.slots, val)
+	if wasInline && cap(t.slots) > len(t.inlineSlots) {
+		t.inlineSlots = [2]Value{NilValue(), NilValue()}
+	}
 }
 
 // RawGetStr looks up a LuaString key (fast path for GETFIELD/SELF/GETTABUP).
@@ -527,7 +538,7 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 					}
 				}
 				t.shape = next
-				t.slots = append(t.slots, val)
+				t.appendSlot(val)
 				return
 			}
 		}

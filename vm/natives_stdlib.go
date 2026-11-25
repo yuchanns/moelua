@@ -53,12 +53,76 @@ func captureToValue(s *State, c luastdlib.CaptureVal, srcLen int) (Value, error)
 	if len(str) > maxShortStringLen && len(str) < srcLen {
 		str = strings.Clone(str)
 	}
+	ls, err := s.TryIntern(str)
+	if err != nil {
+		return NilValue(), err
+	}
+	return StringValue(ls), nil
+}
+
+// capturesToValuesRooted converts pattern captures into Lua Values, rooting accumulated
+// values on the active thread stack whenever a memory limit is active and multiple captures
+// are converted so emergency GC during a later capture still accounts for earlier strings.
+func (s *State) capturesToValuesRooted(caps []luastdlib.CaptureVal, srcLen int, prefix ...Value) ([]Value, error) {
+	total := len(prefix) + len(caps)
+	if total == 0 {
+		return nil, nil
+	}
 	if s.memLimit > 0 {
-		if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
-			return NilValue(), err
+		if err := s.checkMem(int64(total) * 16); err != nil {
+			return nil, err
 		}
 	}
-	return StringValue(s.intern.Intern(str)), nil
+	if s.memLimit > 0 && len(caps) > 1 {
+		th := s.cur
+		savedTop := th.top
+		baseTop := savedTop
+		for fi := range th.nframe {
+			cf := &th.frames[fi]
+			if cf.cl != nil {
+				if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+					baseTop = end
+				}
+			}
+		}
+		if err := th.ensureStack(baseTop + total + 2); err != nil {
+			return nil, err
+		}
+		written := 0
+		defer func() {
+			if written > 0 {
+				fillNil(th.stack[baseTop : baseTop+written])
+			}
+			th.top = savedTop
+		}()
+		for _, pv := range prefix {
+			th.stack[baseTop+written] = pv
+			written++
+		}
+		th.top = baseTop + written
+		for _, c := range caps {
+			cv, cerr := captureToValue(s, c, srcLen)
+			if cerr != nil {
+				return nil, cerr
+			}
+			th.stack[baseTop+written] = cv
+			written++
+			th.top = baseTop + written
+		}
+		out := make([]Value, written)
+		copy(out, th.stack[baseTop:baseTop+written])
+		return out, nil
+	}
+	out := make([]Value, total)
+	copy(out, prefix)
+	for i, c := range caps {
+		cv, cerr := captureToValue(s, c, srcLen)
+		if cerr != nil {
+			return nil, cerr
+		}
+		out[len(prefix)+i] = cv
+	}
+	return out, nil
 }
 
 func nativeStringFind(s *State, args []Value) ([]Value, error) {
@@ -86,17 +150,7 @@ func nativeStringFind(s *State, args []Value) ([]Value, error) {
 	if !found {
 		return []Value{NilValue()}, nil
 	}
-	out := make([]Value, 2+len(caps))
-	out[0] = IntValue(int64(start))
-	out[1] = IntValue(int64(end))
-	for i, c := range caps {
-		cv, cerr := captureToValue(s, c, len(str))
-		if cerr != nil {
-			return nil, cerr
-		}
-		out[2+i] = cv
-	}
-	return out, nil
+	return s.capturesToValuesRooted(caps, len(str), IntValue(int64(start)), IntValue(int64(end)))
 }
 
 func nativeStringMatch(s *State, args []Value) ([]Value, error) {
@@ -123,15 +177,7 @@ func nativeStringMatch(s *State, args []Value) ([]Value, error) {
 	if !found {
 		return []Value{NilValue()}, nil
 	}
-	out := make([]Value, len(caps))
-	for i, c := range caps {
-		cv, cerr := captureToValue(s, c, len(str))
-		if cerr != nil {
-			return nil, cerr
-		}
-		out[i] = cv
-	}
-	return out, nil
+	return s.capturesToValuesRooted(caps, len(str))
 }
 
 func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
@@ -193,15 +239,7 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 			if !ok {
 				return []Value{NilValue()}, nil
 			}
-			out := make([]Value, len(caps))
-			for i, c := range caps {
-				cv, cerr := captureToValue(s, c, len(str))
-				if cerr != nil {
-					return nil, cerr
-				}
-				out[i] = cv
-			}
-			return out, nil
+			return s.capturesToValuesRooted(caps, len(str))
 		},
 	}
 	return []Value{NativeValue(fn)}, nil
@@ -274,13 +312,9 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 		}, maxRepl, cancelFn, checkSize)
 	case repl.IsFunction():
 		outStr, count, err = luastdlib.GSubWithLimits(str, pat, func(caps []luastdlib.CaptureVal) (string, bool, error) {
-			cargs := make([]Value, len(caps))
-			for i, c := range caps {
-				cv, cerr := captureToValue(s, c, len(str))
-				if cerr != nil {
-					return "", false, cerr
-				}
-				cargs[i] = cv
+			cargs, cerr := s.capturesToValuesRooted(caps, len(str))
+			if cerr != nil {
+				return "", false, cerr
 			}
 			res, cerr := s.Call(repl, cargs...)
 			if cerr != nil {
@@ -304,10 +338,11 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 	if !replaced && args[0].IsString() {
 		return []Value{args[0], IntValue(int64(count))}, nil
 	}
-	if err := s.checkMemAndAccount(int64(len(outStr)) + 48); err != nil {
+	ls, err := s.TryIntern(outStr)
+	if err != nil {
 		return nil, err
 	}
-	return []Value{StringValue(s.intern.Intern(outStr)), IntValue(int64(count))}, nil
+	return []Value{StringValue(ls), IntValue(int64(count))}, nil
 }
 
 func nativeStringPack(s *State, args []Value) ([]Value, error) {
