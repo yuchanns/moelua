@@ -4516,3 +4516,174 @@ func TestCodexReviewRound19VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound20VMRegressions(t *testing.T) {
+	// 1. Binary string and byte-slice chunk loading enforces memLimit during undump before allocating huge slices.
+	t.Run("binary_string_and_bytes_undump_enforces_memlimit", func(t *testing.T) {
+		bigProto, err := compiler.Compile("=bigconst", "return")
+		if err != nil {
+			t.Fatal(err)
+		}
+		bigProto.Consts = make([]bytecode.Constant, 32768)
+		binBytes, err := bytecode.Dump(bigProto, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Via State.LoadChunk([]byte)
+		s1 := NewState()
+		defer s1.Close()
+		s1.SetMemoryLimit(131072)
+		runtime.GC()
+		var b1, a1 runtime.MemStats
+		runtime.ReadMemStats(&b1)
+		_, lerr := s1.LoadChunk(binBytes, "=bigconst_bytes")
+		runtime.ReadMemStats(&a1)
+		if lerr == nil || !strings.Contains(lerr.Error(), "not enough memory") {
+			t.Fatalf("expected OOM from LoadChunk(32768 consts), got %v", lerr)
+		}
+		if delta := a1.TotalAlloc - b1.TotalAlloc; delta > 524288 {
+			t.Fatalf("LoadChunk allocated %d bytes before OOM (expected <= 524288)", delta)
+		}
+
+		// Via Lua load(binaryString, ..., "b")
+		s2 := NewState()
+		defer s2.Close()
+		s2.SetGlobal("bin", StringValue(s2.Intern(string(binBytes))))
+		cl, err := s2.LoadChunk([]byte(`
+			local fn, err = load(bin, "=bigconst_str", "b")
+			assert(fn == nil and string.find(tostring(err), "not enough memory", 1, true),
+				"expected OOM from load(binStr), got " .. tostring(fn) .. "," .. tostring(err))
+			return "ok"
+		`), "=load_bin_oom")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s2.SetMemoryLimit(131072)
+		runtime.GC()
+		var b2, a2 runtime.MemStats
+		runtime.ReadMemStats(&b2)
+		res, err := s2.Call(cl)
+		runtime.ReadMemStats(&a2)
+		if err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("load(binStr) OOM check failed: res=%v err=%v", res, err)
+		}
+		if delta := a2.TotalAlloc - b2.TotalAlloc; delta > 524288 {
+			t.Fatalf("load(binStr) allocated %d bytes before OOM (expected <= 524288)", delta)
+		}
+	})
+
+	// 2. utf8.len and utf8.offset poll instruction limits and context cancellation during scans.
+	t.Run("utf8_len_and_offset_honor_execution_controls", func(t *testing.T) {
+		big := strings.Repeat("a", 2*1024*1024)
+		for _, tc := range []struct {
+			name string
+			src  string
+		}{
+			{"utf8_len", `return utf8.len(big)`},
+			{"utf8_offset", `return utf8.offset(big, 500000, 1)`},
+		} {
+			s := NewState()
+			defer s.Close()
+			s.SetGlobal("big", StringValue(s.Intern(big)))
+			cl, err := s.LoadChunk([]byte(tc.src), "="+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetInstructionLimit(100)
+			_, err = s.Call(cl)
+			if !errors.Is(err, ErrInstructionLimit) {
+				t.Fatalf("%s expected ErrInstructionLimit, got %v", tc.name, err)
+			}
+			if s.InstructionsExecuted() <= 100 {
+				t.Fatalf("%s expected InstructionsExecuted > 100, got %d", tc.name, s.InstructionsExecuted())
+			}
+
+			s.SetInstructionLimit(0)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+			defer cancel()
+			time.Sleep(time.Millisecond)
+			s.SetContext(ctx)
+			_, err = s.Call(cl)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%s expected context.DeadlineExceeded, got %v", tc.name, err)
+			}
+		}
+	})
+
+	// 3. coroutine.close() inside synchronous __close during native-callback unwind terminates the coroutine cleanly.
+	t.Run("sync_close_coro_close_self_terminates_cleanly", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local log = {}
+			local co = coroutine.create(function()
+				local outer <close> = setmetatable({}, {
+					__close = function() log[#log + 1] = "outer" end,
+				})
+				local ok, err = pcall(string.gsub, "x", ".", function()
+					local g1 <close> = setmetatable({}, {
+						__close = function() log[#log + 1] = "g1" end,
+					})
+					local g2 <close> = setmetatable({}, {
+						__close = function()
+							log[#log + 1] = "g2"
+							coroutine.close(coroutine.running())
+						end,
+					})
+					error("inner")
+				end)
+				log[#log + 1] = "after:" .. tostring(ok) .. ":" .. tostring(err)
+			end)
+			local rok, rval = coroutine.resume(co)
+			assert(rok == true and rval == nil, "expected resume true, nil; got " .. tostring(rok) .. "," .. tostring(rval))
+			assert(coroutine.status(co) == "dead")
+			assert(table.concat(log, ",") == "g2,g1,outer", "unexpected close log: " .. table.concat(log, ","))
+			return "ok"
+		`), "=sync_close_self")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("sync close self-close failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. Nested synchronous pcall/xpcall (including tailcalls and yields) complete outer protected frames properly.
+	t.Run("nested_pcall_and_xpcall_complete_outer_frames", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local a, b, c = pcall(pcall, type, 1)
+			assert(a == true and b == true and c == "number", "pcall(pcall, type, 1) got " .. tostring(a) .. "," .. tostring(b) .. "," .. tostring(c))
+
+			local x1, x2, x3 = xpcall(pcall, function(e) return e end, type, 1)
+			assert(x1 == true and x2 == true and x3 == "number", "xpcall(pcall, msgh, type, 1) got " .. tostring(x1) .. "," .. tostring(x2) .. "," .. tostring(x3))
+
+			local p1, p2, p3, p4 = pcall(pcall, pcall, type, 1)
+			assert(p1 == true and p2 == true and p3 == true and p4 == "number")
+
+			local e1, e2, e3 = pcall(xpcall, error, function(e) return "H:" .. tostring(e) end, "boom")
+			assert(e1 == true and e2 == false and e3 == "H:boom", "pcall(xpcall, error) got " .. tostring(e1) .. "," .. tostring(e2) .. "," .. tostring(e3))
+
+			local t1, t2, t3 = pcall(function() return pcall(type, 1) end)
+			assert(t1 == true and t2 == true and t3 == "number", "tailcall nested pcall got " .. tostring(t1) .. "," .. tostring(t2) .. "," .. tostring(t3))
+
+			local co = coroutine.create(function()
+				return pcall(pcall, coroutine.yield, "hi")
+			end)
+			local ok1, yv = coroutine.resume(co)
+			assert(ok1 == true and yv == "hi")
+			local ok2, r1, r2, r3 = coroutine.resume(co, "res")
+			assert(ok2 == true and r1 == true and r2 == true and r3 == "res",
+				"yield nested pcall got " .. tostring(ok2) .. "," .. tostring(r1) .. "," .. tostring(r2) .. "," .. tostring(r3))
+			return "ok"
+		`), "=nested_pcall")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("nested pcall/xpcall failed: res=%v err=%v", res, err)
+		}
+	})
+}
