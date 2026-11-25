@@ -110,6 +110,17 @@ func (s *State) fireCallHook(th *Thread, ci, nargs, nparams, entryDepth int) (bo
 	return false, nil
 }
 
+// fireLuaCallHook triggers a Lua "call" hook for the newly pushed Lua frame at th.frames[th.nframe-1].
+func (s *State) fireLuaCallHook(th *Thread, cl *Closure, nargs int) error {
+	if th.hookMask&HookMaskCall == 0 || th.inHook {
+		return nil
+	}
+	nt := min(nargs, int(cl.bp.proto.NumParams))
+	th.frames[th.nframe-1].ftransfer = 1
+	th.frames[th.nframe-1].ntransfer = uint16(nt)
+	return s.fireHook(th, "call", NilValue())
+}
+
 //go:noinline
 func (s *State) fireHook(th *Thread, event string, line Value) error {
 	if th.hook.IsNil() || th.inHook {
@@ -131,7 +142,10 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 			}
 		}
 		funcIdx := base
-		th.ensureStack(funcIdx + 3 + int(p.MaxStackSize) + 8)
+		if err := th.ensureStack(funcIdx + 3 + int(p.MaxStackSize) + 8); err != nil {
+			th.top = savedTop
+			return err
+		}
 		th.stack[funcIdx] = th.hook
 		th.stack[funcIdx+1] = StringValue(s.intern.Intern(event))
 		th.stack[funcIdx+2] = line

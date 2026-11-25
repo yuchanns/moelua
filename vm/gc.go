@@ -537,18 +537,21 @@ func (tr *gcTracer) convergeEphemerons() {
 }
 
 func (tr *gcTracer) clearByValues(tables []*Table) {
+	cleared := false
 	for _, t := range tables {
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
 			arr := t.arrValSlice()
 			for i := range arr {
 				if !arr[i].IsNil() && !tr.isMarked(arr[i]) {
 					arr[i] = NilValue()
+					cleared = true
 				}
 			}
 		}
 		for i := range t.slots {
 			if !t.slots[i].IsNil() && !tr.isMarked(t.slots[i]) {
 				t.slots[i] = NilValue()
+				cleared = true
 			}
 		}
 		if h := t.hash; h != nil {
@@ -560,13 +563,18 @@ func (tr *gcTracer) clearByValues(tables []*Table) {
 					nd.dead = true
 					h.live--
 					h.dictGen++
+					cleared = true
 				}
 			}
 		}
 	}
+	if cleared {
+		tr.s.protoEpoch++
+	}
 }
 
 func (tr *gcTracer) clearByKeys(tables []*Table) {
+	cleared := false
 	for _, t := range tables {
 		if h := t.hash; h != nil {
 			nodes := h.nodes
@@ -577,9 +585,13 @@ func (tr *gcTracer) clearByKeys(tables []*Table) {
 					nd.dead = true
 					h.live--
 					h.dictGen++
+					cleared = true
 				}
 			}
 		}
+	}
+	if cleared {
+		tr.s.protoEpoch++
 	}
 }
 
@@ -668,6 +680,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	}
 	if s.fileMeta != nil {
 		tr.mark(TableValue(s.fileMeta))
+	}
+	if !s.stdinInput.IsNil() {
+		tr.mark(s.stdinInput)
 	}
 	if !s.defaultInput.IsNil() {
 		tr.mark(s.defaultInput)

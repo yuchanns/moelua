@@ -433,6 +433,7 @@ func cloneFromStdTemplate(noEnv bool) *State {
 	s.loadedTbl = &a.tables[tmpl.loadedIdx]
 	s.preloadTbl = &a.tables[tmpl.preloadIdx]
 	s.typeMetas[4] = s.stringMeta
+	s.stdinInput = stdinVal
 	s.defaultInput = stdinVal
 	s.defaultOutput = stdoutVal
 	s.gc.tier1 = false

@@ -166,6 +166,7 @@ type State struct {
 	loadedTbl         *Table
 	preloadTbl        *Table
 	typeMetas         [9]*Table // per-type metatables (debug.setmetatable on primitives!)
+	stdinInput        Value
 	defaultInput      Value
 	defaultOutput     Value
 	openFiles         []*fileInner // open non-std file handles flushed on os.exit / closed LIFO on State.Close (does NOT pin *luaFile)
@@ -565,7 +566,9 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	}
 	funcIdx := base
 	argBase := funcIdx + 1
-	th.ensureStack(argBase + max(len(args), int(p.MaxStackSize)) + 8)
+	if err := th.ensureStack(argBase + max(len(args), int(p.MaxStackSize)) + 8); err != nil {
+		return nil, err
+	}
 	th.stack[funcIdx] = fn
 	for i, a := range args {
 		th.stack[argBase+i] = a
@@ -575,6 +578,11 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	entryDepth := th.nframe
 	if err := th.pushLuaFrame(cl, funcIdx, len(args), -1); err != nil {
 		return nil, err
+	}
+	if herr := s.fireLuaCallHook(th, cl, len(args)); herr != nil {
+		th.nframe = entryDepth
+		th.top = funcIdx
+		return nil, herr
 	}
 	err := s.runThread(th, entryDepth)
 	if err == nil && s.abortErr != nil {
@@ -687,6 +695,12 @@ func (s *State) GetMetatableOf(v Value) *Table { return s.getMetatableOf(v) }
 // SetMetatableOf sets the metatable of v (table, userdata, string, or type metatable)
 // and updates finalizer/prototype tracking. Passing nil clears the metatable.
 func (s *State) SetMetatableOf(v Value, mt *Table) { s.setMetatableOf(v, mt) }
+
+// TableLen evaluates the Lua length operation `#v` (honoring `__len` metamethods).
+func (s *State) TableLen(v Value) (int64, error) { return s.tableLen(v) }
+
+// TableGetInt evaluates `v[i]` (honoring `__index` metamethods).
+func (s *State) TableGetInt(v Value, i int64) (Value, error) { return s.tableGetInt(v, i) }
 
 func (s *State) getTMByObj(v Value, tm TM) Value {
 	return s.getTM(s.getMetatableOf(v), tm)

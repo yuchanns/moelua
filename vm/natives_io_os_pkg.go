@@ -390,6 +390,7 @@ func (s *State) initIOLib() {
 	stdinUD := s.newFileUD(&luaFile{f: os.Stdin, isStd: true})
 	stdoutUD := s.newFileUD(&luaFile{f: os.Stdout, isStd: true})
 	stderrUD := s.newFileUD(&luaFile{f: os.Stderr, isStd: true})
+	s.stdinInput = stdinUD
 	s.defaultInput = stdinUD
 	s.defaultOutput = stdoutUD
 
@@ -819,13 +820,24 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 	return []Value{IntValue(pos)}, nil
 }
 
-// ReadStdinLine reads one line from the State's shared stdin reader (used by REPLs
-// so interactive command reading and Lua io.read() share the exact same buffer).
+// ReadStdinLine reads one line from the State's original io.stdin reader (used by REPLs
+// so interactive command reading shares buffering with io.stdin / default stdin reads
+// without being redirected when Lua code calls io.input(file)).
 func (s *State) ReadStdinLine() (string, error) {
-	if lf, ok := asLuaFile(s.defaultInput); ok && !lf.closed && lf.f != nil {
+	if lf, ok := asLuaFile(s.stdinInput); ok && !lf.closed && lf.f != nil {
 		return lf.reader().ReadString('\n')
 	}
 	return "", io.EOF
+}
+
+// ReadAllStdin reads all remaining bytes from the State's original io.stdin reader
+// so stdin scripts (`moelua -` / piped stdin) consume any bytes buffered by earlier
+// `-e` / `LUA_INIT` stdin reads instead of bypassing them.
+func (s *State) ReadAllStdin() ([]byte, error) {
+	if lf, ok := asLuaFile(s.stdinInput); ok && !lf.closed && lf.f != nil {
+		return io.ReadAll(lf.reader())
+	}
+	return nil, nil
 }
 
 // ioReadErr wraps an OS-level I/O error (distinct from bad-argument format errors).

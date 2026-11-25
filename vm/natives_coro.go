@@ -174,7 +174,12 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 		if fn.IsNative() {
 			nf := fn.AsNative()
 			if nf.Intrinsic == intrPCall && len(args) >= 1 && args[0].IsClosure() {
-				co.ensureStack(len(args) + 8)
+				if err := co.ensureStack(len(args) + 8); err != nil {
+					co.status = ThreadDead
+					ev := errorToLuaValue(s, err)
+					co.errObj = ev
+					return false, []Value{ev}, nil
+				}
 				for i, a := range args {
 					co.stack[1+i] = a
 				}
@@ -191,7 +196,12 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				goto runCoro
 			}
 			if nf.Intrinsic == intrXPCall && len(args) >= 2 && args[0].IsClosure() && args[1].IsFunction() {
-				co.ensureStack(len(args) + 8)
+				if err := co.ensureStack(len(args) + 8); err != nil {
+					co.status = ThreadDead
+					ev := errorToLuaValue(s, err)
+					co.errObj = ev
+					return false, []Value{ev}, nil
+				}
 				for i, a := range args {
 					co.stack[1+i] = a
 				}
@@ -260,7 +270,12 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			return false, []Value{StringValue(s.intern.Intern("cannot resume non-function coroutine"))}, nil
 		}
 		cl := fn.AsClosure()
-		co.ensureStack(1 + len(args) + int(cl.bp.proto.MaxStackSize) + 16)
+		if err := co.ensureStack(1 + len(args) + int(cl.bp.proto.MaxStackSize) + 16); err != nil {
+			co.status = ThreadDead
+			ev := errorToLuaValue(s, err)
+			co.errObj = ev
+			return false, []Value{ev}, nil
+		}
 		for i, a := range args {
 			co.stack[1+i] = a
 		}
@@ -285,7 +300,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 	} else if co.status == ThreadSuspended {
 		// Resuming a yielded coroutine: deliver resume args as the results of coroutine.yield(...)!
 		co.status = ThreadOK
-		co.placeResults(co.yieldDst, args, co.yieldNRes)
+		if err := co.placeResults(co.yieldDst, args, co.yieldNRes); err != nil {
+			if !s.handleError(co, 0, err) {
+				co.status = ThreadDead
+				ev := errorToLuaValue(s, err)
+				co.errObj = ev
+				return false, []Value{ev}, nil
+			}
+		}
 		if co.yieldedNative {
 			co.yieldedNative = false
 			if co.hookMask&HookMaskRet != 0 && !co.inHook {

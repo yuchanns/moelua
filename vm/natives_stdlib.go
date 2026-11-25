@@ -186,12 +186,18 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 	var count int
 	replaced := false
 	cancelFn := s.nativeCancelFunc()
+	var checkSize func(int64) error
+	if s.memLimit > 0 {
+		checkSize = func(n int64) error {
+			return s.checkMem(n + 48)
+		}
+	}
 	switch {
 	case repl.IsString() || repl.IsNumber():
-		outStr, count, err = luastdlib.GSubStringWithCancel(str, pat, FormatValue(repl), maxRepl, cancelFn)
+		outStr, count, err = luastdlib.GSubStringWithLimits(str, pat, FormatValue(repl), maxRepl, cancelFn, checkSize)
 		replaced = count > 0
 	case repl.IsTable():
-		outStr, count, err = luastdlib.GSubTableWithCancel(str, pat, func(key luastdlib.CaptureVal) (string, bool, error) {
+		outStr, count, err = luastdlib.GSubTableWithLimits(str, pat, func(key luastdlib.CaptureVal) (string, bool, error) {
 			kv := captureToValue(s, key)
 			var val Value
 			t := repl.AsTable()
@@ -211,9 +217,9 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 				return FormatValue(val), true, nil
 			}
 			return "", false, fmt.Errorf("invalid replacement value (a %s)", val.TypeName())
-		}, maxRepl, cancelFn)
+		}, maxRepl, cancelFn, checkSize)
 	case repl.IsFunction():
-		outStr, count, err = luastdlib.GSubWithCancel(str, pat, func(caps []luastdlib.CaptureVal) (string, bool, error) {
+		outStr, count, err = luastdlib.GSubWithLimits(str, pat, func(caps []luastdlib.CaptureVal) (string, bool, error) {
 			cargs := make([]Value, len(caps))
 			for i, c := range caps {
 				cargs[i] = captureToValue(s, c)
@@ -230,7 +236,7 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 				return FormatValue(res[0]), true, nil
 			}
 			return "", false, fmt.Errorf("invalid replacement value (a %s)", res[0].TypeName())
-		}, maxRepl, cancelFn)
+		}, maxRepl, cancelFn, checkSize)
 	default:
 		return nil, fmt.Errorf("bad argument #3 to 'gsub' (string/function/table expected, got %s)", repl.TypeName())
 	}
@@ -239,6 +245,9 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 	}
 	if !replaced && args[0].IsString() {
 		return []Value{args[0], IntValue(int64(count))}, nil
+	}
+	if err := s.checkMemAndAccount(int64(len(outStr)) + 48); err != nil {
+		return nil, err
 	}
 	return []Value{StringValue(s.intern.Intern(outStr)), IntValue(int64(count))}, nil
 }
@@ -292,6 +301,11 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(len(vals)+1) * 16); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]Value, len(vals)+1)
 	for i, pv := range vals {
 		switch pv.Kind {
@@ -300,6 +314,9 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 		case luastdlib.PackFloat:
 			out[i] = FloatValue(pv.Flt)
 		case luastdlib.PackString:
+			if err := s.checkMemAndAccount(int64(len(pv.Str)) + 48); err != nil {
+				return nil, err
+			}
 			out[i] = StringValue(s.intern.Intern(pv.Str))
 		}
 	}
@@ -371,10 +388,13 @@ func nativeUTF8Char(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkMemAndAccount(int64(len(res)) + 48); err != nil {
+		return nil, err
+	}
 	return []Value{StringValue(s.intern.Intern(res))}, nil
 }
 
-func nativeUTF8Codepoint(_ *State, args []Value) ([]Value, error) {
+func nativeUTF8Codepoint(s *State, args []Value) ([]Value, error) {
 	str, err := checkStringArg(args, 0, "codepoint")
 	if err != nil {
 		return nil, err
@@ -399,6 +419,11 @@ func nativeUTF8Codepoint(_ *State, args []Value) ([]Value, error) {
 	cps, err := luastdlib.Codepoint(str, i, j, lax)
 	if err != nil {
 		return nil, err
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(len(cps)) * 16); err != nil {
+			return nil, err
+		}
 	}
 	out := make([]Value, len(cps))
 	for k, cp := range cps {

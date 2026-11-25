@@ -503,8 +503,16 @@ func nativeIPairsIter(s *State, args []Value) ([]Value, error) {
 	}
 	ni := i + 1
 	var v Value
-	if args[0].IsTable() && args[0].AsTable().meta == nil {
-		v = args[0].AsTable().RawGetInt(ni)
+	if args[0].IsTable() {
+		t := args[0].AsTable()
+		v = t.RawGetInt(ni)
+		if v.IsNil() && t.meta != nil {
+			var err error
+			v, err = s.finishGet(args[0], IntValue(ni))
+			if err != nil {
+				return nil, err
+			}
+		}
 	} else {
 		var err error
 		v, err = s.finishGet(args[0], IntValue(ni))
@@ -1341,6 +1349,11 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("too many results to unpack")
 	}
 	n := int(un) + 1
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(n) * 16); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]Value, n)
 	rawFast := args[0].IsTable() && args[0].AsTable().meta == nil
 	var t *Table
@@ -1408,6 +1421,11 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 	n := int(n64)
 	if n <= 1 {
 		return nil, nil
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(n) * 16); err != nil {
+			return nil, err
+		}
 	}
 	vals := make([]Value, n)
 	for i := range n {
@@ -1534,19 +1552,43 @@ func nativeStringLen(_ *State, args []Value) ([]Value, error) {
 	return []Value{IntValue(int64(len(args[0].AsString().S)))}, nil
 }
 
-func nativeStringByte(_ *State, args []Value) ([]Value, error) {
-	str := args[0].AsString().S
+func nativeStringByte(s *State, args []Value) ([]Value, error) {
+	if len(args) == 0 {
+		return nil, s.badArgErr(1, "byte", "string expected, got no value")
+	}
+	var str string
+	if args[0].IsString() {
+		str = args[0].AsString().S
+	} else if args[0].IsNumber() {
+		str = FormatValue(args[0])
+	} else {
+		return nil, s.badArgErr(1, "byte", fmt.Sprintf("string expected, got %s", s.objTypeName(args[0])))
+	}
 	n := int64(len(str))
 	i := int64(1)
 	if len(args) >= 2 && !args[1].IsNil() {
-		i, _ = args[1].ToInt()
+		var ok bool
+		i, ok = args[1].ToInt()
+		if !ok {
+			if args[1].IsFloat() {
+				return nil, s.badArgErr(2, "byte", "number has no integer representation")
+			}
+			return nil, s.badArgErr(2, "byte", fmt.Sprintf("number expected, got %s", s.objTypeName(args[1])))
+		}
 	}
 	if i < 0 {
 		i = n + i + 1
 	}
 	j := i
 	if len(args) >= 3 && !args[2].IsNil() {
-		j, _ = args[2].ToInt()
+		var ok bool
+		j, ok = args[2].ToInt()
+		if !ok {
+			if args[2].IsFloat() {
+				return nil, s.badArgErr(3, "byte", "number has no integer representation")
+			}
+			return nil, s.badArgErr(3, "byte", fmt.Sprintf("number expected, got %s", s.objTypeName(args[2])))
+		}
 		if j < 0 {
 			j = n + j + 1
 		}
@@ -1560,7 +1602,16 @@ func nativeStringByte(_ *State, args []Value) ([]Value, error) {
 	if i > j {
 		return nil, nil
 	}
-	out := make([]Value, j-i+1)
+	count := j - i + 1
+	if count > 1_000_000 {
+		return nil, fmt.Errorf("string slice too long")
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMem(count * 16); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]Value, count)
 	for k := i; k <= j; k++ {
 		out[k-i] = IntValue(int64(str[k-1]))
 	}
@@ -1568,6 +1619,9 @@ func nativeStringByte(_ *State, args []Value) ([]Value, error) {
 }
 
 func nativeStringChar(s *State, args []Value) ([]Value, error) {
+	if err := s.checkMemAndAccount(int64(len(args)) + 48); err != nil {
+		return nil, err
+	}
 	buf := make([]byte, len(args))
 	for i, a := range args {
 		v, ok := a.ToInt()
@@ -1660,6 +1714,9 @@ func nativeStringSub(s *State, args []Value) ([]Value, error) {
 	if i > j {
 		return []Value{StringValue(s.intern.Intern(""))}, nil
 	}
+	if err := s.checkMemAndAccount((j - i + 1) + 48); err != nil {
+		return nil, err
+	}
 	return []Value{StringValue(s.intern.Intern(str[i-1 : j]))}, nil
 }
 
@@ -1725,7 +1782,11 @@ func nativeStringReverse(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'reverse' (string expected)")
 	}
-	b := []byte(FormatValue(args[0]))
+	str := FormatValue(args[0])
+	if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
+		return nil, err
+	}
+	b := []byte(str)
 	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
 		b[i], b[j] = b[j], b[i]
 	}
@@ -1737,7 +1798,11 @@ func nativeStringLower(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'lower' (string expected)")
 	}
 	// ASCII-only tolower matching C locale (Lua 5.5 default locale)
-	b := []byte(FormatValue(args[0]))
+	str := FormatValue(args[0])
+	if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
+		return nil, err
+	}
+	b := []byte(str)
 	for i, c := range b {
 		if c >= 'A' && c <= 'Z' {
 			b[i] = c + ('a' - 'A')
@@ -1750,7 +1815,11 @@ func nativeStringUpper(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'upper' (string expected)")
 	}
-	b := []byte(FormatValue(args[0]))
+	str := FormatValue(args[0])
+	if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
+		return nil, err
+	}
+	b := []byte(str)
 	for i, c := range b {
 		if c >= 'a' && c <= 'z' {
 			b[i] = c - ('a' - 'A')

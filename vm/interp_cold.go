@@ -55,7 +55,14 @@ func (s *State) prepareLuaFrame(th *Thread, entryDepth int) (bool, error) {
 			}
 		}
 		if cf.kind != frameLua {
-			if s.finishPCallReturn(th, entryDepth) {
+			done, err := s.finishPCallReturn(th, entryDepth)
+			if err != nil {
+				if s.handleError(th, entryDepth, err) {
+					continue
+				}
+				return false, err
+			}
+			if done {
 				return true, nil
 			}
 			continue
@@ -69,7 +76,7 @@ func (s *State) prepareLuaFrame(th *Thread, entryDepth int) (bool, error) {
 // whose callee returned normally, prepending `true` to the callee's results.
 //
 //go:noinline
-func (s *State) finishPCallReturn(th *Thread, entryDepth int) bool {
+func (s *State) finishPCallReturn(th *Thread, entryDepth int) (bool, error) {
 	cf := &th.frames[th.nframe-1]
 	funcIdx := cf.funcIdx
 	nres := cf.nresults
@@ -78,17 +85,22 @@ func (s *State) finishPCallReturn(th *Thread, entryDepth int) bool {
 	if got < 0 {
 		got = 0
 	}
-	th.nframe--
 	// Results are at th.stack[calleeStart : calleeStart+got].
 	// We need [true, res0, res1, ...] at th.stack[funcIdx..].
 	total := 1 + got
 	if nres < 0 { // MULTRET
-		th.ensureStack(funcIdx + total + 4)
+		if err := th.ensureStack(funcIdx + total + 4); err != nil {
+			return false, err
+		}
+		th.nframe--
 		copy(th.stack[funcIdx+1:funcIdx+1+got], th.stack[calleeStart:calleeStart+got])
 		th.stack[funcIdx] = TrueValue()
 		th.top = funcIdx + total
 	} else {
-		th.ensureStack(funcIdx + nres + 4)
+		if err := th.ensureStack(funcIdx + nres + 4); err != nil {
+			return false, err
+		}
+		th.nframe--
 		if nres > 0 {
 			cp := min(got, nres-1)
 			if cp > 0 {
@@ -101,7 +113,7 @@ func (s *State) finishPCallReturn(th *Thread, entryDepth int) bool {
 		}
 		th.top = funcIdx + nres
 	}
-	return th.nframe <= entryDepth
+	return th.nframe <= entryDepth, nil
 }
 
 // handleError unwinds th.frames inside the flat loop (ZERO Go panic/recover!),
@@ -267,7 +279,9 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 	funcIdx := cf.funcIdx
 	nres := cf.nresults
 	th.nframe--
-	th.placeResults(funcIdx, []Value{FalseValue(), errVal}, nres)
+	if perr := th.placeResults(funcIdx, []Value{FalseValue(), errVal}, nres); perr != nil {
+		return s.handleError(th, entryDepth, perr)
+	}
 	return true
 }
 
@@ -336,7 +350,9 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 		if th.top > slot {
 			slot = th.top
 		}
-		th.ensureStack(slot + 1 + len(args) + 8)
+		if err := th.ensureStack(slot + 1 + len(args) + 8); err != nil {
+			return false, err
+		}
 		th.stack[slot] = tm
 		for i, a := range args {
 			th.stack[slot+1+i] = a
@@ -349,6 +365,9 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 		if err := th.pushLuaFrame(tm.AsClosure(), slot, len(args), 1); err != nil {
 			cf.finish = finishNone
 			return false, err
+		}
+		if herr := s.fireLuaCallHook(th, tm.AsClosure(), len(args)); herr != nil {
+			return false, herr
 		}
 		return true, nil
 	}
@@ -928,13 +947,8 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		if err := th.pushLuaFrame(cl, funcIdx, nargs, nresults); err != nil {
 			return s.catchSlow(th, ev, false, err)
 		}
-		if th.hookMask&HookMaskCall != 0 && !th.inHook {
-			nt := min(nargs, int(cl.bp.proto.NumParams))
-			th.frames[th.nframe-1].ftransfer = 1
-			th.frames[th.nframe-1].ntransfer = uint16(nt)
-			if herr := s.fireHook(th, "call", NilValue()); herr != nil {
-				return s.catchSlow(th, ev, false, herr)
-			}
+		if herr := s.fireLuaCallHook(th, cl, nargs); herr != nil {
+			return s.catchSlow(th, ev, false, herr)
 		}
 		return true, nil
 	}
@@ -963,16 +977,24 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					return s.catchSlow(th, ev, false, fmt.Errorf("dofile failed"))
 				}
 				th.stack[funcIdx] = loaded[0]
-				if err := th.pushLuaFrame(loaded[0].AsClosure(), funcIdx, 0, nresults); err != nil {
+				cl := loaded[0].AsClosure()
+				if err := th.pushLuaFrame(cl, funcIdx, 0, nresults); err != nil {
 					return s.catchSlow(th, ev, false, err)
+				}
+				if herr := s.fireLuaCallHook(th, cl, 0); herr != nil {
+					return s.catchSlow(th, ev, false, herr)
 				}
 				return true, nil
 			}
 			if nf.Intrinsic == intrPairs && nargs >= 1 {
 				if tm := s.getTMByObj(th.stack[funcIdx+1], TMPairs); !tm.IsNil() && tm.IsClosure() {
 					th.stack[funcIdx] = tm
-					if err := th.pushLuaFrame(tm.AsClosure(), funcIdx, 1, nresults); err != nil {
+					cl := tm.AsClosure()
+					if err := th.pushLuaFrame(cl, funcIdx, 1, nresults); err != nil {
 						return s.catchSlow(th, ev, false, err)
+					}
+					if herr := s.fireLuaCallHook(th, cl, 1); herr != nil {
+						return s.catchSlow(th, ev, false, herr)
 					}
 					return true, nil
 				}
@@ -1022,7 +1044,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					th.stack[funcIdx] = rv
 					th.top = funcIdx + 1
 				default:
-					th.ensureStack(funcIdx + nresults + 4)
+					if err := th.ensureStack(funcIdx + nresults + 4); err != nil {
+						return s.catchSlow(th, ev, false, err)
+					}
 					th.stack[funcIdx] = rv
 					fillNil(th.stack[funcIdx+1 : funcIdx+nresults])
 					th.top = funcIdx + nresults
@@ -1049,7 +1073,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				copy(nfrm, th.frames)
 				th.frames = nfrm
 			}
-			th.ensureStack(funcIdx + 2 + 4)
+			if err := th.ensureStack(funcIdx + 2 + 4); err != nil {
+				return s.catchSlow(th, ev, false, err)
+			}
 			th.stack[funcIdx+1] = rv
 			th.frames[th.nframe] = callFrame{
 				kind:      frameNative,
@@ -1066,7 +1092,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			if herr != nil {
 				return s.catchSlow(th, ev, false, herr)
 			}
-			th.placeResults(funcIdx, []Value{rv}, nresults)
+			if err := th.placeResults(funcIdx, []Value{rv}, nresults); err != nil {
+				return s.catchSlow(th, ev, false, err)
+			}
 			if nresults >= 0 {
 				if end := ev.base + int(ev.bp.maxStack); th.top < end {
 					th.top = end
@@ -1080,11 +1108,14 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			if hookedNative {
 				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook {
 					// Place returned results at cf.base so debug.getlocal(2, i) in return hook sees them (db.lua:555)!
-					th.ensureStack(funcIdx + 1 + len(res) + 4)
-					copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
-					th.frames[th.nframe-1].ftransfer = 1
-					th.frames[th.nframe-1].ntransfer = uint16(len(res))
-					hookErr = s.fireHook(th, "return", NilValue())
+					if serr := th.ensureStack(funcIdx + 1 + len(res) + 4); serr != nil {
+						hookErr = serr
+					} else {
+						copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
+						th.frames[th.nframe-1].ftransfer = 1
+						th.frames[th.nframe-1].ntransfer = uint16(len(res))
+						hookErr = s.fireHook(th, "return", NilValue())
+					}
 				}
 				th.nframe--
 			} else {
@@ -1094,20 +1125,23 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					copy(nfrm, th.frames)
 					th.frames = nfrm
 				}
-				th.ensureStack(funcIdx + 1 + len(res) + 4)
-				copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
-				th.frames[th.nframe] = callFrame{
-					kind:      frameNative,
-					base:      funcIdx + 1,
-					funcIdx:   funcIdx,
-					nativeFn:  fn,
-					ftransfer: 1,
-					ntransfer: uint16(len(res)),
-					dirty:     true,
+				if serr := th.ensureStack(funcIdx + 1 + len(res) + 4); serr != nil {
+					hookErr = serr
+				} else {
+					copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
+					th.frames[th.nframe] = callFrame{
+						kind:      frameNative,
+						base:      funcIdx + 1,
+						funcIdx:   funcIdx,
+						nativeFn:  fn,
+						ftransfer: 1,
+						ntransfer: uint16(len(res)),
+						dirty:     true,
+					}
+					th.nframe++
+					hookErr = s.fireHook(th, "return", NilValue())
+					th.nframe--
 				}
-				th.nframe++
-				hookErr = s.fireHook(th, "return", NilValue())
-				th.nframe--
 			}
 			if hookErr != nil && err == nil {
 				return s.catchSlow(th, ev, false, hookErr)
@@ -1132,7 +1166,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			}
 			return false, nil
 		}
-		th.placeResults(funcIdx, res, nresults)
+		if err := th.placeResults(funcIdx, res, nresults); err != nil {
+			return s.catchSlow(th, ev, false, err)
+		}
 		if nresults >= 0 {
 			if end := ev.base + int(ev.bp.proto.MaxStackSize); th.top < end {
 				th.top = end
@@ -1146,17 +1182,23 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		if tm.IsNil() {
 			return s.catchSlow(th, ev, false, fmt.Errorf("attempt to call a %s value%s", fn.TypeName(), varInfo(ev.bp.proto, th.frames[ev.ci].pc-1, a)))
 		}
-		th.ensureStack(funcIdx + nargs + 4)
+		if err := th.ensureStack(funcIdx + nargs + 4); err != nil {
+			return s.catchSlow(th, ev, false, err)
+		}
 		copy(th.stack[funcIdx+2:funcIdx+2+nargs], th.stack[funcIdx+1:funcIdx+1+nargs])
 		th.stack[funcIdx+1] = fn
 		th.stack[funcIdx] = tm
 		nargs++
 		fn = tm
 		if fn.IsClosure() {
-			if err := th.pushLuaFrame(fn.AsClosure(), funcIdx, nargs, nresults); err != nil {
+			cl := fn.AsClosure()
+			if err := th.pushLuaFrame(cl, funcIdx, nargs, nresults); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
 			th.frames[th.nframe-1].extraArgs = uint8(depth)
+			if herr := s.fireLuaCallHook(th, cl, nargs); herr != nil {
+				return s.catchSlow(th, ev, false, herr)
+			}
 			return true, nil
 		}
 		if fn.IsNative() {
@@ -1171,7 +1213,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				}
 				return s.catchSlow(th, ev, false, err)
 			}
-			th.placeResults(funcIdx, res, nresults)
+			if err := th.placeResults(funcIdx, res, nresults); err != nil {
+				return s.catchSlow(th, ev, false, err)
+			}
 			if nresults >= 0 {
 				if end := ev.base + int(ev.bp.proto.MaxStackSize); th.top < end {
 					th.top = end
@@ -1277,13 +1321,30 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 			return false, err
 		}
 		// Normal return from native inside pcall/xpcall: place results at calleeIdx and finishPCallReturn!
-		th.placeResults(calleeIdx, res, -1)
-		s.finishPCallReturn(th, 0)
+		if perr := th.placeResults(calleeIdx, res, -1); perr != nil {
+			if s.handleError(th, 0, perr) {
+				return true, nil
+			}
+			return false, perr
+		}
+		if _, ferr := s.finishPCallReturn(th, 0); ferr != nil {
+			if s.handleError(th, 0, ferr) {
+				return true, nil
+			}
+			return false, ferr
+		}
 		return false, nil
 	}
-	if err := th.pushLuaFrame(targetVal.AsClosure(), calleeIdx, calleeArgs, -1); err != nil {
+	cl := targetVal.AsClosure()
+	if err := th.pushLuaFrame(cl, calleeIdx, calleeArgs, -1); err != nil {
 		th.nframe--
 		return false, err
+	}
+	if herr := s.fireLuaCallHook(th, cl, calleeArgs); herr != nil {
+		if s.handleError(th, 0, herr) {
+			return true, nil
+		}
+		return false, herr
 	}
 	return true, nil
 }
@@ -1306,7 +1367,9 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 			return false, nil
 		}
 	}
-	th.ensureStack(fnIdx + max(c, 3) + 4)
+	if err := th.ensureStack(fnIdx + max(c, 3) + 4); err != nil {
+		return s.catchSlow(th, ev, false, err)
+	}
 	th.stack[fnIdx+2] = th.stack[base+int(a)+3] // control var
 	th.stack[fnIdx+1] = th.stack[base+int(a)+1] // state
 	th.stack[fnIdx] = fn                        // iterator fn
@@ -1323,12 +1386,18 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 			}
 			return s.catchSlow(th, ev, false, err)
 		}
-		th.placeResults(fnIdx, res, c)
+		if err := th.placeResults(fnIdx, res, c); err != nil {
+			return s.catchSlow(th, ev, false, err)
+		}
 		return false, nil
 	}
 	if fn.IsClosure() {
-		if err := th.pushLuaFrame(fn.AsClosure(), fnIdx, 2, c); err != nil {
+		cl := fn.AsClosure()
+		if err := th.pushLuaFrame(cl, fnIdx, 2, c); err != nil {
 			return s.catchSlow(th, ev, false, err)
+		}
+		if herr := s.fireLuaCallHook(th, cl, 2); herr != nil {
+			return s.catchSlow(th, ev, false, herr)
 		}
 		return true, nil
 	}
@@ -1370,7 +1439,9 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 			if th.top > slot {
 				slot = th.top
 			}
-			th.ensureStack(slot + 4)
+			if err := th.ensureStack(slot + 4); err != nil {
+				return false, err
+			}
 			th.stack[slot] = tm
 			th.stack[slot+1] = obj
 			if ncloseArgs == 2 {
@@ -1379,9 +1450,13 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 			cf.dirty = true
 			cf.oldTop = slot
 			cf.finish = finishClose
-			if err := th.pushLuaFrame(tm.AsClosure(), slot, ncloseArgs, 0); err != nil {
+			cl := tm.AsClosure()
+			if err := th.pushLuaFrame(cl, slot, ncloseArgs, 0); err != nil {
 				cf.finish = finishNone
 				return false, err
+			}
+			if herr := s.fireLuaCallHook(th, cl, ncloseArgs); herr != nil {
+				return false, herr
 			}
 			return false, nil
 		}
@@ -1422,7 +1497,9 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 		errVal := cf.closeErr
 		cf.closeResume = 0
 		th.nframe--
-		th.placeResults(funcIdx, []Value{FalseValue(), errVal}, nres)
+		if err := th.placeResults(funcIdx, []Value{FalseValue(), errVal}, nres); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 	if cf.closeResume == 1 {
@@ -1438,13 +1515,18 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 		nres := cf.nresults
 		srcStart := cf.closeRetSrc
 		n := cf.closeRetN
-		th.nframe--
 		if nres < 0 {
-			th.ensureStack(funcIdx + n + 4)
+			if err := th.ensureStack(funcIdx + n + 4); err != nil {
+				return false, err
+			}
+			th.nframe--
 			copy(th.stack[funcIdx:funcIdx+n], th.stack[srcStart:srcStart+n])
 			th.top = funcIdx + n
 		} else {
-			th.ensureStack(funcIdx + nres + 4)
+			if err := th.ensureStack(funcIdx + nres + 4); err != nil {
+				return false, err
+			}
+			th.nframe--
 			cp := min(n, nres)
 			copy(th.stack[funcIdx:funcIdx+cp], th.stack[srcStart:srcStart+cp])
 			if cp < nres {
@@ -2283,7 +2365,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				if tm.IsNil() {
 					return coldContinue, pc, fmt.Errorf("attempt to call a %s value%s", fn.TypeName(), varInfo(ev.bp.proto, ipc, int(a)))
 				}
-				th.ensureStack(srcStart + nargs + 4)
+				if err := th.ensureStack(srcStart + nargs + 4); err != nil {
+					return coldContinue, pc, err
+				}
 				copy(th.stack[srcStart+2:srcStart+2+nargs], th.stack[srcStart+1:srcStart+1+nargs])
 				th.stack[srcStart+1] = fn
 				th.stack[srcStart] = tm
@@ -2301,7 +2385,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		if fn.IsClosure() {
 			callee := fn.AsClosure()
 			p := callee.bp.proto
-			th.ensureStack(funcIdx + 1 + max(nargs, int(p.MaxStackSize)) + int(p.NumParams) + 8)
+			if err := th.ensureStack(funcIdx + 1 + max(nargs, int(p.MaxStackSize)) + int(p.NumParams) + 8); err != nil {
+				return coldContinue, pc, err
+			}
 			copy(th.stack[funcIdx:funcIdx+1+nargs], th.stack[srcStart:srcStart+1+nargs])
 			newBase := funcIdx + 1
 			if p.IsVararg() {
@@ -2339,23 +2425,33 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		nf := fn.AsNative()
 		if nf.Intrinsic == intrPCall && nargs >= 1 && isFlatProtectedTarget(th.stack[srcStart+1]) {
 			nres := cf.nresults
-			th.ensureStack(funcIdx + 1 + nargs + 4)
+			if err := th.ensureStack(funcIdx + 1 + nargs + 4); err != nil {
+				return coldContinue, pc, err
+			}
 			copy(th.stack[funcIdx:funcIdx+1+nargs], th.stack[srcStart:srcStart+1+nargs])
 			th.nframe--
 			_, err := s.pushProtectedCall(th, funcIdx, nargs, nres, false)
 			if err != nil {
 				return coldContinue, pc, err
 			}
+			if th.nframe <= entryDepth {
+				return coldReturn, 0, nil
+			}
 			return coldReload, 0, nil
 		}
 		if nf.Intrinsic == intrXPCall && nargs >= 2 && isFlatProtectedTarget(th.stack[srcStart+1]) && th.stack[srcStart+2].IsFunction() {
 			nres := cf.nresults
-			th.ensureStack(funcIdx + 1 + nargs + 4)
+			if err := th.ensureStack(funcIdx + 1 + nargs + 4); err != nil {
+				return coldContinue, pc, err
+			}
 			copy(th.stack[funcIdx:funcIdx+1+nargs], th.stack[srcStart:srcStart+1+nargs])
 			th.nframe--
 			_, err := s.pushProtectedCall(th, funcIdx, nargs, nres, true)
 			if err != nil {
 				return coldContinue, pc, err
+			}
+			if th.nframe <= entryDepth {
+				return coldReturn, 0, nil
 			}
 			return coldReload, 0, nil
 		}
@@ -2373,8 +2469,10 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		if err != nil {
 			return coldContinue, pc, err
 		}
+		if err := th.placeResults(funcIdx, res, nres); err != nil {
+			return coldContinue, pc, err
+		}
 		th.nframe--
-		th.placeResults(funcIdx, res, nres)
 		if th.nframe <= entryDepth {
 			return coldReturn, 0, nil
 		}
@@ -2439,13 +2537,18 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		}
 		funcIdx := cf.funcIdx
 		nres := cf.nresults
-		th.nframe--
 		if nres < 0 {
-			th.ensureStack(funcIdx + n + 4)
+			if err := th.ensureStack(funcIdx + n + 4); err != nil {
+				return coldContinue, pc, err
+			}
+			th.nframe--
 			copy(th.stack[funcIdx:funcIdx+n], th.stack[srcStart:srcStart+n])
 			th.top = funcIdx + n
 		} else {
-			th.ensureStack(funcIdx + nres + 4)
+			if err := th.ensureStack(funcIdx + nres + 4); err != nil {
+				return coldContinue, pc, err
+			}
+			th.nframe--
 			cp := min(n, nres)
 			copy(th.stack[funcIdx:funcIdx+cp], th.stack[srcStart:srcStart+cp])
 			if cp < nres {
@@ -2547,7 +2650,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			if err := s.ConsumeMemErr(); err != nil {
 				return coldContinue, pc, err
 			}
-			th.ensureStack(cf.base + int(p.MaxStackSize) + 8)
+			if err := th.ensureStack(cf.base + int(p.MaxStackSize) + 8); err != nil {
+				return coldContinue, pc, err
+			}
 			th.stack[cf.base+nparams] = TableValue(vt)
 			if int(p.MaxStackSize) > nparams+1 {
 				fillNil(th.stack[cf.base+nparams+1 : cf.base+int(p.MaxStackSize)])
@@ -2560,7 +2665,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		}
 		if nextra > 0 {
 			newBase := cf.base + nactual
-			th.ensureStack(newBase + int(p.MaxStackSize) + 8)
+			if err := th.ensureStack(newBase + int(p.MaxStackSize) + 8); err != nil {
+				return coldContinue, pc, err
+			}
 			copy(th.stack[newBase:newBase+nparams], th.stack[cf.base:cf.base+nparams])
 			if int(p.MaxStackSize) > nparams {
 				fillNil(th.stack[newBase+nparams : newBase+int(p.MaxStackSize)])
@@ -2571,7 +2678,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			ev.base = newBase
 			th.top = newBase + int(p.MaxStackSize)
 		} else {
-			th.ensureStack(cf.base + int(p.MaxStackSize) + 8)
+			if err := th.ensureStack(cf.base + int(p.MaxStackSize) + 8); err != nil {
+				return coldContinue, pc, err
+			}
 			if int(p.MaxStackSize) > nparams {
 				fillNil(th.stack[cf.base+nparams : cf.base+int(p.MaxStackSize)])
 			}
@@ -2594,14 +2703,19 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				return coldContinue, pc, fmt.Errorf("vararg table has no proper 'n'")
 			}
 			n := int(nv.Int())
-			if want < 0 {
+			open := want < 0
+			if open {
 				want = n
-				th.top = ev.base + int(a) + want
 			}
 			if ev.base+int(a)+want+4 > 1000000 {
 				return coldContinue, pc, fmt.Errorf("stack overflow")
 			}
-			th.ensureStack(ev.base + int(a) + want + 4)
+			if err := th.ensureStack(ev.base + int(a) + want + 4); err != nil {
+				return coldContinue, pc, err
+			}
+			if open {
+				th.top = ev.base + int(a) + want
+			}
 			for i := 0; i < want; i++ {
 				if i < n {
 					th.stack[ev.base+int(a)+i] = vt.RawGetInt(int64(i + 1))
@@ -2612,11 +2726,16 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			return coldContinue, pc, nil
 		}
 		nextra := cf.nextraargs
-		if want < 0 {
+		open := want < 0
+		if open {
 			want = nextra
+		}
+		if err := th.ensureStack(ev.base + int(a) + want + 4); err != nil {
+			return coldContinue, pc, err
+		}
+		if open {
 			th.top = ev.base + int(a) + want
 		}
-		th.ensureStack(ev.base + int(a) + want + 4)
 		extraStart := ev.base - nextra
 		for i := 0; i < want; i++ {
 			if i < nextra {
@@ -2822,7 +2941,9 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			if th.top > slot {
 				slot = th.top
 			}
-			th.ensureStack(slot + 4)
+			if err := th.ensureStack(slot + 4); err != nil {
+				return false, err
+			}
 			th.stack[slot] = tm
 			th.stack[slot+1] = lhs
 			th.stack[slot+2] = rhs
@@ -2831,9 +2952,13 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			cf.finish = finishConcat
 			cf.concatStart = start
 			cf.concatIdx = cur - 1
-			if err := th.pushLuaFrame(tm.AsClosure(), slot, 2, 1); err != nil {
+			cl := tm.AsClosure()
+			if err := th.pushLuaFrame(cl, slot, 2, 1); err != nil {
 				cf.finish = finishNone
 				return false, err
+			}
+			if herr := s.fireLuaCallHook(th, cl, 2); herr != nil {
+				return false, herr
 			}
 			return true, nil
 		}

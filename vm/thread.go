@@ -163,22 +163,37 @@ func newThread(s *State, stackCap int) *Thread {
 	return th
 }
 
-func (th *Thread) ensureStack(need int) {
+const maxStackSlots = 2_000_000
+
+func (th *Thread) ensureStack(need int) error {
 	if need+stackSlack <= len(th.stack) {
-		return
+		return nil
+	}
+	if need < 0 || need+stackSlack > maxStackSlots {
+		if th.state != nil {
+			return &LuaError{Val: StringValue(th.state.intern.Intern("stack overflow"))}
+		}
+		return fmt.Errorf("stack overflow")
 	}
 	newSize := len(th.stack) * 2
 	for newSize < need+stackSlack {
 		newSize *= 2
 	}
+	if newSize > maxStackSlots {
+		newSize = maxStackSlots
+	}
+	delta := int64(newSize-len(th.stack)) * 16
+	if th.state != nil && th.state.memLimit > 0 {
+		if err := th.state.checkMemAndAccount(delta); err != nil {
+			return err
+		}
+	}
 	ns := make([]Value, newSize)
 	copy(ns, th.stack)
 	fillNil(ns[len(th.stack):])
-	if th.state != nil && th.state.memLimit > 0 {
-		th.state.gc.allocBytes += int64(newSize-len(th.stack)) * 16
-	}
 	th.stack = ns
 	th.stackGen++
+	return nil
 }
 
 // window returns a *[256]Value view rooted at th.stack[base].
@@ -313,6 +328,12 @@ func (th *Thread) pushLuaFrame(cl *Closure, funcIdx, nargs, nresults int) error 
 		if newCap > limit {
 			newCap = limit
 		}
+		if th.state != nil && th.state.memLimit > 0 {
+			delta := int64(newCap-len(th.frames)) * int64(unsafe.Sizeof(callFrame{}))
+			if err := th.state.checkMemAndAccount(delta); err != nil {
+				return err
+			}
+		}
 		nf := make([]callFrame, newCap)
 		copy(nf, th.frames)
 		th.frames = nf
@@ -322,10 +343,14 @@ func (th *Thread) pushLuaFrame(cl *Closure, funcIdx, nargs, nresults int) error 
 	base := funcIdx + 1
 
 	if p.IsVararg() {
-		th.ensureStack(base + max(nargs, int(p.MaxStackSize)) + nparams + 8)
+		if err := th.ensureStack(base + max(nargs, int(p.MaxStackSize)) + nparams + 8); err != nil {
+			return err
+		}
 		th.top = base + nargs
 	} else {
-		th.ensureStack(base + int(p.MaxStackSize) + 8)
+		if err := th.ensureStack(base + int(p.MaxStackSize) + 8); err != nil {
+			return err
+		}
 		if nargs < nparams {
 			fillNil(th.stack[base+nargs : base+nparams])
 		}
@@ -351,20 +376,25 @@ func (th *Thread) pushLuaFrame(cl *Closure, funcIdx, nargs, nresults int) error 
 	return nil
 }
 
-func (th *Thread) placeResults(dst int, res []Value, nresults int) {
+func (th *Thread) placeResults(dst int, res []Value, nresults int) error {
 	if nresults < 0 {
-		th.ensureStack(dst + len(res) + 4)
+		if err := th.ensureStack(dst + len(res) + 4); err != nil {
+			return err
+		}
 		copy(th.stack[dst:dst+len(res)], res)
 		th.top = dst + len(res)
-		return
+		return nil
 	}
-	th.ensureStack(dst + nresults + 4)
+	if err := th.ensureStack(dst + nresults + 4); err != nil {
+		return err
+	}
 	n := min(len(res), nresults)
 	copy(th.stack[dst:dst+n], res[:n])
 	if n < nresults {
 		fillNil(th.stack[dst+n : dst+nresults])
 	}
 	th.top = dst + nresults
+	return nil
 }
 
 // IsYieldable reports whether th can currently yield (matching PUC-Rio lua_isyieldable: th.nny == 0).
