@@ -467,13 +467,13 @@ func (s *State) TryNewMetatable(name string) (*Table, bool, error) {
 	if !s.ready() {
 		return nil, false, ErrStateClosed
 	}
-	reg := s.vm.Registry()
-	if existing := reg.RawGetStr(s.vm.Intern(name)); existing.IsTable() {
-		return &Table{state: s, raw: existing.AsTable()}, false, nil
-	}
 	key, err := s.vm.TryIntern(name)
 	if err != nil {
 		return nil, false, err
+	}
+	reg := s.vm.Registry()
+	if existing := reg.RawGetStr(key); existing.IsTable() {
+		return &Table{state: s, raw: existing.AsTable()}, false, nil
 	}
 	mt, err := s.vm.TryNewTable(0, 4)
 	if err != nil {

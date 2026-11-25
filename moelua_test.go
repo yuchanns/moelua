@@ -943,6 +943,34 @@ func TestNewMetatableMemoryLimitEnforcement(t *testing.T) {
 	if err != nil || len(res) != 1 || res[0].Int() != 3 {
 		t.Fatalf("subsequent Lua execution failed after NewMetatable OOM: res=%v err=%v", res, err)
 	}
+
+	// Regression: distinct <=40-byte metatable names must be accounted BEFORE interning so
+	// recounted live storage never silently exceeds WithMemoryLimit.
+	s2 := moelua.New(moelua.WithMemoryLimit(65536))
+	defer s2.Close()
+	s2.CollectGarbage()
+	hitLimit := false
+	for i := range 200 {
+		name := fmt.Sprintf("%040d", i) // exact 40-byte short string
+		mt, created, err := s2.TryNewMetatable(name)
+		if err != nil {
+			if mt != nil || created || !strings.Contains(err.Error(), "not enough memory") {
+				t.Fatalf("unexpected TryNewMetatable error at %d: mt=%v created=%v err=%v", i, mt, created, err)
+			}
+			hitLimit = true
+			break
+		}
+		if !created || mt == nil {
+			t.Fatalf("expected created=true for %q", name)
+		}
+	}
+	if !hitLimit {
+		t.Fatalf("expected 40-byte TryNewMetatable registrations to hit 64KiB memory limit")
+	}
+	s2.CollectGarbage()
+	if usage := s2.MemoryUsage(); usage > 65536 {
+		t.Fatalf("recounted MemoryUsage()=%d exceeded 65536 limit after short-name TryNewMetatable registrations", usage)
+	}
 }
 
 func TestTableSetStringMemoryLimitEnforcement(t *testing.T) {
