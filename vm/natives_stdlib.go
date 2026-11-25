@@ -237,7 +237,7 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 				return nil, err
 			}
 			if !ok {
-				return []Value{NilValue()}, nil
+				return nil, nil
 			}
 			return s.capturesToValuesRooted(caps, len(str))
 		},
@@ -365,11 +365,8 @@ func nativeStringPack(s *State, args []Value) ([]Value, error) {
 			pargs[i] = luastdlib.PackValue{Kind: ^luastdlib.PackKind(0)}
 		}
 	}
-	var checkSize func(int64) error
-	if s.memLimit > 0 {
-		checkSize = func(n int64) error {
-			return s.checkMem(n + 48)
-		}
+	checkSize := func(n int64) error {
+		return s.checkMem(n + 48)
 	}
 	res, err := luastdlib.PackWithControls(fmtStr, checkSize, s.nativeCancelFunc(), pargs...)
 	if err != nil {
@@ -405,6 +402,9 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 	var strBytes int64
 	nextPos, err := luastdlib.UnpackEachWithCancel(fmtStr, data, initPos, cancelFn, func(pv luastdlib.PackValue) error {
 		count++
+		if count > 1_000_000 {
+			return fmt.Errorf("too many results to unpack")
+		}
 		if s.memLimit > 0 {
 			checkNow := (count & 63) == 0
 			if pv.Kind == luastdlib.PackString {
@@ -649,6 +649,9 @@ func nativeUTF8Codepoint(s *State, args []Value) ([]Value, error) {
 	var count int64
 	if err := luastdlib.CodepointEach(str, i, j, lax, func(_ int64) error {
 		count++
+		if count > 1_000_000 {
+			return fmt.Errorf("string slice too long")
+		}
 		if cancelFn != nil && (count&1023) == 0 {
 			if cerr := cancelFn(); cerr != nil {
 				return cerr
@@ -714,6 +717,42 @@ func nativeUTF8Len(s *State, args []Value) ([]Value, error) {
 	return []Value{IntValue(cnt)}, nil
 }
 
+var (
+	utf8CodesStrictIter = &NativeFunc{
+		Name: "utf8_codes_iter",
+		Fn:   makeUTF8CodesIterFn(false),
+	}
+	utf8CodesLaxIter = &NativeFunc{
+		Name: "utf8_codes_iter",
+		Fn:   makeUTF8CodesIterFn(true),
+	}
+)
+
+func makeUTF8CodesIterFn(lax bool) func(*State, []Value) ([]Value, error) {
+	return func(_ *State, iargs []Value) ([]Value, error) {
+		sv, err := checkStringArg(iargs, 0, "codes")
+		if err != nil {
+			return nil, err
+		}
+		pos := int64(0)
+		if len(iargs) >= 2 && !iargs[1].IsNil() {
+			var ok bool
+			pos, ok = iargs[1].CoerceInt()
+			if !ok {
+				return nil, fmt.Errorf("bad argument #2 to 'codes' (number expected)")
+			}
+		}
+		nextPos, cp, ok, err := luastdlib.Next(sv, pos, lax)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, nil
+		}
+		return []Value{IntValue(nextPos), IntValue(cp)}, nil
+	}
+}
+
 func nativeUTF8Codes(s *State, args []Value) ([]Value, error) {
 	str, err := checkStringArg(args, 0, "codes")
 	if err != nil {
@@ -733,29 +772,9 @@ func nativeUTF8Codes(s *State, args []Value) ([]Value, error) {
 		}
 		strVal = StringValue(ls)
 	}
-	if s.memLimit > 0 {
-		if err := s.checkMemAndAccount(48); err != nil {
-			return nil, err
-		}
-	}
-	iter := &NativeFunc{
-		Name:        "utf8_codes_iter",
-		Collectable: true,
-		Fn: func(_ *State, iargs []Value) ([]Value, error) {
-			sv, _ := checkStringArg(iargs, 0, "codes")
-			pos := int64(0)
-			if len(iargs) >= 2 && !iargs[1].IsNil() {
-				pos, _ = iargs[1].CoerceInt()
-			}
-			nextPos, cp, ok, err := luastdlib.Next(sv, pos, lax)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				return []Value{NilValue()}, nil
-			}
-			return []Value{IntValue(nextPos), IntValue(cp)}, nil
-		},
+	iter := utf8CodesStrictIter
+	if lax {
+		iter = utf8CodesLaxIter
 	}
 	return []Value{NativeValue(iter), strVal, IntValue(0)}, nil
 }
@@ -854,6 +873,25 @@ func estimateDumpBytes(p *bytecode.Proto, strip bool) int64 {
 type limitedStringWriter struct {
 	sb        strings.Builder
 	checkSize func(int64) error
+	cancelFn  func() error
+	written   int64
+}
+
+func (w *limitedStringWriter) pollCancel(n int) error {
+	if w.cancelFn == nil || n <= 0 {
+		return nil
+	}
+	const stride = 4096
+	prev := w.written / stride
+	w.written += int64(n)
+	cur := w.written / stride
+	for prev < cur {
+		prev++
+		if err := w.cancelFn(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *limitedStringWriter) Write(p []byte) (int, error) {
@@ -861,6 +899,24 @@ func (w *limitedStringWriter) Write(p []byte) (int, error) {
 		if err := w.checkSize(int64(w.sb.Len() + len(p))); err != nil {
 			return 0, err
 		}
+	}
+	if w.cancelFn != nil && len(p) > 4096 {
+		total := 0
+		for off := 0; off < len(p); off += 4096 {
+			end := min(off+4096, len(p))
+			if err := w.pollCancel(end - off); err != nil {
+				return total, err
+			}
+			n, err := w.sb.Write(p[off:end])
+			total += n
+			if err != nil {
+				return total, err
+			}
+		}
+		return total, nil
+	}
+	if err := w.pollCancel(len(p)); err != nil {
+		return 0, err
 	}
 	return w.sb.Write(p)
 }
@@ -871,6 +927,24 @@ func (w *limitedStringWriter) WriteString(s string) (int, error) {
 			return 0, err
 		}
 	}
+	if w.cancelFn != nil && len(s) > 4096 {
+		total := 0
+		for off := 0; off < len(s); off += 4096 {
+			end := min(off+4096, len(s))
+			if err := w.pollCancel(end - off); err != nil {
+				return total, err
+			}
+			n, err := w.sb.WriteString(s[off:end])
+			total += n
+			if err != nil {
+				return total, err
+			}
+		}
+		return total, nil
+	}
+	if err := w.pollCancel(len(s)); err != nil {
+		return 0, err
+	}
 	return w.sb.WriteString(s)
 }
 
@@ -880,6 +954,16 @@ func nativeStringDump(s *State, args []Value) ([]Value, error) {
 	}
 	strip := len(args) >= 2 && !args[1].IsFalsy()
 	p := args[0].AsClosure().bp.proto
+	cancelFn := s.nativeCancelFunc()
+	if s.abortErr != nil {
+		return nil, s.abortErr
+	}
+	if s.ctx != nil {
+		if err := s.ctx.Err(); err != nil {
+			s.abortErr = err
+			return nil, err
+		}
+	}
 	var checkSize func(int64) error
 	if s.memLimit > 0 {
 		est := estimateDumpBytes(p, strip)
@@ -890,7 +974,7 @@ func nativeStringDump(s *State, args []Value) ([]Value, error) {
 			return s.checkMem(n + 48)
 		}
 	}
-	w := limitedStringWriter{checkSize: checkSize}
+	w := limitedStringWriter{checkSize: checkSize, cancelFn: cancelFn}
 	if err := bytecode.DumpTo(&w, p, strip); err != nil {
 		return nil, err
 	}

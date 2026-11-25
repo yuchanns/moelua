@@ -65,12 +65,13 @@ const (
 
 // Userdata represents a full Lua userdata with metatable and user values (Lua 5.4/5.5 nuvalue).
 type Userdata struct {
-	Data    any
-	Meta    *Table
-	UValues []Value
-	gcMark  uint64
-	gcFnzed bool
-	gcInFnz bool
+	Data      any
+	Meta      *Table
+	UValues   []Value
+	gcMark    uint64
+	gcFnzed   bool
+	gcInFnz   bool
+	gcPending bool
 }
 
 // LuaError wraps any Lua Value raised via error(v) so pcall/xpcall preserve non-string errors verbatim.

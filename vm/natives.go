@@ -113,6 +113,7 @@ func (s *State) initStdlib() {
 	s.stringMeta = s.NewTable(0, 12)
 	s.stringMeta.RawSetStr(s, s.intern.tms[TMIndex], TableValue(strTbl))
 	s.initStringArithMetamethods(s.stringMeta)
+	s.stringMeta.markProto(s)
 	s.typeMetas[4] = s.stringMeta
 
 	// coroutine, debug, io, os, package, load/loadfile/dofile/warn
@@ -208,8 +209,8 @@ func (s *State) toStringValue(v Value) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if len(res) > 0 && res[0].IsString() {
-			return res[0].AsString().S, nil
+		if len(res) > 0 && (res[0].IsString() || res[0].IsNumber()) {
+			return FormatValue(res[0]), nil
 		}
 		return "", fmt.Errorf("'__tostring' must return a string")
 	}
@@ -278,9 +279,14 @@ func nativeError(s *State, args []Value) ([]Value, error) {
 	}
 	level := 1
 	if len(args) >= 2 && !args[1].IsNil() {
-		if lv, ok := args[1].CoerceInt(); ok {
-			level = int(lv)
+		lv, ok := args[1].CoerceInt()
+		if !ok {
+			if args[1].IsFloat() {
+				return nil, fmt.Errorf("bad argument #2 to 'error' (number has no integer representation)")
+			}
+			return nil, fmt.Errorf("bad argument #2 to 'error' (number expected, got %s)", s.objTypeName(args[1]))
 		}
+		level = int(lv)
 	}
 	if level > 0 && args[0].IsString() {
 		if where := s.errorWhere(level); where != "" {
@@ -326,7 +332,14 @@ func nativeXPCall(s *State, args []Value) ([]Value, error) {
 		if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 			return nil, err
 		}
-		errVal, uerr := s.callXPCallHandler(s.cur, args[1], errorToLuaValue(s, err))
+		var rawErr Value
+		var le *LuaError
+		if errors.As(err, &le) {
+			rawErr = le.Val
+		} else {
+			rawErr = errorToLuaValue(s, err)
+		}
+		errVal, uerr := s.callXPCallHandler(s.cur, args[1], rawErr)
 		if uerr != nil {
 			return nil, uerr
 		}
@@ -363,7 +376,7 @@ func nativeToString(s *State, args []Value) ([]Value, error) {
 	return []Value{StringValue(ls)}, nil
 }
 
-func nativeToNumber(_ *State, args []Value) ([]Value, error) {
+func nativeToNumber(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'tonumber' (value expected)")
 	}
@@ -384,12 +397,19 @@ func nativeToNumber(_ *State, args []Value) ([]Value, error) {
 		}
 		return []Value{FloatValue(fv)}, nil
 	}
-	base, ok := args[1].CoerceInt()
-	if !ok || base < 2 || base > 36 {
-		return nil, fmt.Errorf("bad argument #2 to 'tonumber' (base out of range)")
-	}
+	// Per Lua 5.5 lbaselib.c:luaB_tonumber: validate argument #1 is a string BEFORE checking base (#2).
 	if !v.IsString() {
-		return nil, fmt.Errorf("bad argument #1 to 'tonumber' (string expected)")
+		return nil, fmt.Errorf("bad argument #1 to 'tonumber' (string expected, got %s)", s.objTypeName(v))
+	}
+	base, ok := args[1].CoerceInt()
+	if !ok {
+		if args[1].IsFloat() {
+			return nil, fmt.Errorf("bad argument #2 to 'tonumber' (number has no integer representation)")
+		}
+		return nil, fmt.Errorf("bad argument #2 to 'tonumber' (number expected, got %s)", s.objTypeName(args[1]))
+	}
+	if base < 2 || base > 36 {
+		return nil, fmt.Errorf("bad argument #2 to 'tonumber' (base out of range)")
 	}
 	iv, ok := luastdlib.StrToIntBase(v.AsString().S, int(base))
 	if !ok {
@@ -422,16 +442,33 @@ func nativeSelect(_ *State, args []Value) ([]Value, error) {
 	return args[idx:], nil
 }
 
-func nativeRawGet(_ *State, args []Value) ([]Value, error) {
-	if len(args) < 2 || !args[0].IsTable() {
-		return nil, fmt.Errorf("bad argument #1 to 'rawget' (table expected)")
+func nativeRawGet(s *State, args []Value) ([]Value, error) {
+	if len(args) == 0 || !args[0].IsTable() {
+		got := "no value"
+		if len(args) >= 1 {
+			got = s.objTypeName(args[0])
+		}
+		return nil, fmt.Errorf("bad argument #1 to 'rawget' (table expected, got %s)", got)
+	}
+	if len(args) < 2 {
+		return nil, fmt.Errorf("bad argument #2 to 'rawget' (value expected)")
 	}
 	return []Value{args[0].AsTable().RawGet(args[1])}, nil
 }
 
 func nativeRawSet(s *State, args []Value) ([]Value, error) {
-	if len(args) < 3 || !args[0].IsTable() {
-		return nil, fmt.Errorf("bad argument #1 to 'rawset' (table expected)")
+	if len(args) == 0 || !args[0].IsTable() {
+		got := "no value"
+		if len(args) >= 1 {
+			got = s.objTypeName(args[0])
+		}
+		return nil, fmt.Errorf("bad argument #1 to 'rawset' (table expected, got %s)", got)
+	}
+	if len(args) < 2 {
+		return nil, fmt.Errorf("bad argument #2 to 'rawset' (value expected)")
+	}
+	if len(args) < 3 {
+		return nil, fmt.Errorf("bad argument #3 to 'rawset' (value expected)")
 	}
 	if err := args[0].AsTable().RawSet(s, args[1], args[2]); err != nil {
 		return nil, err
@@ -460,8 +497,20 @@ func nativeRawLen(_ *State, args []Value) ([]Value, error) {
 }
 
 func nativeSetMetatable(s *State, args []Value) ([]Value, error) {
-	if len(args) < 2 || !args[0].IsTable() {
-		return nil, fmt.Errorf("bad argument #1 to 'setmetatable' (table expected)")
+	if len(args) == 0 || !args[0].IsTable() {
+		got := "no value"
+		if len(args) >= 1 {
+			got = s.objTypeName(args[0])
+		}
+		return nil, fmt.Errorf("bad argument #1 to 'setmetatable' (table expected, got %s)", got)
+	}
+	// Per Lua 5.5 lbaselib.c:luaB_setmetatable: check argument #2 type BEFORE checking __metatable protection.
+	if len(args) < 2 || (!args[1].IsNil() && !args[1].IsTable()) {
+		got := "no value"
+		if len(args) >= 2 {
+			got = s.objTypeName(args[1])
+		}
+		return nil, fmt.Errorf("bad argument #2 to 'setmetatable' (nil or table expected, got %s)", got)
 	}
 	t := args[0].AsTable()
 	if t.meta != nil && !t.meta.RawGetStr(s.intern.Intern("__metatable")).IsNil() {
@@ -473,9 +522,6 @@ func nativeSetMetatable(s *State, args []Value) ([]Value, error) {
 			return nil, err
 		}
 		return []Value{args[0]}, nil
-	}
-	if !args[1].IsTable() {
-		return nil, fmt.Errorf("bad argument #2 to 'setmetatable' (nil or table expected)")
 	}
 	s.SetMetatable(t, args[1].AsTable())
 	if err := s.ConsumeMemErr(); err != nil {
@@ -692,18 +738,30 @@ func nativeMathAtan(_ *State, args []Value) ([]Value, error) {
 	return []Value{FloatValue(math.Atan(y))}, nil
 }
 
-func nativeMathLog(_ *State, args []Value) ([]Value, error) {
+func nativeMathLog(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'log' (number expected, got no value)")
 	}
 	x, ok := args[0].CoerceFloat()
 	if !ok {
-		return nil, fmt.Errorf("bad argument #1 to 'log' (number expected, got %s)", args[0].TypeName())
+		return nil, fmt.Errorf("bad argument #1 to 'log' (number expected, got %s)", s.objTypeName(args[0]))
 	}
 	if len(args) >= 2 && !args[1].IsNil() {
 		b, ok := args[1].CoerceFloat()
 		if !ok {
-			return nil, fmt.Errorf("bad argument #2 to 'log'")
+			return nil, fmt.Errorf("bad argument #2 to 'log' (number expected, got %s)", s.objTypeName(args[1]))
+		}
+		if b == 2.0 {
+			return []Value{FloatValue(math.Log2(x))}, nil
+		}
+		if b == 10.0 {
+			r := math.Log10(x)
+			if !math.IsNaN(r) && !math.IsInf(r, 0) {
+				if ri := math.Round(r); ri >= -308 && ri <= 308 && math.Pow10(int(ri)) == x {
+					r = ri
+				}
+			}
+			return []Value{FloatValue(r)}, nil
 		}
 		return []Value{FloatValue(math.Log(x) / math.Log(b))}, nil
 	}
@@ -1028,6 +1086,7 @@ func nativeTableCreate(s *State, args []Value) ([]Value, error) {
 	}
 	t := s.NewTable(int(nseq), int(nrec))
 	s.gc.allocBytes += checkBytes
+	s.gcAddDebt(checkBytes)
 	return []Value{TableValue(t)}, nil
 }
 
@@ -1334,6 +1393,11 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 		}
 		iterCount++
 		if k > i && sep != "" {
+			if s.memLimit > 0 {
+				if err := s.checkMem(int64(sb.Len()) + int64(len(sep)) + 48); err != nil {
+					return nil, err
+				}
+			}
 			sb.WriteString(sep)
 		}
 		var v Value
@@ -1349,12 +1413,13 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 		if !v.IsString() && !v.IsNumber() {
 			return nil, fmt.Errorf("invalid value (%s) at index %d in table for 'concat'", v.TypeName(), k)
 		}
-		sb.WriteString(FormatValue(v))
-		if s.memLimit > 0 && int64(sb.Len()) > s.memLimit {
-			if err := s.checkMem(int64(sb.Len())); err != nil {
+		piece := FormatValue(v)
+		if s.memLimit > 0 {
+			if err := s.checkMem(int64(sb.Len()) + int64(len(piece)) + 48); err != nil {
 				return nil, err
 			}
 		}
+		sb.WriteString(piece)
 		if k == math.MaxInt64 {
 			break
 		}
@@ -1405,6 +1470,29 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 			}
 			reverse = eq
 		}
+		var rootSlot int
+		var savedTop int
+		var th *Thread
+		if !rawFast {
+			th = s.cur
+			savedTop = th.top
+			rootSlot = savedTop
+			for fi := range th.nframe {
+				cf := &th.frames[fi]
+				if cf.cl != nil {
+					if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > rootSlot {
+						rootSlot = end
+					}
+				}
+			}
+			if err := th.ensureStack(rootSlot + 2); err != nil {
+				return nil, err
+			}
+			defer func() {
+				th.stack[rootSlot] = NilValue()
+				th.top = savedTop
+			}()
+		}
 		if reverse {
 			for i := n - 1; i >= 0; i-- {
 				if cancelFn != nil && ((n-1-i)&1023) == 0 {
@@ -1422,6 +1510,8 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 					if err != nil {
 						return nil, err
 					}
+					th.stack[rootSlot] = v
+					th.top = rootSlot + 1
 					if err := s.tableSetInt(dst, tpos+i, v); err != nil {
 						return nil, err
 					}
@@ -1444,6 +1534,8 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 					if err != nil {
 						return nil, err
 					}
+					th.stack[rootSlot] = v
+					th.top = rootSlot + 1
 					if err := s.tableSetInt(dst, tpos+i, v); err != nil {
 						return nil, err
 					}
@@ -1783,6 +1875,9 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 	if n <= 1 {
 		return nil, nil
 	}
+	if hasComp && !args[1].IsFunction() {
+		return nil, fmt.Errorf("bad argument #2 to 'sort' (function expected, got %s)", s.objTypeName(args[1]))
+	}
 	if s.memLimit > 0 {
 		if err := s.checkMem(int64(n) * 16); err != nil {
 			return nil, err
@@ -2045,6 +2140,19 @@ func nativeStringByte(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeStringChar(s *State, args []Value) ([]Value, error) {
+	checkByte := func(i int, a Value) (byte, error) {
+		v, ok := a.CoerceInt()
+		if !ok {
+			if a.IsFloat() {
+				return 0, fmt.Errorf("bad argument #%d to 'char' (number has no integer representation)", i+1)
+			}
+			return 0, fmt.Errorf("bad argument #%d to 'char' (number expected, got %s)", i+1, s.objTypeName(a))
+		}
+		if v < 0 || v > 255 {
+			return 0, fmt.Errorf("bad argument #%d to 'char' (value out of range)", i+1)
+		}
+		return byte(v), nil
+	}
 	cancelFn := s.nativeCancelFunc()
 	if cancelFn != nil {
 		if s.memLimit > 0 {
@@ -2059,11 +2167,11 @@ func nativeStringChar(s *State, args []Value) ([]Value, error) {
 					return nil, err
 				}
 			}
-			v, ok := a.CoerceInt()
-			if !ok || v < 0 || v > 255 {
-				return nil, fmt.Errorf("bad argument #%d to 'char' (value out of range)", i+1)
+			b, err := checkByte(i, a)
+			if err != nil {
+				return nil, err
 			}
-			buf = append(buf, byte(v))
+			buf = append(buf, b)
 		}
 		ls, err := s.TryIntern(string(buf))
 		if err != nil {
@@ -2076,11 +2184,11 @@ func nativeStringChar(s *State, args []Value) ([]Value, error) {
 	}
 	buf := make([]byte, len(args))
 	for i, a := range args {
-		v, ok := a.CoerceInt()
-		if !ok || v < 0 || v > 255 {
-			return nil, fmt.Errorf("bad argument #%d to 'char' (value out of range)", i+1)
+		b, err := checkByte(i, a)
+		if err != nil {
+			return nil, err
 		}
-		buf[i] = byte(v)
+		buf[i] = b
 	}
 	return []Value{StringValue(s.intern.Intern(string(buf)))}, nil
 }
@@ -2090,19 +2198,23 @@ func (s *State) callerIsMethod() bool {
 	if s.cur == nil || s.cur.nframe == 0 {
 		return false
 	}
-	for i := s.cur.nframe - 1; i >= 0; i-- {
-		cf := &s.cur.frames[i]
-		if cf.kind == frameLua && cf.cl != nil {
-			p := cf.cl.bp.proto
-			pc := cf.pc - 1
-			if pc >= 0 && pc < len(p.Code) {
-				w := p.Code[pc]
-				if w.Op() == bytecode.OP_CALL || w.Op() == bytecode.OP_TAILCALL {
-					_, kind := findObjectName(p, int(w.A()), pc)
-					return kind == "method"
-				}
+	idx := s.cur.nframe - 1
+	if s.cur.frames[idx].kind == frameNative {
+		idx--
+	}
+	if idx < 0 {
+		return false
+	}
+	cf := &s.cur.frames[idx]
+	if cf.kind == frameLua && cf.cl != nil {
+		p := cf.cl.bp.proto
+		pc := cf.pc - 1
+		if pc >= 0 && pc < len(p.Code) {
+			w := p.Code[pc]
+			if w.Op() == bytecode.OP_CALL || w.Op() == bytecode.OP_TAILCALL {
+				_, kind := findObjectName(p, int(w.A()), pc)
+				return kind == "method"
 			}
-			return false
 		}
 	}
 	return false
@@ -2208,7 +2320,7 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #3 to 'rep' (string expected, got %s)", args[2].TypeName())
 		}
 	}
-	const maxRepSize = 1 << 28 // 256 MiB guard against int overflow / OOM
+	const maxRepSize = 1 << 30 // 1 GiB guard matching checkMem hardSingleAllocLimit
 	l := int64(len(str))
 	ls := int64(len(sep))
 	if l == 0 && ls == 0 {

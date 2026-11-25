@@ -477,6 +477,9 @@ func PackWithControls(fmtStr string, checkSize func(int64) error, cancelFn func(
 			}
 			buf = append(buf, s...)
 			if pad := size - uint64(len(s)); pad > 0 {
+				if pad > (1 << 30) {
+					return "", errors.New("result too long")
+				}
 				buf = append(buf, make([]byte, pad)...)
 			}
 

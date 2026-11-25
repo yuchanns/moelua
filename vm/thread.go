@@ -126,6 +126,7 @@ type Thread struct {
 	hookCount     int
 	oldPC         int
 	inHook        bool
+	suppressHook  bool // true inside __gc finalizers (matching L->allowhook = 0 without clobbering hookMask)
 
 	// Window generation counter for -tags moeluaregcheck verification.
 	stackGen uint32
@@ -176,9 +177,6 @@ func (th *Thread) ensureFrameCap(need, limit int) error {
 		return nil
 	}
 	if need > limit {
-		if th.state != nil {
-			return &LuaError{Val: StringValue(th.state.intern.Intern("stack overflow"))}
-		}
 		return fmt.Errorf("stack overflow")
 	}
 	newCap := len(th.frames) * 2
@@ -209,18 +207,19 @@ func (th *Thread) ensureStack(need int) error {
 	if need+stackSlack <= len(th.stack) {
 		return nil
 	}
-	if need < 0 || need+stackSlack > maxStackSlots {
-		if th.state != nil {
-			return &LuaError{Val: StringValue(th.state.intern.Intern("stack overflow"))}
-		}
+	limit := maxStackSlots
+	if th.inErrHandler {
+		limit = maxStackSlots + 8192
+	}
+	if need < 0 || need+stackSlack > limit {
 		return fmt.Errorf("stack overflow")
 	}
 	newSize := len(th.stack) * 2
 	for newSize < need+stackSlack {
 		newSize *= 2
 	}
-	if newSize > maxStackSlots {
-		newSize = maxStackSlots
+	if newSize > limit {
+		newSize = limit
 	}
 	delta := int64(newSize-len(th.stack)) * 16
 	if th.state != nil && th.state.memLimit > 0 {
@@ -311,6 +310,11 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 	th.closeUpvals(level)
 	raised := false
 	prevCur := th.state.cur
+	var prevStatus ThreadStatus
+	if prevCur != nil && prevCur != th {
+		prevStatus = prevCur.status
+		prevCur.status = ThreadNormal
+	}
 	th.state.cur = th
 	errSlot := len(th.syncCloseErrs)
 	th.syncCloseErrs = append(th.syncCloseErrs, errVal)
@@ -318,6 +322,9 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 		th.syncCloseErrs[errSlot] = NilValue()
 		th.syncCloseErrs = th.syncCloseErrs[:errSlot]
 		th.state.cur = prevCur
+		if prevCur != nil && prevCur != th {
+			prevCur.status = prevStatus
+		}
 	}()
 	for len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level {
 		idx := th.tbc[len(th.tbc)-1]
@@ -347,6 +354,14 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 				return errVal, hasErr, raised
 			}
 			if errors.Is(err, errCoroCloseSelf) {
+				if th.closing {
+					// Coroutine called coroutine.close(self) while already closing:
+					// unwind this __close call and continue closing any remaining TBC vars.
+					if errors.Is(th.state.abortErr, errCoroCloseSelf) {
+						th.state.abortErr = nil
+					}
+					continue
+				}
 				th.state.abortErr = err
 				return errVal, hasErr, raised
 			}

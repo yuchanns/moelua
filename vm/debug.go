@@ -31,6 +31,9 @@ func getFuncLine(p *bytecode.Proto, pc int) int {
 			}
 		}
 		basePC = int(p.AbsLineInfo[lo].PC)
+		if basePC < 0 {
+			basePC = 0
+		}
 		baseLine = int(p.AbsLineInfo[lo].Line)
 		for i := basePC + 1; i <= pc; i++ {
 			baseLine += int(p.LineInfo[i])
@@ -179,7 +182,7 @@ func (s *State) formatTraceback(th *Thread, msg string, hasMsg bool, level int) 
 			eb.WriteString(" in main chunk")
 		} else if name, namewhat := funcNameFromCall(th, i); namewhat != "" {
 			if namewhat == "metamethod" {
-				eb.WriteString(fmt.Sprintf(" in metamethod '%s'", strings.TrimPrefix(name, "__")))
+				eb.WriteString(fmt.Sprintf(" in metamethod '%s'", name))
 			} else if namewhat == "hook" {
 				eb.WriteString(" in hook '?'")
 			} else if namewhat == "for iterator" {
@@ -273,8 +276,11 @@ func nativeUpvalueCount(nf *NativeFunc) int {
 	return n
 }
 
-func fillCFrameInfo(s *State, what string, cfunc Value, cname, namewhat string, ftransfer, ntransfer int64) *Table {
-	info := s.NewTable(0, 10)
+func fillCFrameInfo(s *State, what string, cfunc Value, cname, namewhat string, ftransfer, ntransfer int64) (*Table, error) {
+	info, err := s.TryNewTable(0, 10)
+	if err != nil {
+		return nil, err
+	}
 	nups := int64(0)
 	if cfunc.IsNative() {
 		nups = int64(nativeUpvalueCount(cfunc.AsNative()))
@@ -309,7 +315,10 @@ func fillCFrameInfo(s *State, what string, cfunc Value, cname, namewhat string, 
 	if strings.ContainsRune(what, 'f') {
 		info.RawSetStr(s, s.intern.Intern("func"), cfunc)
 	}
-	return info
+	if err := s.ConsumeMemErr(); err != nil {
+		return nil, err
+	}
+	return info, nil
 }
 
 func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
@@ -345,7 +354,11 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			if s.builtinDebugGetInfo != nil {
 				cfunc = NativeValue(s.builtinDebugGetInfo)
 			}
-			return []Value{TableValue(fillCFrameInfo(s, what, cfunc, "getinfo", "field", 0, 0))}, nil
+			info, err := fillCFrameInfo(s, what, cfunc, "getinfo", "field", 0, 0)
+			if err != nil {
+				return nil, err
+			}
+			return []Value{TableValue(info)}, nil
 		}
 		// Level 0 on a suspended coroutine is coroutine.yield (C frame).
 		if th != s.cur && th.status == ThreadSuspended && lvl == 0 {
@@ -353,7 +366,11 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			if s.builtinCoroYield != nil {
 				cfunc = NativeValue(s.builtinCoroYield)
 			}
-			return []Value{TableValue(fillCFrameInfo(s, what, cfunc, "yield", "field", 0, 0))}, nil
+			info, err := fillCFrameInfo(s, what, cfunc, "yield", "field", 0, 0)
+			if err != nil {
+				return nil, err
+			}
+			return []Value{TableValue(info)}, nil
 		}
 		// Walk frames (1-based on current thread unless frameNative for getinfo itself is already on top;
 		// also 1-based on suspended coroutine because level 0 is coroutine.yield).
@@ -406,13 +423,20 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 					cfunc = s.GetGlobal("xpcall")
 				}
 			}
-			return []Value{TableValue(fillCFrameInfo(s, what, cfunc, cname, namewhat, int64(cf.ftransfer), int64(cf.ntransfer)))}, nil
+			info, err := fillCFrameInfo(s, what, cfunc, cname, namewhat, int64(cf.ftransfer), int64(cf.ntransfer))
+			if err != nil {
+				return nil, err
+			}
+			return []Value{TableValue(info)}, nil
 		}
 	} else {
 		return nil, fmt.Errorf("bad argument #1 to 'getinfo' (function or level expected)")
 	}
 
-	info := s.NewTable(0, 12)
+	info, err := s.TryNewTable(0, 12)
+	if err != nil {
+		return nil, err
+	}
 	if fn.IsClosure() {
 		p := fn.AsClosure().bp.proto
 		if strings.ContainsRune(what, 'S') {
@@ -479,7 +503,10 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			info.RawSetStr(s, s.intern.Intern("func"), fn)
 		}
 		if strings.ContainsRune(what, 'L') {
-			al := s.NewTable(0, 16)
+			al, err := s.TryNewTable(0, 16)
+			if err != nil {
+				return nil, err
+			}
 			startPC := 0
 			if len(p.Code) > 0 && p.Code[0].Op() == bytecode.OP_VARARGPREP {
 				startPC = 1
@@ -488,6 +515,9 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 				ln := getFuncLine(p, pc)
 				if ln > 0 {
 					al.RawSetInt(s, int64(ln), TrueValue())
+					if err := s.ConsumeMemErr(); err != nil {
+						return nil, err
+					}
 				}
 			}
 			info.RawSetStr(s, s.intern.Intern("activelines"), TableValue(al))
@@ -520,6 +550,9 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		if strings.ContainsRune(what, 'f') {
 			info.RawSetStr(s, s.intern.Intern("func"), fn)
 		}
+	}
+	if err := s.ConsumeMemErr(); err != nil {
+		return nil, err
 	}
 	return []Value{TableValue(info)}, nil
 }
@@ -631,6 +664,8 @@ func findObjectName(p *bytecode.Proto, reg, lastpc int) (string, string) {
 				}
 				return p.Consts[kIdx].Str, "field"
 			}
+		} else if w.Op() == bytecode.OP_GETI {
+			return "integer index", "field"
 		} else if w.Op() == bytecode.OP_GETTABLE {
 			// When constant index > 255, Lua 5.5 emits OP_LOADK/OP_LOADKX + OP_GETTABLE (errors.lua:327-331).
 			kReg := int(w.C())
@@ -680,6 +715,18 @@ func findObjectName(p *bytecode.Proto, reg, lastpc int) (string, string) {
 			}
 		}
 		return "", ""
+	case bytecode.OP_LOADK:
+		idx := w.Bx()
+		if idx < len(p.Consts) && p.Consts[idx].Kind == bytecode.ConstString {
+			return p.Consts[idx].Str, "constant"
+		}
+	case bytecode.OP_LOADKX:
+		if setpc+1 < len(p.Code) {
+			idx := p.Code[setpc+1].Ax()
+			if idx < len(p.Consts) && p.Consts[idx].Kind == bytecode.ConstString {
+				return p.Consts[idx].Str, "constant"
+			}
+		}
 	case bytecode.OP_SELF:
 		kIdx := int(w.C())
 		if kIdx < len(p.Consts) && p.Consts[kIdx].Kind == bytecode.ConstString {
@@ -703,12 +750,10 @@ func funcNameFromCall(th *Thread, cfIdx int) (string, string) {
 	if cfIdx == 0 || th.frames[cfIdx].isTailCall {
 		return "", ""
 	}
-	// Find enclosing Lua frame (skipping framePCall/frameXPCall wrappers).
+	// Only inspect immediate Lua caller frame (matching ldebug.c:funcnamefromcall;
+	// callbacks invoked from C frames like table.sort/pcall/gsub have no caller name).
 	callerIdx := cfIdx - 1
-	for callerIdx >= 0 && th.frames[callerIdx].kind != frameLua {
-		callerIdx--
-	}
-	if callerIdx < 0 {
+	if callerIdx < 0 || th.frames[callerIdx].kind != frameLua {
 		return "", ""
 	}
 	caller := &th.frames[callerIdx]
@@ -1139,11 +1184,14 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 		return nil, nil
 	}
 	if !rest[0].IsFunction() {
-		return nil, fmt.Errorf("bad argument #1 to 'sethook' (function expected)")
+		return nil, fmt.Errorf("bad argument #1 to 'sethook' (function expected, got %s)", s.objTypeName(rest[0]))
 	}
 	maskStr := ""
-	if len(rest) >= 2 && rest[1].IsString() {
-		maskStr = rest[1].AsString().S
+	if len(rest) >= 2 && !rest[1].IsNil() {
+		if !rest[1].IsString() && !rest[1].IsNumber() {
+			return nil, fmt.Errorf("bad argument #2 to 'sethook' (string expected, got %s)", s.objTypeName(rest[1]))
+		}
+		maskStr = FormatValue(rest[1])
 	}
 	var mask uint8
 	for i := range len(maskStr) {
@@ -1160,19 +1208,30 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 	if len(rest) >= 3 && !rest[2].IsNil() {
 		c, ok := rest[2].CoerceInt()
 		if !ok {
-			return nil, fmt.Errorf("bad argument #3 to 'sethook' (number expected)")
+			return nil, fmt.Errorf("bad argument #3 to 'sethook' (number expected, got %s)", s.objTypeName(rest[2]))
 		}
 		if c > 0 {
 			count = int(c)
 			mask |= HookMaskCount
 		}
 	}
+	if mask == 0 {
+		th.hook = NilValue()
+		th.hookMask = 0
+		th.baseHookCount = 0
+		th.hookCount = 0
+		return nil, nil
+	}
 	th.hook = rest[0]
 	th.hookMask = mask
 	th.baseHookCount = count
 	th.hookCount = count
-	if th.nframe > 0 {
-		cf := &th.frames[th.nframe-1]
+	idx := th.nframe - 1
+	if th == s.cur && idx >= 0 && th.frames[idx].kind == frameNative {
+		idx--
+	}
+	if idx >= 0 {
+		cf := &th.frames[idx]
 		if cf.kind == frameLua && cf.pc > 0 {
 			cf.dirty = true
 			cf.oldPC = cf.pc - 1
@@ -1183,6 +1242,9 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 
 func nativeDebugGetHook(s *State, args []Value) ([]Value, error) {
 	th, _ := optThreadArg(s, args)
+	if th.hook.IsNil() && th.hookMask == 0 {
+		return []Value{NilValue()}, nil
+	}
 	var sb strings.Builder
 	if th.hookMask&HookMaskCall != 0 {
 		sb.WriteByte('c')

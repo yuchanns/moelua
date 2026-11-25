@@ -94,6 +94,17 @@ func (s *State) finishPCallReturn(th *Thread, entryDepth int) (bool, error) {
 	// Results are at th.stack[calleeStart : calleeStart+got].
 	// We need [true, res0, res1, ...] at th.stack[funcIdx..].
 	total := 1 + got
+	if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
+		if err := th.ensureStack(calleeStart + got + 4); err != nil {
+			return false, err
+		}
+		cf.ftransfer = 1
+		cf.ntransfer = uint16(got)
+		if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+			th.nframe--
+			return false, herr
+		}
+	}
 	if nres < 0 { // MULTRET
 		if err := th.ensureStack(funcIdx + total + 4); err != nil {
 			return false, err
@@ -128,19 +139,18 @@ func (s *State) finishPCallReturn(th *Thread, entryDepth int) (bool, error) {
 //
 //go:noinline
 func (s *State) callXPCallHandler(th *Thread, msgh Value, errVal Value) (Value, error) {
+	if s.nCcalls >= maxCCallsErrHandler {
+		return StringValue(s.intern.Intern("error in error handling")), nil
+	}
 	prevErrH := th.inErrHandler
 	th.inErrHandler = true
 	defer func() { th.inErrHandler = prevErrH }()
 	for depth := 0; depth <= maxCCalls; depth++ {
-		if depth == maxCCalls || s.nCcalls >= maxCCalls-2 {
-			// Give msgh one last chance with "C stack overflow" (errors.lua:639); if that errors too -> "error in error handling".
+		if depth == maxCCalls || s.nCcalls >= maxCCalls {
+			// Give msgh one last chance with "C stack overflow" (errors.lua:639) using the
+			// reserved headroom up to maxCCallsErrHandler; never lower s.nCcalls.
 			overflowMsg := StringValue(s.intern.Intern("C stack overflow"))
-			savedCC := s.nCcalls
-			if s.nCcalls >= maxCCalls-2 {
-				s.nCcalls = maxCCalls - 4
-			}
 			hres, herr := s.callOnThread(th, msgh, []Value{overflowMsg})
-			s.nCcalls = savedCC
 			if herr != nil {
 				if errors.Is(herr, errCoroCloseSelf) || isUncatchableErr(herr) {
 					return NilValue(), herr
@@ -158,7 +168,7 @@ func (s *State) callXPCallHandler(th *Thread, msgh Value, errVal Value) (Value, 
 				return NilValue(), herr
 			}
 			// Per Lua 5.5 ldo.c:luaG_errormsg, an error inside msgh re-invokes msgh with the new error (errors.lua:635)!
-			errVal = s.runtimeErrorToValue(th, herr)
+			errVal = s.rawRuntimeErrorToValue(th, herr)
 			continue
 		}
 		if len(hres) == 0 || hres[0].IsNil() {
@@ -169,15 +179,26 @@ func (s *State) callXPCallHandler(th *Thread, msgh Value, errVal Value) (Value, 
 	return StringValue(s.intern.Intern("error in error handling")), nil
 }
 
+func (s *State) normalizeErrVal(v Value) Value {
+	if v.IsNil() {
+		return StringValue(s.intern.Intern("<no error object>"))
+	}
+	return v
+}
+
 func (s *State) runtimeErrorToValue(th *Thread, err error) Value {
+	if err == nil {
+		return NilValue()
+	}
+	return s.normalizeErrVal(s.rawRuntimeErrorToValue(th, err))
+}
+
+func (s *State) rawRuntimeErrorToValue(th *Thread, err error) Value {
 	if err == nil {
 		return NilValue()
 	}
 	var le *LuaError
 	if errors.As(err, &le) {
-		if le.Val.IsNil() {
-			return StringValue(s.intern.Intern("<no error object>"))
-		}
 		return le.Val
 	}
 	msg := err.Error()
@@ -223,7 +244,7 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 	if err == errYieldSentinel || err == errCoroCloseSelf || errors.Is(err, errYieldSentinel) || errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 		return false
 	}
-	errVal := s.runtimeErrorToValue(th, err)
+	rawErrVal := s.rawRuntimeErrorToValue(th, err)
 	// Locate nearest enclosing pcall/xpcall frame before unwinding anything.
 	catchIdx := -1
 	for j := th.nframe - 1; j >= entryDepth; j-- {
@@ -238,15 +259,19 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 	}
 	isXP := th.frames[catchIdx].kind == frameXPCall
 	var msgh Value
+	var errVal Value
 	if isXP {
 		msgh = th.frames[catchIdx].errFunc
-		// Call xpcall message handler BEFORE unwinding so debug.traceback/getinfo see full stack!
+		// Call xpcall message handler BEFORE unwinding so debug.traceback/getinfo see full stack,
+		// passing raw error value (including nil) per ldebug.c:luaG_errormsg.
 		var uerr error
-		errVal, uerr = s.callXPCallHandler(th, msgh, errVal)
+		errVal, uerr = s.callXPCallHandler(th, msgh, rawErrVal)
 		if uerr != nil {
 			s.abortErr = uerr
 			return false
 		}
+	} else {
+		errVal = s.normalizeErrVal(rawErrVal)
 	}
 	// Unwind frames down to catchIdx BEFORE running TBC __close so debug.getinfo(2) sees pcall/xpcall (coroutine.lua:249)!
 	cf := &th.frames[catchIdx]
@@ -286,6 +311,16 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 			}
 		} else {
 			errVal = newErr
+		}
+	}
+	if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
+		if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+			th.nframe--
+			if errors.Is(herr, errCoroCloseSelf) || isUncatchableErr(herr) {
+				s.abortErr = herr
+				return false
+			}
+			return s.handleError(th, entryDepth, herr)
 		}
 	}
 	funcIdx := cf.funcIdx
@@ -675,6 +710,9 @@ func (s *State) walkIndexChainOrFn(orig *Table, key *LuaString) (val Value, fnTM
 				return NilValue(), NilValue(), NilValue(), true, nil
 			}
 		} else {
+			if mt := s.getMetatableOf(cur); mt != nil {
+				mt.markProto(s)
+			}
 			tm = s.getTMByObj(cur, TMIndex)
 			if tm.IsNil() {
 				return NilValue(), NilValue(), NilValue(), false, fmt.Errorf("attempt to index a %s value", cur.TypeName())
@@ -1097,9 +1135,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			}
 		}
 		th.top = funcIdx + 1 + nargs
-		hookedNative := false
-		if th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook {
-			hookedNative = true
+		hookedNative := th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook && !th.suppressHook
+		pushedFrame := hookedNative || (nf.FastFn == nil && nf.Intrinsic == intrNone)
+		if pushedFrame {
 			if err := th.ensureFrameCap(th.nframe+1, maxFrames+128); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
@@ -1113,7 +1151,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				dirty:     true,
 			}
 			th.nframe++
-			if th.hookMask&HookMaskCall != 0 {
+			if hookedNative && th.hookMask&HookMaskCall != 0 {
 				if herr := s.fireHook(th, "call", NilValue()); herr != nil {
 					th.nframe--
 					return s.catchSlow(th, ev, false, herr)
@@ -1122,9 +1160,10 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		}
 		// Slice arguments after any call hook in case the hook grew th.stack or modified locals via debug.setlocal.
 		args := th.stack[funcIdx+1 : funcIdx+1+nargs]
-		if nf.FastFn != nil && !hookedNative {
+		if nf.FastFn != nil && !pushedFrame {
 			rv, err := nf.FastFn(s, args)
-			if err == nil && (th.hookMask == 0 || th.hookMask&HookMaskRet == 0 || th.inHook) {
+			if err == nil && (th.hookMask == 0 || th.hookMask&HookMaskRet == 0 || th.inHook || th.suppressHook) {
+				liveTop := funcIdx + 1
 				switch nresults {
 				case 1:
 					th.stack[funcIdx] = rv
@@ -1132,6 +1171,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 						th.top = end
 					}
 				case 0:
+					liveTop = funcIdx
 					if end := ev.base + int(ev.bp.maxStack); th.top < end {
 						th.top = end
 					}
@@ -1145,8 +1185,15 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					th.stack[funcIdx] = rv
 					fillNil(th.stack[funcIdx+1 : funcIdx+nresults])
 					th.top = funcIdx + nresults
+					liveTop = funcIdx + nresults
 					if end := ev.base + int(ev.bp.maxStack); th.top < end {
 						th.top = end
+					}
+				}
+				if s.gc.tier1 {
+					s.gcCheckDebt(liveTop)
+					if s.abortErr != nil {
+						return false, s.abortErr
 					}
 				}
 				return false, nil
@@ -1192,18 +1239,26 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			if err := th.placeResults(funcIdx, []Value{rv}, nresults); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
+			liveTop := th.top
 			if nresults >= 0 {
+				liveTop = funcIdx + nresults
 				if end := ev.base + int(ev.bp.maxStack); th.top < end {
 					th.top = end
+				}
+			}
+			if s.gc.tier1 {
+				s.gcCheckDebt(liveTop)
+				if s.abortErr != nil {
+					return false, s.abortErr
 				}
 			}
 			return false, nil
 		}
 		res, err := nf.callMulti(s, args)
-		if hookedNative || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook) {
+		if pushedFrame || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook) {
 			var hookErr error
-			if hookedNative {
-				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook {
+			if pushedFrame {
+				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
 					// Place returned results at cf.base so debug.getlocal(2, i) in return hook sees them (db.lua:555)!
 					if serr := th.ensureStack(funcIdx + 1 + len(res) + 4); serr != nil {
 						hookErr = serr
@@ -1270,14 +1325,28 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			if end := ev.base + int(ev.bp.proto.MaxStackSize); th.top < end {
 				th.top = end
 			}
+			if s.gc.tier1 {
+				s.gcCheckDebt(funcIdx + 1)
+				if s.abortErr != nil {
+					return false, s.abortErr
+				}
+			}
 			return false, nil
 		}
 		if err := th.placeResults(funcIdx, res, nresults); err != nil {
 			return s.catchSlow(th, ev, false, err)
 		}
+		liveTop := th.top
 		if nresults >= 0 {
+			liveTop = funcIdx + nresults
 			if end := ev.base + int(ev.bp.proto.MaxStackSize); th.top < end {
 				th.top = end
+			}
+		}
+		if s.gc.tier1 {
+			s.gcCheckDebt(liveTop)
+			if s.abortErr != nil {
+				return false, s.abortErr
 			}
 		}
 		return false, nil
@@ -1324,9 +1393,17 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			if err := th.placeResults(funcIdx, res, nresults); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
+			liveTop := th.top
 			if nresults >= 0 {
+				liveTop = funcIdx + nresults
 				if end := ev.base + int(ev.bp.proto.MaxStackSize); th.top < end {
 					th.top = end
+				}
+			}
+			if s.gc.tier1 {
+				s.gcCheckDebt(liveTop)
+				if s.abortErr != nil {
+					return false, s.abortErr
 				}
 			}
 			return false, nil
@@ -1340,9 +1417,10 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 // call and returning (results, hookedNative, err).
 func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extraDepth uint8, frameLimit int) ([]Value, bool, error) {
 	th.top = funcIdx + 1 + nargs
-	hookedNative := false
-	if th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook {
-		hookedNative = true
+	nf := fn.AsNative()
+	hookedNative := th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook && !th.suppressHook
+	pushedFrame := hookedNative || (nf.FastFn == nil && nf.Intrinsic == intrNone)
+	if pushedFrame {
 		if err := th.ensureFrameCap(th.nframe+1, frameLimit); err != nil {
 			return nil, false, err
 		}
@@ -1357,7 +1435,7 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 			dirty:     true,
 		}
 		th.nframe++
-		if th.hookMask&HookMaskCall != 0 {
+		if hookedNative && th.hookMask&HookMaskCall != 0 {
 			if herr := s.fireHook(th, "call", NilValue()); herr != nil {
 				th.nframe--
 				return nil, false, herr
@@ -1366,11 +1444,11 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 	}
 	// Re-slice arguments after any call hook in case the hook grew th.stack or modified locals via debug.setlocal.
 	args := th.stack[funcIdx+1 : funcIdx+1+nargs]
-	res, err := fn.AsNative().callMulti(s, args)
-	if hookedNative || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook) {
+	res, err := nf.callMulti(s, args)
+	if pushedFrame || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook) {
 		var hookErr error
-		if hookedNative {
-			if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook {
+		if pushedFrame {
+			if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
 				if serr := th.ensureStack(funcIdx + 1 + len(res) + 4); serr != nil {
 					hookErr = serr
 				} else {
@@ -1443,7 +1521,7 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 	}
 	cLimit := maxCCalls
 	if th.inErrHandler {
-		cLimit = maxCCalls + 20
+		cLimit = maxCCallsErrHandler
 	}
 	if s.nCcalls+pcalls >= cLimit {
 		return false, fmt.Errorf("C stack overflow")
@@ -1472,15 +1550,23 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 		calleeArgs = nargs - 1
 	}
 	th.frames[th.nframe] = callFrame{
-		kind:     kind,
-		base:     calleeIdx,
-		funcIdx:  funcIdx,
-		nresults: nresults,
-		errFunc:  errFunc,
-		nativeFn: th.stack[funcIdx],
-		dirty:    true,
+		kind:      kind,
+		base:      calleeIdx,
+		funcIdx:   funcIdx,
+		nresults:  nresults,
+		errFunc:   errFunc,
+		nativeFn:  th.stack[funcIdx],
+		ftransfer: 1,
+		ntransfer: uint16(nargs),
+		dirty:     true,
 	}
 	th.nframe++
+	if th.hookMask&HookMaskCall != 0 && !th.inHook && !th.suppressHook {
+		if herr := s.fireHook(th, "call", NilValue()); herr != nil {
+			th.nframe--
+			return false, herr
+		}
+	}
 	outerDepth := th.nframe
 	var extraDepth uint8
 	if !targetVal.IsClosure() && !targetVal.IsNative() {
@@ -1649,7 +1735,7 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 	base := ev.base
 	fnIdx := base + int(a) + 3
 	fn := th.stack[base+int(a)]
-	if OptimizeEnabled && (th.hookMask&(HookMaskCall|HookMaskRet) == 0 || th.inHook) && fn.IsNative() && fn.AsNative().Intrinsic == intrNext && th.stack[base+int(a)+1].IsTable() {
+	if OptimizeEnabled && (th.hookMask&(HookMaskCall|HookMaskRet) == 0 || th.inHook || th.suppressHook) && fn.IsNative() && fn.AsNative().Intrinsic == intrNext && th.stack[base+int(a)+1].IsTable() {
 		k, v, err := th.stack[base+int(a)+1].AsTable().Next(th.stack[base+int(a)+3])
 		if err == nil {
 			th.stack[fnIdx] = k
@@ -1816,6 +1902,13 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 	// All TBC vars >= level are closed!
 	if cf.closeResume == 2 {
 		// Finish protected-call error unwind after yieldable TBC close (locals.lua:1015)!
+		if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
+			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+				cf.closeResume = 0
+				th.nframe--
+				return false, herr
+			}
+		}
 		funcIdx := cf.funcIdx
 		nres := cf.nresults
 		errVal := cf.closeErr
@@ -1828,7 +1921,7 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 	}
 	if cf.closeResume == 1 {
 		// Finish pending OP_RETURN (fire return hook while cf is still on top of stack, locals.lua:852)!
-		if th.hookMask&HookMaskRet != 0 && !th.inHook {
+		if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
 			cf.ftransfer = uint16(cf.closeRetSrc - cf.base + 1)
 			cf.ntransfer = uint16(cf.closeRetN)
 			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
@@ -1899,9 +1992,6 @@ func (s *State) forPrepSlow(regs *[256]Value, a uint8) (bool, error) {
 				lim, ok = FloatToIntFloor(f)
 			}
 			if !ok {
-				if math.IsNaN(f) {
-					return true, nil
-				}
 				if f > 0 {
 					if step < 0 {
 						return true, nil
@@ -2672,7 +2762,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			cf.isTailCall = true
 			cf.extraArgs = extraDepth
 			cf.oldPC = -1
-			if th.hookMask&HookMaskCall != 0 && !th.inHook {
+			if th.hookMask&HookMaskCall != 0 && !th.inHook && !th.suppressHook {
 				nt := min(nargs, int(p.NumParams))
 				cf.ftransfer = 1
 				cf.ntransfer = uint16(nt)
@@ -2685,6 +2775,18 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		// Tailcall to native (check yieldable pcall/xpcall and coroutine.yield!)
 		nf := fn.AsNative()
 		if nf.Intrinsic == intrPCall && nargs >= 1 && isFlatProtectedTarget(th.stack[srcStart+1]) {
+			if pc < len(ev.bp.proto.Code) && ev.bp.proto.Code[pc].Op() == bytecode.OP_RETURN {
+				// Keep caller Lua frame alive across C pcall so stack trace & return hooks match Lua 5.5!
+				cf.pc = pc
+				pushed, err := s.pushProtectedCall(th, srcStart, nargs, -1, false)
+				if err != nil {
+					return coldContinue, pc, err
+				}
+				if pushed {
+					return coldReload, 0, nil
+				}
+				return coldContinue, pc, nil
+			}
 			nres := cf.nresults
 			if err := th.ensureStack(funcIdx + 1 + nargs + 4); err != nil {
 				return coldContinue, pc, err
@@ -2703,6 +2805,17 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			return coldReload, 0, nil
 		}
 		if nf.Intrinsic == intrXPCall && nargs >= 2 && isFlatProtectedTarget(th.stack[srcStart+1]) && th.stack[srcStart+2].IsFunction() {
+			if pc < len(ev.bp.proto.Code) && ev.bp.proto.Code[pc].Op() == bytecode.OP_RETURN {
+				cf.pc = pc
+				pushed, err := s.pushProtectedCall(th, srcStart, nargs, -1, true)
+				if err != nil {
+					return coldContinue, pc, err
+				}
+				if pushed {
+					return coldReload, 0, nil
+				}
+				return coldContinue, pc, nil
+			}
 			nres := cf.nresults
 			if err := th.ensureStack(funcIdx + 1 + nargs + 4); err != nil {
 				return coldContinue, pc, err
@@ -2746,9 +2859,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		}
 		nres := cf.nresults
 		th.top = srcStart + 1 + nargs
-		hookedNative := false
-		if th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook {
-			hookedNative = true
+		hookedNative := th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook && !th.suppressHook
+		pushedFrame := hookedNative || (nf.FastFn == nil && nf.Intrinsic == intrNone)
+		if pushedFrame {
 			if err := th.ensureFrameCap(th.nframe+1, maxFrames+128); err != nil {
 				return coldContinue, pc, err
 			}
@@ -2762,7 +2875,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				dirty:     true,
 			}
 			th.nframe++
-			if th.hookMask&HookMaskCall != 0 {
+			if hookedNative && th.hookMask&HookMaskCall != 0 {
 				if herr := s.fireHook(th, "call", NilValue()); herr != nil {
 					th.nframe--
 					return coldContinue, pc, herr
@@ -2772,10 +2885,10 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		args := make([]Value, nargs)
 		copy(args, th.stack[srcStart+1:srcStart+1+nargs])
 		res, err := nf.callMulti(s, args)
-		if hookedNative || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook) {
+		if pushedFrame || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook) {
 			var hookErr error
-			if hookedNative {
-				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook {
+			if pushedFrame {
+				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
 					if serr := th.ensureStack(srcStart + 1 + len(res) + 4); serr != nil {
 						hookErr = serr
 					} else {
@@ -2832,10 +2945,36 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		if err != nil {
 			return coldContinue, pc, err
 		}
+		// Fire caller Lua frame's return hook before popping it (matching Lua 5.5 lvm.c OP_TAILCALL + OP_RETURN).
+		if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
+			if serr := th.ensureStack(srcStart + len(res) + 4); serr != nil {
+				return coldContinue, pc, serr
+			}
+			copy(th.stack[srcStart:srcStart+len(res)], res)
+			if end := srcStart + len(res); th.top < end {
+				th.top = end
+			}
+			callerCF := &th.frames[ev.ci]
+			callerCF.dirty = true
+			callerCF.ftransfer = uint16(srcStart - callerCF.base + 1)
+			callerCF.ntransfer = uint16(len(res))
+			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+				return coldContinue, pc, herr
+			}
+			if len(res) > 0 {
+				copy(res, th.stack[srcStart:srcStart+len(res)])
+			}
+		}
 		if err := th.placeResults(funcIdx, res, nres); err != nil {
 			return coldContinue, pc, err
 		}
 		th.nframe--
+		if s.gc.tier1 {
+			s.gcCheckDebt(th.top)
+			if s.abortErr != nil {
+				return coldContinue, pc, s.abortErr
+			}
+		}
 		if th.nframe <= entryDepth {
 			return coldReturn, 0, nil
 		}
@@ -2886,7 +3025,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				}
 			}
 		}
-		if th.hookMask&HookMaskRet != 0 && !th.inHook {
+		if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
 			cf.dirty = true
 			if op == bytecode.OP_RETURN0 {
 				cf.ftransfer = 0
@@ -3092,6 +3231,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			return coldContinue, pc, nil
 		}
 		nextra := cf.nextraargs
+		if cf.varargTab != nil || ev.base < nextra {
+			return coldContinue, pc, fmt.Errorf("invalid vararg frame")
+		}
 		open := want < 0
 		if open {
 			want = nextra
@@ -3114,6 +3256,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 
 	case bytecode.OP_GETVARG:
 		cf := &th.frames[ev.ci]
+		if cf.varargTab != nil || ev.base < cf.nextraargs {
+			return coldContinue, pc, fmt.Errorf("invalid vararg frame")
+		}
 		rc := regs[uint8(w>>bytecode.PosC)]
 		if idx, ok := rc.ToInt(); ok {
 			if idx >= 1 && idx <= int64(cf.nextraargs) {
@@ -3134,7 +3279,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			if bx > 0 && bx-1 < len(ev.bp.strConsts) && ev.bp.strConsts[bx-1] != nil {
 				return coldContinue, pc, fmt.Errorf("global '%s' already defined", ev.bp.strConsts[bx-1].S)
 			}
-			return coldContinue, pc, fmt.Errorf("global already defined")
+			return coldContinue, pc, fmt.Errorf("global '?' already defined")
 		}
 		return coldContinue, pc, nil
 

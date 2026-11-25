@@ -21,6 +21,7 @@ const (
 	tblFlagGCFnzed    uint8 = 1 << 1
 	tblFlagGCInFnz    uint8 = 1 << 2
 	tblFlagGCWeakCand uint8 = 1 << 3
+	tblFlagGCPending  uint8 = 1 << 4
 )
 
 // hashNode is a slot in the open-addressing hash table.
@@ -438,12 +439,45 @@ func (t *Table) hashSet(key, val Value) int {
 		}
 		return -1
 	}
+	if slot, ok := t.hashFindSlot(key); ok {
+		t.hash.nodes[slot].val = val
+		return slot
+	}
 	if t.hash == nil || len(t.hash.nodes) == 0 {
 		t.initHash(4)
 	} else if int(t.hash.count+1)*10 >= len(t.hash.nodes)*7 {
 		t.growHash()
 	}
 	return t.hashPutNoGrow(key, val)
+}
+
+// hashSetChecked updates an existing hash entry in place (or deletes on nil) without
+// triggering growth or memory checks, and only checks memory before inserting a new key.
+func (t *Table) hashSetChecked(s *State, key, val Value) (int, error) {
+	if val.IsNil() {
+		if slot, ok := t.hashFindSlot(key); ok {
+			h := t.hash
+			h.nodes[slot].val = NilValue()
+			h.nodes[slot].dead = true
+			h.live--
+			h.dictGen++
+			return slot, nil
+		}
+		return -1, nil
+	}
+	if slot, ok := t.hashFindSlot(key); ok {
+		t.hash.nodes[slot].val = val
+		return slot, nil
+	}
+	if err := t.checkHashMem(s); err != nil {
+		return -1, err
+	}
+	if t.hash == nil || len(t.hash.nodes) == 0 {
+		t.initHash(4)
+	} else if int(t.hash.count+1)*10 >= len(t.hash.nodes)*7 {
+		t.growHash()
+	}
+	return t.hashPutNoGrow(key, val), nil
 }
 
 // demoteToDict converts a Shape-mode table into a dict-mode hash table.
@@ -560,11 +594,12 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 			return
 		}
 	}
-	if err := t.checkHashMem(s); err != nil {
+	slot, err := t.hashSetChecked(s, StringValue(k), val)
+	if err != nil {
 		s.memExceeded = true
 		return
 	}
-	if slot := t.hashSet(StringValue(k), val); val.IsNil() && slot >= 0 && s != nil {
+	if val.IsNil() && slot >= 0 && s != nil {
 		s.gc.hasDeadHashKeys = true
 	}
 }
@@ -706,6 +741,22 @@ func (t *Table) migrateHashIntRange(oldLen, newLen int, skipIdx int64) {
 func (t *Table) RawSetInt(s *State, i int64, val Value) {
 	if t.isProto() {
 		s.protoEpoch++
+	}
+	// If key already exists in the hash part (outside [1..arrLen]), update it in place
+	// rather than migrating it into the array mid-traversal (matching ltable.c).
+	if t.hash != nil && t.hash.live > 0 && (i < 1 || uint64(i-1) >= uint64(t.arrLen)) {
+		if slot, ok := t.hashFindSlot(IntValue(i)); ok {
+			h := t.hash
+			if val.IsNil() {
+				h.nodes[slot].val = NilValue()
+				h.nodes[slot].dead = true
+				h.live--
+				h.dictGen++
+			} else {
+				h.nodes[slot].val = val
+			}
+			return
+		}
 	}
 	if OptimizeEnabled {
 		if i >= 1 {
@@ -927,11 +978,10 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				return
 			}
 		}
-		if err := t.checkHashMem(s); err != nil {
+		if _, err := t.hashSetChecked(s, IntValue(i), val); err != nil {
 			s.memExceeded = true
 			return
 		}
-		t.hashSet(IntValue(i), val)
 		return
 	}
 
@@ -955,11 +1005,10 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 			return
 		}
 	}
-	if err := t.checkHashMem(s); err != nil {
+	if _, err := t.hashSetChecked(s, IntValue(i), val); err != nil {
 		s.memExceeded = true
 		return
 	}
-	t.hashSet(IntValue(i), val)
 }
 
 func (t *Table) setArrGeneric(idx int64, val Value) {
@@ -1046,10 +1095,9 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 				return s.ConsumeMemErr()
 			}
 		}
-		if err := t.checkHashMem(s); err != nil {
+		if _, err := t.hashSetChecked(s, key, val); err != nil {
 			return err
 		}
-		t.hashSet(key, val)
 		return nil
 	case key.IsNil():
 		return fmt.Errorf("table index is nil")
@@ -1065,10 +1113,11 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 				return s.ConsumeMemErr()
 			}
 		}
-		if err := t.checkHashMem(s); err != nil {
+		slot, err := t.hashSetChecked(s, key, val)
+		if err != nil {
 			return err
 		}
-		if slot := t.hashSet(key, val); val.IsNil() && slot >= 0 && s != nil && (key.IsString() || isCollectableWeak(key)) {
+		if val.IsNil() && slot >= 0 && s != nil && (key.IsString() || isCollectableWeak(key)) {
 			s.gc.hasDeadHashKeys = true
 		}
 		return nil
@@ -1141,8 +1190,11 @@ func (t *Table) hashFindSlotForNext(key Value) (int, bool) {
 		return -1, false
 	}
 	if key.IsFloat() {
-		if iv, ok := FloatToIntExact(key.Float()); ok {
-			key = IntValue(iv)
+		// Match PUC-Rio ltable.c:findindex/equalkey: integral float keys are normalized to
+		// integer on insert, so a float key with an exact int64 representation never matches
+		// any stored node tag in next().
+		if _, ok := FloatToIntExact(key.Float()); ok {
+			return -1, false
 		}
 	}
 	mask := h.mask
@@ -1166,27 +1218,29 @@ func (t *Table) Next(key Value) (Value, Value, error) {
 	startIdx := 0
 
 	if !key.IsNil() {
-		if key.IsFloat() {
-			if iv, ok := FloatToIntExact(key.Float()); ok {
-				key = IntValue(iv)
+		found := false
+		// Check array first ONLY for genuine integer keys (matching ltable.c:keyinarray).
+		if key.IsInt() {
+			i := key.Int()
+			if i >= 1 && i <= int64(arrLen) {
+				startPhase = 0
+				startIdx = int(i) // next 0-based index after i-1
+				found = true
 			}
 		}
-		found := false
-		// Check array first if integer key.
-		if i, ok := key.ToInt(); ok && i >= 1 && i <= int64(arrLen) {
-			startPhase = 0
-			startIdx = int(i) // next 0-based index after i-1
-			found = true
-		} else if OptimizeEnabled && t.shape != nil && key.IsString() && key.AsString().Short {
+		if !found && OptimizeEnabled && t.shape != nil && key.IsString() && key.AsString().Short {
 			if slot := t.shape.Lookup(key.AsString()); slot >= 0 {
 				startPhase = 1
 				startIdx = int(slot) + 1
 				found = true
 			}
-		} else if slot, ok := t.hashFindSlotForNext(key); ok {
-			startPhase = 2
-			startIdx = slot + 1
-			found = true
+		}
+		if !found {
+			if slot, ok := t.hashFindSlotForNext(key); ok {
+				startPhase = 2
+				startIdx = slot + 1
+				found = true
+			}
 		}
 		if !found {
 			return NilValue(), NilValue(), fmt.Errorf("invalid key to 'next'")

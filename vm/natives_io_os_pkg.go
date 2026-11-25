@@ -317,15 +317,20 @@ func (r *luaFuncReader) Read(p []byte) (int, error) {
 }
 
 func (s *State) undumpBytes(data []byte) (*bytecode.Proto, error) {
-	if s.memLimit > 0 {
-		return bytecode.UndumpWithLimit(data, func(n int64) error {
-			return s.checkMem(n)
-		})
+	cancelFn := s.nativeCancelFunc()
+	if s.memLimit > 0 || cancelFn != nil {
+		var checkMem func(int64) error
+		if s.memLimit > 0 {
+			checkMem = func(n int64) error {
+				return s.checkMem(n)
+			}
+		}
+		return bytecode.UndumpWithControls(data, checkMem, cancelFn)
 	}
 	return bytecode.Undump(data)
 }
 
-func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv bool) (Value, error) {
+func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv, stripFileHeader bool) (Value, error) {
 	isBin := len(src) > 0 && src[0] == 0x1b
 	if isBin {
 		if !strings.ContainsRune(mode, 'b') {
@@ -353,12 +358,16 @@ func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv b
 	var p *bytecode.Proto
 	var err error
 	if s.compilerReaderFn != nil {
-		// Default compiler: preserve string fast path while honoring memLimit if configured.
-		var opts []compiler.Option
+		// Default compiler: preserve string fast path while honoring memLimit, execution controls,
+		// and exact Lua 5.5 file-header stripping policy (load(str) does NOT strip BOM/#!).
+		opts := []compiler.Option{compiler.SkipFileHeader(stripFileHeader)}
 		if s.memLimit > 0 {
 			opts = append(opts, compiler.WithMemoryCheck(func(n int64) error {
 				return s.checkMem(n)
 			}))
+		}
+		if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
+			opts = append(opts, compiler.WithCancel(cancelFn))
 		}
 		p, err = compiler.Compile(chunkName, src, opts...)
 	} else {
@@ -396,7 +405,7 @@ func (s *State) loadChunkBytes(data []byte, chunkName, mode string, env Value, h
 		}
 		return ClosureValue(cl), nil
 	}
-	return s.loadChunkString(string(data), chunkName, mode, env, hasEnv)
+	return s.loadChunkString(string(data), chunkName, mode, env, hasEnv, false)
 }
 
 func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, hasEnv, stripFileHeader bool) (Value, error) {
@@ -425,7 +434,15 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 			return NilValue(), loadFileReadErr{err: err}
 		}
 		if len(b0) == 1 && b0[0] == '#' {
+			cancelFn := s.nativeCancelFunc()
+			var skipped int64
 			for {
+				skipped++
+				if cancelFn != nil && (skipped&4095) == 0 {
+					if cerr := cancelFn(); cerr != nil {
+						return NilValue(), cerr
+					}
+				}
 				pb, perr := br.Peek(1)
 				if perr != nil {
 					if errors.Is(perr, io.EOF) {
@@ -481,11 +498,12 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 			return nil
 		}
 	}
+	cancelFn := s.nativeCancelFunc()
 	if isBin {
 		if !strings.ContainsRune(mode, 'b') {
 			return NilValue(), fmt.Errorf("attempt to load a binary chunk (mode is '%s')", mode)
 		}
-		p, uerr := bytecode.UndumpReaderWithLimit(br, checkMem)
+		p, uerr := bytecode.UndumpReaderWithControls(br, checkMem, cancelFn)
 		if uerr != nil {
 			return NilValue(), uerr
 		}
@@ -511,6 +529,9 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 		opts := []compiler.Option{compiler.SkipFileHeader(false)}
 		if checkMem != nil {
 			opts = append(opts, compiler.WithMemoryCheck(checkMem))
+		}
+		if cancelFn != nil {
+			opts = append(opts, compiler.WithCancel(cancelFn))
 		}
 		p, err = s.compilerReaderFn(chunkName, br, opts...)
 		if err != nil {
@@ -542,12 +563,15 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 func (s *State) readBoundedStream(r io.Reader) ([]byte, error) {
 	var buf bytes.Buffer
 	var readBytes int64
+	var reads int64
 	defer func() {
 		s.gc.tempBytes -= readBytes
 	}()
+	cancelFn := s.nativeCancelFunc()
 	var tmp [4096]byte
 	for {
 		n, err := r.Read(tmp[:])
+		reads++
 		if n > 0 {
 			if merr := s.checkMem(int64(n)); merr != nil {
 				return nil, merr
@@ -555,9 +579,19 @@ func (s *State) readBoundedStream(r io.Reader) ([]byte, error) {
 			if readBytes+int64(n) > (1 << 30) {
 				return nil, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
 			}
+			prevStride := readBytes / 4096
 			buf.Write(tmp[:n])
 			readBytes += int64(n)
 			s.gc.tempBytes += int64(n)
+			if cancelFn != nil && (readBytes/4096 > prevStride || (reads&63) == 0) {
+				if cerr := cancelFn(); cerr != nil {
+					return nil, cerr
+				}
+			}
+		} else if cancelFn != nil && (reads&63) == 0 {
+			if cerr := cancelFn(); cerr != nil {
+				return nil, cerr
+			}
 		}
 		if errors.Is(err, io.EOF) {
 			return buf.Bytes(), nil
@@ -568,9 +602,16 @@ func (s *State) readBoundedStream(r io.Reader) ([]byte, error) {
 	}
 }
 
+func (s *State) internErrStr(msg string) Value {
+	if ls, err := s.TryIntern(msg); err == nil {
+		return StringValue(ls)
+	}
+	return StringValue(s.intern.Intern("not enough memory"))
+}
+
 func nativeLoad(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("bad argument #1 to 'load'")
+		return nil, fmt.Errorf("bad argument #1 to 'load' (string or function expected, got no value)")
 	}
 	chunkName := "=(load)"
 	isStr := args[0].IsString() || args[0].IsNumber()
@@ -579,17 +620,20 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 		strSrc = FormatValue(args[0])
 		chunkName = strSrc
 	} else if !args[0].IsFunction() {
-		return nil, fmt.Errorf("bad argument #1 to 'load' (string or function expected)")
+		return nil, fmt.Errorf("bad argument #1 to 'load' (string or function expected, got %s)", s.objTypeName(args[0]))
 	}
 	if len(args) >= 2 && !args[1].IsNil() {
+		if !args[1].IsString() && !args[1].IsNumber() {
+			return nil, fmt.Errorf("bad argument #2 to 'load' (string expected, got %s)", s.objTypeName(args[1]))
+		}
 		chunkName = FormatValue(args[1])
 	}
 	mode := "bt"
 	if len(args) >= 3 && !args[2].IsNil() {
-		if !args[2].IsString() {
-			return nil, fmt.Errorf("bad argument #3 to 'load' (string expected)")
+		if !args[2].IsString() && !args[2].IsNumber() {
+			return nil, fmt.Errorf("bad argument #3 to 'load' (string expected, got %s)", s.objTypeName(args[2]))
 		}
-		mode = args[2].AsString().S
+		mode = FormatValue(args[2])
 		// Lua 5.5 rejects fixed-buffer mode 'B' from Lua scripts (lbaselib.c:342-349).
 		if strings.ContainsRune(mode, 'B') {
 			return nil, fmt.Errorf("bad argument #3 to 'load' (invalid mode)")
@@ -603,7 +647,7 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 	var fn Value
 	var err error
 	if isStr {
-		fn, err = s.loadChunkString(strSrc, chunkName, mode, env, hasEnv)
+		fn, err = s.loadChunkString(strSrc, chunkName, mode, env, hasEnv, false)
 	} else {
 		lr := &luaFuncReader{s: s, fn: args[0]}
 		fn, err = s.loadChunkReader(lr, chunkName, mode, env, hasEnv, false)
@@ -620,9 +664,91 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 		if errors.As(err, &le) {
 			return []Value{NilValue(), le.Val}, nil
 		}
-		return []Value{NilValue(), StringValue(s.intern.Intern(err.Error()))}, nil
+		return []Value{NilValue(), s.internErrStr(err.Error())}, nil
 	}
 	return []Value{fn}, nil
+}
+
+func (s *State) checkPreCancel() error {
+	if s.abortErr != nil {
+		return s.abortErr
+	}
+	if s.insnLimit > 0 && s.insnCount >= s.insnLimit {
+		s.abortErr = ErrInstructionLimit
+		return ErrInstructionLimit
+	}
+	if s.ctx != nil {
+		if err := s.ctx.Err(); err != nil {
+			s.abortErr = err
+			return err
+		}
+	}
+	return nil
+}
+
+// CompileString compiles Lua 5.5.1 source text into a verified *bytecode.Proto while
+// honoring the State's memory limit, cancellation context, and instruction budget.
+func (s *State) CompileString(name, src string) (*bytecode.Proto, error) {
+	if err := s.checkPreCancel(); err != nil {
+		return nil, err
+	}
+	var compileTempBytes int64
+	defer func() {
+		s.gc.tempBytes -= compileTempBytes
+	}()
+	var opts []compiler.Option
+	if s.memLimit > 0 {
+		opts = append(opts, compiler.WithMemoryCheck(func(n int64) error {
+			if n <= compileTempBytes {
+				return nil
+			}
+			delta := n - compileTempBytes
+			if merr := s.checkMem(delta); merr != nil {
+				return merr
+			}
+			compileTempBytes = n
+			s.gc.tempBytes += delta
+			return nil
+		}))
+	}
+	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
+		opts = append(opts, compiler.WithCancel(cancelFn))
+	}
+	return compiler.Compile(name, src, opts...)
+}
+
+// CompileReader streams Lua 5.5.1 source text from r into a verified *bytecode.Proto while
+// honoring the State's memory limit, cancellation context, and instruction budget.
+func (s *State) CompileReader(name string, r io.Reader) (*bytecode.Proto, error) {
+	if r == nil {
+		return nil, fmt.Errorf("cannot read %s: nil reader", name)
+	}
+	if err := s.checkPreCancel(); err != nil {
+		return nil, err
+	}
+	var compileTempBytes int64
+	defer func() {
+		s.gc.tempBytes -= compileTempBytes
+	}()
+	var opts []compiler.Option
+	if s.memLimit > 0 {
+		opts = append(opts, compiler.WithMemoryCheck(func(n int64) error {
+			if n <= compileTempBytes {
+				return nil
+			}
+			delta := n - compileTempBytes
+			if merr := s.checkMem(delta); merr != nil {
+				return merr
+			}
+			compileTempBytes = n
+			s.gc.tempBytes += delta
+			return nil
+		}))
+	}
+	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
+		opts = append(opts, compiler.WithCancel(cancelFn))
+	}
+	return compiler.CompileReader(name, r, opts...)
 }
 
 // LoadChunk loads a text or binary Lua 5.5.1 chunk from raw bytes, stripping UTF-8 BOM
@@ -658,6 +784,16 @@ func stripBOMAndShebang(data []byte) []byte {
 }
 
 func nativeLoadFile(s *State, args []Value) ([]Value, error) {
+	mode := "bt"
+	if len(args) >= 2 && !args[1].IsNil() {
+		if !args[1].IsString() && !args[1].IsNumber() {
+			return nil, fmt.Errorf("bad argument #2 to 'loadfile' (string expected, got %s)", s.objTypeName(args[1]))
+		}
+		mode = FormatValue(args[1])
+		if strings.ContainsRune(mode, 'B') {
+			return nil, fmt.Errorf("bad argument #2 to 'loadfile' (invalid mode)")
+		}
+	}
 	chunkName := "=stdin"
 	var fname string
 	var r io.Reader
@@ -667,19 +803,18 @@ func nativeLoadFile(s *State, args []Value) ([]Value, error) {
 		// creating a second read-ahead buffer that would consume bytes past the chunk.
 		r = s.StdinReader()
 	} else {
+		if !args[0].IsString() && !args[0].IsNumber() {
+			return nil, fmt.Errorf("bad argument #1 to 'loadfile' (string expected, got %s)", s.objTypeName(args[0]))
+		}
 		fname = FormatValue(args[0])
 		chunkName = "@" + fname
 		var err error
 		f, err = os.Open(fname)
 		if err != nil {
-			return []Value{NilValue(), StringValue(s.intern.Intern(fmt.Sprintf("cannot open %s", err.Error())))}, nil
+			return []Value{NilValue(), s.internErrStr(fmt.Sprintf("cannot open %s", err.Error()))}, nil
 		}
 		defer f.Close()
 		r = fileErrReader{r: f}
-	}
-	mode := "bt"
-	if len(args) >= 2 && !args[1].IsNil() {
-		mode = FormatValue(args[1])
 	}
 	hasEnv := len(args) >= 3
 	env := NilValue()
@@ -701,9 +836,9 @@ func nativeLoadFile(s *State, args []Value) ([]Value, error) {
 			if fname != "" {
 				target = fname
 			}
-			return []Value{NilValue(), StringValue(s.intern.Intern(fmt.Sprintf("cannot read %s: %s", target, fre.err.Error())))}, nil
+			return []Value{NilValue(), s.internErrStr(fmt.Sprintf("cannot read %s: %s", target, fre.err.Error()))}, nil
 		}
-		return []Value{NilValue(), StringValue(s.intern.Intern(err.Error()))}, nil
+		return []Value{NilValue(), s.internErrStr(err.Error())}, nil
 	}
 	return []Value{fn}, nil
 }
@@ -1009,7 +1144,7 @@ func nativeIOOutput(s *State, args []Value) ([]Value, error) {
 
 func nativeIORead(s *State, args []Value) ([]Value, error) {
 	if lf, ok := asLuaFile(s.defaultInput); !ok || lf.closed {
-		return nil, fmt.Errorf("standard input file is closed")
+		return nil, fmt.Errorf("default input file is closed")
 	}
 	all := make([]Value, 1+len(args))
 	all[0] = s.defaultInput
@@ -1019,7 +1154,7 @@ func nativeIORead(s *State, args []Value) ([]Value, error) {
 
 func nativeIOWrite(s *State, args []Value) ([]Value, error) {
 	if lf, ok := asLuaFile(s.defaultOutput); !ok || lf.closed {
-		return nil, fmt.Errorf("standard output file is closed")
+		return nil, fmt.Errorf("default output file is closed")
 	}
 	all := make([]Value, 1+len(args))
 	all[0] = s.defaultOutput
@@ -1180,6 +1315,10 @@ func nativeFileClose(s *State, args []Value) ([]Value, error) {
 	}
 	if lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
+	}
+	if lf.isStd {
+		// Per Lua 5.5 liolib.c:io_noclose: returns exactly 2 values (fail, "cannot close standard file").
+		return []Value{NilValue(), StringValue(s.intern.Intern("cannot close standard file"))}, nil
 	}
 	freed := lf.memBytes()
 	isPipe := lf.cmd != nil
@@ -1945,6 +2084,9 @@ func nativeFileLines(s *State, args []Value) ([]Value, error) {
 
 func nativeIOLines(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || args[0].IsNil() {
+		if lf, ok := asLuaFile(s.defaultInput); !ok || lf.closed {
+			return nil, fmt.Errorf("default input file is closed")
+		}
 		var fmts []Value
 		if len(args) > 1 {
 			fmts = args[1:]
@@ -1953,6 +2095,9 @@ func nativeIOLines(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("too many arguments")
 		}
 		return makeLinesIter(s, s.defaultInput, fmts, false)
+	}
+	if !args[0].IsString() && !args[0].IsNumber() {
+		return nil, fmt.Errorf("bad argument #1 to 'lines' (string expected, got %s)", s.objTypeName(args[0]))
 	}
 	if len(args)-1 > 250 {
 		return nil, fmt.Errorf("too many arguments")
@@ -2198,15 +2343,32 @@ func nativeOSDiffTime(s *State, args []Value) ([]Value, error) {
 func nativeOSDate(s *State, args []Value) ([]Value, error) {
 	fmtStr := "%c"
 	if len(args) >= 1 && !args[0].IsNil() {
+		if !args[0].IsString() && !args[0].IsNumber() {
+			return nil, fmt.Errorf("bad argument #1 to 'date' (string expected, got %s)", s.objTypeName(args[0]))
+		}
 		fmtStr = FormatValue(args[0])
 	}
 	tm := time.Now()
 	if len(args) >= 2 && !args[1].IsNil() {
 		sec, ok := args[1].CoerceInt()
 		if !ok {
-			return nil, fmt.Errorf("bad argument #2 to 'os.date'")
+			if args[1].IsFloat() {
+				return nil, fmt.Errorf("bad argument #2 to 'date' (number has no integer representation)")
+			}
+			return nil, fmt.Errorf("bad argument #2 to 'date' (number expected, got %s)", s.objTypeName(args[1]))
+		}
+		// Match POSIX struct tm.tm_year (int32) representable range in loslib.c:os_date.
+		const (
+			minRepresentableUnix = -67768040609740800
+			maxRepresentableUnix = 67768036191676799
+		)
+		if sec < minRepresentableUnix || sec > maxRepresentableUnix {
+			return nil, fmt.Errorf("date result cannot be represented in this installation")
 		}
 		tm = time.Unix(sec, 0)
+		if y := int64(tm.Year()) - 1900; y < math.MinInt32 || y > math.MaxInt32 {
+			return nil, fmt.Errorf("date result cannot be represented in this installation")
+		}
 	}
 	if strings.HasPrefix(fmtStr, "!") {
 		tm = tm.UTC()
@@ -2277,8 +2439,33 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 		if i >= len(fmtStr) {
 			return nil, fmt.Errorf("invalid conversion specifier '%%'")
 		}
+		spec := fmtStr[i]
+		// Support POSIX/C99 two-character %E / %O modifiers (loslib.c:LUA_STRFTIMEOPTIONS).
+		if spec == 'E' || spec == 'O' {
+			if i+1 >= len(fmtStr) {
+				return nil, fmt.Errorf("invalid conversion specifier '%%%c'", spec)
+			}
+			next := fmtStr[i+1]
+			validMod := false
+			if spec == 'E' {
+				switch next {
+				case 'c', 'C', 'x', 'X', 'y', 'Y':
+					validMod = true
+				}
+			} else {
+				switch next {
+				case 'd', 'e', 'H', 'I', 'm', 'M', 'S', 'u', 'U', 'V', 'w', 'W', 'y':
+					validMod = true
+				}
+			}
+			if !validMod {
+				return nil, fmt.Errorf("invalid conversion specifier '%%%c%c'", spec, next)
+			}
+			i++
+			spec = next
+		}
 		var err error
-		switch fmtStr[i] {
+		switch spec {
 		case '%':
 			err = writeByte('%')
 		case 'Y':
@@ -2379,10 +2566,11 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeOSGetEnv(s *State, args []Value) ([]Value, error) {
-	if len(args) == 0 || !args[0].IsString() {
-		return nil, fmt.Errorf("bad argument #1 to 'os.getenv'")
+	key, err := checkStringArg(args, 0, "getenv")
+	if err != nil {
+		return nil, err
 	}
-	v, ok := os.LookupEnv(args[0].AsString().S)
+	v, ok := os.LookupEnv(key)
 	if !ok {
 		return []Value{NilValue()}, nil
 	}
@@ -2394,20 +2582,26 @@ func nativeOSGetEnv(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeOSRemove(s *State, args []Value) ([]Value, error) {
-	if len(args) == 0 || !args[0].IsString() {
-		return nil, fmt.Errorf("bad argument #1 to 'os.remove'")
+	fname, err := checkStringArg(args, 0, "remove")
+	if err != nil {
+		return nil, err
 	}
-	if err := os.Remove(args[0].AsString().S); err != nil {
+	if err := os.Remove(fname); err != nil {
 		return ioFail(s, err), nil
 	}
 	return []Value{TrueValue()}, nil
 }
 
 func nativeOSRename(s *State, args []Value) ([]Value, error) {
-	if len(args) < 2 || !args[0].IsString() || !args[1].IsString() {
-		return nil, fmt.Errorf("bad arguments to 'os.rename'")
+	oldName, err := checkStringArg(args, 0, "rename")
+	if err != nil {
+		return nil, err
 	}
-	if err := os.Rename(args[0].AsString().S, args[1].AsString().S); err != nil {
+	newName, err := checkStringArg(args, 1, "rename")
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Rename(oldName, newName); err != nil {
 		return ioFail(s, err), nil
 	}
 	return []Value{TrueValue()}, nil
@@ -2436,8 +2630,26 @@ func nativeOSTmpName(s *State, _ []Value) ([]Value, error) {
 }
 
 func nativeOSSetLocale(s *State, args []Value) ([]Value, error) {
-	if len(args) >= 1 && args[0].IsString() {
-		loc := args[0].AsString().S
+	hasLoc := len(args) >= 1 && !args[0].IsNil()
+	var loc string
+	if hasLoc {
+		if !args[0].IsString() && !args[0].IsNumber() {
+			return nil, fmt.Errorf("bad argument #1 to 'setlocale' (string expected, got %s)", s.objTypeName(args[0]))
+		}
+		loc = FormatValue(args[0])
+	}
+	if len(args) >= 2 && !args[1].IsNil() {
+		if !args[1].IsString() && !args[1].IsNumber() {
+			return nil, fmt.Errorf("bad argument #2 to 'setlocale' (string expected, got %s)", s.objTypeName(args[1]))
+		}
+		cat := FormatValue(args[1])
+		switch cat {
+		case "all", "collate", "ctype", "monetary", "numeric", "time":
+		default:
+			return nil, fmt.Errorf("bad argument #2 to 'setlocale' (invalid option '%s')", cat)
+		}
+	}
+	if hasLoc {
 		if loc == "C" || loc == "" || loc == "POSIX" {
 			return []Value{StringValue(s.intern.Intern("C"))}, nil
 		}
@@ -2455,6 +2667,8 @@ func nativeOSExecute(s *State, args []Value) ([]Value, error) {
 	}
 	cmd := shellCommand(FormatValue(args[0]))
 	s.inheritedStdStreams(cmd)
+	s.childExecDepth.Add(1)
+	defer s.childExecDepth.Add(-1)
 	return execResult(s, cmd.Run()), nil
 }
 
@@ -2668,8 +2882,8 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 			}
 			break
 		}
-		if len(res) > 0 && res[0].IsString() {
-			smsg := res[0].AsString().S
+		if len(res) > 0 && (res[0].IsString() || res[0].IsNumber()) {
+			smsg := FormatValue(res[0])
 			if s.memLimit > 0 {
 				if merr := s.checkMem(int64(errs.Len()) + int64(len(smsg)) + 64); merr != nil {
 					return nil, merr
@@ -2730,6 +2944,99 @@ func (s *State) checkedReplaceSize(src, oldStr, newStr string) (int64, error) {
 	return outLen, nil
 }
 
+// forEachSearchCandidate streams ';' -delimited candidates after replacing '?' with name
+// (matching PUC-Rio loadlib.c:488-495: '?' expansion happens BEFORE ';' splitting), while
+// enforcing memLimit and cooperative cancellation without materializing quadratic expansions.
+func (s *State) forEachSearchCandidate(path, name string, cancelFn func() error, fn func(cand string) (bool, error)) error {
+	var steps int64
+	if !strings.ContainsRune(name, ';') {
+		for tmpl := range strings.SplitSeq(path, ";") {
+			steps++
+			if cancelFn != nil && (steps&1023) == 0 {
+				if err := cancelFn(); err != nil {
+					return err
+				}
+			}
+			if _, err := s.checkedReplaceSize(tmpl, "?", name); err != nil {
+				return err
+			}
+			cand := strings.ReplaceAll(tmpl, "?", name)
+			stop, err := fn(cand)
+			if err != nil || stop {
+				return err
+			}
+		}
+		return nil
+	}
+	var cur strings.Builder
+	var stopped bool
+	emitPiece := func(piece string) error {
+		for len(piece) > 0 {
+			semi := strings.IndexByte(piece, ';')
+			if semi < 0 {
+				if s.memLimit > 0 {
+					if err := s.checkMem(int64(cur.Len()) + int64(len(piece)) + 48); err != nil {
+						return err
+					}
+				}
+				cur.WriteString(piece)
+				return nil
+			}
+			if semi > 0 {
+				if s.memLimit > 0 {
+					if err := s.checkMem(int64(cur.Len()) + int64(semi) + 48); err != nil {
+						return err
+					}
+				}
+				cur.WriteString(piece[:semi])
+			}
+			steps++
+			if cancelFn != nil && (steps&1023) == 0 {
+				if err := cancelFn(); err != nil {
+					return err
+				}
+			}
+			cand := cur.String()
+			cur.Reset()
+			stop, err := fn(cand)
+			if err != nil {
+				return err
+			}
+			if stop {
+				stopped = true
+				return nil
+			}
+			piece = piece[semi+1:]
+		}
+		return nil
+	}
+	rest := path
+	for !stopped {
+		q := strings.IndexByte(rest, '?')
+		if q < 0 {
+			if err := emitPiece(rest); err != nil {
+				return err
+			}
+			break
+		}
+		if err := emitPiece(rest[:q]); err != nil {
+			return err
+		}
+		if stopped {
+			break
+		}
+		if err := emitPiece(name); err != nil {
+			return err
+		}
+		rest = rest[q+1:]
+	}
+	if !stopped {
+		_, err := fn(cur.String())
+		return err
+	}
+	return nil
+}
+
 func (s *State) searchPath(name, path, sep, rep string) (string, string, error) {
 	if sep != "" {
 		if _, err := s.checkedReplaceSize(name, sep, rep); err != nil {
@@ -2738,35 +3045,25 @@ func (s *State) searchPath(name, path, sep, rep string) (string, string, error) 
 		name = strings.ReplaceAll(name, sep, rep)
 	}
 	var errBuf strings.Builder
+	var found string
 	cancelFn := s.nativeCancelFunc()
-	var steps int64
 	idx := 0
-	for tmpl := range strings.SplitSeq(path, ";") {
-		steps++
-		if cancelFn != nil && (steps&1023) == 0 {
-			if err := cancelFn(); err != nil {
-				return "", "", err
-			}
-		}
-		candLen, err := s.checkedReplaceSize(tmpl, "?", name)
-		if err != nil {
-			return "", "", err
-		}
-		cand := strings.ReplaceAll(tmpl, "?", name)
+	err := s.forEachSearchCandidate(path, name, cancelFn, func(cand string) (bool, error) {
 		if cand != "" {
 			if f, oerr := os.Open(cand); oerr == nil {
 				_ = f.Close()
-				return cand, "", nil
+				found = cand
+				return true, nil
 			}
 		}
 		// Exact Lua 5.5 loadlib.c:pusherrornotfound formatting
-		addLen := candLen + 11
+		addLen := int64(len(cand)) + 11
 		if idx == 0 {
-			addLen = candLen + 10
+			addLen = int64(len(cand)) + 10
 		}
 		if s.memLimit > 0 {
-			if err := s.checkMem(int64(errBuf.Len()) + addLen + 48); err != nil {
-				return "", "", err
+			if merr := s.checkMem(int64(errBuf.Len()) + addLen + 48); merr != nil {
+				return false, merr
 			}
 		}
 		if idx == 0 {
@@ -2776,6 +3073,13 @@ func (s *State) searchPath(name, path, sep, rep string) (string, string, error) 
 		}
 		errBuf.WriteString(cand)
 		idx++
+		return false, nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+	if found != "" {
+		return found, "", nil
 	}
 	if s.memLimit > 0 {
 		if err := s.checkMem(int64(errBuf.Len()) + 49); err != nil {
@@ -2895,64 +3199,62 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 		return nil
 	}
 	cancelFn := s.nativeCancelFunc()
-	var steps int64
-	for tmpl := range strings.SplitSeq(pathStr, ";") {
-		steps++
-		if cancelFn != nil && (steps&1023) == 0 {
-			if err := cancelFn(); err != nil {
-				return nil, err
-			}
+	var loadedRes []Value
+	err := s.forEachSearchCandidate(pathStr, rel, cancelFn, func(rawCand string) (bool, error) {
+		if rawCand == "" {
+			return false, nil
 		}
-		if tmpl == "" {
-			continue
-		}
-		if _, err := s.checkedReplaceSize(tmpl, "?", rel); err != nil {
-			return nil, err
-		}
-		cand := strings.ReplaceAll(strings.ReplaceAll(tmpl, "?", rel), "\\", "/")
+		cand := strings.ReplaceAll(rawCand, "\\", "/")
 		for strings.HasPrefix(cand, "./") {
 			cand = cand[2:]
 		}
 		if !fs.ValidPath(cand) {
 			if err := appendTried(fmt.Sprintf("no file '%s' (invalid fs path)", cand)); err != nil {
-				return nil, err
+				return false, err
 			}
-			continue
+			return false, nil
 		}
 		f, err := fsys.Open(cand)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				if err := appendTried(fmt.Sprintf("no file '%s' (in fs.FS)", cand)); err != nil {
-					return nil, err
+					return false, err
 				}
-				continue
+				return false, nil
 			}
-			return nil, fmt.Errorf("error reading module '%s' from file '%s': %w", name, cand, err)
+			return false, fmt.Errorf("error reading module '%s' from file '%s': %w", name, cand, err)
 		}
 		if fi, serr := f.Stat(); serr == nil && fi.IsDir() {
 			_ = f.Close()
-			return nil, fmt.Errorf("error reading module '%s' from file '%s': is a directory", name, cand)
+			return false, fmt.Errorf("error reading module '%s' from file '%s': is a directory", name, cand)
 		}
 		fn, err := s.LoadChunkReader(fileErrReader{r: f}, "@"+cand)
 		_ = f.Close()
 		if err != nil {
 			if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
-				return nil, err
+				return false, err
 			}
 			var fre loadFileReadErr
 			if errors.As(err, &fre) {
-				return nil, fmt.Errorf("error reading module '%s' from file '%s': %w", name, cand, fre.err)
+				return false, fmt.Errorf("error reading module '%s' from file '%s': %w", name, cand, fre.err)
 			}
 			if strings.Contains(err.Error(), "not enough memory") {
-				return nil, err
+				return false, err
 			}
-			return nil, fmt.Errorf("error loading module '%s' from file '%s':\n\t%s", name, cand, err.Error())
+			return false, fmt.Errorf("error loading module '%s' from file '%s':\n\t%s", name, cand, err.Error())
 		}
 		candStr, ierr := s.TryIntern(cand)
 		if ierr != nil {
-			return nil, ierr
+			return false, ierr
 		}
-		return []Value{fn, StringValue(candStr)}, nil
+		loadedRes = []Value{fn, StringValue(candStr)}
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if loadedRes != nil {
+		return loadedRes, nil
 	}
 	if triedCount == 0 {
 		return []Value{StringValue(s.intern.Intern("no file in fs.FS"))}, nil

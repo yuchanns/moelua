@@ -16,15 +16,54 @@ import "fmt"
 // Binary chunks remain trusted host/application input; Verify provides panic-freedom
 // defense in depth rather than a security sandbox boundary.
 func Verify(p *Proto) error {
-	return verifyDepth(p, 0)
+	return VerifyWithControls(p, nil, nil)
 }
 
-func verifyDepth(p *Proto, depth int) error {
+// VerifyWithControls validates a Proto tree while honoring optional incremental
+// memory-budget and cooperative cancellation callbacks.
+func VerifyWithControls(p *Proto, checkMem func(int64) error, cancelFn func() error) error {
+	var memUsed int64
+	var work int64
+	return verifyDepth(p, 0, checkMem, &memUsed, cancelFn, &work)
+}
+
+func verifyTick(cancelFn func() error, work *int64, delta int64) error {
+	if cancelFn == nil || delta <= 0 {
+		return nil
+	}
+	prev := *work >> 12
+	*work += delta
+	next := *work >> 12
+	for prev < next {
+		if err := cancelFn(); err != nil {
+			return err
+		}
+		prev++
+	}
+	return nil
+}
+
+func verifyDepth(p *Proto, depth int, checkMem func(int64) error, memUsed *int64, cancelFn func() error, work *int64) error {
+	if p == nil {
+		return fmt.Errorf("verify: nil proto")
+	}
 	if depth > maxProtoDepth {
 		return fmt.Errorf("verify: proto nesting depth exceeds limit (%d)", maxProtoDepth)
 	}
+	if err := verifyTick(cancelFn, work, 64); err != nil {
+		return err
+	}
 	if len(p.Code) == 0 {
 		return fmt.Errorf("verify: empty code in proto %q", p.Source)
+	}
+	if len(p.Upvalues) > MaxArgA {
+		return fmt.Errorf("verify: too many upvalues %d > %d", len(p.Upvalues), MaxArgA)
+	}
+	if p.Flag&(PFVarargHidden|PFVarargTable) == (PFVarargHidden | PFVarargTable) {
+		return fmt.Errorf("verify: conflicting vararg flags 0x%02x", p.Flag)
+	}
+	if p.Flag &^ (PFVarargHidden|PFVarargTable|PFFixed) != 0 {
+		return fmt.Errorf("verify: invalid proto flags 0x%02x", p.Flag)
 	}
 	if p.MaxStackSize > MaxArgA {
 		return fmt.Errorf("verify: maxstacksize %d > %d", p.MaxStackSize, MaxArgA)
@@ -32,8 +71,36 @@ func verifyDepth(p *Proto, depth int) error {
 	if int(p.NumParams) > int(p.MaxStackSize) {
 		return fmt.Errorf("verify: numparams %d > maxstacksize %d", p.NumParams, p.MaxStackSize)
 	}
+	if len(p.LineInfo) != 0 && len(p.LineInfo) != len(p.Code) {
+		return fmt.Errorf("verify: lineinfo len %d != code len %d", len(p.LineInfo), len(p.Code))
+	}
+	if len(p.AbsLineInfo) > 0 {
+		if len(p.LineInfo) == 0 {
+			return fmt.Errorf("verify: abslineinfo present without lineinfo")
+		}
+		for i, ali := range p.AbsLineInfo {
+			if i > 0 && (i&4095) == 0 {
+				if err := verifyTick(cancelFn, work, 4096); err != nil {
+					return err
+				}
+			}
+			if ali.PC < 0 || int(ali.PC) >= len(p.LineInfo) {
+				return fmt.Errorf("verify: abslineinfo[%d].PC=%d out of [0,%d)", i, ali.PC, len(p.LineInfo))
+			}
+			if i > 0 && ali.PC <= p.AbsLineInfo[i-1].PC {
+				return fmt.Errorf("verify: abslineinfo[%d].PC=%d not strictly increasing after %d", i, ali.PC, p.AbsLineInfo[i-1].PC)
+			}
+		}
+	}
 
 	n := len(p.Code)
+	if checkMem != nil {
+		scratchBytes := int64(n)*6 + int64(len(p.Protos))
+		if err := checkMem(*memUsed + scratchBytes); err != nil {
+			return err
+		}
+		*memUsed += int64(n) * 4 // ICSlot is retained on Proto
+	}
 	maxStack := int(p.MaxStackSize)
 	p.ICSlot = make([]int32, n)
 	for i := range p.ICSlot {
@@ -41,6 +108,7 @@ func verifyDepth(p *Proto, depth int) error {
 	}
 	isExtraArg := make([]bool, n)
 	isMMBin := make([]bool, n)
+	verifiedClosure := make([]bool, len(p.Protos))
 	icCount := 0
 
 	// M4: OP_VARARGPREP must appear at pc 0 iff proto is vararg.
@@ -70,6 +138,11 @@ func verifyDepth(p *Proto, depth int) error {
 	}
 
 	for pc := 0; pc < n; pc++ {
+		if cancelFn != nil && pc > 0 && (pc&4095) == 0 {
+			if err := verifyTick(cancelFn, work, 4096); err != nil {
+				return err
+			}
+		}
 		inst := p.Code[pc]
 		op := inst.Op()
 		if op >= NumOpcodes {
@@ -409,18 +482,28 @@ func verifyDepth(p *Proto, depth int) error {
 			if err := checkReg(pc, op, "A", inst.A()); err != nil {
 				return err
 			}
-			if inst.Bx() >= len(p.Protos) {
-				return fmt.Errorf("verify: pc %d CLOSURE Bx=%d >= %d", pc, inst.Bx(), len(p.Protos))
+			bx := inst.Bx()
+			if bx >= len(p.Protos) {
+				return fmt.Errorf("verify: pc %d CLOSURE Bx=%d >= %d", pc, bx, len(p.Protos))
 			}
-			sub := p.Protos[inst.Bx()]
-			for ui, ud := range sub.Upvalues {
-				if ud.InStack == 0 {
-					if int(ud.Idx) >= len(p.Upvalues) {
-						return fmt.Errorf("verify: pc %d CLOSURE sub upval[%d] idx=%d >= %d", pc, ui, ud.Idx, len(p.Upvalues))
-					}
-				} else if int(ud.Idx) >= maxStack {
-					return fmt.Errorf("verify: pc %d CLOSURE sub upval[%d] reg=%d >= maxstack %d", pc, ui, ud.Idx, maxStack)
+			if !verifiedClosure[bx] {
+				sub := p.Protos[bx]
+				if sub == nil {
+					return fmt.Errorf("verify: pc %d CLOSURE nil sub-proto %d", pc, bx)
 				}
+				if len(sub.Upvalues) > MaxArgA {
+					return fmt.Errorf("verify: pc %d CLOSURE sub-proto %d too many upvalues %d > %d", pc, bx, len(sub.Upvalues), MaxArgA)
+				}
+				for ui, ud := range sub.Upvalues {
+					if ud.InStack == 0 {
+						if int(ud.Idx) >= len(p.Upvalues) {
+							return fmt.Errorf("verify: pc %d CLOSURE sub upval[%d] idx=%d >= %d", pc, ui, ud.Idx, len(p.Upvalues))
+						}
+					} else if int(ud.Idx) >= maxStack {
+						return fmt.Errorf("verify: pc %d CLOSURE sub upval[%d] reg=%d >= maxstack %d", pc, ui, ud.Idx, maxStack)
+					}
+				}
+				verifiedClosure[bx] = true
 			}
 		case OP_CALL, OP_TAILCALL:
 			if err := checkReg(pc, op, "A", inst.A()); err != nil {
@@ -518,6 +601,11 @@ func verifyDepth(p *Proto, depth int) error {
 		return nil
 	}
 	for pc := 0; pc < n; pc++ {
+		if cancelFn != nil && pc > 0 && (pc&4095) == 0 {
+			if err := verifyTick(cancelFn, work, 4096); err != nil {
+				return err
+			}
+		}
 		if isExtraArg[pc] {
 			continue
 		}
@@ -566,7 +654,7 @@ func verifyDepth(p *Proto, depth int) error {
 	}
 
 	for _, sub := range p.Protos {
-		if err := verifyDepth(sub, depth+1); err != nil {
+		if err := verifyDepth(sub, depth+1, checkMem, memUsed, cancelFn, work); err != nil {
 			return err
 		}
 	}

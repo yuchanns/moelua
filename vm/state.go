@@ -28,10 +28,11 @@ func isUncatchableErr(err error) bool {
 }
 
 const (
-	initialStackSize = 512
-	stackSlack       = 264 // >= 256 slots above frame base so *[256]Value window is always in-bounds
-	maxFrames        = 10000
-	maxCCalls        = 200
+	initialStackSize    = 512
+	stackSlack          = 264 // >= 256 slots above frame base so *[256]Value window is always in-bounds
+	maxFrames           = 1000000
+	maxCCalls           = 200
+	maxCCallsErrHandler = maxCCalls * 11 / 10 // extra headroom for xpcall error handlers (ldo.c)
 )
 
 // Intrinsic IDs for direct VM call-site inlining (zero slice/call overhead on hot stdlib).
@@ -183,13 +184,14 @@ type State struct {
 
 	// Optional async interrupt flag, context cancellation, and VM instruction step budget;
 	// zero overhead in fast (*State).run when all are unset!
-	intrFlag    *atomic.Bool
-	intrTicks   uint32
-	ctx         context.Context
-	insnLimit   int64
-	insnCount   int64
-	abortErr    error // pending uncatchable abort error (ctx / instruction limit)
-	fsSearchers int
+	intrFlag       *atomic.Bool
+	intrTicks      uint32
+	ctx            context.Context
+	insnLimit      int64
+	insnCount      int64
+	abortErr       error // pending uncatchable abort error (ctx / instruction limit)
+	fsSearchers    int
+	childExecDepth atomic.Int32 // >0 while os.execute child process is running (ignores CLI SIGINT)
 
 	// Lua 5.5 xoshiro256** PRNG state.
 	rng [4]uint64
@@ -266,16 +268,17 @@ func (s *State) ConsumeMemErr() error {
 }
 
 // checkMem verifies that allocating delta bytes stays within hard safety bounds and s.memLimit.
-// On limit pressure it runs an emergency GC trace (without invoking __gc finalizers or
-// mutating weak tables mid-allocation, matching PUC-Rio Lua's emergency collector).
+// On limit pressure it runs an emergency GC trace (without invoking __gc finalizers,
+// matching PUC-Rio Lua's emergency collector).
 func (s *State) checkMem(delta int64) error {
 	const hardSingleAllocLimit = 1 << 30 // 1 GiB single allocation guard against Go OOM fatal
 	if delta < 0 || delta > hardSingleAllocLimit {
 		return &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
 	}
 	if s.memLimit > 0 && s.gc.allocBytes+s.gc.tempBytes+delta > s.memLimit {
-		if !s.gc.inGCTM {
-			s.collectEmergency()
+		s.collectEmergency()
+		if s.abortErr != nil {
+			return s.abortErr
 		}
 		if s.gc.allocBytes+s.gc.tempBytes+delta > s.memLimit {
 			return &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
@@ -291,6 +294,7 @@ func (s *State) checkMemAndAccount(delta int64) error {
 	}
 	if s.memLimit > 0 || s.gc.tier1 {
 		s.gc.allocBytes += delta
+		s.gcAddDebt(delta)
 	}
 	return nil
 }
@@ -313,6 +317,9 @@ func (s *State) SetWarnings(on bool) { s.warnOn = on }
 // SetInterruptFlag attaches an atomic interrupt flag polled periodically in runHooked
 // (used by CLI SIGINT handling; leaves fast run() completely untouched when nil).
 func (s *State) SetInterruptFlag(flag *atomic.Bool) { s.intrFlag = flag }
+
+// InChildExec reports whether this State is currently waiting on an os.execute child process.
+func (s *State) InChildExec() bool { return s.childExecDepth.Load() > 0 }
 
 // SetContext attaches a context for cooperative VM cancellation / timeout.
 // Passing nil or a non-cancelable context (ctx.Done() == nil, e.g. context.Background())
@@ -576,13 +583,14 @@ func (s *State) Load(p *bytecode.Proto) (*Closure, error) {
 	}
 	if chunkBytes > 0 {
 		s.gc.allocBytes += chunkBytes
+		s.gcAddDebt(chunkBytes)
 	}
 	return cl, nil
 }
 
 // UndumpAndLoad decodes, verifies, and loads a Lua 5.5.1 binary chunk.
 func (s *State) UndumpAndLoad(chunk []byte) (*Closure, error) {
-	p, err := bytecode.Undump(chunk)
+	p, err := s.undumpBytes(chunk)
 	if err != nil {
 		return nil, err
 	}
@@ -611,7 +619,11 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		s.abortErr = ErrInstructionLimit
 		return nil, ErrInstructionLimit
 	}
-	if s.nCcalls >= maxCCalls {
+	cLimit := maxCCalls
+	if th.inErrHandler {
+		cLimit = maxCCallsErrHandler
+	}
+	if s.nCcalls >= cLimit {
 		return nil, &LuaError{Val: StringValue(s.intern.Intern("C stack overflow"))}
 	}
 	s.nCcalls++
@@ -667,10 +679,23 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			}
 			th.top = savedTop
 		}()
-		if th.hookMask == 0 || th.inHook {
-			return fn.AsNative().callMulti(s, th.stack[base+1:base+1+len(args)])
+		if th.hookMask == 0 || th.inHook || th.suppressHook {
+			res, err := fn.AsNative().callMulti(s, th.stack[base+1:base+1+len(args)])
+			if err == nil && s.gc.tier1 {
+				s.gcCheckDebt(th.top)
+				if s.abortErr != nil {
+					return nil, s.abortErr
+				}
+			}
+			return res, err
 		}
 		res, _, err := s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
+		if err == nil && s.gc.tier1 {
+			s.gcCheckDebt(th.top)
+			if s.abortErr != nil {
+				return nil, s.abortErr
+			}
+		}
 		return res, err
 	}
 
@@ -727,7 +752,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			clearTopStack()
 			return nil, err
 		}
-		ev := errorToLuaValue(s, err)
+		ev := s.runtimeErrorToValue(th, err)
 		ev, _, _ = th.closeAllSync(funcIdx, ev, true)
 		if s.abortErr != nil {
 			uerr := s.abortErr
@@ -743,6 +768,13 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		clearTopStack()
 		return nil, &LuaError{Val: ev}
 	}
+	if s.gc.tier1 {
+		s.gcCheckDebt(th.top)
+		if s.abortErr != nil {
+			clearTopStack()
+			return nil, s.abortErr
+		}
+	}
 	nres := th.top - funcIdx
 	if nres <= 0 {
 		clearTopStack()
@@ -757,7 +789,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 // runThread dispatches to the fast loop when no debug hooks or interrupt controls are active,
 // or to the hooked variant when debug.sethook / ctx / instruction limits are active (zero cost in fast path!).
 func (s *State) runThread(th *Thread, entryDepth int) error {
-	if (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {
+	if (th.hookMask != 0 && !th.inHook && !th.suppressHook) || s.hasInterruptControl() {
 		return s.runHooked(th, entryDepth)
 	}
 	return s.run(th, entryDepth)

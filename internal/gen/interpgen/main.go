@@ -104,6 +104,12 @@ func generateHooked(src string, withRegcheck bool) string {
 		"\t\t\t} else if OptimizeEnabled && fn.IsNative() && th.hookMask&(HookMaskCall|HookMaskRet) == 0 {\n",
 		1,
 	)
+	// Disable ipairs OP_TFORCALL fast path when call/return hooks are active so iterator hooks fire.
+	fn = strings.Replace(fn,
+		"\t\t\tif OptimizeEnabled && fn.IsNative() && fn.AsNative().Intrinsic == intrIPairsIter && regs[a+1].IsTable() {\n",
+		"\t\t\tif OptimizeEnabled && fn.IsNative() && fn.AsNative().Intrinsic == intrIPairsIter && regs[a+1].IsTable() && th.hookMask&(HookMaskCall|HookMaskRet) == 0 {\n",
+		1,
+	)
 	// Fire call hook on inline OP_CALL Lua frame push (via noinline helper to keep runHooked compact).
 	fn = strings.Replace(fn,
 		"\t\t\t\t\t\tpc = 0\n\t\t\t\t\t\tregs = th.window(newBase)\n\t\t\t\t\t\tcontinue\n",

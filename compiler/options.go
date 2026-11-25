@@ -21,6 +21,7 @@ type config struct {
 	skipFileHeader   bool
 	hasSkipHeaderOpt bool
 	checkMem         func(int64) error
+	cancelFn         func() error
 }
 
 // Option configures compilation behavior.
@@ -61,6 +62,14 @@ func MaxRecursionDepth(depth int) Option {
 func WithMemoryCheck(fn func(int64) error) Option {
 	return func(c *config) {
 		c.checkMem = fn
+	}
+}
+
+// WithCancel registers an optional cooperative cancellation callback polled
+// periodically during lexical scanning and compilation.
+func WithCancel(fn func() error) Option {
+	return func(c *config) {
+		c.cancelFn = fn
 	}
 }
 
@@ -120,7 +129,13 @@ func Compile(name string, src string, opts ...Option) (proto *bytecode.Proto, er
 
 	ls := newLexState(name, src, cfg)
 	p := ls.parseMain()
-	if verr := bytecode.Verify(p); verr != nil {
+	var verifyMem func(int64) error
+	if cfg.checkMem != nil {
+		verifyMem = func(extra int64) error {
+			return cfg.checkMem(ls.memUsed + extra)
+		}
+	}
+	if verr := bytecode.VerifyWithControls(p, verifyMem, cfg.cancelFn); verr != nil {
 		return nil, verr
 	}
 	return p, nil
@@ -147,7 +162,13 @@ func CompileReader(name string, r io.Reader, opts ...Option) (proto *bytecode.Pr
 
 	ls := newLexStateReader(name, r, cfg)
 	p := ls.parseMain()
-	if verr := bytecode.Verify(p); verr != nil {
+	var verifyMem func(int64) error
+	if cfg.checkMem != nil {
+		verifyMem = func(extra int64) error {
+			return cfg.checkMem(ls.memUsed + extra)
+		}
+	}
+	if verr := bytecode.VerifyWithControls(p, verifyMem, cfg.cancelFn); verr != nil {
 		return nil, verr
 	}
 	return p, nil

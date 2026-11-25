@@ -47,7 +47,7 @@ func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error
 			}
 		}
 	}
-	if th.hookMask == 0 || th.inHook {
+	if th.hookMask == 0 || th.inHook || th.suppressHook {
 		return nil
 	}
 	p := ev.bp.proto
@@ -98,7 +98,7 @@ func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error
 
 //go:noinline
 func (s *State) fireCallHook(th *Thread, ci, nargs, nparams, entryDepth int) (bool, error) {
-	if th.hookMask&HookMaskCall == 0 || th.inHook {
+	if th.hookMask&HookMaskCall == 0 || th.inHook || th.suppressHook {
 		return false, nil
 	}
 	nt := min(nargs, nparams)
@@ -116,7 +116,7 @@ func (s *State) fireCallHook(th *Thread, ci, nargs, nparams, entryDepth int) (bo
 
 // fireLuaCallHook triggers a Lua "call" hook for the newly pushed Lua frame at th.frames[th.nframe-1].
 func (s *State) fireLuaCallHook(th *Thread, cl *Closure, nargs int) error {
-	if th.hookMask&HookMaskCall == 0 || th.inHook {
+	if th.hookMask&HookMaskCall == 0 || th.inHook || th.suppressHook {
 		return nil
 	}
 	nt := min(nargs, int(cl.bp.proto.NumParams))
@@ -127,11 +127,15 @@ func (s *State) fireLuaCallHook(th *Thread, cl *Closure, nargs int) error {
 
 //go:noinline
 func (s *State) fireHook(th *Thread, event string, line Value) error {
-	if th.hook.IsNil() || th.inHook {
+	if th.hook.IsNil() || th.inHook || th.suppressHook {
 		return nil
 	}
 	th.inHook = true
-	defer func() { th.inHook = false }()
+	th.nny++
+	defer func() {
+		th.nny--
+		th.inHook = false
+	}()
 	if th.hook.IsClosure() {
 		cl := th.hook.AsClosure()
 		p := cl.bp.proto
@@ -184,7 +188,7 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 				th.top = savedTop
 				return err
 			}
-			ev := errorToLuaValue(s, err)
+			ev := s.runtimeErrorToValue(th, err)
 			ev, _, _ = th.closeAllSync(funcIdx, ev, true)
 			th.nframe = entryDepth
 			th.top = savedTop

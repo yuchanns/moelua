@@ -86,6 +86,9 @@ func (d *dumper) flush() error {
 	}
 	n, err := d.w.Write(d.buf)
 	d.written += n
+	if err == nil && n < len(d.buf) {
+		err = io.ErrShortWrite
+	}
 	d.buf = d.buf[:0]
 	if err != nil {
 		d.err = err
@@ -119,6 +122,9 @@ func (d *dumper) writeBytes(b []byte) {
 		if len(b) >= 4096 {
 			n, err := d.w.Write(b)
 			d.written += n
+			if err == nil && n < len(b) {
+				err = io.ErrShortWrite
+			}
 			if err != nil {
 				d.err = err
 			}
@@ -140,6 +146,9 @@ func (d *dumper) writeStringLiteral(s string) {
 		if len(s) >= 4096 {
 			n, err := io.WriteString(d.w, s)
 			d.written += n
+			if err == nil && n < len(s) {
+				err = io.ErrShortWrite
+			}
 			if err != nil {
 				d.err = err
 			}
@@ -274,9 +283,12 @@ func (d *dumper) writeCode(p *Proto) error {
 	}
 	d.writeAlign(4)
 	for _, inst := range p.Code {
+		if d.err != nil {
+			return d.err
+		}
 		d.writeUint32(uint32(inst))
 	}
-	return nil
+	return d.err
 }
 
 func (d *dumper) writeConstants(p *Proto) error {
@@ -284,6 +296,9 @@ func (d *dumper) writeConstants(p *Proto) error {
 		return err
 	}
 	for i, c := range p.Consts {
+		if d.err != nil {
+			return d.err
+		}
 		switch c.Kind {
 		case ConstNil:
 			d.writeByte(luaVNil)
@@ -310,7 +325,7 @@ func (d *dumper) writeConstants(p *Proto) error {
 			return fmt.Errorf("dump: invalid constant kind %d at index %d", c.Kind, i)
 		}
 	}
-	return nil
+	return d.err
 }
 
 func (d *dumper) writeUpvalues(p *Proto) error {
@@ -318,11 +333,14 @@ func (d *dumper) writeUpvalues(p *Proto) error {
 		return err
 	}
 	for _, uv := range p.Upvalues {
+		if d.err != nil {
+			return d.err
+		}
 		d.writeByte(uv.InStack)
 		d.writeByte(uv.Idx)
 		d.writeByte(uv.Kind)
 	}
-	return nil
+	return d.err
 }
 
 func (d *dumper) writeProtos(p *Proto) error {
@@ -330,6 +348,9 @@ func (d *dumper) writeProtos(p *Proto) error {
 		return err
 	}
 	for _, sub := range p.Protos {
+		if d.err != nil {
+			return d.err
+		}
 		if sub == nil {
 			return fmt.Errorf("dump: nil child proto")
 		}
@@ -337,7 +358,7 @@ func (d *dumper) writeProtos(p *Proto) error {
 			return err
 		}
 	}
-	return nil
+	return d.err
 }
 
 func (d *dumper) writeDebug(p *Proto) error {
@@ -349,6 +370,9 @@ func (d *dumper) writeDebug(p *Proto) error {
 		return err
 	}
 	for i := range nline {
+		if d.err != nil {
+			return d.err
+		}
 		d.writeByte(byte(p.LineInfo[i]))
 	}
 
@@ -362,6 +386,9 @@ func (d *dumper) writeDebug(p *Proto) error {
 	if nabs > 0 {
 		d.writeAlign(4)
 		for i := range nabs {
+			if d.err != nil {
+				return d.err
+			}
 			d.writeUint32(uint32(p.AbsLineInfo[i].PC))
 			d.writeUint32(uint32(p.AbsLineInfo[i].Line))
 		}
@@ -375,6 +402,9 @@ func (d *dumper) writeDebug(p *Proto) error {
 		return err
 	}
 	for i := range nloc {
+		if d.err != nil {
+			return d.err
+		}
 		lv := p.LocVars[i]
 		if lv.Name == "" {
 			d.writeNullString()
@@ -397,13 +427,16 @@ func (d *dumper) writeDebug(p *Proto) error {
 		return err
 	}
 	for i := range nupNames {
+		if d.err != nil {
+			return d.err
+		}
 		if p.Upvalues[i].Name == "" {
 			d.writeNullString()
 		} else if err := d.writeString(p.Upvalues[i].Name); err != nil {
 			return err
 		}
 	}
-	return nil
+	return d.err
 }
 
 func (d *dumper) writeFunction(p *Proto) error {

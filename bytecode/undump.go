@@ -38,6 +38,8 @@ type loader struct {
 	strings  []string          // 1-indexed saved strings for Lua 5.5 deduplication
 	checkMem func(int64) error // optional incremental memory budget check
 	memUsed  int64
+	cancelFn func() error
+	work     int64
 	scratch  [64]byte
 }
 
@@ -50,18 +52,30 @@ func Undump(data []byte) (*Proto, error) {
 // UndumpWithLimit parses and verifies a PUC-Rio Lua 5.5.1 binary chunk from data,
 // invoking checkMem(totalBytes) before allocating decoded Proto buffers when checkMem != nil.
 func UndumpWithLimit(data []byte, checkMem func(int64) error) (*Proto, error) {
-	return undumpWithLoader(&loader{data: data, checkMem: checkMem})
+	return UndumpWithControls(data, checkMem, nil)
+}
+
+// UndumpWithControls parses and verifies a binary chunk from data while honoring
+// optional memory-limit and cooperative cancellation callbacks.
+func UndumpWithControls(data []byte, checkMem func(int64) error, cancelFn func() error) (*Proto, error) {
+	return undumpWithLoader(&loader{data: data, checkMem: checkMem, cancelFn: cancelFn})
 }
 
 // UndumpReader streams and verifies a PUC-Rio Lua 5.5.1 binary chunk from r without
 // materializing the entire input buffer in memory first.
 func UndumpReader(r io.Reader) (*Proto, error) {
-	return UndumpReaderWithLimit(r, nil)
+	return UndumpReaderWithControls(r, nil, nil)
 }
 
 // UndumpReaderWithLimit streams and verifies a PUC-Rio Lua 5.5.1 binary chunk from r,
 // invoking checkMem(totalBytes) before growing decoded Proto buffers when checkMem != nil.
 func UndumpReaderWithLimit(r io.Reader, checkMem func(int64) error) (*Proto, error) {
+	return UndumpReaderWithControls(r, checkMem, nil)
+}
+
+// UndumpReaderWithControls streams and verifies a binary chunk from r while honoring
+// optional memory-limit and cooperative cancellation callbacks.
+func UndumpReaderWithControls(r io.Reader, checkMem func(int64) error, cancelFn func() error) (*Proto, error) {
 	if r == nil {
 		return nil, fmt.Errorf("undump: nil reader")
 	}
@@ -69,7 +83,7 @@ func UndumpReaderWithLimit(r io.Reader, checkMem func(int64) error) (*Proto, err
 	if !ok {
 		br = bufio.NewReaderSize(r, 4096)
 	}
-	return undumpWithLoader(&loader{br: br, checkMem: checkMem})
+	return undumpWithLoader(&loader{br: br, checkMem: checkMem, cancelFn: cancelFn})
 }
 
 func undumpWithLoader(l *loader) (*Proto, error) {
@@ -87,7 +101,12 @@ func undumpWithLoader(l *loader) (*Proto, error) {
 	if int(nup) != len(p.Upvalues) {
 		return nil, fmt.Errorf("undump: root upvalue count mismatch (%d != %d)", nup, len(p.Upvalues))
 	}
-	if err := Verify(p); err != nil {
+	if err := VerifyWithControls(p, func(extra int64) error {
+		if l.checkMem == nil {
+			return nil
+		}
+		return l.checkMem(l.memUsed + extra)
+	}, l.cancelFn); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -104,7 +123,28 @@ func (l *loader) accountMem(delta int64) error {
 	return nil
 }
 
+func (l *loader) tickCancel(delta int64) error {
+	if l.cancelFn == nil || delta <= 0 {
+		return nil
+	}
+	prev := l.work >> 12
+	l.work += delta
+	next := l.work >> 12
+	for prev < next {
+		if err := l.cancelFn(); err != nil {
+			return err
+		}
+		prev++
+	}
+	return nil
+}
+
 func (l *loader) readByte() (byte, error) {
+	if l.cancelFn != nil {
+		if err := l.tickCancel(1); err != nil {
+			return 0, err
+		}
+	}
 	if l.br == nil {
 		if l.off >= len(l.data) {
 			return 0, fmt.Errorf("undump: truncated chunk at offset %d", l.off)
@@ -129,6 +169,11 @@ func (l *loader) readBytes(n int) ([]byte, error) {
 		if n < 0 || n > len(l.data)-l.off {
 			return nil, fmt.Errorf("undump: truncated chunk reading %d bytes at offset %d", n, l.off)
 		}
+		if l.cancelFn != nil && n > 0 {
+			if err := l.tickCancel(int64(n)); err != nil {
+				return nil, err
+			}
+		}
 		b := l.data[l.off : l.off+n]
 		l.off += n
 		return b, nil
@@ -140,6 +185,11 @@ func (l *loader) readBytes(n int) ([]byte, error) {
 		return nil, nil
 	}
 	if n <= len(l.scratch) {
+		if l.cancelFn != nil {
+			if err := l.tickCancel(int64(n)); err != nil {
+				return nil, err
+			}
+		}
 		got, err := io.ReadFull(l.br, l.scratch[:n])
 		l.off += got
 		if err != nil {
@@ -155,6 +205,11 @@ func (l *loader) readBytes(n int) ([]byte, error) {
 	const maxChunk = 32768
 	var out []byte
 	if n <= maxChunk {
+		if l.cancelFn != nil {
+			if err := l.tickCancel(int64(n)); err != nil {
+				return nil, err
+			}
+		}
 		if err := l.accountMem(int64(n)); err != nil {
 			return nil, err
 		}
@@ -174,6 +229,11 @@ func (l *loader) readBytes(n int) ([]byte, error) {
 	rem := n
 	for rem > 0 {
 		want := min(rem, maxChunk)
+		if l.cancelFn != nil {
+			if err := l.tickCancel(int64(want)); err != nil {
+				return nil, err
+			}
+		}
 		got, err := io.ReadFull(l.br, chunk[:want])
 		l.off += got
 		if err != nil {
@@ -432,6 +492,11 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		}
 		p.Code = make([]Instruction, ncode)
 		for i := range ncode {
+			if l.cancelFn != nil && (i&4095) == 0 && i > 0 {
+				if err := l.tickCancel(4096); err != nil {
+					return nil, err
+				}
+			}
 			p.Code[i] = Instruction(binary.LittleEndian.Uint32(codeBytes[i*4 : i*4+4]))
 		}
 	} else if ncode > 0 {
@@ -441,6 +506,11 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		rem := ncode
 		for rem > 0 {
 			cnt := min(rem, batchInsts)
+			if l.cancelFn != nil {
+				if err := l.tickCancel(int64(cnt) * 4); err != nil {
+					return nil, err
+				}
+			}
 			if err := l.accountMem(int64(cnt) * 4); err != nil {
 				return nil, err
 			}
@@ -468,7 +538,7 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		if nconst > len(l.data)-l.off {
 			return nil, fmt.Errorf("undump: truncated chunk reading %d constants", nconst)
 		}
-		if err := l.accountMem(int64(nconst) * 32); err != nil {
+		if err := l.accountMem(int64(nconst) * 48); err != nil {
 			return nil, err
 		}
 		p.Consts = make([]Constant, nconst)
@@ -481,7 +551,7 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 			return nil, err
 		}
 		if l.br != nil {
-			if err := l.accountMem(32); err != nil {
+			if err := l.accountMem(48); err != nil {
 				return nil, err
 			}
 		}
@@ -629,6 +699,11 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 			rem := nline
 			for rem > 0 {
 				cnt := min(rem, batchLines)
+				if l.cancelFn != nil {
+					if err := l.tickCancel(int64(cnt)); err != nil {
+						return nil, err
+					}
+				}
 				if err := l.accountMem(int64(cnt)); err != nil {
 					return nil, err
 				}
@@ -680,6 +755,11 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 			rem := nabs
 			for rem > 0 {
 				cnt := min(rem, batchAbs)
+				if l.cancelFn != nil {
+					if err := l.tickCancel(int64(cnt) * 8); err != nil {
+						return nil, err
+					}
+				}
 				if err := l.accountMem(int64(cnt) * 8); err != nil {
 					return nil, err
 				}
@@ -744,9 +824,8 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		return nil, err
 	}
 	if nupNames != 0 {
-		if nupNames != len(p.Upvalues) {
-			return nil, fmt.Errorf("undump: upvalue debug name count mismatch (%d != %d)", nupNames, len(p.Upvalues))
-		}
+		// Match PUC-Rio lundump.c:loadDebug: any non-zero count means len(p.Upvalues) names follow.
+		nupNames = len(p.Upvalues)
 		for i := range nupNames {
 			name, _, err := l.readString()
 			if err != nil {

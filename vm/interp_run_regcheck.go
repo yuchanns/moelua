@@ -967,20 +967,24 @@ reloadFrame:
 
 		case bytecode.OP_FORLOOP:
 			if regs[a+1].IsInt() {
-				cnt := uint64(regs[a].Int())
-				if cnt > 0 {
-					regs[a].SetIntBits(int64(cnt - 1))
-					regs[a+2].SetIntBits(regs[a+2].Int() + regs[a+1].Int())
-					pc -= w.Bx()
+				if regs[a].IsInt() && regs[a+2].IsInt() {
+					cnt := uint64(regs[a].Int())
+					if cnt > 0 {
+						regs[a].SetInt(int64(cnt - 1))
+						regs[a+2].SetInt(regs[a+2].Int() + regs[a+1].Int())
+						pc -= w.Bx()
+					}
 				}
 				continue
 			}
-			step := regs[a+1].Float()
-			idx := regs[a+2].Float() + step
-			lim := regs[a].Float()
-			if (step > 0 && idx <= lim) || (step <= 0 && idx >= lim) {
-				regs[a+2].SetFloatBits(idx)
-				pc -= w.Bx()
+			if regs[a+1].IsFloat() && regs[a].IsFloat() && regs[a+2].IsFloat() {
+				step := regs[a+1].Float()
+				idx := regs[a+2].Float() + step
+				lim := regs[a].Float()
+				if (step > 0 && idx <= lim) || (step <= 0 && idx >= lim) {
+					regs[a+2].SetFloat(idx)
+					pc -= w.Bx()
+				}
 			}
 			continue
 

@@ -3,6 +3,8 @@ package vm
 import (
 	"errors"
 	"fmt"
+	"math"
+	"math/bits"
 	"strings"
 	"unsafe"
 	"weak"
@@ -52,7 +54,7 @@ type gcState struct {
 	tempBytes     int64 // transient Go-side buffer bytes (e.g. load(reader)) held across calls
 	lastLiveBytes int64 // live bytes measured at end of last full trace (proportional Tier 1 pacing)
 	debt          int64
-	params      [6]int // minormul, majorminor, minormajor, pause, stepmul, stepsize
+	params        [6]byte // encoded via luaGCParamCode: minormul, majorminor, minormajor, pause, stepmul, stepsize
 
 	// Objects marked for finalization at setmetatable time (registration order; scanned in reverse LIFO).
 	finalizable []gcFinalEntry
@@ -75,35 +77,85 @@ const (
 	gcParamStepSize
 )
 
+// luaGCParamCode implements Lua 5.5.1 lobject.c:luaO_codeparam (4-bit exponent + 4-bit mantissa).
+func luaGCParamCode(p uint64) byte {
+	const maxParam = (uint64(0x1F) << (0xF - 7 - 1)) * 100
+	if p >= maxParam {
+		return 0xFF
+	}
+	q := (p*128 + 99) / 100
+	if q < 0x10 {
+		return byte(q)
+	}
+	log := uint(bits.Len64(q) - 5)
+	return byte(((q >> log) - 0x10) | (uint64(log+1) << 4))
+}
+
+// luaGCParamApply implements Lua 5.5.1 lobject.c:luaO_applyparam.
+func luaGCParamApply(p byte, x int64) int64 {
+	m := int64(p & 0xF)
+	e := int(p >> 4)
+	if e > 0 {
+		e--
+		m += 0x10
+	}
+	e -= 7
+	if e >= 0 {
+		if x < (math.MaxInt64/0x1F)>>uint(e) {
+			return (x * m) << uint(e)
+		}
+		return math.MaxInt64
+	}
+	sh := uint(-e)
+	if x < math.MaxInt64/0x1F {
+		return (x * m) >> sh
+	}
+	if (x >> sh) < math.MaxInt64/0x1F {
+		return (x >> sh) * m
+	}
+	return math.MaxInt64
+}
+
 func newGCState() gcState {
 	return gcState{
 		running:       true,
 		mode:          gcModeIncremental,
 		allocBytes:    4096,
 		lastLiveBytes: 4096,
-		params:        [6]int{20, 50, 70, 250, 200, 13}, // Lua 5.5.1 defaults
-		nextRefID:     1,
+		params: [6]byte{
+			luaGCParamCode(20),   // minormul
+			luaGCParamCode(50),   // majorminor
+			luaGCParamCode(70),   // minormajor
+			luaGCParamCode(250),  // pause
+			luaGCParamCode(200),  // stepmul
+			luaGCParamCode(9600), // stepsize (200 * sizeof(Table) on 64-bit)
+		},
+		nextRefID: 1,
 	}
 }
 
-// gcRecordAlloc accounts allocations in Tier 1 mode and triggers automatic GC cycles
-// so loops allocating tables/strings/closures fire weak clearing and __gc finalizers
-// (required by closure.lua:39, gc.lua:88-100, db.lua:926). Zero cost in Tier 0!
-// liveTop matches PUC-Rio lvm.c's checkGC(L, ra+1): only stack[0..liveTop) is live
-// so dead temporaries above R[a] (e.g. from discarded setmetatable({}) calls) are collected!
-func (s *State) gcRecordAlloc(bytes int64, liveTop int) {
-	if !s.gc.tier1 {
-		return
-	}
-	s.gc.allocBytes += bytes
-	if !s.gc.running || s.gc.inGCTM {
+// gcAddDebt adds bytes to the Tier 1 automatic GC pacing debt counter without
+// triggering a collection mid-operation (call gcCheckDebt at a safe point once
+// newly allocated objects are rooted on the thread stack).
+func (s *State) gcAddDebt(bytes int64) {
+	if !s.gc.tier1 || bytes <= 0 || !s.gc.running || s.gc.inGCTM {
 		return
 	}
 	s.gc.debt += bytes
-	pause := s.gc.params[gcParamPause]
+}
+
+// gcCheckDebt triggers an automatic Tier 1 GC cycle (or drains pending finalizers)
+// when accumulated allocation debt reaches the pause threshold.
+// liveTop matches PUC-Rio lvm.c's checkGC(L, ra+1): only stack[0..liveTop) is live
+// so dead temporaries above R[a] are collected.
+func (s *State) gcCheckDebt(liveTop int) {
+	if !s.gc.tier1 || !s.gc.running || s.gc.inGCTM {
+		return
+	}
+	pause := luaGCParamApply(s.gc.params[gcParamPause], 100)
 	threshold := int64(65536)
 	if pause > 100 {
-		if prop := s.gc.lastLiveBytes * int64(pause-100) / 100; prop > threshold {
+		if prop := s.gc.lastLiveBytes * (pause - 100) / 100; prop > threshold {
 			threshold = prop
 		}
 	}
@@ -126,6 +178,18 @@ func (s *State) gcRecordAlloc(bytes int64, liveTop int) {
 	}
 }
 
+// gcRecordAlloc accounts allocations in Tier 1 mode and triggers automatic GC cycles
+// so loops allocating tables/strings/closures fire weak clearing and __gc finalizers
+// (required by closure.lua:39, gc.lua:88-100, db.lua:926). Zero cost in Tier 0!
+func (s *State) gcRecordAlloc(bytes int64, liveTop int) {
+	if !s.gc.tier1 {
+		return
+	}
+	s.gc.allocBytes += bytes
+	s.gcAddDebt(bytes)
+	s.gcCheckDebt(liveTop)
+}
+
 // activateTier1 flips this State into deterministic Tier 1 GC semantics.
 func (s *State) activateTier1() {
 	s.gc.tier1 = true
@@ -144,6 +208,9 @@ func (s *State) registerFinalizable(obj Value, mt *Table) {
 	switch {
 	case obj.IsTable():
 		t := obj.AsTable()
+		if t.flags&tblFlagGCPending != 0 {
+			return // already separated into toBeFnz; matches lgc.c:luaC_checkfinalizer FINALIZEDBIT
+		}
 		if t.flags&tblFlagGCFnzed != 0 {
 			// Re-arming inside __gc (tracegc.lua / gc.lua)!
 			t.flags &^= tblFlagGCFnzed
@@ -154,6 +221,9 @@ func (s *State) registerFinalizable(obj Value, mt *Table) {
 		}
 	case obj.IsUserdata():
 		u := obj.AsUserdata()
+		if u.gcPending {
+			return
+		}
 		if u.gcFnzed {
 			u.gcFnzed = false
 		}
@@ -200,6 +270,9 @@ func (s *State) weakModeOf(t *Table) (weakK, weakV bool) {
 		return false, false
 	}
 	ms := mv.AsString().S
+	if nul := strings.IndexByte(ms, 0); nul >= 0 {
+		ms = ms[:nul]
+	}
 	return strings.ContainsRune(ms, 'k'), strings.ContainsRune(ms, 'v')
 }
 
@@ -214,12 +287,34 @@ func isCollectableWeak(v Value) bool {
 	return v.IsTable() || v.IsClosure() || v.IsUserdata() || v.IsThread()
 }
 
+func gcObjPtr(v Value) (unsafe.Pointer, bool) {
+	switch {
+	case v.IsTable():
+		return unsafe.Pointer(v.AsTable()), true
+	case v.IsClosure():
+		return unsafe.Pointer(v.AsClosure()), true
+	case v.IsNative():
+		nf := v.AsNative()
+		if nf.Collectable {
+			return unsafe.Pointer(nf), true
+		}
+	case v.IsUserdata():
+		return unsafe.Pointer(v.AsUserdata()), true
+	case v.IsThread():
+		return unsafe.Pointer(v.AsThread()), true
+	}
+	return nil, false
+}
+
 type gcTracer struct {
 	s                *State
 	epoch            uint64
 	preserveFrames   bool // true when triggered mid-opcode (e.g. checkMem) where s.cur.top may be stale
 	countStrings     bool // true when s.memLimit > 0 so live strings are counted accurately in liveBytes
 	trackDeadStrings bool // true when deleted hash keys exist so unreachable dead string keys can be released
+	cancelFn         func() error
+	cancelSteps      int64
+	aborted          bool
 	seenStrings      map[*LuaString]struct{}
 	seenProtos       map[*boundProto]struct{}
 	seenShapes       map[*Shape]struct{}
@@ -228,8 +323,38 @@ type gcTracer struct {
 	weakVals         []*Table // __mode="v"
 	ephemerons       []*Table // __mode="k"
 	allWeaks         []*Table // __mode="kv"
+	ephemDeps        map[unsafe.Pointer][]Value
+	ephemReady       []Value
+	ephemScanned     int
 	liveOpenUpvals   []*Upvalue
 	liveBytes        int64
+}
+
+func (tr *gcTracer) tickCancel() bool {
+	if tr.aborted {
+		return true
+	}
+	if tr.cancelFn == nil {
+		return false
+	}
+	tr.cancelSteps++
+	if (tr.cancelSteps & 1023) == 0 {
+		if err := tr.cancelFn(); err != nil {
+			tr.aborted = true
+			return true
+		}
+	}
+	return false
+}
+
+func (tr *gcTracer) unlockEphemDeps(ptr unsafe.Pointer) {
+	if len(tr.ephemDeps) == 0 {
+		return
+	}
+	if deps, ok := tr.ephemDeps[ptr]; ok {
+		tr.ephemReady = append(tr.ephemReady, deps...)
+		delete(tr.ephemDeps, ptr)
+	}
 }
 
 func (tr *gcTracer) markShape(sh *Shape) {
@@ -372,6 +497,7 @@ func (tr *gcTracer) mark(v Value) {
 			return
 		}
 		t.gcMark = tr.epoch
+		tr.unlockEphemDeps(unsafe.Pointer(t))
 		var arrBytes, nodeBytes, slotBytes int64
 		switch t.arrKind {
 		case arrInt, arrFloat:
@@ -398,6 +524,7 @@ func (tr *gcTracer) mark(v Value) {
 			return
 		}
 		c.gcMark = tr.epoch
+		tr.unlockEphemDeps(unsafe.Pointer(c))
 		tr.liveBytes += 64 + int64(len(c.upvals)*24)
 		tr.markBoundProto(c.bp)
 		tr.gray = append(tr.gray, v)
@@ -407,6 +534,7 @@ func (tr *gcTracer) mark(v Value) {
 			return
 		}
 		nf.gcMark = tr.epoch
+		tr.unlockEphemDeps(unsafe.Pointer(nf))
 		tr.liveBytes += 48 + int64(len(nf.upvals))*16
 		if len(nf.upvals) > 0 {
 			tr.gray = append(tr.gray, v)
@@ -417,6 +545,7 @@ func (tr *gcTracer) mark(v Value) {
 			return
 		}
 		u.gcMark = tr.epoch
+		tr.unlockEphemDeps(unsafe.Pointer(u))
 		tr.liveBytes += 64 + int64(len(u.UValues)*16)
 		if lf, ok := u.Data.(*luaFile); ok {
 			tr.liveBytes += lf.memBytes()
@@ -428,6 +557,7 @@ func (tr *gcTracer) mark(v Value) {
 			return
 		}
 		th.gcMark = tr.epoch
+		tr.unlockEphemDeps(unsafe.Pointer(th))
 		tr.liveBytes += 512 + int64(cap(th.stack))*16 + int64(cap(th.frames))*int64(unsafe.Sizeof(callFrame{}))
 		tr.gray = append(tr.gray, v)
 	}
@@ -435,6 +565,9 @@ func (tr *gcTracer) mark(v Value) {
 
 func (tr *gcTracer) propagateAll() {
 	for len(tr.gray) > 0 {
+		if tr.tickCancel() {
+			return
+		}
 		v := tr.gray[len(tr.gray)-1]
 		tr.gray = tr.gray[:len(tr.gray)-1]
 		switch {
@@ -655,27 +788,51 @@ func (tr *gcTracer) traverseTable(t *Table) {
 }
 
 func (tr *gcTracer) convergeEphemerons() {
-	changed := true
-	for changed {
-		changed = false
-		for _, t := range tr.ephemerons {
+	for !tr.aborted {
+		// Scan any newly discovered ephemeron tables once into the key -> dependent-values worklist.
+		for tr.ephemScanned < len(tr.ephemerons) {
+			t := tr.ephemerons[tr.ephemScanned]
+			tr.ephemScanned++
 			if t.hash == nil {
 				continue
 			}
 			nodes := t.hash.nodes
 			for i := range nodes {
+				if tr.tickCancel() {
+					return
+				}
 				nd := &nodes[i]
-				if nd.used && !nd.dead && !nd.val.IsNil() {
-					if tr.isMarked(nd.key) && !tr.isMarked(nd.val) {
+				if !nd.used || nd.dead || nd.val.IsNil() {
+					continue
+				}
+				if tr.isMarked(nd.key) {
+					if !tr.isMarked(nd.val) {
 						tr.mark(nd.val)
-						changed = true
+					}
+				} else if isCollectableWeak(nd.val) && !tr.isMarked(nd.val) {
+					if kptr, ok := gcObjPtr(nd.key); ok {
+						if tr.ephemDeps == nil {
+							tr.ephemDeps = make(map[unsafe.Pointer][]Value, 16)
+						}
+						tr.ephemDeps[kptr] = append(tr.ephemDeps[kptr], nd.val)
 					}
 				}
 			}
 		}
-		if changed {
-			tr.propagateAll()
+		for len(tr.ephemReady) > 0 && !tr.aborted {
+			if tr.tickCancel() {
+				return
+			}
+			v := tr.ephemReady[len(tr.ephemReady)-1]
+			tr.ephemReady = tr.ephemReady[:len(tr.ephemReady)-1]
+			if !tr.isMarked(v) {
+				tr.mark(v)
+			}
 		}
+		if len(tr.gray) == 0 {
+			break
+		}
+		tr.propagateAll()
 	}
 }
 
@@ -946,15 +1103,16 @@ func (s *State) collectEmergency() {
 }
 
 func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
-	if s.gc.inGCTM {
-		return // non-reentrant inside __gc (gc.lua:698-705)
+	if s.gc.inGCTM && !emergency {
+		return // non-reentrant inside __gc (gc.lua:698-705), except emergency GC under memLimit
 	}
 	countStr := s.memLimit > 0
 	trackDeadStr := s.gc.hasDeadHashKeys
+	cancelFn := s.nativeCancelFunc()
 	if emergency || (!s.gc.tier1 && len(s.gc.finalizable) == 0 && len(s.gc.weakFiles) == 0) {
 		// Tier 0 (with no open finalizable handles) or emergency allocation-time recount:
 		// nil-fill dead stack/frame slack and recompute exact live VM bytes without running
-		// __gc finalizers or mutating weak-table slots mid-operation!
+		// __gc finalizers mid-operation!
 		if s.cur != nil {
 			if s.cur.nframe < len(s.cur.frames) {
 				clear(s.cur.frames[s.cur.nframe:])
@@ -984,14 +1142,21 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 			preserveFrames:   preserveFrames,
 			countStrings:     countStr,
 			trackDeadStrings: trackDeadStr,
+			cancelFn:         cancelFn,
 		}
 		tr.markRoots()
 		tr.propagateAll()
+		if tr.aborted {
+			return
+		}
 		if emergency && (len(tr.ephemerons) > 0 || len(tr.weakVals) > 0 || len(tr.allWeaks) > 0 || len(s.gc.finalizable) > 0 || len(s.gc.weakFiles) > 0) {
 			// Match PUC-Rio lgc.c:luaC_fullgc(L, isemergency=1): clear unreachable weak entries
 			// so weak caches cannot pin gigabytes when collectgarbage("stop") is active, while
 			// deferring __gc execution and keeping pending-finalizer objects accounted in liveBytes.
 			tr.convergeEphemerons()
+			if tr.aborted {
+				return
+			}
 			tr.clearByValues(tr.weakVals)
 			tr.clearByValues(tr.allWeaks)
 			for _, fe := range s.gc.finalizable {
@@ -1015,6 +1180,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 			}
 			tr.propagateAll()
 			tr.convergeEphemerons()
+			if tr.aborted {
+				return
+			}
 			tr.clearByKeys(tr.ephemerons)
 			tr.clearByKeys(tr.allWeaks)
 			tr.clearByValues(tr.weakVals)
@@ -1023,6 +1191,15 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		tr.accountWeakStrings()
 		s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
 		tr.sweepInlineCaches()
+		// Close open upvalues belonging to threads that remain unreachable, so dead
+		// coroutines are unpinned for Go's GC even in Tier 0 / emergency GC paths.
+		for _, uv := range tr.liveOpenUpvals {
+			if uv.owner != nil && uv.owner.gcMark != tr.epoch {
+				uv.closed = uv.owner.stack[uv.stackIdx]
+				uv.owner = nil
+				uv.next = nil
+			}
+		}
 		s.intern.Prune()
 		s.shapes.Prune()
 		s.gc.allocBytes = tr.liveBytes
@@ -1040,14 +1217,21 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		preserveFrames:   preserveFrames,
 		countStrings:     countStr,
 		trackDeadStrings: trackDeadStr,
+		cancelFn:         cancelFn,
 	}
 
 	// Mark all VM roots.
 	tr.markRoots()
 	tr.propagateAll()
+	if tr.aborted {
+		return
+	}
 
 	// Step 1: Converge ephemerons before clearing weak values.
 	tr.convergeEphemerons()
+	if tr.aborted {
+		return
+	}
 
 	// Step 2: clearByValues BEFORE __gc separation (weak values are nil inside __gc!).
 	tr.clearByValues(tr.weakVals)
@@ -1061,14 +1245,15 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	for i := len(s.gc.finalizable) - 1; i >= 0; i-- {
 		obj := s.gc.finalizable[i].obj
 		if !tr.isMarked(obj) {
-			// Mark as finalized so it won't fire twice unless re-armed by setmetatable in __gc.
+			// Mark as finalized + pending so it won't fire twice or re-register before running.
 			switch {
 			case obj.IsTable():
 				t := obj.AsTable()
-				t.flags = (t.flags | tblFlagGCFnzed) &^ tblFlagGCInFnz
+				t.flags = (t.flags | tblFlagGCFnzed | tblFlagGCPending) &^ tblFlagGCInFnz
 			case obj.IsUserdata():
 				u := obj.AsUserdata()
 				u.gcFnzed = true
+				u.gcPending = true
 				u.gcInFnz = false
 			}
 			newlySep = append(newlySep, obj)
@@ -1098,6 +1283,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		obj := UserdataValue(u)
 		if !tr.isMarked(obj) {
 			u.gcFnzed = true
+			u.gcPending = true
 			newlySep = append(newlySep, obj)
 		} else {
 			keptFiles = append(keptFiles, wf)
@@ -1114,9 +1300,15 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		tr.mark(obj)
 	}
 	tr.propagateAll()
+	if tr.aborted {
+		return
+	}
 
 	// Step 5: convergeEphemerons + clearByKeys (weak keys of finalizing objects stay alive during __gc!).
 	tr.convergeEphemerons()
+	if tr.aborted {
+		return
+	}
 	tr.clearByKeys(tr.ephemerons)
 	tr.clearByKeys(tr.allWeaks)
 
@@ -1154,23 +1346,69 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	s.compactOpenFiles()
 }
 
+func (s *State) runFinalizerObj(th *Thread, obj Value) bool {
+	var mt *Table
+	switch {
+	case obj.IsTable():
+		t := obj.AsTable()
+		t.flags &^= tblFlagGCPending
+		mt = t.meta
+	case obj.IsUserdata():
+		u := obj.AsUserdata()
+		u.gcPending = false
+		mt = u.Meta
+	}
+	if mt == nil {
+		return true
+	}
+	tm := mt.RawGetStr(s.intern.tms[TMGC])
+	if tm.IsNil() {
+		return true
+	}
+	if !tm.IsClosure() && !tm.IsNative() && s.getTMByObj(tm, TMCall).IsNil() {
+		s.emitWarning(fmt.Sprintf("error in __gc (attempt to call a %s value (metamethod '__gc'))", s.objTypeName(tm)))
+		return true
+	}
+	th.nextFrameFinalizer = true
+	_, err := s.callOnThread(th, tm, []Value{obj})
+	th.nextFrameFinalizer = false
+	if err != nil {
+		if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
+			s.abortErr = err
+			return false
+		}
+		var le *LuaError
+		if errors.As(err, &le) {
+			if le.Val.IsString() {
+				s.emitWarning(fmt.Sprintf("error in __gc (%s)", le.Val.AsString().S))
+			} else {
+				s.emitWarning("error in __gc (error object is not a string)")
+			}
+		} else {
+			s.emitWarning(fmt.Sprintf("error in __gc (%s)", err.Error()))
+		}
+	}
+	return true
+}
+
 func (s *State) drainFinalizers() {
 	if s.gc.inGCTM || len(s.gc.toBeFnz) == 0 {
 		return
 	}
 	s.gc.inGCTM = true
-	// Disable debug hooks and forbid coroutine.yield while running __gc (lgc.c:GCTM).
+	// Suppress debug hooks (without clearing hookMask so debug.gethook/sethook still work)
+	// and forbid coroutine.yield while running __gc (lgc.c:GCTM: L->allowhook = 0).
 	th := s.cur
-	savedMask := uint8(0)
+	savedSuppress := false
 	if th != nil {
-		savedMask = th.hookMask
-		th.hookMask = 0
+		savedSuppress = th.suppressHook
+		th.suppressHook = true
 		th.nny++
 	}
 	defer func() {
 		if th != nil {
 			th.nny--
-			th.hookMask = savedMask
+			th.suppressHook = savedSuppress
 		}
 		s.gc.inGCTM = false
 	}()
@@ -1179,29 +1417,8 @@ func (s *State) drainFinalizers() {
 		obj := s.gc.toBeFnz[0]
 		s.gc.toBeFnz[0] = Value{}
 		s.gc.toBeFnz = s.gc.toBeFnz[1:]
-		var mt *Table
-		switch {
-		case obj.IsTable():
-			mt = obj.AsTable().meta
-		case obj.IsUserdata():
-			mt = obj.AsUserdata().Meta
-		}
-		if mt == nil {
-			continue
-		}
-		tm := mt.RawGetStr(s.intern.tms[TMGC])
-		if tm.IsNil() || (!tm.IsClosure() && !tm.IsNative() && s.getTMByObj(tm, TMCall).IsNil()) {
-			continue
-		}
-		th.nextFrameFinalizer = true
-		_, err := s.callOnThread(th, tm, []Value{obj})
-		th.nextFrameFinalizer = false
-		if err != nil {
-			if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
-				s.abortErr = err
-				return
-			}
-			s.emitWarning(fmt.Sprintf("error in __gc metamethod (%s)", err.Error()))
+		if !s.runFinalizerObj(th, obj) {
+			return
 		}
 	}
 	s.gc.toBeFnz = nil
@@ -1225,10 +1442,11 @@ func (s *State) Close() {
 			switch {
 			case obj.IsTable():
 				t := obj.AsTable()
-				t.flags = (t.flags | tblFlagGCFnzed) &^ tblFlagGCInFnz
+				t.flags = (t.flags | tblFlagGCFnzed | tblFlagGCPending) &^ tblFlagGCInFnz
 			case obj.IsUserdata():
 				u := obj.AsUserdata()
 				u.gcFnzed = true
+				u.gcPending = true
 				u.gcInFnz = false
 			}
 			s.gc.toBeFnz = append(s.gc.toBeFnz, obj)
@@ -1247,6 +1465,7 @@ func (s *State) Close() {
 				continue
 			}
 			u.gcFnzed = true
+			u.gcPending = true
 			s.gc.toBeFnz = append(s.gc.toBeFnz, UserdataValue(u))
 		}
 		s.gc.weakFiles = nil
@@ -1267,29 +1486,8 @@ func (s *State) drainFinalizersQueued() {
 		obj := s.gc.toBeFnz[0]
 		s.gc.toBeFnz[0] = Value{}
 		s.gc.toBeFnz = s.gc.toBeFnz[1:]
-		var mt *Table
-		switch {
-		case obj.IsTable():
-			mt = obj.AsTable().meta
-		case obj.IsUserdata():
-			mt = obj.AsUserdata().Meta
-		}
-		if mt == nil {
-			continue
-		}
-		tm := mt.RawGetStr(s.intern.tms[TMGC])
-		if tm.IsNil() || (!tm.IsClosure() && !tm.IsNative() && s.getTMByObj(tm, TMCall).IsNil()) {
-			continue
-		}
-		th.nextFrameFinalizer = true
-		_, err := s.callOnThread(th, tm, []Value{obj})
-		th.nextFrameFinalizer = false
-		if err != nil {
-			if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
-				s.abortErr = err
-				return
-			}
-			s.emitWarning(fmt.Sprintf("error in __gc metamethod (%s)", err.Error()))
+		if !s.runFinalizerObj(th, obj) {
+			return
 		}
 	}
 	s.gc.toBeFnz = nil
@@ -1308,31 +1506,50 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 	opt := "collect"
 	if len(args) >= 1 && !args[0].IsNil() {
 		if !args[0].IsString() {
-			return nil, fmt.Errorf("bad argument #1 to 'collectgarbage' (string expected)")
+			return nil, fmt.Errorf("bad argument #1 to 'collectgarbage' (string expected, got %s)", s.objTypeName(args[0]))
 		}
 		opt = args[0].AsString().S
 	}
-	// Non-reentrant inside __gc finalizer (gc.lua:698-705).
-	if s.gc.inGCTM {
-		return []Value{NilValue()}, nil
-	}
 	switch opt {
 	case "collect":
+		if s.gc.inGCTM {
+			return []Value{NilValue()}, nil
+		}
 		s.CollectFull()
 		if s.abortErr != nil {
 			return nil, s.abortErr
 		}
 		return []Value{IntValue(0)}, nil
 	case "stop":
+		if s.gc.inGCTM {
+			return []Value{NilValue()}, nil
+		}
 		s.gc.running = false
 		return []Value{IntValue(0)}, nil
 	case "restart":
+		if s.gc.inGCTM {
+			return []Value{NilValue()}, nil
+		}
 		s.gc.running = true
 		return []Value{IntValue(0)}, nil
 	case "count":
+		if s.gc.inGCTM {
+			return []Value{NilValue()}, nil
+		}
 		kb := float64(s.gc.allocBytes) / 1024.0
 		return []Value{FloatValue(kb)}, nil
 	case "step":
+		if len(args) >= 2 && !args[1].IsNil() {
+			if _, ok := args[1].CoerceInt(); !ok {
+				if args[1].IsFloat() {
+					return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (number has no integer representation)")
+				}
+				return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (number expected, got %s)", s.objTypeName(args[1]))
+			}
+		}
+		if s.gc.inGCTM {
+			return []Value{NilValue()}, nil
+		}
 		if s.gc.tier1 {
 			s.CollectFull()
 			if s.abortErr != nil {
@@ -1341,8 +1558,14 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{TrueValue()}, nil
 	case "isrunning":
+		if s.gc.inGCTM {
+			return []Value{NilValue()}, nil
+		}
 		return []Value{BoolValue(s.gc.running)}, nil
 	case "incremental":
+		if s.gc.inGCTM {
+			return []Value{NilValue()}, nil
+		}
 		prev := "incremental"
 		if s.gc.mode == gcModeGenerational {
 			prev = "generational"
@@ -1350,6 +1573,9 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 		s.gc.mode = gcModeIncremental
 		return []Value{StringValue(s.intern.Intern(prev))}, nil
 	case "generational":
+		if s.gc.inGCTM {
+			return []Value{NilValue()}, nil
+		}
 		prev := "incremental"
 		if s.gc.mode == gcModeGenerational {
 			prev = "generational"
@@ -1358,21 +1584,35 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 		return []Value{StringValue(s.intern.Intern(prev))}, nil
 	case "param":
 		if len(args) < 2 || !args[1].IsString() {
-			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (string expected)")
+			got := "no value"
+			if len(args) >= 2 {
+				got = s.objTypeName(args[1])
+			}
+			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (string expected, got %s)", got)
 		}
 		idx, ok := gcParamNames[args[1].AsString().S]
 		if !ok {
 			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (invalid option '%s')", args[1].AsString().S)
 		}
-		old := s.gc.params[idx]
+		nv := int64(-1)
 		if len(args) >= 3 && !args[2].IsNil() {
-			nv, ok := args[2].ToInt()
+			var ok bool
+			nv, ok = args[2].CoerceInt()
 			if !ok {
-				return nil, fmt.Errorf("bad argument #3 to 'collectgarbage' (number expected)")
+				if args[2].IsFloat() {
+					return nil, fmt.Errorf("bad argument #3 to 'collectgarbage' (number has no integer representation)")
+				}
+				return nil, fmt.Errorf("bad argument #3 to 'collectgarbage' (number expected, got %s)", s.objTypeName(args[2]))
 			}
-			s.gc.params[idx] = int(nv)
 		}
-		return []Value{IntValue(int64(old))}, nil
+		if s.gc.inGCTM {
+			return []Value{NilValue()}, nil
+		}
+		old := luaGCParamApply(s.gc.params[idx], 100)
+		if nv >= 0 {
+			s.gc.params[idx] = luaGCParamCode(uint64(nv))
+		}
+		return []Value{IntValue(old)}, nil
 	default:
 		return nil, fmt.Errorf("bad argument #1 to 'collectgarbage' (invalid option '%s')", opt)
 	}

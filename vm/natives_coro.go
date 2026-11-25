@@ -79,9 +79,6 @@ func (s *State) CloseThread(co *Thread) error {
 	if co.state != s {
 		return fmt.Errorf("cannot close thread belonging to another State")
 	}
-	if co.closing {
-		return nil
-	}
 	switch co.StatusString() {
 	case "normal":
 		return fmt.Errorf("cannot close a normal coroutine")
@@ -95,9 +92,11 @@ func (s *State) CloseThread(co *Thread) error {
 			s.abortErr = nil
 		}
 		co.closing = true
+		co.nny++
 		hasInitErr := co.status == ThreadDead && !co.errObj.IsNil()
 		errVal := co.errObj
 		errVal, hasErr, _ := co.closeAllSync(0, errVal, hasInitErr)
+		co.nny--
 		co.closing = false
 		co.status = ThreadDead
 		co.nframe = 0
@@ -121,7 +120,11 @@ func (s *State) CloseThread(co *Thread) error {
 
 func nativeCoroCreate(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsFunction() {
-		return nil, fmt.Errorf("bad argument #1 to 'create' (function expected)")
+		got := "no value"
+		if len(args) >= 1 {
+			got = s.objTypeName(args[0])
+		}
+		return nil, fmt.Errorf("bad argument #1 to 'create' (function expected, got %s)", got)
 	}
 	if s.memLimit > 0 {
 		if err := s.checkMemAndAccount(threadInitMemBytes(128, defaultFrameCap)); err != nil {
@@ -135,13 +138,13 @@ func nativeCoroCreate(s *State, args []Value) ([]Value, error) {
 }
 
 func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
-	if co == s.cur {
+	if co == s.cur || co.closing {
 		return false, []Value{StringValue(s.intern.Intern("cannot resume non-suspended coroutine"))}, nil
 	}
 	if co.status == ThreadDead {
 		return false, []Value{StringValue(s.intern.Intern("cannot resume dead coroutine"))}, nil
 	}
-	if co.status == ThreadNormal {
+	if co.status == ThreadNormal || (co.status == ThreadOK && co.nframe > 0) {
 		return false, []Value{StringValue(s.intern.Intern("cannot resume non-suspended coroutine"))}, nil
 	}
 	if s.nCcalls >= maxCCalls {
@@ -179,7 +182,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			if nf.Intrinsic == intrPCall && len(args) >= 1 && isFlatProtectedTarget(args[0]) {
 				if err := co.ensureStack(len(args) + 8); err != nil {
 					co.status = ThreadDead
-					ev := errorToLuaValue(s, err)
+					ev := s.runtimeErrorToValue(co, err)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -202,7 +205,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					if isUncatchableErr(err) {
 						return false, nil, err
 					}
-					ev := errorToLuaValue(s, err)
+					ev := s.runtimeErrorToValue(co, err)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -211,7 +214,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			if nf.Intrinsic == intrXPCall && len(args) >= 2 && isFlatProtectedTarget(args[0]) && args[1].IsFunction() {
 				if err := co.ensureStack(len(args) + 8); err != nil {
 					co.status = ThreadDead
-					ev := errorToLuaValue(s, err)
+					ev := s.runtimeErrorToValue(co, err)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -234,7 +237,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					if isUncatchableErr(err) {
 						return false, nil, err
 					}
-					ev := errorToLuaValue(s, err)
+					ev := s.runtimeErrorToValue(co, err)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -247,7 +250,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					co.stack[0] = NilValue()
 					var ev Value
 					if lerr != nil {
-						ev = errorToLuaValue(s, lerr)
+						ev = s.runtimeErrorToValue(co, lerr)
 					} else if len(loaded) > 1 {
 						ev = loaded[1]
 					} else {
@@ -261,7 +264,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				co.top = 1
 				if err := co.pushLuaFrame(cl, 0, 0, -1); err != nil {
 					co.status = ThreadDead
-					ev := errorToLuaValue(s, err)
+					ev := s.runtimeErrorToValue(co, err)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -269,7 +272,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			}
 			if err := co.ensureStack(1 + len(args) + 8); err != nil {
 				co.status = ThreadDead
-				ev := errorToLuaValue(s, err)
+				ev := s.runtimeErrorToValue(co, err)
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
@@ -294,7 +297,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				if isUncatchableErr(err) {
 					return false, nil, err
 				}
-				ev := errorToLuaValue(s, err)
+				ev := s.runtimeErrorToValue(co, err)
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
@@ -321,7 +324,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			co.errObj = ev
 			return false, []Value{ev}, nil
 		}
-		if co.hookMask&HookMaskCall != 0 && !co.inHook {
+		if co.hookMask&HookMaskCall != 0 && !co.inHook && !co.suppressHook {
 			if herr := s.fireHook(co, "call", NilValue()); herr != nil {
 				if errors.Is(herr, errCoroCloseSelf) {
 					return s.finishCoroCloseSelf(co)
@@ -340,7 +343,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 						return false, nil, uerr
 					}
 					co.status = ThreadDead
-					ev := errorToLuaValue(s, herr)
+					ev := s.runtimeErrorToValue(co, herr)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -360,14 +363,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					return false, nil, uerr
 				}
 				co.status = ThreadDead
-				ev := errorToLuaValue(s, err)
+				ev := s.runtimeErrorToValue(co, err)
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
 		}
 		if co.yieldedNative {
 			co.yieldedNative = false
-			if co.hookMask&HookMaskRet != 0 && !co.inHook {
+			if co.hookMask&HookMaskRet != 0 && !co.inHook && !co.suppressHook {
 				if herr := s.fireHook(co, "return", NilValue()); herr != nil {
 					if errors.Is(herr, errCoroCloseSelf) {
 						return s.finishCoroCloseSelf(co)
@@ -386,7 +389,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 							return false, nil, uerr
 						}
 						co.status = ThreadDead
-						ev := errorToLuaValue(s, herr)
+						ev := s.runtimeErrorToValue(co, herr)
 						co.errObj = ev
 						return false, []Value{ev}, nil
 					}
@@ -421,7 +424,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 						return false, nil, uerr
 					}
 					co.status = ThreadDead
-					ev := errorToLuaValue(s, cerr)
+					ev := s.runtimeErrorToValue(co, cerr)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -489,23 +492,30 @@ func (s *State) finishCoroCloseSelf(co *Thread) (bool, []Value, error) {
 		s.abortErr = nil
 	}
 	// Coroutine closed itself via coroutine.close(): run TBC finalizers (non-yieldable) and terminate!
+	co.closing = true
 	co.nny++
 	errVal, hasErr, _ := co.closeAllSync(0, NilValue(), false)
 	co.nny--
+	co.closing = false
 	co.status = ThreadDead
 	co.nframe = 0
 	co.top = 0
 	co.stack[0] = NilValue()
-	co.errObj = NilValue()
 	if hasErr {
+		co.errObj = errVal
 		return false, []Value{errVal}, nil
 	}
+	co.errObj = NilValue()
 	return true, nil, nil
 }
 
 func nativeCoroResume(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsThread() {
-		return nil, fmt.Errorf("bad argument #1 to 'resume' (thread expected)")
+		got := "no value"
+		if len(args) >= 1 {
+			got = s.objTypeName(args[0])
+		}
+		return nil, fmt.Errorf("bad argument #1 to 'resume' (thread expected, got %s)", got)
 	}
 	co := args[0].AsThread()
 	ok, res, uerr := s.resumeThread(co, args[1:])
@@ -534,7 +544,11 @@ func nativeCoroYield(s *State, args []Value) ([]Value, error) {
 
 func nativeCoroStatus(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsThread() {
-		return nil, fmt.Errorf("bad argument #1 to 'status' (thread expected)")
+		got := "no value"
+		if len(args) >= 1 {
+			got = s.objTypeName(args[0])
+		}
+		return nil, fmt.Errorf("bad argument #1 to 'status' (thread expected, got %s)", got)
 	}
 	return []Value{StringValue(s.intern.Intern(args[0].AsThread().StatusString()))}, nil
 }
@@ -548,7 +562,7 @@ func nativeCoroIsYieldable(s *State, args []Value) ([]Value, error) {
 	th := s.cur
 	if len(args) >= 1 && !args[0].IsNil() {
 		if !args[0].IsThread() {
-			return nil, fmt.Errorf("bad argument #1 to 'isyieldable' (thread expected)")
+			return nil, fmt.Errorf("bad argument #1 to 'isyieldable' (thread expected, got %s)", s.objTypeName(args[0]))
 		}
 		th = args[0].AsThread()
 	}
@@ -557,7 +571,11 @@ func nativeCoroIsYieldable(s *State, args []Value) ([]Value, error) {
 
 func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsFunction() {
-		return nil, fmt.Errorf("bad argument #1 to 'wrap' (function expected)")
+		got := "no value"
+		if len(args) >= 1 {
+			got = s.objTypeName(args[0])
+		}
+		return nil, fmt.Errorf("bad argument #1 to 'wrap' (function expected, got %s)", got)
 	}
 	if s.memLimit > 0 || s.gc.tier1 {
 		if err := s.checkMemAndAccount(threadInitMemBytes(128, defaultFrameCap) + 48 + 16); err != nil {
@@ -602,6 +620,16 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 					co.stack[0] = NilValue()
 					co.errObj = NilValue()
 				}
+				// Match Lua 5.5 lcorolib.c:luaB_auxwrap: prepend caller location to string error objects.
+				if errVal.IsString() {
+					if where := s.errorWhere(1); where != "" {
+						if ls, ierr := s.TryIntern(where + errVal.AsString().S); ierr == nil {
+							errVal = StringValue(ls)
+						} else {
+							return nil, ierr
+						}
+					}
+				}
 				return nil, &LuaError{Val: errVal}
 			}
 			return res, nil
@@ -614,12 +642,9 @@ func nativeCoroClose(s *State, args []Value) ([]Value, error) {
 	co := s.cur
 	if len(args) >= 1 && !args[0].IsNil() {
 		if !args[0].IsThread() {
-			return nil, fmt.Errorf("bad argument #1 to 'close' (thread expected)")
+			return nil, fmt.Errorf("bad argument #1 to 'close' (thread expected, got %s)", s.objTypeName(args[0]))
 		}
 		co = args[0].AsThread()
-	}
-	if co.closing {
-		return []Value{TrueValue()}, nil
 	}
 	status := co.StatusString()
 	switch status {
@@ -633,9 +658,11 @@ func nativeCoroClose(s *State, args []Value) ([]Value, error) {
 		return nil, errCoroCloseSelf
 	case "dead", "suspended":
 		co.closing = true
+		co.nny++
 		hasInitErr := co.status == ThreadDead && !co.errObj.IsNil()
 		errVal := co.errObj
 		errVal, hasErr, _ := co.closeAllSync(0, errVal, hasInitErr)
+		co.nny--
 		co.closing = false
 		co.status = ThreadDead
 		co.nframe = 0

@@ -474,12 +474,21 @@ func (s *State) applyPackageEnv() {
 }
 
 func expandDefaultPath(val, dflt string) string {
-	// Per Lua 5.5 loadlib.c:setpath (main.lua:222-235): ONLY ';;' expands to the default path.
-	if !strings.Contains(val, ";;") {
+	// Per Lua 5.5 loadlib.c:setpath (main.lua:222-235): replace ONLY the first ';;'
+	// with the default path, preserving any leading/trailing single ';' separators.
+	idx := strings.Index(val, ";;")
+	if idx < 0 {
 		return val
 	}
-	out := strings.ReplaceAll(val, ";;", ";"+dflt+";")
-	out = strings.TrimPrefix(out, ";")
-	out = strings.TrimSuffix(out, ";")
-	return out
+	var sb strings.Builder
+	if idx > 0 {
+		sb.WriteString(val[:idx])
+		sb.WriteByte(';')
+	}
+	sb.WriteString(dflt)
+	if idx+2 < len(val) {
+		sb.WriteByte(';')
+		sb.WriteString(val[idx+2:])
+	}
+	return sb.String()
 }
