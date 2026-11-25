@@ -99,17 +99,14 @@ func generateHooked(src string) string {
 		"\t\t\t\t\t\tpc = 0\n\t\t\t\t\t\tth.frames[newCI].dirty = true\n\t\t\t\t\t\tth.frames[newCI].oldPC = -1\n\t\t\t\t\t\tif reload, err := s.fireCallHook(th, newCI, nargs, nparams, entryDepth); err != nil {\n\t\t\t\t\t\t\treturn err\n\t\t\t\t\t\t} else if reload {\n\t\t\t\t\t\t\tgoto reloadFrame\n\t\t\t\t\t\t}\n\t\t\t\t\t\tregs = th.window(newBase)\n\t\t\t\t\t\tcontinue\n",
 		1,
 	)
-	// Fire return hook on OP_RETURN0 and OP_RETURN1.
-	fn = strings.Replace(fn,
-		"\t\tcase bytecode.OP_RETURN0:\n",
-		"\t\tcase bytecode.OP_RETURN0:\n\t\t\ts.fireRetHook(th, ev.ci, 0, 0)\n",
-		1,
-	)
-	fn = strings.Replace(fn,
-		"\t\tcase bytecode.OP_RETURN1:\n",
-		"\t\tcase bytecode.OP_RETURN1:\n\t\t\ts.fireRetHook(th, ev.ci, uint16(a)+1, 1)\n",
-		1,
-	)
+	// Route OP_RETURN0 and OP_RETURN1 through execColdOp in runHooked so return hooks
+	// and their error propagation share one canonical path while keeping runHooked small.
+	retStart := strings.Index(fn, "\t\tcase bytecode.OP_RETURN0:\n")
+	retEnd := strings.Index(fn, "\t\tcase bytecode.OP_FORLOOP:\n")
+	if retStart < 0 || retEnd < 0 || retEnd <= retStart {
+		panic("interpgen: could not locate OP_RETURN0..OP_RETURN1 block")
+	}
+	fn = fn[:retStart] + fn[retEnd:]
 
 	header := `package vm
 

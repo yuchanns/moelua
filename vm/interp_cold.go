@@ -1061,8 +1061,11 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				dirty:     true,
 			}
 			th.nframe++
-			_ = s.fireHook(th, "return", NilValue())
+			herr := s.fireHook(th, "return", NilValue())
 			th.nframe--
+			if herr != nil {
+				return s.catchSlow(th, ev, false, herr)
+			}
 			th.placeResults(funcIdx, []Value{rv}, nresults)
 			if nresults >= 0 {
 				if end := ev.base + int(ev.bp.maxStack); th.top < end {
@@ -1073,6 +1076,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		}
 		res, err := nf.callMulti(s, args)
 		if hookedNative || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook) {
+			var hookErr error
 			if hookedNative {
 				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook {
 					// Place returned results at cf.base so debug.getlocal(2, i) in return hook sees them (db.lua:555)!
@@ -1080,7 +1084,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
 					th.frames[th.nframe-1].ftransfer = 1
 					th.frames[th.nframe-1].ntransfer = uint16(len(res))
-					_ = s.fireHook(th, "return", NilValue())
+					hookErr = s.fireHook(th, "return", NilValue())
 				}
 				th.nframe--
 			} else {
@@ -1102,8 +1106,11 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					dirty:     true,
 				}
 				th.nframe++
-				_ = s.fireHook(th, "return", NilValue())
+				hookErr = s.fireHook(th, "return", NilValue())
 				th.nframe--
+			}
+			if hookErr != nil && err == nil {
+				return s.catchSlow(th, ev, false, hookErr)
 			}
 		}
 		if err != nil {
@@ -2373,18 +2380,26 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		}
 		return coldReload, 0, nil
 
-	case bytecode.OP_RETURN:
-		b := int(uint8(w >> bytecode.PosB))
-		n := b - 1
-		if n < 0 {
-			n = max(0, th.top-(ev.base+int(a)))
+	case bytecode.OP_RETURN, bytecode.OP_RETURN0, bytecode.OP_RETURN1:
+		var n int
+		switch op {
+		case bytecode.OP_RETURN0:
+			n = 0
+		case bytecode.OP_RETURN1:
+			n = 1
+		default:
+			b := int(uint8(w >> bytecode.PosB))
+			n = b - 1
+			if n < 0 {
+				n = max(0, th.top-(ev.base+int(a)))
+			}
 		}
 		cf := &th.frames[ev.ci]
 		srcStart := ev.base + int(a)
 		if srcStart+n > len(th.stack) {
 			n = max(0, len(th.stack)-srcStart)
 		}
-		if w.K() {
+		if op == bytecode.OP_RETURN && w.K() {
 			th.closeUpvals(ev.base)
 			if th.hasTBCAtOrAbove(ev.base) {
 				// Yieldable TBC close before completing return!
@@ -2412,7 +2427,11 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		}
 		if th.hookMask&HookMaskRet != 0 && !th.inHook {
 			cf.dirty = true
-			cf.ftransfer = uint16(srcStart - cf.base + 1)
+			if op == bytecode.OP_RETURN0 {
+				cf.ftransfer = 0
+			} else {
+				cf.ftransfer = uint16(srcStart - cf.base + 1)
+			}
 			cf.ntransfer = uint16(n)
 			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
 				return coldContinue, pc, herr

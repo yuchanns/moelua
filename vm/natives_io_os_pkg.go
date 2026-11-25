@@ -819,10 +819,77 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 	return []Value{IntValue(pos)}, nil
 }
 
+// ReadStdinLine reads one line from the State's shared stdin reader (used by REPLs
+// so interactive command reading and Lua io.read() share the exact same buffer).
+func (s *State) ReadStdinLine() (string, error) {
+	if lf, ok := asLuaFile(s.defaultInput); ok && !lf.closed && lf.f != nil {
+		return lf.reader().ReadString('\n')
+	}
+	return "", io.EOF
+}
+
 // ioReadErr wraps an OS-level I/O error (distinct from bad-argument format errors).
 type ioReadErr struct{ err error }
 
 func (e ioReadErr) Error() string { return e.err.Error() }
+
+func readBoundedLine(s *State, r *bufio.Reader, keepNL bool) (string, bool, error) {
+	var buf bytes.Buffer
+	for {
+		frag, err := r.ReadSlice('\n')
+		if len(frag) > 0 {
+			if merr := s.checkMem(int64(buf.Len()) + int64(len(frag)) + 64); merr != nil {
+				return "", false, merr
+			}
+			buf.Write(frag)
+		}
+		if err == nil {
+			line := buf.String()
+			if !keepNL {
+				line = strings.TrimSuffix(line, "\n")
+			}
+			s.gc.allocBytes += int64(len(line)) + 64
+			return line, true, nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			if buf.Len() == 0 {
+				return "", false, nil
+			}
+			line := buf.String()
+			if !keepNL {
+				line = strings.TrimSuffix(line, "\n")
+			}
+			s.gc.allocBytes += int64(len(line)) + 64
+			return line, true, nil
+		}
+		return "", false, ioReadErr{err}
+	}
+}
+
+func readBoundedAll(s *State, r *bufio.Reader) (string, error) {
+	var buf bytes.Buffer
+	var chunk [4096]byte
+	for {
+		n, err := r.Read(chunk[:])
+		if n > 0 {
+			if merr := s.checkMem(int64(buf.Len()) + int64(n) + 64); merr != nil {
+				return "", merr
+			}
+			buf.Write(chunk[:n])
+		}
+		if err == io.EOF {
+			res := buf.String()
+			s.gc.allocBytes += int64(len(res)) + 64
+			return res, nil
+		}
+		if err != nil {
+			return "", ioReadErr{err}
+		}
+	}
+}
 
 func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 	r := lf.reader()
@@ -840,8 +907,16 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		if n < 0 {
 			return NilValue(), false, fmt.Errorf("invalid read count")
 		}
+		if s.memLimit > 0 {
+			if err := s.checkMemAndAccount(n + 64); err != nil {
+				return NilValue(), false, err
+			}
+		}
 		buf := make([]byte, n)
 		got, err := io.ReadFull(r, buf)
+		if s.memLimit > 0 && int64(got) < n {
+			s.gc.allocBytes -= n - int64(got)
+		}
 		if got == 0 && err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return NilValue(), false, nil
@@ -856,6 +931,13 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 	}
 	switch spec[0] {
 	case 'l', 'L':
+		if s.memLimit > 0 {
+			line, ok, err := readBoundedLine(s, r, spec[0] == 'L')
+			if err != nil || !ok {
+				return NilValue(), false, err
+			}
+			return StringValue(s.intern.Intern(line)), true, nil
+		}
 		line, err := r.ReadString('\n')
 		if len(line) == 0 && err != nil {
 			if errors.Is(err, io.EOF) {
@@ -868,6 +950,13 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		}
 		return StringValue(s.intern.Intern(line)), true, nil
 	case 'a':
+		if s.memLimit > 0 {
+			all, err := readBoundedAll(s, r)
+			if err != nil {
+				return NilValue(), false, err
+			}
+			return StringValue(s.intern.Intern(all)), true, nil
+		}
 		all, err := io.ReadAll(r)
 		if err != nil {
 			return NilValue(), false, ioReadErr{err}
@@ -1342,7 +1431,7 @@ func nativeOSRename(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeOSTmpName(s *State, _ []Value) ([]Value, error) {
-	f, err := os.CreateTemp("", "moelua-name-*")
+	f, err := os.CreateTemp("", "moelua_name_*")
 	if err != nil {
 		return nil, err
 	}

@@ -237,6 +237,8 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			res, err := nf.callMulti(s, args)
 			if errors.Is(err, errYieldSentinel) {
 				co.status = ThreadSuspended
+				co.yieldDst = 0
+				co.yieldNRes = -1 // MULTRET: resume args become coroutine return values
 				out := co.yieldVals
 				co.yieldVals = nil
 				return true, out, nil

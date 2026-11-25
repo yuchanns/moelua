@@ -177,7 +177,7 @@ func buildStdTemplate() *stdTemplate {
 	}
 
 	tmpl := &stdTemplate{
-		short:             b.intern.short,
+		short:             b.intern.SnapshotFrozen(),
 		tms:               b.intern.tms,
 		nextStrID:         b.intern.nextID,
 		nextShapeID:       b.shapes.nextID,

@@ -2,7 +2,9 @@ package vm
 
 import (
 	"hash/maphash"
+	"strings"
 	"sync/atomic"
+	"weak"
 )
 
 const maxShortStringLen = 40
@@ -110,23 +112,62 @@ func hashString(s string, seed uint32) uint32 {
 }
 
 type stringInterner struct {
-	seed   uint32
-	nextID uint32
-	frozen map[string]*LuaString // read-only shared stdlib short strings (never mutated after template init)
-	short  map[string]*LuaString // lazily allocated per-State map for user short strings
-	tms    [tmCount]*LuaString
+	seed      uint32
+	nextID    uint32
+	shortAdds int
+	frozen    map[string]*LuaString              // read-only shared stdlib short strings (never mutated after template init)
+	short     map[uint32][]weak.Pointer[LuaString] // hash-bucketed weak interner so unreachable short strings are reclaimed
+	tms       [tmCount]*LuaString
 }
 
 func newStringInterner(_ uint32) stringInterner {
 	si := stringInterner{
 		seed:   globalStrSeed,
 		nextID: 1,
-		short:  make(map[string]*LuaString, 160),
+		short:  make(map[uint32][]weak.Pointer[LuaString], 160),
 	}
 	for i := range tmCount {
 		si.tms[i] = si.Intern(tmNames[i])
 	}
 	return si
+}
+
+// SnapshotFrozen returns a strong map of all currently live short strings (used once when freezing stdTemplate).
+func (si *stringInterner) SnapshotFrozen() map[string]*LuaString {
+	out := make(map[string]*LuaString, len(si.short))
+	for _, bucket := range si.short {
+		for _, wp := range bucket {
+			if ls := wp.Value(); ls != nil {
+				out[ls.S] = ls
+			}
+		}
+	}
+	return out
+}
+
+// Prune removes collected weak entries and empty hash buckets from the per-State interner.
+func (si *stringInterner) Prune() int {
+	si.shortAdds = 0
+	if len(si.short) == 0 {
+		return 0
+	}
+	live := 0
+	for h, bucket := range si.short {
+		kept := bucket[:0]
+		for _, wp := range bucket {
+			if wp.Value() != nil {
+				kept = append(kept, wp)
+			}
+		}
+		if len(kept) == 0 {
+			delete(si.short, h)
+		} else {
+			clear(bucket[len(kept):])
+			si.short[h] = kept
+			live += len(kept)
+		}
+	}
+	return live
 }
 
 // hash returns the cached hash, computing it lazily for long strings (len > 40)
@@ -153,21 +194,57 @@ func (si *stringInterner) Intern(s string) *LuaString {
 				return ls
 			}
 		}
+		h := hashString(s, si.seed)
 		if si.short != nil {
-			if ls, ok := si.short[s]; ok {
-				return ls
+			if bucket := si.short[h]; len(bucket) > 0 {
+				var found *LuaString
+				dead := false
+				for _, wp := range bucket {
+					ls := wp.Value()
+					if ls == nil {
+						dead = true
+						continue
+					}
+					if ls.S == s {
+						found = ls
+						if !dead {
+							return ls
+						}
+					}
+				}
+				if dead {
+					kept := bucket[:0]
+					for _, wp := range bucket {
+						if wp.Value() != nil {
+							kept = append(kept, wp)
+						}
+					}
+					clear(bucket[len(kept):])
+					if len(kept) == 0 {
+						delete(si.short, h)
+					} else {
+						si.short[h] = kept
+					}
+				}
+				if found != nil {
+					return found
+				}
 			}
 		} else {
-			si.short = make(map[string]*LuaString, 32)
+			si.short = make(map[uint32][]weak.Pointer[LuaString], 32)
 		}
 		ls := &LuaString{
-			S:     s,
-			Hash:  hashString(s, si.seed),
+			S:     strings.Clone(s),
+			Hash:  h,
 			ID:    si.nextID,
 			Short: true,
 		}
 		si.nextID++
-		si.short[s] = ls
+		si.short[h] = append(si.short[h], weak.Make(ls))
+		si.shortAdds++
+		if si.shortAdds >= 1024 && len(si.short) > 64 {
+			si.Prune()
+		}
 		return ls
 	}
 	return &LuaString{

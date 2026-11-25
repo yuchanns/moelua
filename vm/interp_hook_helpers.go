@@ -111,17 +111,6 @@ func (s *State) fireCallHook(th *Thread, ci, nargs, nparams, entryDepth int) (bo
 }
 
 //go:noinline
-func (s *State) fireRetHook(th *Thread, ci int, ftransfer, ntransfer uint16) {
-	if th.hookMask&HookMaskRet == 0 || th.inHook {
-		return
-	}
-	th.frames[ci].dirty = true
-	th.frames[ci].ftransfer = ftransfer
-	th.frames[ci].ntransfer = ntransfer
-	_ = s.fireHook(th, "return", NilValue())
-}
-
-//go:noinline
 func (s *State) fireHook(th *Thread, event string, line Value) error {
 	if th.hook.IsNil() || th.inHook {
 		return nil

@@ -910,44 +910,6 @@ reloadFrame:
 			regs = th.window(ev.base)
 			continue
 
-		case bytecode.OP_RETURN0:
-			s.fireRetHook(th, ev.ci, 0, 0)
-			nres := th.frames[ev.ci].nresults
-			funcIdx := th.frames[ev.ci].funcIdx
-			th.nframe--
-			if nres > 0 {
-				fillNil(th.stack[funcIdx : funcIdx+nres])
-				th.top = funcIdx + nres
-			} else {
-				th.top = funcIdx
-			}
-			if th.nframe <= entryDepth {
-				return nil
-			}
-			goto reloadFrame
-
-		case bytecode.OP_RETURN1:
-			s.fireRetHook(th, ev.ci, uint16(a)+1, 1)
-			retVal := regs[a]
-			nres := th.frames[ev.ci].nresults
-			funcIdx := th.frames[ev.ci].funcIdx
-			th.nframe--
-			if nres == 0 {
-				th.top = funcIdx
-			} else {
-				th.stack[funcIdx] = retVal
-				if nres > 1 {
-					fillNil(th.stack[funcIdx+1 : funcIdx+nres])
-					th.top = funcIdx + nres
-				} else {
-					th.top = funcIdx + 1
-				}
-			}
-			if th.nframe <= entryDepth {
-				return nil
-			}
-			goto reloadFrame
-
 		case bytecode.OP_FORLOOP:
 			if regs[a+1].IsInt() {
 				cnt := uint64(regs[a].Int())

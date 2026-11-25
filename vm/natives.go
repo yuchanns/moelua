@@ -664,7 +664,13 @@ func nativeMathLog(_ *State, args []Value) ([]Value, error) {
 }
 
 func nativeMathFmod(_ *State, args []Value) ([]Value, error) {
-	if len(args) >= 2 && BothInt(args[0], args[1]) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("bad argument #1 to 'fmod' (number expected, got no value)")
+	}
+	if len(args) < 2 {
+		return nil, fmt.Errorf("bad argument #2 to 'fmod' (number expected, got no value)")
+	}
+	if BothInt(args[0], args[1]) {
 		b := args[1].Int()
 		if b == 0 {
 			return nil, fmt.Errorf("bad argument #2 to 'fmod' (zero)")
@@ -674,8 +680,14 @@ func nativeMathFmod(_ *State, args []Value) ([]Value, error) {
 		}
 		return []Value{IntValue(args[0].Int() % b)}, nil
 	}
-	x, _ := args[0].ToFloat()
-	y, _ := args[1].ToFloat()
+	x, ok1 := args[0].ToFloat()
+	if !ok1 {
+		return nil, fmt.Errorf("bad argument #1 to 'fmod' (number expected)")
+	}
+	y, ok2 := args[1].ToFloat()
+	if !ok2 {
+		return nil, fmt.Errorf("bad argument #2 to 'fmod' (number expected)")
+	}
 	return []Value{FloatValue(math.Mod(x, y))}, nil
 }
 
@@ -701,22 +713,31 @@ func nativeMathModf(_ *State, args []Value) ([]Value, error) {
 }
 
 func nativeMathFrexp(_ *State, args []Value) ([]Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("bad argument #1 to 'frexp' (number expected, got no value)")
+	}
 	f, ok := args[0].ToFloat()
 	if !ok {
-		return nil, fmt.Errorf("bad argument #1 to 'frexp'")
+		return nil, fmt.Errorf("bad argument #1 to 'frexp' (number expected)")
 	}
 	m, e := math.Frexp(f)
 	return []Value{FloatValue(m), IntValue(int64(e))}, nil
 }
 
 func nativeMathLdexp(_ *State, args []Value) ([]Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("bad argument #1 to 'ldexp' (number expected, got no value)")
+	}
+	if len(args) < 2 {
+		return nil, fmt.Errorf("bad argument #2 to 'ldexp' (number expected, got no value)")
+	}
 	m, ok := args[0].ToFloat()
 	if !ok {
-		return nil, fmt.Errorf("bad argument #1 to 'ldexp'")
+		return nil, fmt.Errorf("bad argument #1 to 'ldexp' (number expected)")
 	}
 	e, ok := args[1].ToInt()
 	if !ok {
-		return nil, fmt.Errorf("bad argument #2 to 'ldexp'")
+		return nil, fmt.Errorf("bad argument #2 to 'ldexp' (number expected)")
 	}
 	return []Value{FloatValue(math.Ldexp(m, int(e)))}, nil
 }
@@ -790,10 +811,19 @@ func nativeMathType(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeMathUlt(_ *State, args []Value) ([]Value, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("bad argument #1 to 'ult' (number expected, got no value)")
+	}
+	if len(args) < 2 {
+		return nil, fmt.Errorf("bad argument #2 to 'ult' (number expected, got no value)")
+	}
 	a, ok1 := args[0].ToInt()
+	if !ok1 {
+		return nil, fmt.Errorf("bad argument #1 to 'ult' (number expected)")
+	}
 	b, ok2 := args[1].ToInt()
-	if !ok1 || !ok2 {
-		return nil, fmt.Errorf("bad argument to 'ult'")
+	if !ok2 {
+		return nil, fmt.Errorf("bad argument #2 to 'ult' (number expected)")
 	}
 	return []Value{BoolValue(uint64(a) < uint64(b))}, nil
 }
@@ -840,11 +870,22 @@ func nativeMathRandom(s *State, args []Value) ([]Value, error) {
 	if lo > hi {
 		return nil, fmt.Errorf("bad argument to 'random' (interval is empty)")
 	}
-	span := uint64(hi) - uint64(lo) + 1
-	if span == 0 {
+	// Exact PUC-Rio Lua 5.5 lmathlib.c:project unbiased rejection sampling over [0..n].
+	n := uint64(hi) - uint64(lo)
+	if n == ^uint64(0) {
 		return []Value{IntValue(int64(r))}, nil
 	}
-	return []Value{IntValue(lo + int64(r%span))}, nil
+	lim := n
+	for sh := uint(1); (lim & (lim + 1)) != 0; sh *= 2 {
+		lim |= lim >> sh
+	}
+	for {
+		p := r & lim
+		if p <= n {
+			return []Value{IntValue(lo + int64(p))}, nil
+		}
+		r = s.nextRand()
+	}
 }
 
 func nativeMathRandomSeed(s *State, args []Value) ([]Value, error) {

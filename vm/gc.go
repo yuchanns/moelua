@@ -48,8 +48,6 @@ type gcState struct {
 	finalizable []gcFinalEntry
 	// Queue of unreachable objects pending __gc invocation in LIFO order.
 	toBeFnz []Value
-	// All tables whose metatable ever had __mode (weak table candidates).
-	weakCandidates []*Table
 	// Host-pinned references (analog of luaL_ref) so Tier 1 marker keeps host-held Lua values alive.
 	pinnedRefs map[int]Value
 	nextRefID  int
@@ -150,17 +148,14 @@ func (s *State) registerFinalizable(obj Value, mt *Table) {
 	}
 }
 
-// registerWeakCandidate records t if its metatable has a __mode field.
+// registerWeakCandidate activates Tier 1 GC if mt has a __mode field.
 func (s *State) registerWeakCandidate(t, mt *Table) {
 	if mt == nil {
 		return
 	}
 	if !mt.RawGetStr(s.intern.tms[TMMode]).IsNil() {
 		s.activateTier1()
-		if t.flags&tblFlagGCWeakCand == 0 {
-			t.flags |= tblFlagGCWeakCand
-			s.gc.weakCandidates = append(s.gc.weakCandidates, t)
-		}
+		t.flags |= tblFlagGCWeakCand
 	}
 }
 
@@ -646,9 +641,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 			tr.mark(v)
 		}
 		tr.propagateAll()
-		if countStr && s.intern.short != nil {
-			tr.liveBytes += int64(len(s.intern.short) * 80)
-		}
+		s.intern.Prune()
 		s.gc.allocBytes = tr.liveBytes
 		s.gc.lastLiveBytes = tr.liveBytes
 		return
@@ -702,7 +695,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	tr.clearByValues(tr.allWeaks)
 
 	// Step 3: separateToBeFnz in STRICT REVERSE (LIFO) registration order!
-	kept := s.gc.finalizable[:0]
+	// Use a separate slice for kept entries so reverse traversal never overwrites
+	// earlier unvisited entries in s.gc.finalizable.
+	var kept []gcFinalEntry
 	var newlySep []Value
 	for i := len(s.gc.finalizable) - 1; i >= 0; i-- {
 		obj := s.gc.finalizable[i].obj
@@ -752,9 +747,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		}
 	}
 
-	if countStr && s.intern.short != nil {
-		tr.liveBytes += int64(len(s.intern.short) * 80)
-	}
+	s.intern.Prune()
 	s.gc.allocBytes = tr.liveBytes
 	s.gc.lastLiveBytes = tr.liveBytes
 	s.gc.debt = 0
