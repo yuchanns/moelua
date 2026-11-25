@@ -35,17 +35,19 @@ const (
 )
 
 // Non-zero-size static sentinel array in .noptrbss (never aliases runtime.zerobase).
-// Layout: [0]=nil, [1]=false, [2]=true, [3]=altScalar (float in intnil, int in floatnil).
+// Layout: [0]=nil, [1]=false, [2]=true, [3]=altScalar (float in intnil, int in floatnil),
+// [4]=nullLightUD (distinct nonnumeric sentinel so LightUDValue(nil) stays LUA_TLIGHTUSERDATA).
 // Keeping [0]=nil and [1]=false adjacent makes IsFalsy a single SUB+CMP:
 //   uintptr(v.ptr) - tagBase < 16
-var scalarTags [4]uint64
+var scalarTags [5]uint64
 
 var (
-	tagNil   = unsafe.Pointer(&scalarTags[0])
-	tagFalse = unsafe.Pointer(&scalarTags[1])
-	tagTrue  = unsafe.Pointer(&scalarTags[2])
-	tagAlt   = unsafe.Pointer(&scalarTags[3])
-	tagBase  = uintptr(unsafe.Pointer(&scalarTags[0]))
+	tagNil         = unsafe.Pointer(&scalarTags[0])
+	tagFalse       = unsafe.Pointer(&scalarTags[1])
+	tagTrue        = unsafe.Pointer(&scalarTags[2])
+	tagAlt         = unsafe.Pointer(&scalarTags[3])
+	tagNullLightUD = unsafe.Pointer(&scalarTags[4])
+	tagBase        = uintptr(unsafe.Pointer(&scalarTags[0]))
 )
 
 // Quiet-NaN-spaced heap object kind tags stored in Value.bits when ptr is a Go heap pointer.
@@ -97,6 +99,9 @@ func NativeValue(f *NativeFunc) Value  { return Value{ptr: unsafe.Pointer(f), bi
 func ThreadValue(th *Thread) Value     { return Value{ptr: unsafe.Pointer(th), bits: kindThread} }
 func UserdataValue(u *Userdata) Value  { return Value{ptr: unsafe.Pointer(u), bits: kindUserdata} }
 func LightUDValue(p unsafe.Pointer) Value {
+	if p == nil {
+		return Value{ptr: tagNullLightUD, bits: kindLightUD}
+	}
 	return Value{ptr: p, bits: kindLightUD}
 }
 
@@ -130,6 +135,9 @@ func (v Value) AsNative() *NativeFunc { return (*NativeFunc)(v.ptr) }
 func (v Value) AsThread() *Thread     { return (*Thread)(v.ptr) }
 func (v Value) AsUserdata() *Userdata { return (*Userdata)(v.ptr) }
 func (v Value) AsLightUD() unsafe.Pointer {
+	if v.ptr == tagNullLightUD {
+		return nil
+	}
 	return v.ptr
 }
 
@@ -279,8 +287,8 @@ func RawEqual(a, b Value) bool {
 		if a.IsFloat() {
 			return a.Float() == b.Float()
 		}
-		// Heap objects with identical pointer (including interned short strings) are equal.
-		return true
+		// Heap and light-userdata objects with identical pointer and kind tag are equal.
+		return a.bits == b.bits
 	}
 	// Cross int/float comparison
 	if a.IsInt() && b.IsFloat() {
@@ -511,6 +519,8 @@ func FormatValue(v Value) string {
 		return fmt.Sprintf("function: %p", v.AsNative())
 	case v.IsThread():
 		return fmt.Sprintf("thread: %p", v.AsThread())
+	case v.IsLightUD():
+		return fmt.Sprintf("userdata: %p", v.AsLightUD())
 	default:
 		return fmt.Sprintf("userdata: %p", v.ptr)
 	}

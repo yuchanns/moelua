@@ -24,7 +24,7 @@ func (s *State) NewThread(fn Value) (*Thread, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'NewThread' (function expected)")
 	}
 	if s.memLimit > 0 {
-		if err := s.checkMemAndAccount(512 + 128*16); err != nil {
+		if err := s.checkMemAndAccount(threadInitMemBytes(128, defaultFrameCap)); err != nil {
 			return nil, err
 		}
 	}
@@ -121,7 +121,7 @@ func nativeCoroCreate(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'create' (function expected)")
 	}
 	if s.memLimit > 0 {
-		if err := s.checkMemAndAccount(512 + 128*16); err != nil {
+		if err := s.checkMemAndAccount(threadInitMemBytes(128, defaultFrameCap)); err != nil {
 			return nil, err
 		}
 	}
@@ -471,7 +471,7 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'wrap' (function expected)")
 	}
 	if s.memLimit > 0 {
-		if err := s.checkMemAndAccount(512 + 128*16); err != nil {
+		if err := s.checkMemAndAccount(threadInitMemBytes(128, defaultFrameCap)); err != nil {
 			return nil, err
 		}
 	}

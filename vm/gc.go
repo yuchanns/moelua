@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"strings"
+	"unsafe"
 	"weak"
 )
 
@@ -385,7 +386,7 @@ func (tr *gcTracer) mark(v Value) {
 			return
 		}
 		th.gcMark = tr.epoch
-		tr.liveBytes += 512 + int64(len(th.stack)*16)
+		tr.liveBytes += 512 + int64(cap(th.stack))*16 + int64(cap(th.frames))*int64(unsafe.Sizeof(callFrame{}))
 		tr.gray = append(tr.gray, v)
 	}
 }

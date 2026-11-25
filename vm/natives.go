@@ -1,13 +1,17 @@
 package vm
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
 	"math/bits"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/internal/luastdlib"
@@ -893,26 +897,58 @@ func nativeMathRandom(s *State, args []Value) ([]Value, error) {
 	}
 }
 
-func nativeMathRandomSeed(s *State, args []Value) ([]Value, error) {
-	var x, y uint64
-	if len(args) >= 1 && !args[0].IsNil() {
-		v, ok := args[0].CoerceInt()
-		if !ok {
-			return nil, fmt.Errorf("bad argument #1 to 'randomseed'")
-		}
-		x = uint64(v)
+var (
+	globalRandSalt    uint64
+	globalRandCounter atomic.Uint64
+)
+
+func init() {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		globalRandSalt = binary.LittleEndian.Uint64(b[:])
+	} else {
+		globalRandSalt = uint64(time.Now().UnixNano()) ^ 0x9e3779b97f4a7c15
 	}
-	if len(args) >= 2 && !args[1].IsNil() {
-		v, ok := args[1].CoerceInt()
-		if !ok {
-			return nil, fmt.Errorf("bad argument #2 to 'randomseed'")
-		}
-		y = uint64(v)
-	}
+}
+
+func makeRandomSeed(s *State) uint64 {
+	seq := globalRandCounter.Add(1)
+	x := globalRandSalt ^ uint64(time.Now().UnixNano()) ^ (seq * 0x9e3779b97f4a7c15) ^ uint64(uintptr(unsafe.Pointer(s)))
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
+}
+
+func (s *State) seedRNG(x, y uint64) {
 	s.rng = [4]uint64{x, 0xff, y, 0}
 	for range 16 {
 		s.nextRand()
 	}
+}
+
+func nativeMathRandomSeed(s *State, args []Value) ([]Value, error) {
+	var x, y uint64
+	if len(args) == 0 {
+		x = makeRandomSeed(s)
+		y = s.nextRand()
+	} else {
+		v, ok := args[0].CoerceInt()
+		if !ok {
+			return nil, fmt.Errorf("bad argument #1 to 'randomseed' (number expected, got %s)", args[0].TypeName())
+		}
+		x = uint64(v)
+		if len(args) >= 2 && !args[1].IsNil() {
+			v2, ok := args[1].CoerceInt()
+			if !ok {
+				return nil, fmt.Errorf("bad argument #2 to 'randomseed' (number expected, got %s)", args[1].TypeName())
+			}
+			y = uint64(v2)
+		}
+	}
+	s.seedRNG(x, y)
 	return []Value{IntValue(int64(x)), IntValue(int64(y))}, nil
 }
 

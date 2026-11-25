@@ -217,8 +217,8 @@ func newBootstrapState() *State {
 		startTime:  time.Now(),
 		gc:         newGCState(),
 		compilerFn: defaultCompileFunc,
-		rng:        [4]uint64{0x6a09e667f3bcc909, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1},
 	}
+	s.seedRNG(makeRandomSeed(s), 0)
 	s.shapes.root = &s.shapes.rootShape
 	s.mainThread = newThread(s, initialStackSize)
 	s.mainThread.nny = 1 // main thread is never yieldable (L->nny = 1)

@@ -148,6 +148,12 @@ const (
 	HookMaskCount uint8 = 1 << 3
 )
 
+const defaultFrameCap = 32
+
+func threadInitMemBytes(stackCap, frameCap int) int64 {
+	return 512 + int64(stackCap)*16 + int64(frameCap)*int64(unsafe.Sizeof(callFrame{}))
+}
+
 func newThread(s *State, stackCap int) *Thread {
 	if stackCap < 128 {
 		stackCap = 128
@@ -155,13 +161,45 @@ func newThread(s *State, stackCap int) *Thread {
 	th := &Thread{
 		state:  s,
 		stack:  make([]Value, stackCap),
-		frames: make([]callFrame, 32),
+		frames: make([]callFrame, defaultFrameCap),
 		status: ThreadOK,
 		errObj: NilValue(),
 		hook:   NilValue(),
 	}
 	fillNil(th.stack)
 	return th
+}
+
+func (th *Thread) ensureFrameCap(need, limit int) error {
+	if need <= len(th.frames) {
+		return nil
+	}
+	if need > limit {
+		if th.state != nil {
+			return &LuaError{Val: StringValue(th.state.intern.Intern("stack overflow"))}
+		}
+		return fmt.Errorf("stack overflow")
+	}
+	newCap := len(th.frames) * 2
+	if newCap < defaultFrameCap {
+		newCap = defaultFrameCap
+	}
+	for newCap < need {
+		newCap *= 2
+	}
+	if newCap > limit {
+		newCap = limit
+	}
+	if th.state != nil && th.state.memLimit > 0 {
+		delta := int64(newCap-len(th.frames)) * int64(unsafe.Sizeof(callFrame{}))
+		if err := th.state.checkMemAndAccount(delta); err != nil {
+			return err
+		}
+	}
+	nf := make([]callFrame, newCap)
+	copy(nf, th.frames)
+	th.frames = nf
+	return nil
 }
 
 const maxStackSlots = 2_000_000
@@ -327,23 +365,8 @@ func (th *Thread) pushLuaFrame(cl *Closure, funcIdx, nargs, nresults int) error 
 	if th.inErrHandler {
 		limit = maxFrames + 128
 	}
-	if th.nframe >= limit {
-		return &LuaError{Val: StringValue(th.state.intern.Intern("stack overflow"))}
-	}
-	if th.nframe >= len(th.frames) {
-		newCap := len(th.frames) * 2
-		if newCap > limit {
-			newCap = limit
-		}
-		if th.state != nil && th.state.memLimit > 0 {
-			delta := int64(newCap-len(th.frames)) * int64(unsafe.Sizeof(callFrame{}))
-			if err := th.state.checkMemAndAccount(delta); err != nil {
-				return err
-			}
-		}
-		nf := make([]callFrame, newCap)
-		copy(nf, th.frames)
-		th.frames = nf
+	if err := th.ensureFrameCap(th.nframe+1, limit); err != nil {
+		return err
 	}
 	p := cl.bp.proto
 	nparams := int(p.NumParams)

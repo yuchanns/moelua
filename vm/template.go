@@ -324,7 +324,7 @@ func cloneFromStdTemplate(noEnv bool) *State {
 	s.compilerFn = defaultCompileFunc
 	s.builtinNext = tmpl.builtinNext
 	s.builtinIPairsIter = tmpl.builtinIPairsIter
-	s.rng = [4]uint64{0x6a09e667f3bcc909, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1}
+	s.seedRNG(makeRandomSeed(s), 0)
 
 	// Wire mainThread with embedded stack & frame slices (zero separate heap allocs!).
 	a.initStack = tmpl.nilStack
