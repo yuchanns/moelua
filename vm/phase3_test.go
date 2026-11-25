@@ -6595,3 +6595,60 @@ func TestCodexReviewRound29VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound30VMRegressions(t *testing.T) {
+	t.Run("gmatch_state_comes_from_live_upvalue", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(131072)
+		cl, err := s.LoadChunk([]byte(`
+			local it = string.gmatch("ab", ".")
+			assert(it() == "a")
+			local keep = {}
+			for i = 1, 100 do
+				local iter = string.gmatch(string.rep("a", 32768) .. tostring(i), ".")
+				debug.setupvalue(iter, 1, nil)
+				debug.setupvalue(iter, 2, nil)
+				debug.setupvalue(iter, 3, nil)
+				keep[i] = iter
+				collectgarbage("collect")
+			end
+			assert(it() == "b" and it() == nil)
+			local ok, e = pcall(keep[1])
+			assert(not ok and tostring(e):find("bad gmatch iterator state", 1, true), tostring(e))
+			return #keep
+		`), "=gmatch_live_upvalue")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].Int() != 100 {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("read_number_whitespace_polls_execution_controls", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "spaces.txt")
+		if err := os.WriteFile(path, bytes.Repeat([]byte{' '}, 32<<20), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`local f = assert(io.open(...)); return f, f.read`), "=read_n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl, StringValue(s.intern.Intern(path)))
+		if err != nil || len(res) != 2 {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+		s.SetInstructionLimit(100)
+		_, err = s.Call(res[1], res[0], StringValue(s.intern.Intern("n")))
+		if !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("read('n') over 32MiB whitespace ignored instruction limit: err=%v", err)
+		}
+		s.SetInstructionLimit(0)
+		if _, err := s.Call(s.GetGlobal("io").AsTable().RawGetStr(s.intern.Intern("close")), res[0]); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	})
+}
