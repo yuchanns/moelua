@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -401,4 +402,92 @@ func TestCLIFlagsREPLAndStdinParity(t *testing.T) {
 			t.Fatalf("expected REPL result to remain anchored across _G.__index print lookup, got stdout=%q stderr=%q", out, stderr)
 		}
 	})
+
+	// 19. -v banner matches Lua 5.5.1 copyright year (1994-2026).
+	t.Run("version_banner_2026", func(t *testing.T) {
+		out, stderr, err := run("", "", nil, "-v")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%s", err, stderr)
+		}
+		const want = "Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio"
+		if strings.TrimSpace(out) != want {
+			t.Fatalf("expected %q, got %q", want, out)
+		}
+	})
+
+	// 20. __tostring returning a string returns verbatim with NO traceback (lua.c:msghandler).
+	t.Run("msgh_tostring_string_omits_traceback", func(t *testing.T) {
+		_, stderr, err := run("", "", nil, "-E", "-e", `error(setmetatable({}, {__tostring=function() return "custom-msg" end}))`)
+		if err == nil {
+			t.Fatalf("expected non-zero exit")
+		}
+		if !strings.Contains(stderr, "custom-msg") {
+			t.Fatalf("expected custom-msg in stderr, got %q", stderr)
+		}
+		if strings.Contains(stderr, "stack traceback:") {
+			t.Fatalf("expected NO stack traceback when __tostring returns string, got stderr=%q", stderr)
+		}
+	})
+
+	// 21. __tostring returning a number does NOT qualify as LUA_TSTRING; falls back with traceback (lua.c:msghandler).
+	t.Run("msgh_tostring_number_falls_back_with_traceback", func(t *testing.T) {
+		_, stderr, err := run("", "", nil, "-E", "-e", `error(setmetatable({}, {__tostring=function() return 123 end}))`)
+		if err == nil {
+			t.Fatalf("expected non-zero exit")
+		}
+		if !strings.Contains(stderr, "(error object is a table value)") || !strings.Contains(stderr, "stack traceback:") {
+			t.Fatalf("expected '(error object is a table value)' with stack traceback, got stderr=%q", stderr)
+		}
+	})
+
+	// 22. error() / error(nil) reports '(error object is a nil value)' with traceback (lua.c:msghandler + luaG_errormsg).
+	t.Run("error_nil_reports_nil_object_with_traceback", func(t *testing.T) {
+		for _, expr := range []string{`error()`, `error(nil)`} {
+			_, stderr, err := run("", "", nil, "-E", "-e", expr)
+			if err == nil {
+				t.Fatalf("%s: expected non-zero exit", expr)
+			}
+			if !strings.Contains(stderr, "(error object is a nil value)") || !strings.Contains(stderr, "stack traceback:") {
+				t.Fatalf("%s: expected '(error object is a nil value)' with stack traceback, got stderr=%q", expr, stderr)
+			}
+		}
+	})
+
+	// 23. SIGINT delivered to parent while os.execute runs a child process is ignored by parent.
+	if runtime.GOOS != "windows" {
+		t.Run("sigint_during_os_execute_ignored_by_parent", func(t *testing.T) {
+			cmd := exec.Command(bin, "-E", "-e", `
+				local ok = os.execute("printf 'CHILD_READY\\n'; sleep 0.35")
+				io.stdout:write("AFTER_EXEC=" .. tostring(ok) .. "\n")
+				io.stdout:flush()
+			`)
+			stdoutPipe, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			buf := make([]byte, 32)
+			n, err := stdoutPipe.Read(buf)
+			if err != nil {
+				_ = cmd.Process.Kill()
+				t.Fatalf("failed reading CHILD_READY: %v", err)
+			}
+			if err := cmd.Process.Signal(os.Interrupt); err != nil {
+				_ = cmd.Process.Kill()
+				t.Fatalf("sending SIGINT to parent failed: %v", err)
+			}
+			rest, _ := io.ReadAll(stdoutPipe)
+			out := string(buf[:n]) + string(rest)
+			if err := cmd.Wait(); err != nil {
+				t.Fatalf("parent aborted on SIGINT during os.execute: err=%v stdout=%q stderr=%q", err, out, stderr.String())
+			}
+			if !strings.Contains(out, "AFTER_EXEC=true") {
+				t.Fatalf("expected AFTER_EXEC=true, got stdout=%q stderr=%q", out, stderr.String())
+			}
+		})
+	}
 }

@@ -14,7 +14,7 @@ import (
 	"github.com/yuchanns/moelua/vm"
 )
 
-const luaReleaseBanner = "Lua 5.5.1  Copyright (C) 1994-2025 Lua.org, PUC-Rio"
+const luaReleaseBanner = "Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio"
 
 type cliFlags struct {
 	hasE    bool
@@ -131,18 +131,26 @@ func armInterruptHandler(s *vm.State) func() {
 	signal.Notify(sigCh, os.Interrupt)
 	s.SetInterruptFlag(&intrFlag)
 	go func() {
-		select {
-		case <-done:
-			return
-		case <-sigCh:
-			// Match lua.c:laction: restore default SIGINT disposition on the first signal
-			// so a second SIGINT terminates the process even if Lua caught the first via pcall.
-			signal.Reset(os.Interrupt)
-			intrFlag.Store(true)
+		for {
 			select {
+			case <-done:
+				return
 			case <-sigCh:
-				os.Exit(130)
-			default:
+				// While os.execute runs a child process, ignore SIGINT in the parent
+				// (matching POSIX system(3) / lua.c) so Ctrl-C only interrupts the child.
+				if s.InChildExec() {
+					continue
+				}
+				// Match lua.c:laction: restore default SIGINT disposition on the first signal
+				// so a second SIGINT terminates the process even if Lua caught the first via pcall.
+				signal.Reset(os.Interrupt)
+				intrFlag.Store(true)
+				select {
+				case <-sigCh:
+					os.Exit(130)
+				default:
+				}
+				return
 			}
 		}
 	}()
@@ -169,9 +177,8 @@ local function msgh(err)
 	local tm = _type(mt) == "table" and _rawget(mt, "__tostring") or nil
 	if tm ~= nil then
 		local r = invokeToString(tm, err)
-		local rt = _type(r)
-		if rt == "string" or rt == "number" then
-			return _tb(_tostring(r), 2)
+		if _type(r) == "string" then
+			return r
 		end
 	end
 	return _tb("(error object is a " .. t .. " value)", 2)

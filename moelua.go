@@ -692,14 +692,30 @@ func (s *State) GetGlobal(name string) Value {
 	return s.vm.GetGlobal(name)
 }
 
-// Compile compiles Lua 5.5.1 source text into a *Chunk.
+// Compile compiles Lua 5.5.1 source text into a *Chunk while honoring this State's
+// memory limit, cancellation context, and instruction budget.
 func (s *State) Compile(name, src string) (*Chunk, error) {
-	return Compile(name, src)
+	if !s.ready() {
+		return nil, ErrStateClosed
+	}
+	p, err := s.vm.CompileString(name, src)
+	if err != nil {
+		return nil, err
+	}
+	return &Chunk{proto: p}, nil
 }
 
-// CompileReader streams Lua 5.5.1 source text from r into a *Chunk.
+// CompileReader streams Lua 5.5.1 source text from r into a *Chunk while honoring this State's
+// memory limit, cancellation context, and instruction budget.
 func (s *State) CompileReader(name string, r io.Reader) (*Chunk, error) {
-	return CompileReader(name, r)
+	if !s.ready() {
+		return nil, ErrStateClosed
+	}
+	p, err := s.vm.CompileReader(name, r)
+	if err != nil {
+		return nil, err
+	}
+	return &Chunk{proto: p}, nil
 }
 
 // Load instantiates an immutable *Chunk as a Lua closure bound to this State's _ENV.
@@ -744,7 +760,7 @@ func (s *State) DoStringNamed(name, src string) ([]Value, error) {
 	if !s.ready() {
 		return nil, ErrStateClosed
 	}
-	ch, err := Compile(name, src)
+	ch, err := s.Compile(name, src)
 	if err != nil {
 		return nil, err
 	}

@@ -1129,3 +1129,69 @@ func TestUserdataMemoryLimitAccounting(t *testing.T) {
 		t.Fatalf("expected NewUserdataWithMeta to fail with memory error, got u=%v err=%v", u, err)
 	}
 }
+
+func TestStateCompileEnforcesSandboxControls(t *testing.T) {
+	// 1. Closed / nil State returns ErrStateClosed from Compile and CompileReader.
+	var nilState *moelua.State
+	if _, err := nilState.Compile("=nil", "return 1"); !errors.Is(err, moelua.ErrStateClosed) {
+		t.Fatalf("expected ErrStateClosed on nil State.Compile, got %v", err)
+	}
+	if _, err := nilState.CompileReader("=nil", strings.NewReader("return 1")); !errors.Is(err, moelua.ErrStateClosed) {
+		t.Fatalf("expected ErrStateClosed on nil State.CompileReader, got %v", err)
+	}
+	closed := moelua.New()
+	closed.Close()
+	if _, err := closed.Compile("=closed", "return 1"); !errors.Is(err, moelua.ErrStateClosed) {
+		t.Fatalf("expected ErrStateClosed on closed State.Compile, got %v", err)
+	}
+	if _, err := closed.CompileReader("=closed", strings.NewReader("return 1")); !errors.Is(err, moelua.ErrStateClosed) {
+		t.Fatalf("expected ErrStateClosed on closed State.CompileReader, got %v", err)
+	}
+
+	// 2. State.Compile, State.CompileReader, and State.DoString enforce WithMemoryLimit.
+	hugeLit := `return "` + strings.Repeat("a", 512*1024) + `"`
+	sMem := moelua.New(moelua.WithMemoryLimit(128 * 1024))
+	defer sMem.Close()
+	if _, err := sMem.Compile("=big", hugeLit); err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected memory error from State.Compile, got %v", err)
+	}
+	if _, err := sMem.CompileReader("=big", strings.NewReader(hugeLit)); err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected memory error from State.CompileReader, got %v", err)
+	}
+	if _, err := sMem.DoString(hugeLit); err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected memory error from State.DoString, got %v", err)
+	}
+
+	// 3. State.Compile and State.CompileReader honor pre-canceled context.
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sCtx := moelua.New(moelua.WithContext(cctx))
+	defer sCtx.Close()
+	if _, err := sCtx.Compile("=cancel", "return 1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled from State.Compile, got %v", err)
+	}
+	if _, err := sCtx.CompileReader("=cancel", strings.NewReader("return 1")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled from State.CompileReader, got %v", err)
+	}
+
+	// 4. State.Compile, State.CompileReader, and State.DoString honor WithInstructionLimit on huge source.
+	hugeComments := strings.Repeat("-- "+strings.Repeat("x", 1020)+"\n", 64) + "return 1\n"
+	sInsn := moelua.New(moelua.WithInstructionLimit(500))
+	defer sInsn.Close()
+	if _, err := sInsn.Compile("=huge", hugeComments); !errors.Is(err, moelua.ErrInstructionLimit) {
+		t.Fatalf("expected ErrInstructionLimit from State.Compile, got %v", err)
+	}
+	sInsn.SetInstructionLimit(500)
+	if _, err := sInsn.CompileReader("=huge", strings.NewReader(hugeComments)); !errors.Is(err, moelua.ErrInstructionLimit) {
+		t.Fatalf("expected ErrInstructionLimit from State.CompileReader, got %v", err)
+	}
+	sInsn.SetInstructionLimit(500)
+	if _, err := sInsn.DoString(hugeComments); !errors.Is(err, moelua.ErrInstructionLimit) {
+		t.Fatalf("expected ErrInstructionLimit from State.DoString, got %v", err)
+	}
+	sInsn.SetInstructionLimit(0)
+	res, err := sInsn.DoString("return 21 + 21")
+	if err != nil || len(res) != 1 || res[0].Int() != 42 {
+		t.Fatalf("State unusable after compile abort: res=%v err=%v", res, err)
+	}
+}
