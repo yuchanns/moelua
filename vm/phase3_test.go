@@ -1874,12 +1874,12 @@ func TestCodexReviewRound9VMRegressions(t *testing.T) {
 		}
 		s := NewState()
 		defer s.Close()
-		s.SetMemoryLimit(65536)
+		s.SetMemoryLimit(196608)
 		cl, err := s.LoadChunk([]byte(`
 			local keys = {}
 			for i = 1, 64 do keys[i] = "k" .. i end
 			local kept = {}
-			for i = 1, 16 do
+			for i = 1, 32 do
 				local t = {}
 				for j = 1, 64 do t[keys[j]] = j end
 				kept[i] = t
@@ -2507,6 +2507,256 @@ func TestCodexReviewRound11VMRegressions(t *testing.T) {
 			assert(tbl[null_p2] == "null" and tbl[0] == "zero" and tbl[nonNil] == "ptr")
 			return "ok"
 		`), "=null_lightud")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+}
+
+func TestCodexReviewRound12VMRegressions(t *testing.T) {
+	// 1. Long substrings from string.sub and string.match clone their backing storage instead of pinning huge sources.
+	t.Run("substring_clones_backing_storage", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local kept = {}
+			for i = 1, 300 do
+				local big = string.rep(string.char(65 + (i % 26)), 32768)
+				kept[i] = string.sub(big, 1, 41)
+			end
+			for i = 1, 100 do
+				local big = string.rep("z", 32768)
+				kept[300 + i] = string.match(big, "^(zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz)")
+			end
+			_G._kept_subs = kept
+			return #kept
+		`), "=sub_clone")
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 1 || res[0].Int() != 400 {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		runtime.GC()
+		runtime.GC()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		// Without cloning, 400 * 32 KiB = 13.1 MB would stay pinned on the Go heap.
+		if after.HeapAlloc > before.HeapAlloc+4*1024*1024 {
+			t.Fatalf("substrings pinned source allocations: before=%d after=%d delta=%d",
+				before.HeapAlloc, after.HeapAlloc, after.HeapAlloc-before.HeapAlloc)
+		}
+	})
+
+	// 2. Shape transitions and lookup maps are checked against memLimit and recounted on GC.
+	t.Run("retained_shapes_accounted_in_memlimit", func(t *testing.T) {
+		if !OptimizeEnabled {
+			t.Skip("shape trees are disabled in faithful mode")
+		}
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local kept = {}
+			local failed = false
+			local errMsg = ""
+			for i = 1, 30 do
+				local ok, res = pcall(function()
+					local tbl = {}
+					for j = 1, 64 do
+						tbl["p_" .. i .. "_" .. j] = j
+					end
+					return tbl
+				end)
+				if not ok then
+					failed = true
+					errMsg = tostring(res)
+					break
+				end
+				kept[i] = res
+				collectgarbage("collect")
+			end
+			local count = #kept
+			kept = nil
+			collectgarbage("collect")
+			assert(failed and count < 10 and string.find(errMsg, "not enough memory", 1, true),
+				"expected OOM creating distinct 64-prop shapes, got failed=" .. tostring(failed) .. " count=" .. count .. " err=" .. errMsg)
+			return "ok"
+		`), "=shape_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. os.time honors __index when reading date fields and __newindex when writing normalized fields back.
+	t.Run("os_time_honors_index_and_newindex", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local writes = {}
+			local backing = { year = 2024, month = 1, day = 1, hour = 0, min = 0, sec = 0 }
+			local dt = setmetatable({}, {
+				__index = backing,
+				__newindex = function(_, k, v) writes[k] = v end,
+			})
+			local ts = os.time(dt)
+			assert(type(ts) == "number")
+			assert(writes.year == 2024 and writes.month == 1 and writes.day == 1 and writes.wday == 2 and writes.yday == 1)
+
+			local bad = setmetatable({}, {
+				__index = function() error("boom_from_index") end,
+			})
+			local ok, err = pcall(os.time, bad)
+			assert(not ok and string.find(tostring(err), "boom_from_index", 1, true))
+			return "ok"
+		`), "=os_time_mm")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. pairs() normalizes __pairs results to exactly four values on all dispatch paths (including yieldable).
+	t.Run("pairs_normalizes_metamethod_arity_to_four", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local t1 = setmetatable({}, { __pairs = function() return next end })
+			local t5 = setmetatable({}, { __pairs = function() return 1, 2, 3, 4, 5 end })
+			assert(select("#", pairs({})) == 4)
+			assert(select("#", pairs(t1)) == 4)
+			assert(select("#", pairs(t5)) == 4)
+			local a, b, c, d, e = pairs(t5)
+			assert(a == 1 and b == 2 and c == 3 and d == 4 and e == nil)
+			local function tailPairs(x) return pairs(x) end
+			assert(select("#", tailPairs(t1)) == 4)
+			assert(select("#", tailPairs(t5)) == 4)
+			assert(select("#", pcall(pairs, t1)) == 5)
+			assert(select("#", pcall(pairs, t5)) == 5)
+
+			-- Yieldable __pairs preserving exact 4-value normalization:
+			local ty = setmetatable({}, {
+				__pairs = function()
+					coroutine.yield("in_pairs")
+					return 10, 20, 30, 40, 50
+				end,
+			})
+			local co = coroutine.create(function()
+				local n = select("#", pairs(ty))
+				return n
+			end)
+			local ok1, y1 = coroutine.resume(co)
+			assert(ok1 and y1 == "in_pairs")
+			local ok2, n2 = coroutine.resume(co)
+			assert(ok2 and n2 == 4, "expected yieldable __pairs arity 4, got " .. tostring(n2))
+			return "ok"
+		`), "=pairs_arity")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 5. os.date supports standard C89/C99 conversion specifiers including %I, %p, %U, %W.
+	t.Run("os_date_supports_c89_and_c99_specifiers", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local fmt = "!%Y-%m-%d %I:%M:%S %p %U %W %C %D %e %F %g %G %V %r %R %T %u"
+			assert(os.date(fmt, 0) == "1970-01-01 12:00:00 AM 00 00 19 01/01/70  1 1970-01-01 70 1970 01 12:00:00 AM 00:00 00:00:00 4")
+			assert(os.date(fmt, 12*3600) == "1970-01-01 12:00:00 PM 00 00 19 01/01/70  1 1970-01-01 70 1970 01 12:00:00 PM 12:00 12:00:00 4")
+			assert(os.date(fmt, 13*3600) == "1970-01-01 01:00:00 PM 00 00 19 01/01/70  1 1970-01-01 70 1970 01 01:00:00 PM 13:00 13:00:00 4")
+			assert(os.date(fmt, 1704067200) == "2024-01-01 12:00:00 AM 00 01 20 01/01/24  1 2024-01-01 24 2024 01 12:00:00 AM 00:00 00:00:00 1")
+			assert(os.date(fmt, 1735689599) == "2024-12-31 11:59:59 PM 52 53 20 12/31/24 31 2024-12-31 25 2025 01 11:59:59 PM 23:59 23:59:59 2")
+			assert(not pcall(os.date, "!%Q", 0))
+			return "ok"
+		`), "=os_date_c99")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 6. string.gmatch iterators observe instruction limits attached after iterator creation.
+	t.Run("gmatch_refreshes_cancellation_controls", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		mk, err := s.LoadChunk([]byte(`
+			_G.iter = string.gmatch(string.rep("a", 300), "a*a*a*b")
+		`), "=gmatch_mk")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(mk); err != nil {
+			t.Fatalf("setup Call failed: %v", err)
+		}
+		s.SetInstructionLimit(100)
+		runIt, err := s.LoadChunk([]byte(`return _G.iter()`), "=gmatch_run")
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		_, err = s.Call(runIt)
+		elapsed := time.Since(start)
+		if !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("expected ErrInstructionLimit advancing pre-created gmatch iterator, got %v (elapsed=%v)", err, elapsed)
+		}
+		if elapsed > 2*time.Second {
+			t.Fatalf("gmatch abort took too long: %v", elapsed)
+		}
+	})
+
+	// 7. Primitive tostring formatting ignores __name when __tostring is absent.
+	t.Run("primitive_tostring_ignores_metatable_name", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetGlobal("null_ptr", LightUDValue(nil))
+		cl, err := s.LoadChunk([]byte(`
+			debug.setmetatable(0, { __name = "MyNum" })
+			debug.setmetatable(true, { __name = "MyBool" })
+			debug.setmetatable(nil, { __name = "MyNil" })
+			local origStrMT = debug.getmetatable("")
+			origStrMT.__name = "MyStr"
+			assert(tostring(42) == "42", "got " .. tostring(42))
+			assert(tostring(3.5) == "3.5", "got " .. tostring(3.5))
+			assert(tostring(true) == "true", "got " .. tostring(true))
+			assert(tostring(false) == "false", "got " .. tostring(false))
+			assert(tostring(nil) == "nil", "got " .. tostring(nil))
+			assert(tostring("hi") == "hi", "got " .. tostring("hi"))
+
+			-- Explicit __tostring on primitives still takes precedence.
+			debug.setmetatable(0, { __name = "MyNum", __tostring = function(x) return "num:" .. x end })
+			assert(tostring(42) == "num:42")
+
+			-- Non-primitives (table, lightuserdata) still honor __name.
+			local t = setmetatable({}, { __name = "MyTbl" })
+			assert(string.sub(tostring(t), 1, 7) == "MyTbl: ", "got " .. tostring(t))
+			debug.setmetatable(null_ptr, { __name = "MyPtr" })
+			assert(tostring(null_ptr) == "MyPtr: 0x0", "got " .. tostring(null_ptr))
+
+			origStrMT.__name = nil
+			debug.setmetatable(0, nil)
+			debug.setmetatable(true, nil)
+			debug.setmetatable(nil, nil)
+			debug.setmetatable(null_ptr, nil)
+			return "ok"
+		`), "=primitive_tostring_name")
 		if err != nil {
 			t.Fatal(err)
 		}
