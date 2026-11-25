@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	_ "time/tzdata"
@@ -1856,6 +1857,222 @@ func TestCodexReviewRound8VMRegressions(t *testing.T) {
 			assert(not ok and tostring(e):find("eq_boom", 1, true), tostring(e))
 			return "ok"
 		`), "=move_eq_mm")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+}
+
+func TestCodexReviewRound9VMRegressions(t *testing.T) {
+	// 1. Demoting shaped tables to dict mode enforces State memory limits before initHash.
+	t.Run("shape_demotion_memlimit", func(t *testing.T) {
+		if !OptimizeEnabled {
+			t.Skip("shape demotion applies only when OptimizeEnabled")
+		}
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(65536)
+		cl, err := s.LoadChunk([]byte(`
+			local keys = {}
+			for i = 1, 64 do keys[i] = "k" .. i end
+			local kept = {}
+			for i = 1, 16 do
+				local t = {}
+				for j = 1, 64 do t[keys[j]] = j end
+				kept[i] = t
+			end
+			local ok, err = pcall(function()
+				for i = 1, #kept do
+					kept[i][false] = 1
+				end
+			end)
+			kept = nil
+			collectgarbage("collect")
+			assert(not ok and tostring(err):find("not enough memory", 1, true),
+				"expected memory error on shape demotion, got ok=" .. tostring(ok) .. " err=" .. tostring(err))
+			return "ok"
+		`), "=shape_demote_mem")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. GC recounts retained array backing capacity (arrCap) rather than logical length.
+	t.Run("gc_recounts_array_backing_capacity", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(65536)
+		cl, err := s.LoadChunk([]byte(`
+			local kept = {}
+			local ok, err = pcall(function()
+				for i = 1, 100 do
+					local t = table.create(2000)
+					t[1] = true
+					kept[i] = t
+					collectgarbage("collect")
+				end
+			end)
+			kept = nil
+			collectgarbage("collect")
+			assert(not ok and tostring(err):find("not enough memory", 1, true),
+				"expected memory error retaining preallocated arrays, got ok=" .. tostring(ok) .. " err=" .. tostring(err))
+			return "ok"
+		`), "=gc_recount_cap")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. Synchronous closeAllSync roots replacement errors across subsequent __close callbacks.
+	t.Run("closeAllSync_roots_replacement_error", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local fin = 0
+			local co = coroutine.create(function()
+				local outer <close> = setmetatable({}, {
+					__close = function()
+						collectgarbage("collect")
+					end,
+				})
+				local inner <close> = setmetatable({}, {
+					__close = function()
+						error(setmetatable({ tag = "from_inner" }, { __gc = function() fin = fin + 1 end }))
+					end,
+				})
+				coroutine.yield("ready")
+			end)
+			local ok1, tag = coroutine.resume(co)
+			assert(ok1 and tag == "ready")
+			local cok, cerr = coroutine.close(co)
+			assert(not cok and type(cerr) == "table" and cerr.tag == "from_inner")
+			assert(fin == 0, "replacement close error was finalized prematurely: fin=" .. fin)
+			return "ok"
+		`), "=sync_close_root")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. Standard-library numeric arguments coerce numeric strings while keeping strict contexts distinct.
+	t.Run("stdlib_coerces_numeric_strings", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			assert(math.sqrt("9") == 3.0)
+			assert(math.floor("3.5") == 3 and math.type(math.floor("3.5")) == "integer")
+			assert(math.abs("-5") == 5.0 and math.type(math.abs("-5")) == "float")
+			assert(math.tointeger("3") == 3 and math.tointeger("3.0") == 3 and math.tointeger("3.5") == nil)
+			assert(math.type("3") == nil)
+			assert(string.rep("x", "3") == "xxx")
+			assert(string.sub("abcd", "2", "3") == "bc")
+			assert(string.byte("abc", "2") == 98)
+			assert(string.char("65") == "A")
+			assert(table.concat({"a", "b", "c"}, "-", "2", "3") == "b-c")
+			assert(os.difftime("10", "3") == 7.0)
+			assert(utf8.char("65") == "A")
+			local f = assert(io.tmpfile())
+			f:write("abcdef"); f:seek("set", 0)
+			local ok = pcall(f.read, f, "4")
+			assert(not ok, "f:read('4') must stay a string format error")
+			f:close()
+			return "ok"
+		`), "=stdlib_num_coerce")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 5. os.clock returns process CPU time rather than elapsed wall-clock sleep time.
+	t.Run("os_clock_measures_cpu_not_wall_sleep", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetGlobal("hostSleep", NativeValue(&NativeFunc{
+			Name: "hostSleep",
+			Fn: func(_ *State, _ []Value) ([]Value, error) {
+				time.Sleep(150 * time.Millisecond)
+				return nil, nil
+			},
+		}))
+		cl, err := s.LoadChunk([]byte(`
+			local t0 = os.clock()
+			hostSleep()
+			local dt = os.clock() - t0
+			assert(dt >= 0 and dt < 0.08, "os.clock counted wall-clock sleep time: dt=" .. tostring(dt))
+			return "ok"
+		`), "=os_clock_cpu")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 6. I/O failure helpers preserve the underlying OS errno (e.g. ENOENT).
+	t.Run("io_fail_preserves_os_errno", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		missing := filepath.Join(t.TempDir(), "does-not-exist", "file.txt")
+		cl, err := s.LoadChunk([]byte(fmt.Sprintf(`
+			local f, msg, code = io.open(%q, "r")
+			assert(f == nil and type(msg) == "string" and type(code) == "number")
+			return code
+		`, missing)), "=io_errno")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 1 {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		got := res[0].Int()
+		if runtime.GOOS != "windows" {
+			if got != int64(syscall.ENOENT) {
+				t.Fatalf("expected ENOENT (%d), got %d", int64(syscall.ENOENT), got)
+			}
+		} else if got <= 1 {
+			t.Fatalf("expected Windows OS error code > 1 for missing path, got %d", got)
+		}
+	})
+
+	// 7. Native tail calls dispatch call/return debug hooks and support debug.setlocal on arguments.
+	t.Run("native_tailcall_dispatches_debug_hooks", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local events = {}
+			debug.sethook(function(ev)
+				local info = debug.getinfo(2, "f")
+				if info and info.func == math.abs then
+					events[#events + 1] = ev
+					if ev == "call" then
+						debug.setlocal(2, 1, -99)
+					end
+				end
+			end, "cr")
+			local function g() return math.abs(-42) end
+			local r = g()
+			debug.sethook()
+			assert(r == 99, "expected 99 after tailcall hook setlocal, got " .. tostring(r))
+			assert(table.concat(events, ",") == "call,return", "expected 'call,return', got " .. table.concat(events, ","))
+			return "ok"
+		`), "=tailcall_native_hook")
 		if err != nil {
 			t.Fatal(err)
 		}
