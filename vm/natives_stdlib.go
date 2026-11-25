@@ -151,11 +151,39 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 		}
 		initPos = int(iv)
 	}
+	var strVal Value
+	if args[0].IsString() {
+		strVal = args[0]
+	} else {
+		ls, ierr := s.TryIntern(str)
+		if ierr != nil {
+			return nil, ierr
+		}
+		strVal = StringValue(ls)
+		str = ls.S
+	}
+	var patVal Value
+	if args[1].IsString() {
+		patVal = args[1]
+	} else {
+		ls, ierr := s.TryIntern(pat)
+		if ierr != nil {
+			return nil, ierr
+		}
+		patVal = StringValue(ls)
+		pat = ls.S
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMemAndAccount(48 + 32); err != nil {
+			return nil, err
+		}
+	}
 	it := luastdlib.GMatchWithCancel(str, pat, initPos, s.dynamicNativeCancelFunc())
 	fn := &NativeFunc{
 		Name:        "gmatch_iter",
 		NumUpvals:   3,
 		Collectable: true,
+		gcChildren:  []Value{strVal, patVal},
 		Fn: func(s *State, _ []Value) ([]Value, error) {
 			caps, ok, err := it.Next()
 			if err != nil {
@@ -531,6 +559,21 @@ func nativeUTF8Codes(s *State, args []Value) ([]Value, error) {
 		return nil, err
 	}
 	lax := len(args) >= 2 && !args[1].IsFalsy()
+	var strVal Value
+	if args[0].IsString() {
+		strVal = args[0]
+	} else {
+		ls, ierr := s.TryIntern(str)
+		if ierr != nil {
+			return nil, ierr
+		}
+		strVal = StringValue(ls)
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMemAndAccount(48); err != nil {
+			return nil, err
+		}
+	}
 	iter := &NativeFunc{
 		Name:        "utf8_codes_iter",
 		Collectable: true,
@@ -550,7 +593,7 @@ func nativeUTF8Codes(s *State, args []Value) ([]Value, error) {
 			return []Value{IntValue(nextPos), IntValue(cp)}, nil
 		},
 	}
-	return []Value{NativeValue(iter), StringValue(s.intern.Intern(str)), IntValue(0)}, nil
+	return []Value{NativeValue(iter), strVal, IntValue(0)}, nil
 }
 
 // nativeUTF8Offset implements Lua 5.5.1 two-return utf8.offset(s, n [, i]) -> start, end!
@@ -586,16 +629,85 @@ func nativeUTF8Offset(_ *State, args []Value) ([]Value, error) {
 	return []Value{IntValue(start), IntValue(end)}, nil
 }
 
+func estimateDumpBytes(p *bytecode.Proto, strip bool) int64 {
+	seen := make(map[string]struct{})
+	total := int64(41) // Lua 5.5 header + root upvalue count
+	addStr := func(str string) {
+		if _, ok := seen[str]; ok {
+			total += 3
+			return
+		}
+		seen[str] = struct{}{}
+		total += int64(len(str)) + 3
+	}
+	var walk func(fn *bytecode.Proto)
+	walk = func(fn *bytecode.Proto) {
+		if fn == nil {
+			return
+		}
+		total += 16 + int64(len(fn.Code))*4 + int64(len(fn.Upvalues))*3
+		for _, c := range fn.Consts {
+			switch c.Kind {
+			case bytecode.ConstInt, bytecode.ConstFloat:
+				total += 9
+			case bytecode.ConstString:
+				addStr(c.Str)
+			default:
+				total++
+			}
+		}
+		if !strip && !fn.NoSource {
+			addStr(fn.Source)
+		} else {
+			total += 2
+		}
+		if !strip {
+			total += int64(len(fn.LineInfo)) + int64(len(fn.AbsLineInfo))*8
+			for _, lv := range fn.LocVars {
+				if lv.Name != "" {
+					addStr(lv.Name)
+				} else {
+					total += 2
+				}
+				total += 4
+			}
+			for _, uv := range fn.Upvalues {
+				if uv.Name != "" {
+					addStr(uv.Name)
+				} else {
+					total += 2
+				}
+			}
+		}
+		for _, sub := range fn.Protos {
+			walk(sub)
+		}
+	}
+	walk(p)
+	return total
+}
+
 func nativeStringDump(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsClosure() {
 		return nil, fmt.Errorf("bad argument #1 to 'dump' (Lua function expected)")
 	}
 	strip := len(args) >= 2 && !args[1].IsFalsy()
-	data, err := bytecode.Dump(args[0].AsClosure().bp.proto, strip)
+	p := args[0].AsClosure().bp.proto
+	if s.memLimit > 0 {
+		est := estimateDumpBytes(p, strip)
+		if err := s.checkMem(est + 48); err != nil {
+			return nil, err
+		}
+	}
+	data, err := bytecode.Dump(p, strip)
 	if err != nil {
 		return nil, err
 	}
-	return []Value{StringValue(s.intern.Intern(string(data)))}, nil
+	ls, err := s.TryIntern(string(data))
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 // Unused math import guard if needed

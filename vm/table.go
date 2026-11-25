@@ -542,7 +542,9 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 		s.memExceeded = true
 		return
 	}
-	t.hashSet(StringValue(k), val)
+	if slot := t.hashSet(StringValue(k), val); val.IsNil() && slot >= 0 && s != nil {
+		s.gc.hasDeadHashKeys = true
+	}
 }
 
 // RawGetInt looks up integer key i (1-based dense array fast path).
@@ -1044,7 +1046,9 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 		if err := t.checkHashMem(s); err != nil {
 			return err
 		}
-		t.hashSet(key, val)
+		if slot := t.hashSet(key, val); val.IsNil() && slot >= 0 && s != nil && (key.IsString() || isCollectableWeak(key)) {
+			s.gc.hasDeadHashKeys = true
+		}
 		return nil
 	}
 }

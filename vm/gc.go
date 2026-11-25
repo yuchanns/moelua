@@ -40,8 +40,9 @@ const (
 )
 
 type gcState struct {
-	tier1       bool // true once __gc or __mode has been observed in this State
-	epoch       uint64
+	tier1           bool // true once __gc or __mode has been observed in this State
+	hasDeadHashKeys bool // true once a string or collectable hash key has been deleted since last full trace
+	epoch           uint64
 	running       bool
 	inGCTM        bool // true while draining __gc finalizers (prevents re-entrant collectgarbage)
 	closing       bool // true once State.Close() has begun (new __gc objects registered during close are ignored)
@@ -213,19 +214,21 @@ func isCollectableWeak(v Value) bool {
 }
 
 type gcTracer struct {
-	s              *State
-	epoch          uint64
-	preserveFrames bool // true when triggered mid-opcode (e.g. checkMem) where s.cur.top may be stale
-	countStrings   bool // true when s.memLimit > 0 so live strings are counted accurately in liveBytes
-	seenStrings    map[*LuaString]struct{}
-	seenProtos     map[*boundProto]struct{}
-	seenShapes     map[*Shape]struct{}
-	gray           []Value
-	weakVals       []*Table // __mode="v"
-	ephemerons     []*Table // __mode="k"
-	allWeaks       []*Table // __mode="kv"
-	liveOpenUpvals []*Upvalue
-	liveBytes      int64
+	s                *State
+	epoch            uint64
+	preserveFrames   bool // true when triggered mid-opcode (e.g. checkMem) where s.cur.top may be stale
+	countStrings     bool // true when s.memLimit > 0 so live strings are counted accurately in liveBytes
+	trackDeadStrings bool // true when deleted hash keys exist so unreachable dead string keys can be released
+	seenStrings      map[*LuaString]struct{}
+	seenProtos       map[*boundProto]struct{}
+	seenShapes       map[*Shape]struct{}
+	gray             []Value
+	hashedTables     []*Table // all marked tables with t.hash != nil (for dead hash-key clearing)
+	weakVals         []*Table // __mode="v"
+	ephemerons       []*Table // __mode="k"
+	allWeaks         []*Table // __mode="kv"
+	liveOpenUpvals   []*Upvalue
+	liveBytes        int64
 }
 
 func (tr *gcTracer) markShape(sh *Shape) {
@@ -245,7 +248,7 @@ func (tr *gcTracer) markShape(sh *Shape) {
 			continue
 		}
 		tr.liveBytes += shapeNodeBytes(cur)
-		if tr.countStrings && cur.key != nil {
+		if (tr.countStrings || tr.trackDeadStrings) && cur.key != nil {
 			tr.mark(StringValue(cur.key))
 		}
 	}
@@ -263,7 +266,7 @@ func (tr *gcTracer) markBoundProto(bp *boundProto) {
 	}
 	tr.seenProtos[bp] = struct{}{}
 	tr.liveBytes += protoOwnBytes(bp.proto, len(bp.ic) > 0)
-	if tr.countStrings {
+	if tr.countStrings || tr.trackDeadStrings {
 		for _, ls := range bp.strConsts {
 			if ls != nil {
 				tr.mark(StringValue(ls))
@@ -335,14 +338,16 @@ func (tr *gcTracer) isMarked(v Value) bool {
 
 func (tr *gcTracer) mark(v Value) {
 	if v.IsString() {
-		if tr.countStrings {
+		if tr.countStrings || tr.trackDeadStrings {
 			ls := v.AsString()
 			if _, ok := tr.seenStrings[ls]; !ok {
 				if tr.seenStrings == nil {
 					tr.seenStrings = make(map[*LuaString]struct{}, 64)
 				}
 				tr.seenStrings[ls] = struct{}{}
-				tr.liveBytes += 48 + int64(len(ls.S))
+				if tr.countStrings {
+					tr.liveBytes += 48 + int64(len(ls.S))
+				}
 			}
 		}
 		return
@@ -392,8 +397,8 @@ func (tr *gcTracer) mark(v Value) {
 			return
 		}
 		nf.gcMark = tr.epoch
-		tr.liveBytes += 48
-		if !nf.gcChild.IsNil() && nf.gcChild.ptr != nil {
+		tr.liveBytes += 48 + int64(len(nf.gcChildren))*16
+		if (!nf.gcChild.IsNil() && nf.gcChild.ptr != nil) || len(nf.gcChildren) > 0 {
 			tr.gray = append(tr.gray, v)
 		}
 	case v.IsUserdata():
@@ -445,6 +450,9 @@ func (tr *gcTracer) propagateAll() {
 			nf := v.AsNative()
 			if nf.gcChild.ptr != nil {
 				tr.mark(nf.gcChild)
+			}
+			for _, ch := range nf.gcChildren {
+				tr.mark(ch)
 			}
 		case v.IsUserdata():
 			u := v.AsUserdata()
@@ -570,6 +578,9 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 func (tr *gcTracer) traverseTable(t *Table) {
 	if t.meta != nil {
 		tr.mark(TableValue(t.meta))
+	}
+	if t.hash != nil {
+		tr.hashedTables = append(tr.hashedTables, t)
 	}
 	weakK, weakV := tr.s.weakModeOf(t)
 	if !weakK && !weakV {
@@ -722,6 +733,38 @@ func (tr *gcTracer) clearByKeys(tables []*Table) {
 	}
 }
 
+// clearDeadHashKeys releases strong Go references held by dead/tombstoned hash keys
+// that are no longer reachable from anywhere in the VM (matching lgc.c:clearkey),
+// while preserving live tombstoned keys (e.g. active pairs() traversal) and hash probe chains.
+func (tr *gcTracer) clearDeadHashKeys() bool {
+	anyDead := false
+	for _, t := range tr.hashedTables {
+		nodes := t.hash.nodes
+		for i := range nodes {
+			nd := &nodes[i]
+			if !nd.used || !nd.dead || nd.key.IsNil() {
+				continue
+			}
+			if nd.key.IsString() {
+				if tr.countStrings || tr.trackDeadStrings {
+					if _, live := tr.seenStrings[nd.key.AsString()]; !live {
+						nd.key = NilValue()
+						continue
+					}
+				}
+				anyDead = true
+			} else if isCollectableWeak(nd.key) {
+				if !tr.isMarked(nd.key) {
+					nd.key = NilValue()
+					continue
+				}
+				anyDead = true
+			}
+		}
+	}
+	return anyDead
+}
+
 // CollectFull executes a full deterministic Tier 1 GC cycle (exact lgc.c atomic() 6-step order)
 // and drains all newly separated __gc finalizers synchronously on the VM thread.
 func (s *State) CollectFull() {
@@ -740,6 +783,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		return // non-reentrant inside __gc (gc.lua:698-705)
 	}
 	countStr := s.memLimit > 0
+	trackDeadStr := s.gc.hasDeadHashKeys
 	if emergency || (!s.gc.tier1 && len(s.gc.finalizable) == 0 && len(s.gc.weakFiles) == 0) {
 		// Tier 0 (with no open finalizable handles) or emergency allocation-time recount:
 		// nil-fill dead stack/frame slack and recompute exact live VM bytes without running
@@ -767,9 +811,16 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		if s.gc.epoch == 0 {
 			s.gc.epoch = 1
 		}
-		tr := &gcTracer{s: s, epoch: s.gc.epoch, preserveFrames: preserveFrames, countStrings: countStr}
+		tr := &gcTracer{
+			s:                s,
+			epoch:            s.gc.epoch,
+			preserveFrames:   preserveFrames,
+			countStrings:     countStr,
+			trackDeadStrings: trackDeadStr,
+		}
 		tr.markRoots()
 		tr.propagateAll()
+		s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
 		s.intern.Prune()
 		s.shapes.Prune()
 		s.gc.allocBytes = tr.liveBytes
@@ -781,7 +832,13 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	if s.gc.epoch == 0 {
 		s.gc.epoch = 1
 	}
-	tr := &gcTracer{s: s, epoch: s.gc.epoch, preserveFrames: preserveFrames, countStrings: countStr}
+	tr := &gcTracer{
+		s:                s,
+		epoch:            s.gc.epoch,
+		preserveFrames:   preserveFrames,
+		countStrings:     countStr,
+		trackDeadStrings: trackDeadStr,
+	}
 
 	// Mark all VM roots.
 	tr.markRoots()
@@ -864,6 +921,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	// Step 6: clearByValues again on ALL weak-value/all-weak tables (including any resurrected in Step 4, gc.lua:444!).
 	tr.clearByValues(tr.weakVals)
 	tr.clearByValues(tr.allWeaks)
+
+	// Release strong Go pointers from unreachable dead/tombstoned hash keys (matching lgc.c:clearkey).
+	s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
 
 	// Close open upvalues belonging to threads that remain unreachable after Step 4 resurrection,
 	// so live closures keep their captured values and dead threads are unpinned for Go's GC.

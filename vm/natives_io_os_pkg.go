@@ -767,19 +767,36 @@ func execResult(s *State, err error) []Value {
 	return []Value{NilValue(), StringValue(s.intern.Intern("exit")), IntValue(1)}
 }
 
+func validPopenMode(mode string) bool {
+	if runtime.GOOS == "windows" {
+		switch mode {
+		case "r", "w", "rb", "rt", "wb", "wt":
+			return true
+		}
+		return false
+	}
+	return mode == "r" || mode == "w"
+}
+
 func nativeIOPopen(s *State, args []Value) ([]Value, error) {
-	if len(args) == 0 || !args[0].IsString() {
-		return nil, fmt.Errorf("bad argument #1 to 'io.popen' (string expected)")
+	prog, err := checkStringArg(args, 0, "popen")
+	if err != nil {
+		return nil, err
 	}
 	mode := "r"
 	if len(args) >= 2 && !args[1].IsNil() {
+		if !args[1].IsString() && !args[1].IsNumber() {
+			return nil, fmt.Errorf("bad argument #2 to 'popen' (string expected, got %s)", s.objTypeName(args[1]))
+		}
 		mode = FormatValue(args[1])
+		if !validPopenMode(mode) {
+			return nil, fmt.Errorf("bad argument #2 to 'popen' (invalid mode)")
+		}
 	}
-	cmd := shellCommand(args[0].AsString().S)
+	cmd := shellCommand(prog)
 	s.inheritedStdStreams(cmd)
 	var f *os.File
-	var err error
-	if mode == "w" {
+	if mode[0] == 'w' {
 		pr, pw, perr := os.Pipe()
 		if perr != nil {
 			return ioFail(s, perr), nil
@@ -1255,6 +1272,9 @@ func readLuaNumber(s *State, r *bufio.Reader) (Value, bool, error) {
 	for {
 		b, err := r.ReadByte()
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return NilValue(), false, ioReadErr{err}
+			}
 			return NilValue(), false, nil
 		}
 		if b != ' ' && b != '\t' && b != '\n' && b != '\r' && b != '\f' && b != '\v' {
@@ -1266,9 +1286,13 @@ func readLuaNumber(s *State, r *bufio.Reader) (Value, bool, error) {
 	var buf [maxNumLen]byte
 	n := 0
 	eof := false
+	var readErr error
 	nextChar := func() {
 		b, err := r.ReadByte()
 		if err != nil {
+			if !errors.Is(err, io.EOF) && readErr == nil {
+				readErr = err
+			}
 			eof = true
 			cur = 0
 		} else {
@@ -1324,6 +1348,9 @@ func readLuaNumber(s *State, r *bufio.Reader) (Value, bool, error) {
 		if !eof {
 			_ = r.UnreadByte()
 		}
+		if readErr != nil {
+			return NilValue(), false, ioReadErr{readErr}
+		}
 		return NilValue(), false, nil
 	}
 	count += d1
@@ -1332,6 +1359,9 @@ func readLuaNumber(s *State, r *bufio.Reader) (Value, bool, error) {
 		if d2 < 0 {
 			if !eof {
 				_ = r.UnreadByte()
+			}
+			if readErr != nil {
+				return NilValue(), false, ioReadErr{readErr}
 			}
 			return NilValue(), false, nil
 		}
@@ -1348,12 +1378,18 @@ func readLuaNumber(s *State, r *bufio.Reader) (Value, bool, error) {
 				if !eof {
 					_ = r.UnreadByte()
 				}
+				if readErr != nil {
+					return NilValue(), false, ioReadErr{readErr}
+				}
 				return NilValue(), false, nil
 			}
 		}
 	}
 	if !eof {
 		_ = r.UnreadByte()
+	}
+	if readErr != nil {
+		return NilValue(), false, ioReadErr{readErr}
 	}
 	if count == 0 {
 		return NilValue(), false, nil
@@ -1453,12 +1489,18 @@ func nativeFileWrite(s *State, args []Value) ([]Value, error) {
 	return []Value{args[0]}, nil
 }
 
-func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) []Value {
+func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) ([]Value, error) {
+	if s.memLimit > 0 {
+		if err := s.checkMemAndAccount(48 + int64(len(fmts))*16); err != nil {
+			return nil, err
+		}
+	}
 	savedFmts := append([]Value(nil), fmts...)
 	iter := &NativeFunc{
 		Name:        "io.lines_iter",
 		Collectable: true,
 		gcChild:     fileVal,
+		gcChildren:  savedFmts,
 		Fn: func(s *State, _ []Value) ([]Value, error) {
 			lf, ok := asLuaFile(fileVal)
 			if !ok || lf.closed {
@@ -1488,7 +1530,7 @@ func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) []Valu
 	if autoClose {
 		closeVar = fileVal
 	}
-	return []Value{NativeValue(iter), NilValue(), NilValue(), closeVar}
+	return []Value{NativeValue(iter), NilValue(), NilValue(), closeVar}, nil
 }
 
 func nativeFileLines(s *State, args []Value) ([]Value, error) {
@@ -1502,7 +1544,7 @@ func nativeFileLines(s *State, args []Value) ([]Value, error) {
 	if len(args)-1 > 250 {
 		return nil, fmt.Errorf("too many arguments")
 	}
-	return makeLinesIter(s, args[0], args[1:], false), nil
+	return makeLinesIter(s, args[0], args[1:], false)
 }
 
 func nativeIOLines(s *State, args []Value) ([]Value, error) {
@@ -1514,7 +1556,7 @@ func nativeIOLines(s *State, args []Value) ([]Value, error) {
 		if len(fmts) > 250 {
 			return nil, fmt.Errorf("too many arguments")
 		}
-		return makeLinesIter(s, s.defaultInput, fmts, false), nil
+		return makeLinesIter(s, s.defaultInput, fmts, false)
 	}
 	if len(args)-1 > 250 {
 		return nil, fmt.Errorf("too many arguments")
@@ -1527,7 +1569,12 @@ func nativeIOLines(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return makeLinesIter(s, ud, args[1:], true), nil
+	res, err := makeLinesIter(s, ud, args[1:], true)
+	if err != nil {
+		_ = lf.closeFile()
+		return nil, err
+	}
+	return res, nil
 }
 
 // --- os library ---

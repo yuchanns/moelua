@@ -454,12 +454,13 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 		}
 		return true, nil
 	}
-	// Yieldable native metamethod invocation (supports coroutine.yield as a metamethod!).
+	// Yieldable native metamethod invocation (supports coroutine.yield as a metamethod and debug hooks!).
 	if err := th.ensureStack(slot + 1 + len(args) + 8); err != nil {
 		return false, err
 	}
-	th.top = slot
-	res, err := tm.AsNative().callMulti(s, args)
+	th.stack[slot] = tm
+	copy(th.stack[slot+1:slot+1+len(args)], args)
+	res, hooked, err := s.callNativeHooked(th, tm, slot, len(args), extraDepth, maxFrames+128)
 	cf = &th.frames[ev.ci]
 	if errors.Is(err, errYieldSentinel) {
 		cf.dirty = true
@@ -469,9 +470,14 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 		cf.finishFlag = flag
 		th.yieldDst = slot
 		th.yieldNRes = 1
+		th.yieldedNative = hooked
 		return false, errYieldSentinel
 	}
+	th.top = slot
 	if err != nil {
+		if !errors.Is(err, errCoroCloseSelf) {
+			th.lastErrNative = tm
+		}
 		return false, err
 	}
 	v := NilValue()
@@ -1290,14 +1296,16 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			return true, nil
 		}
 		if fn.IsNative() {
-			th.top = funcIdx + 1 + nargs
-			args := th.stack[funcIdx+1 : funcIdx+1+nargs]
-			res, err := fn.AsNative().callMulti(s, args)
+			res, hooked, err := s.callNativeHooked(th, fn, funcIdx, nargs, uint8(depth), maxFrames+128)
 			if err != nil {
 				if errors.Is(err, errYieldSentinel) {
 					th.yieldDst = funcIdx
 					th.yieldNRes = nresults
+					th.yieldedNative = hooked
 					return false, errYieldSentinel
+				}
+				if !errors.Is(err, errCoroCloseSelf) {
+					th.lastErrNative = fn
 				}
 				return s.catchSlow(th, ev, false, err)
 			}
@@ -1313,6 +1321,97 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		}
 	}
 	return s.catchSlow(th, ev, false, fmt.Errorf("'__call' chain too long"))
+}
+
+// callNativeHooked invokes native function fn located at th.stack[funcIdx] with arguments
+// at th.stack[funcIdx+1 : funcIdx+1+nargs], firing Lua call/return debug hooks around the
+// call and returning (results, hookedNative, err).
+func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extraDepth uint8, frameLimit int) ([]Value, bool, error) {
+	th.top = funcIdx + 1 + nargs
+	hookedNative := false
+	if th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook {
+		hookedNative = true
+		if err := th.ensureFrameCap(th.nframe+1, frameLimit); err != nil {
+			return nil, false, err
+		}
+		th.frames[th.nframe] = callFrame{
+			kind:      frameNative,
+			base:      funcIdx + 1,
+			funcIdx:   funcIdx,
+			nativeFn:  fn,
+			ftransfer: 1,
+			ntransfer: uint16(nargs),
+			extraArgs: extraDepth,
+			dirty:     true,
+		}
+		th.nframe++
+		if th.hookMask&HookMaskCall != 0 {
+			if herr := s.fireHook(th, "call", NilValue()); herr != nil {
+				th.nframe--
+				return nil, false, herr
+			}
+		}
+	}
+	// Re-slice arguments after any call hook in case the hook grew th.stack or modified locals via debug.setlocal.
+	args := th.stack[funcIdx+1 : funcIdx+1+nargs]
+	res, err := fn.AsNative().callMulti(s, args)
+	if hookedNative || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook) {
+		var hookErr error
+		if hookedNative {
+			if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook {
+				if serr := th.ensureStack(funcIdx + 1 + len(res) + 4); serr != nil {
+					hookErr = serr
+				} else {
+					copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
+					if end := funcIdx + 1 + len(res); th.top < end {
+						th.top = end
+					}
+					th.frames[th.nframe-1].ftransfer = 1
+					th.frames[th.nframe-1].ntransfer = uint16(len(res))
+					hookErr = s.fireHook(th, "return", NilValue())
+					if hookErr == nil && len(res) > 0 {
+						out := make([]Value, len(res))
+						copy(out, th.stack[funcIdx+1:funcIdx+1+len(res)])
+						res = out
+					}
+				}
+			}
+			th.nframe--
+		} else {
+			if ferr := th.ensureFrameCap(th.nframe+1, frameLimit); ferr != nil {
+				hookErr = ferr
+			} else if serr := th.ensureStack(funcIdx + 1 + len(res) + 4); serr != nil {
+				hookErr = serr
+			} else {
+				copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
+				if end := funcIdx + 1 + len(res); th.top < end {
+					th.top = end
+				}
+				th.frames[th.nframe] = callFrame{
+					kind:      frameNative,
+					base:      funcIdx + 1,
+					funcIdx:   funcIdx,
+					nativeFn:  fn,
+					ftransfer: 1,
+					ntransfer: uint16(len(res)),
+					extraArgs: extraDepth,
+					dirty:     true,
+				}
+				th.nframe++
+				hookErr = s.fireHook(th, "return", NilValue())
+				if hookErr == nil && len(res) > 0 {
+					out := make([]Value, len(res))
+					copy(out, th.stack[funcIdx+1:funcIdx+1+len(res)])
+					res = out
+				}
+				th.nframe--
+			}
+		}
+		if hookErr != nil && err == nil {
+			err = hookErr
+		}
+	}
+	return res, hookedNative, err
 }
 
 func isFlatProtectedTarget(_ Value) bool {
@@ -1431,92 +1530,7 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 			return ok, nil
 		}
 		// General native inside pcall/xpcall (e.g. xpcall(coroutine.yield, msgh) in coroutine.lua:568!):
-		th.top = calleeIdx + 1 + calleeArgs
-		hookedNative := false
-		if th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook {
-			hookedNative = true
-			if err := th.ensureFrameCap(th.nframe+1, frameLimit); err != nil {
-				if s.handleError(th, 0, err) {
-					return true, nil
-				}
-				return false, err
-			}
-			th.frames[th.nframe] = callFrame{
-				kind:      frameNative,
-				base:      calleeIdx + 1,
-				funcIdx:   calleeIdx,
-				nativeFn:  targetVal,
-				ftransfer: 1,
-				ntransfer: uint16(calleeArgs),
-				extraArgs: extraDepth,
-				dirty:     true,
-			}
-			th.nframe++
-			if th.hookMask&HookMaskCall != 0 {
-				if herr := s.fireHook(th, "call", NilValue()); herr != nil {
-					th.nframe--
-					if s.handleError(th, 0, herr) {
-						return true, nil
-					}
-					return false, herr
-				}
-			}
-		}
-		// Slice arguments after any call hook in case the hook grew th.stack or modified locals via debug.setlocal.
-		nargsSlice := th.stack[calleeIdx+1 : calleeIdx+1+calleeArgs]
-		res, err := nf.callMulti(s, nargsSlice)
-		if hookedNative || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook) {
-			var hookErr error
-			if hookedNative {
-				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook {
-					if serr := th.ensureStack(calleeIdx + 1 + len(res) + 4); serr != nil {
-						hookErr = serr
-					} else {
-						copy(th.stack[calleeIdx+1:calleeIdx+1+len(res)], res)
-						if end := calleeIdx + 1 + len(res); th.top < end {
-							th.top = end
-						}
-						th.frames[th.nframe-1].ftransfer = 1
-						th.frames[th.nframe-1].ntransfer = uint16(len(res))
-						hookErr = s.fireHook(th, "return", NilValue())
-						if hookErr == nil && len(res) > 0 {
-							copy(res, th.stack[calleeIdx+1:calleeIdx+1+len(res)])
-						}
-					}
-				}
-				th.nframe--
-			} else {
-				if ferr := th.ensureFrameCap(th.nframe+1, frameLimit); ferr != nil {
-					hookErr = ferr
-				} else if serr := th.ensureStack(calleeIdx + 1 + len(res) + 4); serr != nil {
-					hookErr = serr
-				} else {
-					copy(th.stack[calleeIdx+1:calleeIdx+1+len(res)], res)
-					if end := calleeIdx + 1 + len(res); th.top < end {
-						th.top = end
-					}
-					th.frames[th.nframe] = callFrame{
-						kind:      frameNative,
-						base:      calleeIdx + 1,
-						funcIdx:   calleeIdx,
-						nativeFn:  targetVal,
-						ftransfer: 1,
-						ntransfer: uint16(len(res)),
-						extraArgs: extraDepth,
-						dirty:     true,
-					}
-					th.nframe++
-					hookErr = s.fireHook(th, "return", NilValue())
-					if hookErr == nil && len(res) > 0 {
-						copy(res, th.stack[calleeIdx+1:calleeIdx+1+len(res)])
-					}
-					th.nframe--
-				}
-			}
-			if hookErr != nil && err == nil {
-				err = hookErr
-			}
-		}
+		res, hookedNative, err := s.callNativeHooked(th, targetVal, calleeIdx, calleeArgs, extraDepth, frameLimit)
 		if errors.Is(err, errYieldSentinel) {
 			th.yieldDst = calleeIdx
 			th.yieldNRes = -1
@@ -1568,7 +1582,7 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 	base := ev.base
 	fnIdx := base + int(a) + 3
 	fn := th.stack[base+int(a)]
-	if OptimizeEnabled && fn.IsNative() && fn.AsNative().Intrinsic == intrNext && th.stack[base+int(a)+1].IsTable() {
+	if OptimizeEnabled && (th.hookMask&(HookMaskCall|HookMaskRet) == 0 || th.inHook) && fn.IsNative() && fn.AsNative().Intrinsic == intrNext && th.stack[base+int(a)+1].IsTable() {
 		k, v, err := th.stack[base+int(a)+1].AsTable().Next(th.stack[base+int(a)+3])
 		if err == nil {
 			th.stack[fnIdx] = k
@@ -1588,11 +1602,12 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 	th.stack[fnIdx+1] = th.stack[base+int(a)+1] // state
 	th.stack[fnIdx] = fn                        // iterator fn
 	if fn.IsNative() {
-		res, err := fn.AsNative().callMulti(s, th.stack[fnIdx+1:fnIdx+3])
+		res, hooked, err := s.callNativeHooked(th, fn, fnIdx, 2, 0, maxFrames+128)
 		if err != nil {
 			if errors.Is(err, errYieldSentinel) {
 				th.yieldDst = fnIdx
 				th.yieldNRes = c
+				th.yieldedNative = hooked
 				return false, errYieldSentinel
 			}
 			if !errors.Is(err, errCoroCloseSelf) {
@@ -1702,22 +1717,32 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 			}
 			return false, nil
 		}
+		slot := slotBase
+		if th.top > slot {
+			slot = th.top
+		}
+		if err := th.ensureStack(slot + 1 + len(cargs) + 8); err != nil {
+			return false, err
+		}
+		th.stack[slot] = tm
+		copy(th.stack[slot+1:slot+1+len(cargs)], cargs)
 		cfIdx := th.nframe - 1
-		_, err := tm.AsNative().callMulti(s, cargs)
+		_, hooked, err := s.callNativeHooked(th, tm, slot, len(cargs), extraDepth, maxFrames+128)
 		cf = &th.frames[cfIdx]
 		if errors.Is(err, errYieldSentinel) {
-			slot := slotBase
-			if th.top > slot {
-				slot = th.top
-			}
 			cf.dirty = true
 			cf.oldTop = slot
 			cf.finish = finishClose
 			th.yieldDst = slot
 			th.yieldNRes = 0
+			th.yieldedNative = hooked
 			return false, errYieldSentinel
 		}
+		th.top = slot
 		if err != nil {
+			if !errors.Is(err, errCoroCloseSelf) {
+				th.lastErrNative = tm
+			}
 			return false, err
 		}
 	}
@@ -3254,11 +3279,13 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			}
 			return true, nil
 		}
-		if err := th.ensureStack(slot + 4); err != nil {
+		if err := th.ensureStack(slot + 1 + len(cargs) + 8); err != nil {
 			return false, err
 		}
+		th.stack[slot] = tm
+		copy(th.stack[slot+1:slot+1+len(cargs)], cargs)
 		cfIdx := th.nframe - 1
-		res, err := tm.AsNative().callMulti(s, cargs)
+		res, hooked, err := s.callNativeHooked(th, tm, slot, len(cargs), extraDepth, maxFrames+128)
 		cf = &th.frames[cfIdx]
 		if errors.Is(err, errYieldSentinel) {
 			cf.dirty = true
@@ -3268,9 +3295,14 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			cf.concatIdx = cur - 1
 			th.yieldDst = slot
 			th.yieldNRes = 1
+			th.yieldedNative = hooked
 			return false, errYieldSentinel
 		}
+		th.top = slot
 		if err != nil {
+			if !errors.Is(err, errCoroCloseSelf) {
+				th.lastErrNative = tm
+			}
 			return false, err
 		}
 		if len(res) > 0 {

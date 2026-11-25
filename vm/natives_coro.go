@@ -244,11 +244,20 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				goto runCoro
 			}
-			res, err := nf.callMulti(s, args)
+			if err := co.ensureStack(1 + len(args) + 8); err != nil {
+				co.status = ThreadDead
+				ev := errorToLuaValue(s, err)
+				co.errObj = ev
+				return false, []Value{ev}, nil
+			}
+			co.stack[0] = fn
+			copy(co.stack[1:1+len(args)], args)
+			res, hooked, err := s.callNativeHooked(co, fn, 0, len(args), 0, maxFrames+128)
 			if errors.Is(err, errYieldSentinel) {
 				co.status = ThreadSuspended
 				co.yieldDst = 0
 				co.yieldNRes = -1 // MULTRET: resume args become coroutine return values
+				co.yieldedNative = hooked
 				out := co.yieldVals
 				co.yieldVals = nil
 				return true, out, nil
@@ -471,7 +480,7 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'wrap' (function expected)")
 	}
 	if s.memLimit > 0 {
-		if err := s.checkMemAndAccount(threadInitMemBytes(128, defaultFrameCap)); err != nil {
+		if err := s.checkMemAndAccount(threadInitMemBytes(128, defaultFrameCap) + 48); err != nil {
 			return nil, err
 		}
 	}

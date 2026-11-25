@@ -1173,22 +1173,20 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #2 to 'remove' (position out of bounds)")
 		}
 		res := t.RawGetInt(pos)
-		if pos <= size {
-			for i := pos; i < size; i++ {
-				if cancelFn != nil && ((i-pos)&1023) == 0 {
-					if err := cancelFn(); err != nil {
-						return nil, err
-					}
-				}
-				t.RawSetInt(s, i, t.RawGetInt(i+1))
-				if err := s.ConsumeMemErr(); err != nil {
+		for ; pos < size; pos++ {
+			if cancelFn != nil && (pos&1023) == 0 {
+				if err := cancelFn(); err != nil {
 					return nil, err
 				}
 			}
-			t.RawSetInt(s, size, NilValue())
+			t.RawSetInt(s, pos, t.RawGetInt(pos+1))
 			if err := s.ConsumeMemErr(); err != nil {
 				return nil, err
 			}
+		}
+		t.RawSetInt(s, pos, NilValue())
+		if err := s.ConsumeMemErr(); err != nil {
+			return nil, err
 		}
 		return []Value{res}, nil
 	}
@@ -1211,49 +1209,47 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	if pos <= size {
-		// Root res on the active thread stack across subsequent __index/__newindex callbacks
-		// so GC cannot prematurely finalize or clear the removed value before return.
-		th := s.cur
-		savedTop := th.top
-		baseTop := savedTop
-		for fi := range th.nframe {
-			cf := &th.frames[fi]
-			if cf.cl != nil {
-				if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
-					baseTop = end
-				}
+	// Root res on the active thread stack across subsequent __index/__newindex callbacks
+	// so GC cannot prematurely finalize or clear the removed value before return.
+	th := s.cur
+	savedTop := th.top
+	baseTop := savedTop
+	for fi := range th.nframe {
+		cf := &th.frames[fi]
+		if cf.cl != nil {
+			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+				baseTop = end
 			}
 		}
-		if err := th.ensureStack(baseTop + 4); err != nil {
-			return nil, err
-		}
-		th.stack[baseTop] = res
-		th.top = baseTop + 1
-		defer func() {
-			th.stack[baseTop] = NilValue()
-			th.top = savedTop
-		}()
-		for i := pos; i < size; i++ {
-			if cancelFn != nil && ((i-pos)&1023) == 0 {
-				if err := cancelFn(); err != nil {
-					return nil, err
-				}
-			}
-			th.top = baseTop + 1
-			v, err := s.tableGetInt(args[0], i+1)
-			if err != nil {
-				return nil, err
-			}
-			th.top = baseTop + 1
-			if err := s.tableSetInt(args[0], i, v); err != nil {
+	}
+	if err := th.ensureStack(baseTop + 4); err != nil {
+		return nil, err
+	}
+	th.stack[baseTop] = res
+	th.top = baseTop + 1
+	defer func() {
+		th.stack[baseTop] = NilValue()
+		th.top = savedTop
+	}()
+	for ; pos < size; pos++ {
+		if cancelFn != nil && (pos&1023) == 0 {
+			if err := cancelFn(); err != nil {
 				return nil, err
 			}
 		}
 		th.top = baseTop + 1
-		if err := s.tableSetInt(args[0], size, NilValue()); err != nil {
+		v, err := s.tableGetInt(args[0], pos+1)
+		if err != nil {
 			return nil, err
 		}
+		th.top = baseTop + 1
+		if err := s.tableSetInt(args[0], pos, v); err != nil {
+			return nil, err
+		}
+	}
+	th.top = baseTop + 1
+	if err := s.tableSetInt(args[0], pos, NilValue()); err != nil {
+		return nil, err
 	}
 	return []Value{res}, nil
 }
@@ -1759,10 +1755,11 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 // --- string ---
 
 func nativeStringLen(_ *State, args []Value) ([]Value, error) {
-	if len(args) == 0 || !args[0].IsString() {
-		return nil, fmt.Errorf("bad argument #1 to 'string.len'")
+	str, err := checkStringArg(args, 0, "len")
+	if err != nil {
+		return nil, err
 	}
-	return []Value{IntValue(int64(len(args[0].AsString().S)))}, nil
+	return []Value{IntValue(int64(len(str)))}, nil
 }
 
 func nativeStringByte(s *State, args []Value) ([]Value, error) {

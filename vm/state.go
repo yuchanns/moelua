@@ -68,10 +68,11 @@ type NativeFunc struct {
 	Fn          func(s *State, args []Value) ([]Value, error)
 	FastFn      func(s *State, args []Value) (Value, error) // optional zero-alloc single-return fast path
 	Intrinsic   uint8
-	NumUpvals   uint8  // logical C closure upvalue count (e.g. string.gmatch = 3)
-	Collectable bool   // true for dynamic C closures (coroutine.wrap, gmatch, io.lines, utf8.codes); false for immutable light builtins
-	gcMark      uint64 // Tier 1 GC mark epoch (only mutated when Collectable == true)
-	gcChild     Value  // optional referenced Lua object kept alive by this closure (e.g. wrapped Thread / FILE*)
+	NumUpvals   uint8   // logical C closure upvalue count (e.g. string.gmatch = 3)
+	Collectable bool    // true for dynamic C closures (coroutine.wrap, gmatch, io.lines, utf8.codes); false for immutable light builtins
+	gcMark      uint64  // Tier 1 GC mark epoch (only mutated when Collectable == true)
+	gcChild     Value   // optional referenced Lua object kept alive by this closure (e.g. wrapped Thread / FILE*)
+	gcChildren  []Value // optional additional referenced Lua values kept alive by this closure (e.g. gmatch subject/pattern, io.lines formats)
 }
 
 func (nf *NativeFunc) callMulti(s *State, args []Value) ([]Value, error) {
@@ -610,11 +611,9 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		s.nCcalls--
 	}()
 
-	if fn.IsNative() {
-		return fn.AsNative().callMulti(s, args)
-	}
-	if !fn.IsClosure() {
-		for depth := 0; depth < 15; depth++ {
+	var extraDepth uint8
+	if !fn.IsClosure() && !fn.IsNative() {
+		for depth := 1; depth <= 15; depth++ {
 			tm := s.getTMByObj(fn, TMCall)
 			if tm.IsNil() {
 				return nil, &LuaError{Val: StringValue(s.intern.Intern(fmt.Sprintf("attempt to call a %s value", fn.TypeName())))}
@@ -624,16 +623,37 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			copy(all[1:], args)
 			fn = tm
 			args = all
-			if fn.IsNative() {
-				return fn.AsNative().callMulti(s, args)
-			}
-			if fn.IsClosure() {
+			extraDepth = uint8(depth)
+			if fn.IsClosure() || fn.IsNative() {
 				break
 			}
 		}
-		if !fn.IsClosure() {
+		if !fn.IsClosure() && !fn.IsNative() {
 			return nil, &LuaError{Val: StringValue(s.intern.Intern("'__call' chain too long"))}
 		}
+	}
+	if fn.IsNative() {
+		if th.hookMask == 0 || th.inHook {
+			return fn.AsNative().callMulti(s, args)
+		}
+		savedTop := th.top
+		base := th.top
+		if th.nframe > 0 {
+			prev := &th.frames[th.nframe-1]
+			if prev.kind == frameLua && prev.cl != nil {
+				if prevEnd := prev.base + int(prev.cl.bp.proto.MaxStackSize); prevEnd > base {
+					base = prevEnd
+				}
+			}
+		}
+		if err := th.ensureStack(base + 1 + len(args) + 8); err != nil {
+			return nil, err
+		}
+		th.stack[base] = fn
+		copy(th.stack[base+1:base+1+len(args)], args)
+		res, _, err := s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
+		th.top = savedTop
+		return res, err
 	}
 
 	cl := fn.AsClosure()
