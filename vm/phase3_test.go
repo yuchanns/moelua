@@ -1,12 +1,15 @@
 package vm
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+	"weak"
 )
 
 func TestArrBoolLifecycleAndPromotion(t *testing.T) {
@@ -675,4 +678,198 @@ func TestCodexReviewRound2VMRegressions(t *testing.T) {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
+}
+
+func TestCodexReviewRound3VMRegressions(t *testing.T) {
+	// 1. File methods, os.difftime, and package.searchers validate missing args without panicking.
+	t.Run("file_os_searcher_arg_validation", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			for _, fn in ipairs({
+				io.stdin.read, io.stdin.write, io.stdin.seek, io.stdin.lines,
+				os.difftime,
+				package.searchers[1], package.searchers[2], package.searchers[3],
+			}) do
+				local ok, e = pcall(fn)
+				assert(not ok and type(e) == "string", "expected Lua error, got " .. tostring(ok) .. " " .. tostring(e))
+			end
+			local ok, e = pcall(os.difftime, 10)
+			assert(not ok and tostring(e):find("number expected", 1, true), tostring(e))
+			return "ok"
+		`), "=file_os_searcher_args")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. table.move polls context cancellation periodically in huge loops.
+	t.Run("table_move_cancellation", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		s.SetContext(ctx)
+		cl, err := s.LoadChunk([]byte(`
+			table.move({}, 1, 100000000, 1)
+		`), "=table_move_cancel")
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		_, err = s.Call(cl)
+		elapsed := time.Since(start)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected context.DeadlineExceeded from table.move, got %v (elapsed=%v)", err, elapsed)
+		}
+		if elapsed > 2*time.Second {
+			t.Fatalf("table.move took too long to cancel: %v", elapsed)
+		}
+	})
+
+	// 3. Cached metatable shapes (metaRoots & metaTrans) do not retain unreachable metatables.
+	t.Run("weak_metatable_shapes_reclaimed", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		var w1, w2 weak.Pointer[Table]
+		func() {
+			mt1 := s.NewTable(0, 1)
+			mt1.RawSetStr(s, s.intern.Intern("payload"), StringValue(s.intern.Intern("empty_tbl_mt")))
+			w1 = weak.Make(mt1)
+			t1 := s.NewTable(0, 0)
+			s.SetMetatable(t1, mt1)
+
+			mt2 := s.NewTable(0, 1)
+			mt2.RawSetStr(s, s.intern.Intern("payload"), StringValue(s.intern.Intern("shaped_tbl_mt")))
+			w2 = weak.Make(mt2)
+			t2 := s.NewTable(0, 2)
+			t2.RawSetStr(s, s.intern.Intern("x"), IntValue(1))
+			s.SetMetatable(t2, mt2)
+			_ = t1
+			_ = t2
+		}()
+		for range 5 {
+			runtime.GC()
+		}
+		s.shapes.Prune()
+		if w1.Value() != nil {
+			t.Fatalf("metatable retained by metaRoots after dropping table")
+		}
+		if w2.Value() != nil {
+			t.Fatalf("metatable retained by metaTrans after dropping shaped table")
+		}
+	})
+
+	// 4. Appending to specialized arrays (int/float/bool) via OP_SETTABLE honors __newindex.
+	t.Run("array_append_honors_newindex", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			for _, tc in ipairs({
+				{ name = "int", init = {1}, val = 9 },
+				{ name = "float", init = {1.5}, val = 2.5 },
+				{ name = "bool", init = {true}, val = false },
+			}) do
+				local called = 0
+				local t = setmetatable(tc.init, {
+					__newindex = function(self, k, v)
+						called = called + 1
+						error("blocked_" .. tc.name)
+					end,
+				})
+				local i = 2
+				local ok, err = pcall(function() t[i] = tc.val end)
+				assert(not ok and called == 1 and tostring(err):find("blocked_" .. tc.name, 1, true),
+					tc.name .. ": ok=" .. tostring(ok) .. " called=" .. called .. " err=" .. tostring(err))
+				assert(rawget(t, 2) == nil, tc.name .. ": rawget(t,2) should stay nil")
+			end
+			return "ok"
+		`), "=array_append_newindex")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 5. Re-assigning __gc metatable on userdata does not duplicate finalizer execution.
+	t.Run("userdata_finalizer_dedup", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local count = 0
+			local mt = { __gc = function() count = count + 1 end }
+			do
+				local f = assert(io.tmpfile())
+				debug.setmetatable(f, mt)
+				debug.setmetatable(f, mt)
+			end
+			collectgarbage("collect")
+			assert(count == 1, "expected userdata __gc to run once, got " .. count)
+			return "ok"
+		`), "=ud_gc_dedup")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 6. string.format defers __tostring until %s actually consumes the argument.
+	t.Run("string_format_lazy_tostring", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local calls = 0
+			local t = setmetatable({}, {
+				__tostring = function()
+					calls = calls + 1
+					error("tostring_boom")
+				end,
+			})
+			assert(string.format("plain", t) == "plain")
+			assert(calls == 0)
+			local p = string.format("%p", t)
+			assert(p:sub(1, 2) == "0x", p)
+			assert(calls == 0)
+			local ok, err = pcall(string.format, "%s", t)
+			assert(not ok and tostring(err):find("tostring_boom", 1, true) and calls == 1)
+			return "ok"
+		`), "=format_lazy_tostring")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 7. Failed seek on a non-seekable buffered pipe preserves unread buffered bytes.
+	if runtime.GOOS != "windows" {
+		t.Run("file_seek_failure_preserves_buffer", func(t *testing.T) {
+			s := NewState()
+			defer s.Close()
+			cl, err := s.LoadChunk([]byte(`
+				local f = assert(io.popen("printf abcdef", "r"))
+				assert(f:read(1) == "a")
+				local pos, msg = f:seek()
+				assert(pos == nil and type(msg) == "string")
+				local rest = f:read("a")
+				f:close()
+				assert(rest == "bcdef", "expected 'bcdef', got " .. string.format("%q", tostring(rest)))
+				return "ok"
+			`), "=seek_preserve_buf")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+				t.Fatalf("Call failed: res=%v err=%v", res, err)
+			}
+		})
+	}
 }
