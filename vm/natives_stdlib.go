@@ -363,34 +363,126 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #3 to 'unpack' (number expected)")
 		}
 	}
-	vals, nextPos, err := luastdlib.Unpack(fmtStr, data, initPos)
+	// Pass 1: validate format/data and count decoded outputs with zero slice allocations,
+	// enforcing memLimit and cancellation controls before allocating any result storage.
+	cancelFn := s.nativeCancelFunc()
+	var count int64
+	var strBytes int64
+	nextPos, err := luastdlib.UnpackEach(fmtStr, data, initPos, func(pv luastdlib.PackValue) error {
+		count++
+		if cancelFn != nil && (count&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return err
+			}
+		}
+		if s.memLimit > 0 {
+			checkNow := (count & 63) == 0
+			if pv.Kind == luastdlib.PackString {
+				if _, exists := s.intern.lookupExistingShort(pv.Str); !exists {
+					strBytes += int64(len(pv.Str)) + 48
+					checkNow = true
+				}
+			}
+			if checkNow {
+				if err := s.checkMem((count+1)*16 + strBytes); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
 	if s.memLimit > 0 {
-		if err := s.checkMem(int64(len(vals)+1) * 16); err != nil {
+		if err := s.checkMem((count+1)*16 + strBytes); err != nil {
 			return nil, err
 		}
 	}
-	out := make([]Value, len(vals)+1)
-	for i, pv := range vals {
+	// Pass 2: fill a single exact-sized []Value slice (rooting on the active thread stack
+	// when strings are interned under a memory limit so emergency GC recounts earlier strings).
+	nOut := int(count) + 1
+	if s.memLimit > 0 && strBytes > 0 {
+		th := s.cur
+		savedTop := th.top
+		baseTop := savedTop
+		for fi := range th.nframe {
+			cf := &th.frames[fi]
+			if cf.cl != nil {
+				if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+					baseTop = end
+				}
+			}
+		}
+		if err := th.ensureStack(baseTop + nOut + 2); err != nil {
+			return nil, err
+		}
+		written := 0
+		defer func() {
+			if written > 0 {
+				fillNil(th.stack[baseTop : baseTop+written])
+			}
+			th.top = savedTop
+		}()
+		_, err = luastdlib.UnpackEach(fmtStr, data, initPos, func(pv luastdlib.PackValue) error {
+			var v Value
+			switch pv.Kind {
+			case luastdlib.PackInt:
+				v = IntValue(pv.Int)
+			case luastdlib.PackFloat:
+				v = FloatValue(pv.Flt)
+			case luastdlib.PackString:
+				str := pv.Str
+				if len(str) > maxShortStringLen && len(str) < len(data) {
+					str = strings.Clone(str)
+				}
+				ls, ierr := s.TryIntern(str)
+				if ierr != nil {
+					return ierr
+				}
+				v = StringValue(ls)
+			}
+			th.stack[baseTop+written] = v
+			written++
+			th.top = baseTop + written
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		th.stack[baseTop+written] = IntValue(nextPos)
+		written++
+		th.top = baseTop + written
+		out := make([]Value, written)
+		copy(out, th.stack[baseTop:baseTop+written])
+		return out, nil
+	}
+	out := make([]Value, nOut)
+	idx := 0
+	_, err = luastdlib.UnpackEach(fmtStr, data, initPos, func(pv luastdlib.PackValue) error {
 		switch pv.Kind {
 		case luastdlib.PackInt:
-			out[i] = IntValue(pv.Int)
+			out[idx] = IntValue(pv.Int)
 		case luastdlib.PackFloat:
-			out[i] = FloatValue(pv.Flt)
+			out[idx] = FloatValue(pv.Flt)
 		case luastdlib.PackString:
 			str := pv.Str
 			if len(str) > maxShortStringLen && len(str) < len(data) {
 				str = strings.Clone(str)
 			}
-			if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
-				return nil, err
+			ls, ierr := s.TryIntern(str)
+			if ierr != nil {
+				return ierr
 			}
-			out[i] = StringValue(s.intern.Intern(str))
+			out[idx] = StringValue(ls)
 		}
+		idx++
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	out[len(vals)] = IntValue(nextPos)
+	out[idx] = IntValue(nextPos)
 	return out, nil
 }
 

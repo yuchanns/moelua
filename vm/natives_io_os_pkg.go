@@ -200,27 +200,40 @@ func (s *State) emitWarning(msg string) {
 }
 
 func nativeWarn(s *State, args []Value) ([]Value, error) {
-	if len(args) == 0 || !args[0].IsString() {
+	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'warn' (string expected)")
 	}
-	first := args[0].AsString().S
-	if len(args) == 1 && strings.HasPrefix(first, "@") {
-		switch first {
-		case "@on":
-			s.warnOn = true
-		case "@off":
-			s.warnOn = false
+	for i := 1; i < len(args); i++ {
+		if !args[i].IsString() && !args[i].IsNumber() {
+			return nil, fmt.Errorf("bad argument #%d to 'warn' (string expected)", i+1)
 		}
+	}
+	if len(args) == 1 && args[0].IsString() {
+		first := args[0].AsString().S
+		if strings.HasPrefix(first, "@") {
+			switch first {
+			case "@on":
+				s.warnOn = true
+			case "@off":
+				s.warnOn = false
+			}
+			return nil, nil
+		}
+	}
+	if !s.warnOn || s.errOut == nil {
 		return nil, nil
 	}
-	var sb strings.Builder
+	// Stream arguments directly to s.errOut without allocating a concatenated buffer
+	// (matches Lua 5.5 lbaselib.c:luaB_warn).
+	_, _ = io.WriteString(s.errOut, "Lua warning: ")
 	for _, a := range args {
-		if !a.IsString() && !a.IsNumber() {
-			return nil, fmt.Errorf("bad argument to 'warn' (string expected)")
+		if a.IsString() {
+			_, _ = io.WriteString(s.errOut, a.AsString().S)
+		} else {
+			_, _ = io.WriteString(s.errOut, FormatValue(a))
 		}
-		sb.WriteString(FormatValue(a))
 	}
-	s.emitWarning(sb.String())
+	_, _ = io.WriteString(s.errOut, "\n")
 	return nil, nil
 }
 
@@ -1745,8 +1758,51 @@ func nativeFileRead(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{v}, nil
 	}
-	out := make([]Value, 0, len(fmts))
-	for _, f := range fmts {
+	if len(fmts) == 1 {
+		v, _, err := readOneItem(s, lf, fmts[0])
+		if err != nil {
+			if re, ok := err.(ioReadErr); ok {
+				return ioFail(s, re.err), nil
+			}
+			return nil, err
+		}
+		return []Value{v}, nil
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(len(fmts)) * 16); err != nil {
+			return nil, err
+		}
+	}
+	// Root accumulated results on the active thread stack across subsequent readOneItem calls
+	// so emergency GC triggered while reading later formats still accounts for earlier strings.
+	th := s.cur
+	savedTop := th.top
+	baseTop := savedTop
+	for fi := range th.nframe {
+		cf := &th.frames[fi]
+		if cf.cl != nil {
+			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+				baseTop = end
+			}
+		}
+	}
+	if err := th.ensureStack(baseTop + len(fmts) + 2); err != nil {
+		return nil, err
+	}
+	written := 0
+	defer func() {
+		if written > 0 {
+			fillNil(th.stack[baseTop : baseTop+written])
+		}
+		th.top = savedTop
+	}()
+	cancelFn := s.nativeCancelFunc()
+	for idx, f := range fmts {
+		if cancelFn != nil && idx > 0 && (idx&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
 		v, ok, err := readOneItem(s, lf, f)
 		if err != nil {
 			if re, ok := err.(ioReadErr); ok {
@@ -1754,11 +1810,15 @@ func nativeFileRead(s *State, args []Value) ([]Value, error) {
 			}
 			return nil, err
 		}
-		out = append(out, v)
+		th.stack[baseTop+written] = v
+		written++
+		th.top = baseTop + written
 		if !ok {
 			break
 		}
 	}
+	out := make([]Value, written)
+	copy(out, th.stack[baseTop:baseTop+written])
 	return out, nil
 }
 

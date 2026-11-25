@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -1541,6 +1542,138 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 	return out, nil
 }
 
+// sortOrderedCancelable sorts a slice of ordered numeric values in place using introsort
+// (median-of-three quicksort + insertion sort + heapsort fallback) while polling cancelFn
+// every 1024 comparisons so context timeouts and instruction budgets are enforced promptly.
+func sortOrderedCancelable[T cmp.Ordered](a []T, cancelFn func() error) error {
+	if len(a) <= 1 {
+		return nil
+	}
+	var steps uint64
+	tick := func() error {
+		steps++
+		if (steps & 1023) == 0 {
+			return cancelFn()
+		}
+		return nil
+	}
+	insertionSort := func(lo, hi int) error {
+		for i := lo + 1; i <= hi; i++ {
+			key := a[i]
+			j := i - 1
+			for j >= lo {
+				if err := tick(); err != nil {
+					return err
+				}
+				if !(key < a[j]) {
+					break
+				}
+				a[j+1] = a[j]
+				j--
+			}
+			a[j+1] = key
+		}
+		return nil
+	}
+	siftDown := func(lo, root, hi int) error {
+		for {
+			child := 2*root + 1
+			if child > hi {
+				return nil
+			}
+			if child+1 <= hi {
+				if err := tick(); err != nil {
+					return err
+				}
+				if a[lo+child] < a[lo+child+1] {
+					child++
+				}
+			}
+			if err := tick(); err != nil {
+				return err
+			}
+			if !(a[lo+root] < a[lo+child]) {
+				return nil
+			}
+			a[lo+root], a[lo+child] = a[lo+child], a[lo+root]
+			root = child
+		}
+	}
+	heapSort := func(lo, hi int) error {
+		n := hi - lo + 1
+		for i := n/2 - 1; i >= 0; i-- {
+			if err := siftDown(lo, i, n-1); err != nil {
+				return err
+			}
+		}
+		for end := n - 1; end > 0; end-- {
+			a[lo], a[lo+end] = a[lo+end], a[lo]
+			if err := siftDown(lo, 0, end-1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	var introSort func(lo, hi, depth int) error
+	introSort = func(lo, hi, depth int) error {
+		for hi-lo >= 16 {
+			if depth == 0 {
+				return heapSort(lo, hi)
+			}
+			depth--
+			mid := lo + (hi-lo)/2
+			if a[mid] < a[lo] {
+				a[lo], a[mid] = a[mid], a[lo]
+			}
+			if a[hi] < a[lo] {
+				a[lo], a[hi] = a[hi], a[lo]
+			}
+			if a[hi] < a[mid] {
+				a[mid], a[hi] = a[hi], a[mid]
+			}
+			pivot := a[mid]
+			i, j := lo-1, hi+1
+			for {
+				for {
+					i++
+					if err := tick(); err != nil {
+						return err
+					}
+					if !(a[i] < pivot) {
+						break
+					}
+				}
+				for {
+					j--
+					if err := tick(); err != nil {
+						return err
+					}
+					if !(pivot < a[j]) {
+						break
+					}
+				}
+				if i >= j {
+					break
+				}
+				a[i], a[j] = a[j], a[i]
+			}
+			if j-lo < hi-j {
+				if err := introSort(lo, j, depth); err != nil {
+					return err
+				}
+				lo = j + 1
+			} else {
+				if err := introSort(j+1, hi, depth); err != nil {
+					return err
+				}
+				hi = j
+			}
+		}
+		return insertionSort(lo, hi)
+	}
+	return introSort(0, len(a)-1, 2*bits.Len(uint(len(a))))
+}
+
 func nativeTableSort(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'table.sort' (table expected)")
@@ -1549,6 +1682,7 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'table.sort' (table expected, got %s)", s.objTypeName(args[0]))
 	}
 	hasComp := len(args) >= 2 && !args[1].IsNil()
+	cancelFn := s.nativeCancelFunc()
 	if args[0].IsTable() && args[0].AsTable().meta == nil {
 		t := args[0].AsTable()
 		n := int(t.Len())
@@ -1558,22 +1692,45 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 		// Fast path: homogeneous int64/float64 array without custom comparator!
 		if OptimizeEnabled && !hasComp {
 			if t.arrKind == arrInt && int(t.arrLen) == n {
-				slices.Sort(t.arrIntSlice())
-				return nil, nil
+				if cancelFn == nil {
+					slices.Sort(t.arrIntSlice())
+					return nil, nil
+				}
+				if s.ctx != nil {
+					if err := s.ctx.Err(); err != nil {
+						s.abortErr = err
+						return nil, err
+					}
+				}
+				return nil, sortOrderedCancelable(t.arrIntSlice(), cancelFn)
 			}
 			if t.arrKind == arrFloat && int(t.arrLen) == n {
 				// Fall back to auxsort when NaN is present so Lua 5.5 comparison semantics match PUC-Rio C Lua.
 				fs := t.arrFloatSlice()
+				if cancelFn != nil && s.ctx != nil {
+					if err := s.ctx.Err(); err != nil {
+						s.abortErr = err
+						return nil, err
+					}
+				}
 				hasNaN := false
-				for _, fv := range fs {
+				for i, fv := range fs {
+					if cancelFn != nil && i > 0 && (i&1023) == 0 {
+						if err := cancelFn(); err != nil {
+							return nil, err
+						}
+					}
 					if math.IsNaN(fv) {
 						hasNaN = true
 						break
 					}
 				}
 				if !hasNaN {
-					slices.Sort(fs)
-					return nil, nil
+					if cancelFn == nil {
+						slices.Sort(fs)
+						return nil, nil
+					}
+					return nil, sortOrderedCancelable(fs, cancelFn)
 				}
 			}
 		}
@@ -1618,7 +1775,6 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 		}
 		th.top = savedTop
 	}()
-	cancelFn := s.nativeCancelFunc()
 	for i := range n {
 		if cancelFn != nil && (i&1023) == 0 {
 			if err := cancelFn(); err != nil {
@@ -1634,7 +1790,16 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 		written = i + 1
 		th.top = baseTop + written
 	}
+	var cmpSteps uint64
 	comp := func(a, b Value) (bool, error) {
+		if cancelFn != nil {
+			cmpSteps++
+			if (cmpSteps & 1023) == 0 {
+				if err := cancelFn(); err != nil {
+					return false, err
+				}
+			}
+		}
 		th.top = baseTop + n
 		if hasComp {
 			res, err := s.Call(args[1], a, b)

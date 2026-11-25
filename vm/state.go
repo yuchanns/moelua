@@ -854,6 +854,20 @@ func (s *State) TryIntern(str string) (*LuaString, error) {
 	return s.intern.Intern(str), nil
 }
 
+// TryAllocNative checks and accounts for a dynamically allocated native closure against
+// the State's memory limit and returns it as a Value.
+func (s *State) TryAllocNative(nf *NativeFunc) (Value, error) {
+	if nf == nil {
+		return NilValue(), nil
+	}
+	if s.memLimit > 0 || s.gc.tier1 {
+		if err := s.checkMemAndAccount(48 + int64(len(nf.upvals))*16); err != nil {
+			return NilValue(), err
+		}
+	}
+	return NativeValue(nf), nil
+}
+
 // SetGlobalMM assigns a global in `_G`, honoring `_G`'s `__newindex` metamethod
 // (matching PUC-Rio `lua_setglobal`).
 func (s *State) SetGlobalMM(name string, val Value) error {
