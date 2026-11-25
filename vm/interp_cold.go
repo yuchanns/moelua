@@ -1812,13 +1812,14 @@ func strToNumForLoop(v Value) Value {
 
 //go:noinline
 func (s *State) forPrepSlow(regs *[256]Value, a uint8) (bool, error) {
-	pinit, plim, pstep := strToNumForLoop(regs[a]), strToNumForLoop(regs[a+1]), strToNumForLoop(regs[a+2])
-	if BothInt(pinit, pstep) {
-		initV := pinit.Int()
-		step := pstep.Int()
+	origInit, origLim, origStep := regs[a], regs[a+1], regs[a+2]
+	if BothInt(origInit, origStep) {
+		initV := origInit.Int()
+		step := origStep.Int()
 		if step == 0 {
 			return false, fmt.Errorf("'for' step is zero")
 		}
+		plim := strToNumForLoop(origLim)
 		var lim int64
 		var ok bool
 		if plim.IsInt() {
@@ -1872,6 +1873,7 @@ func (s *State) forPrepSlow(regs *[256]Value, a uint8) (bool, error) {
 		regs[a+2].SetInt(initV)
 		return false, nil
 	}
+	plim, pstep, pinit := strToNumForLoop(origLim), strToNumForLoop(origStep), strToNumForLoop(origInit)
 	lim, ok := plim.ToFloat()
 	if !ok {
 		return false, fmt.Errorf("bad 'for' limit (number expected, got %s)", s.objTypeName(plim))

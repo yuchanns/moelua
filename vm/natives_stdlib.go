@@ -379,10 +379,14 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 		case luastdlib.PackFloat:
 			out[i] = FloatValue(pv.Flt)
 		case luastdlib.PackString:
-			if err := s.checkMemAndAccount(int64(len(pv.Str)) + 48); err != nil {
+			str := pv.Str
+			if len(str) > maxShortStringLen && len(str) < len(data) {
+				str = strings.Clone(str)
+			}
+			if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
 				return nil, err
 			}
-			out[i] = StringValue(s.intern.Intern(pv.Str))
+			out[i] = StringValue(s.intern.Intern(str))
 		}
 	}
 	out[len(vals)] = IntValue(nextPos)
@@ -449,14 +453,21 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgPointer, Ptr: uintptr(a.ptr), ToString: lazyToStr}
 		}
 	}
-	res, err := luastdlib.Format(fmtStr, fargs)
+	var checkSize func(int64) error
+	if s.memLimit > 0 {
+		checkSize = func(n int64) error {
+			return s.checkMem(n + 48)
+		}
+	}
+	res, err := luastdlib.FormatWithLimits(fmtStr, fargs, checkSize)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkMemAndAccount(int64(len(res)) + 48); err != nil {
+	ls, err := s.TryIntern(res)
+	if err != nil {
 		return nil, err
 	}
-	return []Value{StringValue(s.intern.Intern(res))}, nil
+	return []Value{StringValue(ls)}, nil
 }
 
 // --- utf8 library ---

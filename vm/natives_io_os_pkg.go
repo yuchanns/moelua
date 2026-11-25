@@ -1977,6 +1977,9 @@ func nativeOSExecute(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || args[0].IsNil() {
 		return []Value{TrueValue()}, nil
 	}
+	if !args[0].IsString() && !args[0].IsNumber() {
+		return nil, fmt.Errorf("bad argument #1 to 'os.execute' (string expected, got %s)", s.objTypeName(args[0]))
+	}
 	cmd := shellCommand(FormatValue(args[0]))
 	s.inheritedStdStreams(cmd)
 	return execResult(s, cmd.Run()), nil
@@ -1985,10 +1988,22 @@ func nativeOSExecute(s *State, args []Value) ([]Value, error) {
 func nativeOSExit(s *State, args []Value) ([]Value, error) {
 	code := 0
 	if len(args) >= 1 && !args[0].IsNil() {
-		if args[0].IsFalse() {
-			code = 1
-		} else if i, ok := args[0].CoerceInt(); ok {
+		a := args[0]
+		if a.IsBool() {
+			if a.IsFalse() {
+				code = 1
+			}
+		} else if i, ok := a.CoerceInt(); ok {
 			code = int(i)
+		} else if a.IsNumber() {
+			return nil, fmt.Errorf("bad argument #1 to 'os.exit' (number has no integer representation)")
+		} else {
+			if a.IsString() {
+				if _, ok := luastdlib.StrToFloat(a.AsString().S); ok {
+					return nil, fmt.Errorf("bad argument #1 to 'os.exit' (number has no integer representation)")
+				}
+			}
+			return nil, fmt.Errorf("bad argument #1 to 'os.exit' (number expected, got %s)", s.objTypeName(a))
 		}
 	}
 	s.flushOpenFiles()
