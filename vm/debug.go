@@ -249,11 +249,20 @@ func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
 	if th == s.cur && level > 0 && !hasNativeTop {
 		level--
 	}
+	if hasMsg && s.memLimit > 0 {
+		if err := s.checkMem(int64(len(msg)) + 256); err != nil {
+			return nil, err
+		}
+	}
 	tb := s.formatTraceback(th, msg, hasMsg, level)
 	if includeSelf {
 		tb = strings.Replace(tb, "stack traceback:", "stack traceback:\n\t[C]: in function 'traceback'", 1)
 	}
-	return []Value{StringValue(s.intern.Intern(tb))}, nil
+	ls, err := s.TryIntern(tb)
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeUpvalueCount(nf *NativeFunc) int {
@@ -373,18 +382,31 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		}
 		if cf.kind != frameLua {
 			// framePCall / frameXPCall / frameNative C boundary frame!
-			cname := "pcall"
-			cfunc := s.GetGlobal("pcall")
-			if cf.kind == frameXPCall {
-				cname = "xpcall"
-				cfunc = s.GetGlobal("xpcall")
-			} else if cf.kind == frameNative {
-				cfunc = cf.nativeFn
-				if cf.nativeFn.IsNative() {
+			cfunc := cf.nativeFn
+			cname, namewhat := "", ""
+			if cfIdx > 0 && th.frames[cfIdx-1].kind == frameLua {
+				cname, namewhat = funcNameFromCall(th, cfIdx)
+			}
+			if cname == "" {
+				if cf.kind == framePCall {
+					cname = "pcall"
+					namewhat = "global"
+				} else if cf.kind == frameXPCall {
+					cname = "xpcall"
+					namewhat = "global"
+				} else if cf.nativeFn.IsNative() {
 					cname = cf.nativeFn.AsNative().Name
+					namewhat = "global"
 				}
 			}
-			return []Value{TableValue(fillCFrameInfo(s, what, cfunc, cname, "global", int64(cf.ftransfer), int64(cf.ntransfer)))}, nil
+			if cfunc.IsNil() {
+				if cf.kind == framePCall {
+					cfunc = s.GetGlobal("pcall")
+				} else if cf.kind == frameXPCall {
+					cfunc = s.GetGlobal("xpcall")
+				}
+			}
+			return []Value{TableValue(fillCFrameInfo(s, what, cfunc, cname, namewhat, int64(cf.ftransfer), int64(cf.ntransfer)))}, nil
 		}
 	} else {
 		return nil, fmt.Errorf("bad argument #1 to 'getinfo' (function or level expected)")
@@ -411,9 +433,9 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		if strings.ContainsRune(what, 'l') {
 			line := -1
 			if cf != nil {
-				pc := cf.pc - 1
-				if pc < 0 {
-					pc = 0
+				pc := cf.pc
+				if !cf.atCurrentPC && pc > 0 {
+					pc--
 				}
 				line = getFuncLine(p, pc)
 			}

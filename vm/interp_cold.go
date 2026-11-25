@@ -192,9 +192,9 @@ func (s *State) runtimeErrorToValue(th *Thread, err error) Value {
 			cf := &th.frames[topIdx]
 			if cf.kind == frameLua && cf.cl != nil {
 				p := cf.cl.bp.proto
-				pc := cf.pc - 1
-				if pc < 0 {
-					pc = 0
+				pc := cf.pc
+				if !cf.atCurrentPC && pc > 0 {
+					pc--
 				}
 				line := getFuncLine(p, pc)
 				if line > 0 {
@@ -209,6 +209,12 @@ func (s *State) runtimeErrorToValue(th *Thread, err error) Value {
 				}
 			}
 		}
+	}
+	if s.memLimit > 0 {
+		if ls, ierr := s.TryIntern(msg); ierr == nil {
+			return StringValue(ls)
+		}
+		return StringValue(s.intern.Intern("not enough memory"))
 	}
 	return StringValue(s.intern.Intern(msg))
 }
@@ -1471,6 +1477,7 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 		funcIdx:  funcIdx,
 		nresults: nresults,
 		errFunc:  errFunc,
+		nativeFn: th.stack[funcIdx],
 		dirty:    true,
 	}
 	th.nframe++

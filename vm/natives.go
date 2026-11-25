@@ -261,9 +261,9 @@ func (s *State) errorWhere(level int) string {
 		return ""
 	}
 	p := cf.cl.bp.proto
-	pc := cf.pc - 1
-	if pc < 0 {
-		pc = 0
+	pc := cf.pc
+	if !cf.atCurrentPC && pc > 0 {
+		pc--
 	}
 	line := getFuncLine(p, pc)
 	if line > 0 {
@@ -284,7 +284,17 @@ func nativeError(s *State, args []Value) ([]Value, error) {
 	}
 	if level > 0 && args[0].IsString() {
 		if where := s.errorWhere(level); where != "" {
-			return nil, &LuaError{Val: StringValue(s.intern.Intern(where + args[0].AsString().S))}
+			msg := args[0].AsString().S
+			if s.memLimit > 0 {
+				if err := s.checkMem(int64(len(where)) + int64(len(msg)) + 48); err != nil {
+					return nil, err
+				}
+			}
+			ls, err := s.TryIntern(where + msg)
+			if err != nil {
+				return nil, err
+			}
+			return nil, &LuaError{Val: StringValue(ls)}
 		}
 	}
 	return nil, &LuaError{Val: args[0]}
@@ -339,11 +349,18 @@ func nativeToString(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'tostring' (value expected)")
 	}
+	if args[0].IsString() && s.getTMByObj(args[0], TMToString).IsNil() {
+		return []Value{args[0]}, nil
+	}
 	str, err := s.toStringValue(args[0])
 	if err != nil {
 		return nil, err
 	}
-	return []Value{StringValue(s.intern.Intern(str))}, nil
+	ls, err := s.TryIntern(str)
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeToNumber(_ *State, args []Value) ([]Value, error) {

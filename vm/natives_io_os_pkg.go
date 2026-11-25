@@ -2386,7 +2386,11 @@ func nativeOSGetEnv(s *State, args []Value) ([]Value, error) {
 	if !ok {
 		return []Value{NilValue()}, nil
 	}
-	return []Value{StringValue(s.intern.Intern(v))}, nil
+	ls, err := s.TryIntern(v)
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeOSRemove(s *State, args []Value) ([]Value, error) {
@@ -2424,7 +2428,11 @@ func nativeOSTmpName(s *State, _ []Value) ([]Value, error) {
 	if runtime.GOOS == "windows" {
 		_ = os.Remove(name)
 	}
-	return []Value{StringValue(s.intern.Intern(name))}, nil
+	ls, err := s.TryIntern(name)
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeOSSetLocale(s *State, args []Value) ([]Value, error) {
@@ -2525,7 +2533,16 @@ func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
 	name := FormatValue(args[0])
 	v := s.preloadTbl.RawGetStr(s.intern.Intern(name))
 	if v.IsNil() {
-		return []Value{StringValue(s.intern.Intern(fmt.Sprintf("no field package.preload['%s']", name)))}, nil
+		if s.memLimit > 0 {
+			if err := s.checkMem(int64(len(name)) + 80); err != nil {
+				return nil, err
+			}
+		}
+		ls, err := s.TryIntern(fmt.Sprintf("no field package.preload['%s']", name))
+		if err != nil {
+			return nil, err
+		}
+		return []Value{StringValue(ls)}, nil
 	}
 	return []Value{v, StringValue(s.intern.Intern(":preload:"))}, nil
 }
@@ -2539,18 +2556,29 @@ func nativeSearcherLua(s *State, args []Value) ([]Value, error) {
 	if !pathVal.IsString() {
 		return nil, fmt.Errorf("'package.path' must be a string")
 	}
-	fname, errmsg := searchPath(name, pathVal.AsString().S, ".", string(filepath.Separator))
-	if fname == "" {
-		return []Value{StringValue(s.intern.Intern(errmsg))}, nil
+	fname, errmsg, err := s.searchPath(name, pathVal.AsString().S, ".", string(filepath.Separator))
+	if err != nil {
+		return nil, err
 	}
-	res, err := nativeLoadFile(s, []Value{StringValue(s.intern.Intern(fname))})
+	if fname == "" {
+		ls, ierr := s.TryIntern(errmsg)
+		if ierr != nil {
+			return nil, ierr
+		}
+		return []Value{StringValue(ls)}, nil
+	}
+	fnameLS, ierr := s.TryIntern(fname)
+	if ierr != nil {
+		return nil, ierr
+	}
+	res, err := nativeLoadFile(s, []Value{StringValue(fnameLS)})
 	if err != nil {
 		return nil, err
 	}
 	if res[0].IsNil() {
 		return nil, fmt.Errorf("error loading module '%s' from file '%s':\n\t%s", name, fname, FormatValue(res[1]))
 	}
-	return []Value{res[0], StringValue(s.intern.Intern(fname))}, nil
+	return []Value{res[0], StringValue(fnameLS)}, nil
 }
 
 func nativeSearcherC(s *State, args []Value) ([]Value, error) {
@@ -2562,8 +2590,15 @@ func nativeSearcherC(s *State, args []Value) ([]Value, error) {
 	if !cpathVal.IsString() {
 		return nil, fmt.Errorf("'package.cpath' must be a string")
 	}
-	_, errmsg := searchPath(name, cpathVal.AsString().S, ".", string(filepath.Separator))
-	return []Value{StringValue(s.intern.Intern(errmsg))}, nil
+	_, errmsg, err := s.searchPath(name, cpathVal.AsString().S, ".", string(filepath.Separator))
+	if err != nil {
+		return nil, err
+	}
+	ls, ierr := s.TryIntern(errmsg)
+	if ierr != nil {
+		return nil, ierr
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeRequire(s *State, args []Value) ([]Value, error) {
@@ -2634,8 +2669,14 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 			break
 		}
 		if len(res) > 0 && res[0].IsString() {
+			smsg := res[0].AsString().S
+			if s.memLimit > 0 {
+				if merr := s.checkMem(int64(errs.Len()) + int64(len(smsg)) + 64); merr != nil {
+					return nil, merr
+				}
+			}
 			errs.WriteString("\n\t")
-			errs.WriteString(res[0].AsString().S)
+			errs.WriteString(smsg)
 		}
 	}
 	th.stack[baseTop] = loader
@@ -2667,23 +2708,82 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	return []Value{finalVal, extra}, nil
 }
 
-func searchPath(name, path, sep, rep string) (string, string) {
+func (s *State) checkedReplaceSize(src, oldStr, newStr string) (int64, error) {
+	baseLen := int64(len(src))
+	if oldStr == "" {
+		return baseLen, nil
+	}
+	cnt := int64(strings.Count(src, oldStr))
+	if cnt == 0 {
+		return baseLen, nil
+	}
+	diff := int64(len(newStr)) - int64(len(oldStr))
+	if diff > 0 && cnt > (math.MaxInt64-baseLen)/diff {
+		return 0, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+	}
+	outLen := baseLen + cnt*diff
+	if s.memLimit > 0 {
+		if err := s.checkMem(outLen + 48); err != nil {
+			return 0, err
+		}
+	}
+	return outLen, nil
+}
+
+func (s *State) searchPath(name, path, sep, rep string) (string, string, error) {
 	if sep != "" {
+		if _, err := s.checkedReplaceSize(name, sep, rep); err != nil {
+			return "", "", err
+		}
 		name = strings.ReplaceAll(name, sep, rep)
 	}
-	expanded := strings.ReplaceAll(path, "?", name)
-	for tmpl := range strings.SplitSeq(expanded, ";") {
-		if tmpl == "" {
-			continue
+	var errBuf strings.Builder
+	cancelFn := s.nativeCancelFunc()
+	var steps int64
+	idx := 0
+	for tmpl := range strings.SplitSeq(path, ";") {
+		steps++
+		if cancelFn != nil && (steps&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return "", "", err
+			}
 		}
-		if f, err := os.Open(tmpl); err == nil {
-			_ = f.Close()
-			return tmpl, ""
+		candLen, err := s.checkedReplaceSize(tmpl, "?", name)
+		if err != nil {
+			return "", "", err
+		}
+		cand := strings.ReplaceAll(tmpl, "?", name)
+		if cand != "" {
+			if f, oerr := os.Open(cand); oerr == nil {
+				_ = f.Close()
+				return cand, "", nil
+			}
+		}
+		// Exact Lua 5.5 loadlib.c:pusherrornotfound formatting
+		addLen := candLen + 11
+		if idx == 0 {
+			addLen = candLen + 10
+		}
+		if s.memLimit > 0 {
+			if err := s.checkMem(int64(errBuf.Len()) + addLen + 48); err != nil {
+				return "", "", err
+			}
+		}
+		if idx == 0 {
+			errBuf.WriteString("no file '")
+		} else {
+			errBuf.WriteString("'\n\tno file '")
+		}
+		errBuf.WriteString(cand)
+		idx++
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(errBuf.Len()) + 49); err != nil {
+			return "", "", err
 		}
 	}
-	// Exact Lua 5.5 loadlib.c:pusherrornotfound formatting
-	errmsg := "no file '" + strings.ReplaceAll(expanded, ";", "'\n\tno file '") + "'"
-	return "", errmsg
+	errBuf.WriteByte('\'')
+	return "", errBuf.String(), nil
 }
 
 func nativePackageSearchPath(s *State, args []Value) ([]Value, error) {
@@ -2700,11 +2800,22 @@ func nativePackageSearchPath(s *State, args []Value) ([]Value, error) {
 	if len(args) >= 4 && !args[3].IsNil() {
 		rep = FormatValue(args[3])
 	}
-	fname, errmsg := searchPath(name, path, sep, rep)
-	if fname == "" {
-		return []Value{NilValue(), StringValue(s.intern.Intern(errmsg))}, nil
+	fname, errmsg, err := s.searchPath(name, path, sep, rep)
+	if err != nil {
+		return nil, err
 	}
-	return []Value{StringValue(s.intern.Intern(fname))}, nil
+	if fname == "" {
+		ls, ierr := s.TryIntern(errmsg)
+		if ierr != nil {
+			return nil, ierr
+		}
+		return []Value{NilValue(), StringValue(ls)}, nil
+	}
+	ls, ierr := s.TryIntern(fname)
+	if ierr != nil {
+		return nil, ierr
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 // AddFS registers a Lua package.searchers loader backed by fsys (e.g. embed.FS or os.DirFS).
@@ -2760,25 +2871,60 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 	if pv := s.pkgTbl.RawGetStr(s.intern.Intern("path")); pv.IsString() {
 		pathStr = pv.AsString().S
 	}
+	if _, err := s.checkedReplaceSize(name, ".", "/"); err != nil {
+		return nil, err
+	}
 	rel := strings.ReplaceAll(name, ".", "/")
-	expanded := strings.ReplaceAll(pathStr, "?", rel)
-	var tried []string
-	for tmpl := range strings.SplitSeq(expanded, ";") {
+	var tried strings.Builder
+	var triedCount int
+	appendTried := func(msg string) error {
+		add := int64(len(msg))
+		if triedCount > 0 {
+			add += 2
+		}
+		if s.memLimit > 0 {
+			if err := s.checkMem(int64(tried.Len()) + add + 48); err != nil {
+				return err
+			}
+		}
+		if triedCount > 0 {
+			tried.WriteString("\n\t")
+		}
+		tried.WriteString(msg)
+		triedCount++
+		return nil
+	}
+	cancelFn := s.nativeCancelFunc()
+	var steps int64
+	for tmpl := range strings.SplitSeq(pathStr, ";") {
+		steps++
+		if cancelFn != nil && (steps&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
 		if tmpl == "" {
 			continue
 		}
-		cand := strings.ReplaceAll(tmpl, "\\", "/")
+		if _, err := s.checkedReplaceSize(tmpl, "?", rel); err != nil {
+			return nil, err
+		}
+		cand := strings.ReplaceAll(strings.ReplaceAll(tmpl, "?", rel), "\\", "/")
 		for strings.HasPrefix(cand, "./") {
 			cand = cand[2:]
 		}
 		if !fs.ValidPath(cand) {
-			tried = append(tried, fmt.Sprintf("no file '%s' (invalid fs path)", cand))
+			if err := appendTried(fmt.Sprintf("no file '%s' (invalid fs path)", cand)); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		f, err := fsys.Open(cand)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				tried = append(tried, fmt.Sprintf("no file '%s' (in fs.FS)", cand))
+				if err := appendTried(fmt.Sprintf("no file '%s' (in fs.FS)", cand)); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			return nil, fmt.Errorf("error reading module '%s' from file '%s': %w", name, cand, err)
@@ -2808,8 +2954,12 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 		}
 		return []Value{fn, StringValue(candStr)}, nil
 	}
-	if len(tried) == 0 {
+	if triedCount == 0 {
 		return []Value{StringValue(s.intern.Intern("no file in fs.FS"))}, nil
 	}
-	return []Value{StringValue(s.intern.Intern(strings.Join(tried, "\n\t")))}, nil
+	ls, ierr := s.TryIntern(tried.String())
+	if ierr != nil {
+		return nil, ierr
+	}
+	return []Value{StringValue(ls)}, nil
 }

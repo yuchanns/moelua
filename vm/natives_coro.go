@@ -183,6 +183,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
+				co.stack[0] = fn
 				for i, a := range args {
 					co.stack[1+i] = a
 				}
@@ -214,6 +215,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
+				co.stack[0] = fn
 				for i, a := range args {
 					co.stack[1+i] = a
 				}
