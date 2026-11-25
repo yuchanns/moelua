@@ -6700,3 +6700,35 @@ func TestCodexReviewRound31VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound32VMRegressions(t *testing.T) {
+	t.Run("close_clears_pinned_refs", func(t *testing.T) {
+		s := NewState()
+		var id int
+		var wp weak.Pointer[byte]
+		func() {
+			buf := make([]byte, 1<<20)
+			wp = weak.Make(&buf[0])
+			ud, err := s.TryNewUserdata(buf, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id = s.Ref(ud)
+		}()
+		s.Close()
+		s.Unref(id) // safe no-op after Close
+		if len(s.gc.pinnedRefs) != 0 {
+			t.Fatalf("expected pinnedRefs cleared on Close, got %d entries", len(s.gc.pinnedRefs))
+		}
+		for range 10 {
+			runtime.GC()
+			if wp.Value() == nil {
+				break
+			}
+		}
+		if wp.Value() != nil {
+			t.Fatalf("closed vm.State retained pinned userdata buffer after Close")
+		}
+		runtime.KeepAlive(s)
+	})
+}
