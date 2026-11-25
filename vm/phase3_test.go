@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	_ "time/tzdata"
 	"weak"
 )
 
@@ -1216,4 +1217,166 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCodexReviewRound5VMRegressions(t *testing.T) {
+	// 1. load(reader) bounds cumulative input buffers against State memory limits.
+	t.Run("load_reader_memory_limit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(65536)
+		var peakMem int64
+		s.SetGlobal("recordMem", NativeValue(&NativeFunc{
+			Name: "recordMem",
+			Fn: func(s *State, _ []Value) ([]Value, error) {
+				if u := s.MemoryUsage(); u > peakMem {
+					peakMem = u
+				}
+				return nil, nil
+			},
+		}))
+		cl, err := s.LoadChunk([]byte(`
+			local chunk = string.rep(" ", 1024)
+			local n = 0
+			local fn, err = load(function()
+				recordMem()
+				n = n + 1
+				if n <= 1024 then return chunk end
+				return nil
+			end)
+			assert(fn == nil and tostring(err):find("not enough memory", 1, true),
+				"expected memory error, got fn=" .. tostring(fn) .. " err=" .. tostring(err))
+			assert(n < 100, "reader ran too many times before hitting 64KiB limit: " .. n)
+			return "ok"
+		`), "=load_reader_mem")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		if peakMem < 16384 {
+			t.Fatalf("expected peak MemoryUsage during load(reader) to include buffered bytes, got %d", peakMem)
+		}
+		if s.gc.tempBytes != 0 {
+			t.Fatalf("expected tempBytes == 0 after load(reader) returns, got %d", s.gc.tempBytes)
+		}
+	})
+
+	// 2. loadfile()/dofile() without filename share stdin's buffered reader with earlier io.read().
+	t.Run("loadfile_stdin_preserves_buffered_bytes", func(t *testing.T) {
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pr.Close()
+		if _, err := pw.WriteString("Xreturn 42\n"); err != nil {
+			pw.Close()
+			t.Fatal(err)
+		}
+		pw.Close()
+
+		origStdin := os.Stdin
+		os.Stdin = pr
+		s := NewState()
+		os.Stdin = origStdin
+		defer s.Close()
+
+		cl, err := s.LoadChunk([]byte(`
+			local c = io.read(1)
+			local f = assert(loadfile())
+			return c, f()
+		`), "=loadfile_stdin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl)
+		if err != nil {
+			t.Fatalf("Call failed: %v", err)
+		}
+		if len(res) != 2 || res[0].AsString().S != "X" || res[1].Int() != 42 {
+			t.Fatalf("expected ('X', 42), got %v", res)
+		}
+	})
+
+	// 3. table.unpack roots accumulated results on the thread stack across __index GC cycles.
+	t.Run("table_unpack_roots_results_across_index_gc", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function runCase()
+				local fin = 0
+				local p = setmetatable({}, {
+					__index = function(_, i)
+						if i == 1 then
+							return setmetatable({ v = 123 }, { __gc = function() fin = fin + 1 end })
+						end
+						collectgarbage("collect")
+						return "second"
+					end,
+				})
+				local a, b = table.unpack(p, 1, 2)
+				assert(fin == 0, "first unpacked result was finalized prematurely: fin=" .. fin)
+				assert(a.v == 123 and b == "second")
+			end
+			runCase()
+			-- Also verify under active call hook (frameNative on stack)
+			debug.sethook(function() end, "c")
+			runCase()
+			debug.sethook()
+			return "ok"
+		`), "=unpack_gc_root")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. os.time honors isdst (disambiguating autumn folds, normalizing mismatches, and round-tripping os.date("*t")).
+	t.Run("os_time_isdst_disambiguation_and_roundtrip", func(t *testing.T) {
+		ny, err := time.LoadLocation("America/New_York")
+		if err != nil {
+			t.Skipf("America/New_York tzdata unavailable: %v", err)
+		}
+		origLocal := time.Local
+		time.Local = ny
+		defer func() { time.Local = origLocal }()
+
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local cases = {
+				{ "fold_true",    {year=2024, month=11, day=3,  hour=1,  min=30, sec=0, isdst=true},  1730611800, true  },
+				{ "fold_false",   {year=2024, month=11, day=3,  hour=1,  min=30, sec=0, isdst=false}, 1730615400, false },
+				{ "fold_nil",     {year=2024, month=11, day=3,  hour=1,  min=30, sec=0},              1730611800, true  },
+				{ "winter_true",  {year=2024, month=1,  day=15, hour=12, min=0,  sec=0, isdst=true},  1705334400, false },
+				{ "winter_false", {year=2024, month=1,  day=15, hour=12, min=0,  sec=0, isdst=false}, 1705338000, false },
+				{ "summer_true",  {year=2024, month=7,  day=15, hour=12, min=0,  sec=0, isdst=true},  1721059200, true  },
+				{ "summer_false", {year=2024, month=7,  day=15, hour=12, min=0,  sec=0, isdst=false}, 1721062800, true  },
+				{ "gap_true",     {year=2024, month=3,  day=10, hour=2,  min=30, sec=0, isdst=true},  1710052200, false },
+				{ "gap_false",    {year=2024, month=3,  day=10, hour=2,  min=30, sec=0, isdst=false}, 1710055800, true  },
+			}
+			for _, tc in ipairs(cases) do
+				local name, tbl, wantTS, wantDST = tc[1], tc[2], tc[3], tc[4]
+				local gotTS = os.time(tbl)
+				assert(gotTS == wantTS and tbl.isdst == wantDST,
+					string.format("%s: got ts=%s isdst=%s, want ts=%s isdst=%s",
+						name, tostring(gotTS), tostring(tbl.isdst), tostring(wantTS), tostring(wantDST)))
+			end
+			-- Round-trip both occurrences of the autumn DST fold via os.date("*t", ts)
+			for _, ts in ipairs({1730611800, 1730615400}) do
+				local d = os.date("*t", ts)
+				assert(os.time(d) == ts, string.format("roundtrip failed for %d: got %s", ts, tostring(os.time(d))))
+			end
+			return "ok"
+		`), "=os_time_isdst")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
 }
