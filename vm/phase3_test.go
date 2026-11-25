@@ -2765,3 +2765,311 @@ func TestCodexReviewRound12VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound13VMRegressions(t *testing.T) {
+	// 1. string.gmatch iterators expose captured subject/pattern strings to GC recounting.
+	t.Run("gmatch_retains_subject_pattern_in_gc_memlimit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local kept = {}
+			local failed = false
+			local errMsg = ""
+			for i = 1, 100 do
+				local ok, res = pcall(function()
+					return string.gmatch(string.rep("x", 32768), ".")
+				end)
+				if not ok then
+					failed = true
+					errMsg = tostring(res)
+					break
+				end
+				kept[i] = res
+				collectgarbage("collect")
+			end
+			local count = #kept
+			kept = nil
+			collectgarbage("collect")
+			assert(failed and count >= 1 and count < 6 and string.find(errMsg, "not enough memory", 1, true),
+				"expected OOM retaining 32KiB gmatch iterators, got failed=" .. tostring(failed) .. " count=" .. count .. " err=" .. errMsg)
+			return "ok"
+		`), "=gmatch_gc_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. Deleted hash keys release unreachable Go references on GC while preserving live pairs() traversal.
+	t.Run("deleted_hash_keys_released_on_gc", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local kept = {}
+			for i = 1, 200 do
+				local t = {}
+				local k = string.rep(string.char(65 + (i % 26)), 32768)
+				t[k] = i
+				t[k] = nil
+				kept[i] = t
+				k = nil
+				collectgarbage("collect")
+			end
+			_G._kept_tombstone_tables = kept
+
+			-- Live deleted keys remain valid for active pairs() traversal even across GC:
+			local pt = {}
+			for i = 1, 8 do
+				pt[string.rep(string.char(97 + i), 64)] = i
+			end
+			local seen = 0
+			for k, v in pairs(pt) do
+				seen = seen + v
+				pt[k] = nil
+				collectgarbage("collect")
+			end
+			assert(seen == 36, "expected pairs sum 36, got " .. tostring(seen))
+			return #kept
+		`), "=deleted_hash_keys")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(262144)
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 1 || res[0].Int() != 200 {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		runtime.GC()
+		runtime.GC()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		// Without dead-key release, 200 * 32 KiB = 6.55 MB would stay pinned on the Go heap.
+		if after.HeapAlloc > before.HeapAlloc+2*1024*1024 {
+			t.Fatalf("deleted hash keys pinned heap allocations: before=%d after=%d delta=%d",
+				before.HeapAlloc, after.HeapAlloc, after.HeapAlloc-before.HeapAlloc)
+		}
+	})
+
+	// 3. string.dump enforces the state's memory limit before and after serialization.
+	t.Run("string_dump_enforces_memlimit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function sample(x) return x + 1 end
+			local kept = {}
+			local failed = false
+			local errMsg = ""
+			for i = 1, 2000 do
+				local ok, res = pcall(string.dump, sample)
+				if not ok then
+					failed = true
+					errMsg = tostring(res)
+					break
+				end
+				kept[i] = res
+			end
+			local count = #kept
+			kept = nil
+			collectgarbage("collect")
+			assert(failed and count < 1500 and string.find(errMsg, "not enough memory", 1, true),
+				"expected OOM retaining repeated string.dump outputs, got failed=" .. tostring(failed) .. " count=" .. count .. " err=" .. errMsg)
+			return "ok"
+		`), "=dump_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. Native metamethods (__len, __call, __concat, __close) dispatch call/return debug hooks.
+	t.Run("native_metamethods_dispatch_debug_hooks", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local events = {}
+			local target = nil
+			local function hook(ev)
+				local info = debug.getinfo(2, "f")
+				if info and info.func == target then
+					events[#events + 1] = ev
+				end
+			end
+
+			-- __len native metamethod:
+			local tlen = setmetatable({}, { __len = tostring })
+			target = tostring
+			events = {}
+			debug.sethook(hook, "cr")
+			local rlen = #tlen
+			debug.sethook()
+			assert(type(rlen) == "string")
+			assert(table.concat(events, ",") == "call,return", "__len events: " .. table.concat(events, ","))
+
+			-- __call native metamethod:
+			local tcall = setmetatable({}, { __call = tostring })
+			target = tostring
+			events = {}
+			debug.sethook(hook, "cr")
+			local rcall = tcall()
+			debug.sethook()
+			assert(type(rcall) == "string")
+			assert(table.concat(events, ",") == "call,return", "__call events: " .. table.concat(events, ","))
+
+			-- __concat native metamethod:
+			local tcat = setmetatable({}, { __concat = tostring })
+			target = tostring
+			events = {}
+			debug.sethook(hook, "cr")
+			local rcat = tcat .. "x"
+			debug.sethook()
+			assert(type(rcat) == "string")
+			assert(table.concat(events, ",") == "call,return", "__concat events: " .. table.concat(events, ","))
+
+			-- __close native metamethod:
+			target = tostring
+			events = {}
+			debug.sethook(hook, "cr")
+			do
+				local x <close> = setmetatable({}, { __close = tostring })
+			end
+			debug.sethook()
+			assert(table.concat(events, ",") == "call,return", "__close events: " .. table.concat(events, ","))
+			return "ok"
+		`), "=native_mm_hooks")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 5. Numeric file reads propagate non-EOF OS read errors (e.g. EISDIR on a directory) instead of returning bare nil.
+	t.Run("numeric_file_read_propagates_non_eof_error", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("opening a directory for reading is POSIX-specific")
+		}
+		s := NewState()
+		defer s.Close()
+		dir := t.TempDir()
+		cl, err := s.LoadChunk([]byte(fmt.Sprintf(`
+			local f = assert(io.open(%q, "r"))
+			local v, msg, code = f:read("n")
+			assert(v == nil and type(msg) == "string" and code == %d,
+				"expected nil, errmsg, EISDIR; got " .. tostring(v) .. ", " .. tostring(msg) .. ", " .. tostring(code))
+			local it = f:lines("n")
+			local ok, lerr = pcall(it)
+			assert(not ok and type(lerr) == "string", "expected lines('n') to error on directory read, got " .. tostring(ok) .. ", " .. tostring(lerr))
+			f:close()
+			return "ok"
+		`, dir, int(syscall.EISDIR))), "=read_num_eisdir")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 6. table.remove clears pos even when pos == #t + 1 (or pos == #t == 0) with custom __len / proxy tables.
+	t.Run("table_remove_clears_boundary_position", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local t = setmetatable({ 42 }, { __len = function() return 0 end })
+			local v = table.remove(t, 1)
+			assert(v == 42, "expected removed value 42, got " .. tostring(v))
+			assert(t[1] == nil, "expected t[1] to be cleared, got " .. tostring(t[1]))
+
+			local t0 = setmetatable({ [0] = 99 }, { __len = function() return 0 end })
+			local v0 = table.remove(t0)
+			assert(v0 == 99 and t0[0] == nil, "expected t0[0] to be removed and cleared")
+
+			local writes = {}
+			local proxy = setmetatable({}, {
+				__len = function() return 0 end,
+				__index = function(_, k) if k == 1 then return "proxy_val" end end,
+				__newindex = function(_, k, val) writes[#writes + 1] = tostring(k) .. "=" .. tostring(val) end,
+			})
+			assert(table.remove(proxy, 1) == "proxy_val")
+			assert(table.concat(writes, ",") == "1=nil", "expected __newindex(1, nil), got " .. table.concat(writes, ","))
+			return "ok"
+		`), "=table_remove_boundary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 7. string.len coerces numeric arguments while keeping invalid types rejected.
+	t.Run("string_len_coerces_numbers", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			assert(string.len(12345) == 5)
+			assert(string.len(1.5) == 3)
+			assert(string.len(-0) == 1)
+			assert(string.len("abc") == 3)
+			local ok1, r1 = pcall(string.len, 12345)
+			assert(ok1 and r1 == 5)
+			assert(not pcall(string.len))
+			assert(not pcall(string.len, nil))
+			assert(not pcall(string.len, true))
+			assert(not pcall(string.len, {}))
+			return "ok"
+		`), "=string_len_num")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 8. io.popen validates mode before starting the subprocess.
+	t.Run("io_popen_validates_mode_before_starting", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		marker := filepath.Join(t.TempDir(), "should_not_exist.txt")
+		var cmdStr string
+		if runtime.GOOS == "windows" {
+			cmdStr = fmt.Sprintf(`echo boom > "%s"`, marker)
+		} else {
+			cmdStr = fmt.Sprintf(`touch %q`, marker)
+		}
+		cl, err := s.LoadChunk([]byte(fmt.Sprintf(`
+			local cmd = %q
+			local ok1, e1 = pcall(io.popen, cmd, "invalid")
+			assert(not ok1 and string.find(tostring(e1), "invalid mode", 1, true), "unexpected invalid mode result: " .. tostring(ok1) .. "," .. tostring(e1))
+			local ok2, e2 = pcall(io.popen, cmd, {})
+			assert(not ok2 and string.find(tostring(e2), "string expected", 1, true), "unexpected non-string mode result: " .. tostring(ok2) .. "," .. tostring(e2))
+			local ok3, e3 = pcall(io.popen, cmd, 123)
+			assert(not ok3 and string.find(tostring(e3), "invalid mode", 1, true), "unexpected numeric mode result: " .. tostring(ok3) .. "," .. tostring(e3))
+			if %v then
+				local ok4, e4 = pcall(io.popen, cmd, "rb")
+				assert(not ok4 and string.find(tostring(e4), "invalid mode", 1, true), "expected POSIX popen to reject 'rb', got " .. tostring(ok4) .. "," .. tostring(e4))
+			end
+			return "ok"
+		`, cmdStr, runtime.GOOS != "windows")), "=popen_mode")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+			t.Fatalf("io.popen started subprocess despite invalid mode (marker %q exists or stat err=%v)", marker, statErr)
+		}
+	})
+}
