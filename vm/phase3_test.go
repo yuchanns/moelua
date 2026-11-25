@@ -6508,3 +6508,90 @@ func TestCodexReviewRound28VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound29VMRegressions(t *testing.T) {
+	t.Run("long_string_key_hash_polls_execution_controls", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		tbl := s.NewDictTable(4)
+		for _, k := range []string{"a", "b", "c"} {
+			tbl.RawSetStr(s, s.intern.Intern(k), TrueValue())
+		}
+		key := StringValue(s.intern.Intern(strings.Repeat("k", 32<<20)))
+		s.SetInstructionLimit(100)
+		_, err := s.Call(s.GetGlobal("rawget"), TableValue(tbl), key)
+		if !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("rawget with fresh 32MiB key ignored instruction limit: err=%v", err)
+		}
+	})
+
+	t.Run("gc_table_traversal_polls_execution_controls", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local shared = {}
+			local big = table.create(2000000)
+			for i = 1, 2000000 do big[i] = shared end
+			KEEP = big
+		`), "=gc_big")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(cl); err != nil {
+			t.Fatal(err)
+		}
+		s.SetInstructionLimit(100)
+		_, err = s.Call(s.GetGlobal("collectgarbage"), StringValue(s.intern.Intern("collect")))
+		if !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("collectgarbage over 2M-ref table ignored instruction limit: err=%v", err)
+		}
+	})
+
+	t.Run("hook_error_respects_native_call_boundary", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function cb()
+				debug.sethook(function()
+					if debug.getinfo(2, 'f').func == pcall then debug.sethook(); error("hookfail") end
+				end, "r")
+				return pcall(type, 1)
+			end
+			local ok, e = pcall(string.gsub, 'x', '.', cb)
+			assert(ok == false and tostring(e):find("hookfail", 1, true), tostring(e))
+			return "ok"
+		`), "=hook_native_boundary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("native_results_aliasing_args_survive_state_call", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		x := StringValue(s.intern.Intern("x"))
+		res, err := s.Call(s.GetGlobal("assert"), TrueValue(), x)
+		if err != nil || len(res) != 2 || !res[0].IsTrue() || res[1] != x {
+			t.Fatalf("assert: res=%v err=%v", res, err)
+		}
+		b := StringValue(s.intern.Intern("b"))
+		res, err = s.Call(s.GetGlobal("select"), IntValue(2), x, b)
+		if err != nil || len(res) != 1 || res[0] != b {
+			t.Fatalf("select: res=%v err=%v", res, err)
+		}
+		cl, err := s.LoadChunk([]byte(`
+			local t = setmetatable({}, {__index = assert})
+			assert(t[1] == t and table.unpack(t, 1, 1) == t)
+			return "ok"
+		`), "=alias_index")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+}
