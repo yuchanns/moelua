@@ -1,7 +1,7 @@
 package vm_test
 
 import (
-	"bytes"
+	"io"
 	"testing"
 
 	"github.com/yuchanns/moelua/bytecode"
@@ -11,9 +11,8 @@ import (
 
 func newBoundedFuzzState(stepLimit int) (*vm.State, error) {
 	s := vm.NewStateNoEnv()
-	var sink bytes.Buffer
-	s.SetOutput(&sink)
-	s.SetErrOutput(&sink)
+	s.SetOutput(io.Discard)
+	s.SetErrOutput(io.Discard)
 	// Restrict OS/IO/filesystem side effects across globals, package.loaded, and package.searchers.
 	s.SetGlobal("io", vm.NilValue())
 	s.SetGlobal("os", vm.NilValue())
@@ -257,5 +256,22 @@ func TestFuzzStateSandboxGuards(t *testing.T) {
 	}
 	if _, err := s3.Call(cl3); err != nil {
 		t.Fatalf("fuzz memory limit check failed: %v", err)
+	}
+
+	// 4. Repeated print() output is discarded via io.Discard rather than retained in memory.
+	s4, err := newBoundedFuzzState(2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s4.Close()
+	cl4, err := s4.LoadChunk([]byte(`
+		local x = string.rep("x", 256 * 1024)
+		for i = 1, 50 do print(x) end
+	`), "=fuzz_print_discard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s4.Call(cl4); err != nil {
+		t.Fatalf("fuzz print discard check failed: %v", err)
 	}
 }

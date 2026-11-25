@@ -505,3 +505,174 @@ func TestCodexReviewVMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound2VMRegressions(t *testing.T) {
+	// 1. Thread stack growth & table.unpack honor State memory limit.
+	t.Run("stack_growth_memlimit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(65536)
+		cl, err := s.LoadChunk([]byte(`
+			local ok, err = pcall(function() return table.unpack({}, 1, 999999) end)
+			assert(not ok and tostring(err):find("not enough memory", 1, true), "unpack bypassed memLimit: " .. tostring(err))
+			-- Also test vararg stack growth directly.
+			local function rec(n, ...)
+				if n == 0 then return ... end
+				return rec(n - 1, 1, 2, 3, 4, 5, 6, 7, 8, ...)
+			end
+			local ok2, err2 = pcall(rec, 2000)
+			assert(not ok2 and (tostring(err2):find("not enough memory", 1, true) or tostring(err2):find("stack overflow", 1, true)), "rec bypassed memLimit: " .. tostring(err2))
+			return "ok"
+		`), "=stack_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		if used := s.MemoryUsage(); used > 131072 {
+			t.Fatalf("MemoryUsage blew past limit: %d", used)
+		}
+	})
+
+	// 2. string.gsub bounds output growth and accounts completed strings under memory limit.
+	t.Run("string_gsub_memlimit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(65536)
+		cl, err := s.LoadChunk([]byte(`
+			local x = string.rep("x", 1000)
+			local ok1, e1 = pcall(string.gsub, x, ".", x)
+			assert(not ok1 and tostring(e1):find("not enough memory", 1, true), "gsub string bypassed memLimit: " .. tostring(e1))
+			local tbl = {x = x}
+			local ok2, e2 = pcall(string.gsub, x, ".", tbl)
+			assert(not ok2 and tostring(e2):find("not enough memory", 1, true), "gsub table bypassed memLimit: " .. tostring(e2))
+			local ok3, e3 = pcall(string.gsub, x, ".", function() return x end)
+			assert(not ok3 and tostring(e3):find("not enough memory", 1, true), "gsub func bypassed memLimit: " .. tostring(e3))
+			return "ok"
+		`), "=gsub_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. string.byte validates arg count and types without panicking.
+	t.Run("string_byte_arg_validation", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local ok1, e1 = pcall(string.byte)
+			assert(not ok1 and tostring(e1):find("string expected", 1, true), tostring(e1))
+			local ok2, e2 = pcall(string.byte, {})
+			assert(not ok2 and tostring(e2):find("string expected", 1, true), tostring(e2))
+			local ok3, e3 = pcall(string.byte, "abc", "bad")
+			assert(not ok3 and tostring(e3):find("number expected", 1, true), tostring(e3))
+			local ok4, e4 = pcall(string.byte, "abc", 1, 1.5)
+			assert(not ok4 and tostring(e4):find("no integer representation", 1, true), tostring(e4))
+			local a, b, c = string.byte(123, 1, 3)
+			assert(a == 49 and b == 50 and c == 51)
+			return "ok"
+		`), "=string_byte_args")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. pcall and xpcall fire call hooks for protected Lua callees and catch call-hook errors.
+	t.Run("pcall_xpcall_call_hook", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function f() return 42 end
+			local calls, rets = 0, 0
+			debug.sethook(function(ev)
+				local info = debug.getinfo(2, "f")
+				if info and info.func == f then
+					if ev == "call" then calls = calls + 1
+					elseif ev == "return" then rets = rets + 1 end
+				end
+			end, "cr")
+			f()
+			assert(pcall(f))
+			assert(xpcall(f, function(e) return e end))
+			debug.sethook()
+			assert(calls == 3 and rets == 3, "expected 3 calls / 3 rets, got " .. calls .. "/" .. rets)
+
+			-- Error thrown from call hook inside pcall must be caught by pcall.
+			debug.sethook(function(ev)
+				local info = debug.getinfo(2, "f")
+				if ev == "call" and info and info.func == f then
+					error("call_hook_boom")
+				end
+			end, "c")
+			local ok, err = pcall(f)
+			debug.sethook()
+			assert(not ok and tostring(err):find("call_hook_boom", 1, true), tostring(err))
+			return "ok"
+		`), "=pcall_call_hook")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 5. ipairs reads raw table entries before consulting __index metatable.
+	t.Run("ipairs_metatable_raw_first", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local t1 = setmetatable({10, 20}, {})
+			local out1 = {}
+			for i, v in ipairs(t1) do out1[#out1+1] = i .. "=" .. v end
+			assert(table.concat(out1, ",") == "1=10,2=20", table.concat(out1, ","))
+
+			local t2 = setmetatable({10, 20}, {__index = function(_, k)
+				if k == 1 then return 999 end
+				if k == 3 then return 30 end
+			end})
+			local out2 = {}
+			for i, v in ipairs(t2) do out2[#out2+1] = i .. "=" .. v end
+			assert(table.concat(out2, ",") == "1=10,2=20,3=30", table.concat(out2, ","))
+			return "ok"
+		`), "=ipairs_mt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 6. GC clearing weak-value prototype entries invalidates icProtoVal inline caches.
+	t.Run("weak_value_proto_ic_invalidation", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local p = setmetatable({}, {__mode = "v"})
+			p.foo = {marker = 123}
+			local x = setmetatable({}, {__index = p})
+			local function get(o) return o.foo end
+			for i = 1, 10 do
+				assert(get(x).marker == 123)
+			end
+			collectgarbage("collect")
+			assert(p.foo == nil, "p.foo should be collected")
+			assert(get(x) == nil, "cached icProtoVal returned stale collected table")
+			return "ok"
+		`), "=weak_proto_ic")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+}
