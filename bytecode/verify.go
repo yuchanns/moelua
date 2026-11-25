@@ -296,6 +296,17 @@ func verifyDepth(p *Proto, depth int) error {
 			if inst.C() >= len(p.Consts) {
 				return fmt.Errorf("verify: pc %d %s C=%d >= %d", pc, OpNames[op], inst.C(), len(p.Consts))
 			}
+			ck := p.Consts[inst.C()].Kind
+			switch op {
+			case OP_BANDK, OP_BORK, OP_BXORK:
+				if ck != ConstInt {
+					return fmt.Errorf("verify: pc %d %s K[%d] must be integer constant", pc, OpNames[op], inst.C())
+				}
+			default:
+				if ck != ConstInt && ck != ConstFloat {
+					return fmt.Errorf("verify: pc %d %s K[%d] must be numeric constant", pc, OpNames[op], inst.C())
+				}
+			}
 			if pc+1 >= n || p.Code[pc+1].Op() != OP_MMBINK {
 				return fmt.Errorf("verify: pc %d %s not followed by MMBINK", pc, OpNames[op])
 			}

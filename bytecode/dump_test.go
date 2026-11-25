@@ -471,4 +471,52 @@ func TestVerifyReturnOpenBaseHiddenVarargAndUndumpOverflow(t *testing.T) {
 	if _, err := bytecode.Undump(mut); err == nil {
 		t.Fatalf("expected Undump to reject truncated nline=MaxInt32 chunk")
 	}
+
+	// 4. Reject non-integer constants for BANDK/BORK/BXORK and non-numeric constants for ADDK..IDIVK.
+	for _, op := range []bytecode.OpCode{bytecode.OP_BANDK, bytecode.OP_BORK, bytecode.OP_BXORK} {
+		for _, ck := range []bytecode.Constant{
+			{Kind: bytecode.ConstString, Str: "str", IsShort: true},
+			{Kind: bytecode.ConstFloat, Float: 1.5},
+		} {
+			p := &bytecode.Proto{
+				Source:       "=bad_bitk",
+				MaxStackSize: 2,
+				Consts:       []bytecode.Constant{ck},
+				Code: []bytecode.Instruction{
+					mkABC(op, 0, 0, 0),
+					mkABC(bytecode.OP_MMBINK, 0, 0, 13),
+					mkABC(bytecode.OP_RETURN0, 0, 0, 0),
+				},
+			}
+			if err := bytecode.Verify(p); err == nil {
+				t.Fatalf("expected Verify to reject %s with const kind %v", bytecode.OpNames[op], ck.Kind)
+			}
+		}
+		good := &bytecode.Proto{
+			Source:       "=good_bitk",
+			MaxStackSize: 2,
+			Consts:       []bytecode.Constant{{Kind: bytecode.ConstInt, Int: 7}},
+			Code: []bytecode.Instruction{
+				mkABC(op, 0, 0, 0),
+				mkABC(bytecode.OP_MMBINK, 0, 0, 13),
+				mkABC(bytecode.OP_RETURN0, 0, 0, 0),
+			},
+		}
+		if err := bytecode.Verify(good); err != nil {
+			t.Fatalf("expected Verify to accept %s with ConstInt, got %v", bytecode.OpNames[op], err)
+		}
+	}
+	badAddK := &bytecode.Proto{
+		Source:       "=bad_addk",
+		MaxStackSize: 2,
+		Consts:       []bytecode.Constant{{Kind: bytecode.ConstString, Str: "1", IsShort: true}},
+		Code: []bytecode.Instruction{
+			mkABC(bytecode.OP_ADDK, 0, 0, 0),
+			mkABC(bytecode.OP_MMBINK, 0, 0, 6),
+			mkABC(bytecode.OP_RETURN0, 0, 0, 0),
+		},
+	}
+	if err := bytecode.Verify(badAddK); err == nil {
+		t.Fatalf("expected Verify to reject ADDK with string constant")
+	}
 }
