@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,6 +15,9 @@ import (
 	"time"
 	_ "time/tzdata"
 	"weak"
+
+	"github.com/yuchanns/moelua/bytecode"
+	"github.com/yuchanns/moelua/compiler"
 )
 
 func TestArrBoolLifecycleAndPromotion(t *testing.T) {
@@ -1237,12 +1241,14 @@ func TestCodexReviewRound5VMRegressions(t *testing.T) {
 			},
 		}))
 		cl, err := s.LoadChunk([]byte(`
-			local chunk = string.rep(" ", 1024)
+			local payload = string.rep("a", 1024)
 			local n = 0
 			local fn, err = load(function()
 				recordMem()
 				n = n + 1
-				if n <= 1024 then return chunk end
+				if n == 1 then return "local s = \"" end
+				if n <= 1024 then return payload end
+				if n == 1025 then return "\"\nreturn s" end
 				return nil
 			end)
 			assert(fn == nil and tostring(err):find("not enough memory", 1, true),
@@ -1257,7 +1263,7 @@ func TestCodexReviewRound5VMRegressions(t *testing.T) {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 		if peakMem < 16384 {
-			t.Fatalf("expected peak MemoryUsage during load(reader) to include buffered bytes, got %d", peakMem)
+			t.Fatalf("expected peak MemoryUsage during load(reader) to include compiler memory, got %d", peakMem)
 		}
 		if s.gc.tempBytes != 0 {
 			t.Fatalf("expected tempBytes == 0 after load(reader) returns, got %d", s.gc.tempBytes)
@@ -3195,6 +3201,495 @@ func TestCodexReviewRound14VMRegressions(t *testing.T) {
 		}
 		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+}
+
+func TestCodexReviewRound15VMRegressions(t *testing.T) {
+	// 1. Inline caches (monomorphic and polymorphic) release invalidated/unreachable references on GC.
+	t.Run("inline_cache_releases_unreachable_entries_on_gc", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local getters = {}
+			for i = 1, 80 do
+				local fn = assert(load("return function(o) return o.v end"))()
+				local proto = { v = string.rep(string.char(65 + (i % 26)), 32768) }
+				local mt = { __index = proto }
+				local o1 = setmetatable({ a = 1 }, mt)
+				local o2 = setmetatable({ b = 2 }, mt)
+				assert(#fn(o1) == 32768)
+				assert(#fn(o2) == 32768) -- populate polymorphic IC slot too
+				mt.__index = nil
+				proto = nil
+				o1, o2, mt = nil, nil, nil
+				getters[i] = fn
+				collectgarbage("collect")
+			end
+			_G._kept_ic_getters = getters
+			return #getters
+		`), "=ic_gc_sweep")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(524288)
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 1 || res[0].Int() != 80 {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		runtime.GC()
+		runtime.GC()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		// Without IC sweeping, 80 * 32 KiB = 2.62 MB would stay pinned on the Go heap.
+		if after.HeapAlloc > before.HeapAlloc+1536*1024 {
+			t.Fatalf("inline caches pinned unreachable strings: before=%d after=%d delta=%d",
+				before.HeapAlloc, after.HeapAlloc, after.HeapAlloc-before.HeapAlloc)
+		}
+	})
+
+	// 2. State.Call roots native callee and arguments even when debug hooks are disabled.
+	t.Run("state_call_roots_native_args_without_hooks", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local t = setmetatable({ live = true }, {
+				__gc = function(self) self.live = false end,
+			})
+			return t
+		`), "=mk_gc_tbl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 1 {
+			t.Fatalf("setup failed: res=%v err=%v", res, err)
+		}
+		tblVal := res[0]
+		liveDuringCall := false
+		consumer := NativeValue(&NativeFunc{
+			Name: "gc_consumer",
+			Fn: func(st *State, args []Value) ([]Value, error) {
+				st.CollectFull()
+				v := args[0].AsTable().RawGetStr(st.Intern("live"))
+				liveDuringCall = v.IsTrue()
+				return []Value{BoolValue(liveDuringCall)}, nil
+			},
+		})
+		out, err := s.Call(consumer, tblVal)
+		if err != nil || len(out) != 1 || !out[0].IsTrue() || !liveDuringCall {
+			t.Fatalf("native argument finalized prematurely during State.Call: out=%v live=%v err=%v", out, liveDuringCall, err)
+		}
+		// Once the call returns and the table is no longer referenced in the VM, GC finalizes it.
+		s.CollectFull()
+		if tblVal.AsTable().RawGetStr(s.Intern("live")).IsTrue() {
+			t.Fatalf("expected table to finalize after State.Call returned")
+		}
+	})
+
+	// 3. __close metamethod receives 1 argument on normal close (matching PUC-Rio lfunc.c:callclosemethod)
+	// and 2 arguments (obj, err) when unwinding an active error (including error(nil)).
+	t.Run("close_metamethod_arity_matches_lua55", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local n1, a1, b1
+			do
+				local x <close> = setmetatable({}, {
+					__close = function(...) n1 = select("#", ...); a1, b1 = ... end,
+				})
+			end
+			assert(n1 == 1 and type(a1) == "table" and b1 == nil, "normal close arity: " .. tostring(n1))
+
+			local n2
+			local co = coroutine.create(function()
+				local x <close> = setmetatable({}, {
+					__close = function(...) n2 = select("#", ...) end,
+				})
+				coroutine.yield()
+			end)
+			assert(coroutine.resume(co))
+			assert(coroutine.close(co))
+			assert(n2 == 1, "coroutine.close arity: " .. tostring(n2))
+
+			local n3, e3
+			local ok = pcall(function()
+				local x <close> = setmetatable({}, {
+					__close = function(...) n3 = select("#", ...); e3 = select(2, ...) end,
+				})
+				error("boom")
+			end)
+			assert(not ok and n3 == 2 and string.find(tostring(e3), "boom", 1, true), "error close arity: " .. tostring(n3))
+			return "ok"
+		`), "=close_arity")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. dofile preserves yieldability across normal call, tail call, pcall, and xpcall.
+	t.Run("dofile_yieldable_across_tailcall_and_protected_calls", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		p := filepath.Join(t.TempDir(), "yield_dofile.lua")
+		if err := os.WriteFile(p, []byte(`local v = coroutine.yield("paused"); return "done:" .. tostring(v)`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cl, err := s.LoadChunk([]byte(fmt.Sprintf(`
+			local path = %q
+			local function runCase(fn)
+				local co = coroutine.create(fn)
+				local ok1, y1 = coroutine.resume(co)
+				assert(ok1 and y1 == "paused", "first resume failed: " .. tostring(ok1) .. "," .. tostring(y1))
+				local ok2, r2, r3 = coroutine.resume(co, 7)
+				return ok2, r2, r3
+			end
+
+			-- Direct call:
+			local ok, r = runCase(function() local x = dofile(path); return x end)
+			assert(ok and r == "done:7", "direct: " .. tostring(ok) .. "," .. tostring(r))
+
+			-- Tail call:
+			ok, r = runCase(function() return dofile(path) end)
+			assert(ok and r == "done:7", "tailcall: " .. tostring(ok) .. "," .. tostring(r))
+
+			-- pcall(dofile, path):
+			local okP, rP
+			ok, okP, rP = runCase(function() return pcall(dofile, path) end)
+			assert(ok and okP and rP == "done:7", "pcall: " .. tostring(ok) .. "," .. tostring(okP) .. "," .. tostring(rP))
+
+			-- xpcall(dofile, msgh, path):
+			ok, okP, rP = runCase(function() return xpcall(dofile, function(e) return "msgh:" .. tostring(e) end, path) end)
+			assert(ok and okP and rP == "done:7", "xpcall: " .. tostring(ok) .. "," .. tostring(okP) .. "," .. tostring(rP))
+			return "ok"
+		`, p)), "=dofile_yield")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 5. require honors __index and __newindex metamethods on package.loaded.
+	t.Run("require_honors_package_loaded_metamethods", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local writes = {}
+			setmetatable(package.loaded, {
+				__index = function(_, k)
+					if k == "virt.sentinel" then return "SENTINEL" end
+					if k == "virt.err" then error("index_boom") end
+				end,
+				__newindex = function(t, k, v)
+					writes[k] = v
+					rawset(t, k, v)
+				end,
+			})
+			assert(require("virt.sentinel") == "SENTINEL")
+			local okErr, errMsg = pcall(require, "virt.err")
+			assert(not okErr and string.find(tostring(errMsg), "index_boom", 1, true))
+
+			package.preload["virt.preload_mod"] = function() return "PRELOAD_VAL" end
+			local v, extra = require("virt.preload_mod")
+			assert(v == "PRELOAD_VAL" and extra == ":preload:")
+			assert(writes["virt.preload_mod"] == "PRELOAD_VAL")
+			setmetatable(package.loaded, nil)
+			return "ok"
+		`), "=require_loaded_mm")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 6. debug.getinfo(0, ...) populates func, nups, nparams, isvararg, istailcall (active and suspended).
+	t.Run("debug_getinfo_level0_populates_all_fields", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local info = debug.getinfo(0, "futSlnr")
+			assert(info.func == debug.getinfo, "expected info.func == debug.getinfo")
+			assert(info.nups == 0 and info.nparams == 0 and info.isvararg == true)
+			assert(info.istailcall == false and info.extraargs == 0)
+			assert(info.what == "C" and info.name == "getinfo")
+
+			local co = coroutine.create(function() coroutine.yield("here") end)
+			assert(coroutine.resume(co))
+			local cinfo = debug.getinfo(co, 0, "futSlnr")
+			assert(cinfo.func == coroutine.yield, "expected suspended level 0 func == coroutine.yield")
+			assert(cinfo.nups == 0 and cinfo.nparams == 0 and cinfo.isvararg == true)
+			assert(cinfo.istailcall == false and cinfo.what == "C" and cinfo.name == "yield")
+			return "ok"
+		`), "=getinfo_lvl0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 7. tableSetInt and tableSetStr follow non-function __newindex values as indexing targets.
+	t.Run("table_set_follows_non_function_newindex_targets", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local backing = {}
+			debug.setmetatable(0, {
+				__newindex = function(_, k, v) backing[k] = v end,
+			})
+			local t = setmetatable({}, { __newindex = 0 })
+			table.insert(t, 42)
+			assert(backing[1] == 42, "expected table.insert to follow non-function __newindex target, got " .. tostring(backing[1]))
+
+			local dt = setmetatable({}, {
+				__index = { year = 2024, month = 1, day = 1, hour = 0, min = 0, sec = 0 },
+				__newindex = 0,
+			})
+			assert(type(os.time(dt)) == "number")
+			assert(backing.year == 2024 and backing.month == 1 and backing.day == 1)
+			debug.setmetatable(0, nil)
+			return "ok"
+		`), "=newindex_nonfunc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+}
+
+type tinyChunkReader struct {
+	data []byte
+	step int
+	off  int
+}
+
+func (r *tinyChunkReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := min(len(p), r.step)
+	n = min(n, len(r.data)-r.off)
+	copy(p[:n], r.data[r.off:r.off+n])
+	r.off += n
+	return n, nil
+}
+
+func TestStreamingLoadAndDump(t *testing.T) {
+	// 1. bytecode.DumpTo / DumpString / UndumpReader match fast Dump / Undump byte-for-byte,
+	// and malformed huge length headers fail cleanly at EOF without pre-allocating gigabytes.
+	t.Run("bytecode_stream_dump_and_undump_identity", func(t *testing.T) {
+		src := `
+			local function fib(n)
+				if n < 2 then return n end
+				return fib(n - 1) + fib(n - 2)
+			end
+			local s = "hello " .. string.rep("z", 64)
+			return fib(10), s
+		`
+		p, err := compiler.Compile("=stream_bc", src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantBytes, err := bytecode.Dump(p, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var streamed bytes.Buffer
+		if err := bytecode.DumpTo(&streamed, p, false); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(wantBytes, streamed.Bytes()) {
+			t.Fatalf("DumpTo mismatch: got %d bytes, want %d bytes", streamed.Len(), len(wantBytes))
+		}
+		strDump, err := bytecode.DumpString(p, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantStrip, err := bytecode.Dump(p, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strDump != string(wantStrip) {
+			t.Fatalf("DumpString(strip=true) mismatch")
+		}
+
+		// Stream back through a 7-byte reader and re-dump to verify exact Proto fidelity.
+		p2, err := bytecode.UndumpReader(&tinyChunkReader{data: wantBytes, step: 7})
+		if err != nil {
+			t.Fatalf("UndumpReader failed: %v", err)
+		}
+		reDumped, err := bytecode.Dump(p2, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(wantBytes, reDumped) {
+			t.Fatalf("UndumpReader round-trip mismatch")
+		}
+
+		// Truncated stream declaring an enormous instruction count must fail cleanly without OOM.
+		corrupt := append([]byte(nil), wantBytes[:39]...) // valid header + root nup + proto header up to ncode
+		// Append varint encoding of 1<<28 (268,435,456 instructions = 1 GiB) and truncate immediately!
+		corrupt = append(corrupt, 0x81, 0x80, 0x80, 0x80, 0x00)
+		if _, err := bytecode.UndumpReader(bytes.NewReader(corrupt)); err == nil {
+			t.Fatalf("expected truncated chunk error on corrupted huge ncode stream")
+		}
+	})
+
+	// 2. compiler.CompileReader streams 3 bytes at a time and produces byte-identical bytecode to Compile.
+	t.Run("compiler_stream_matches_string_fast_path", func(t *testing.T) {
+		src := "\xef\xbb\xbf#!/usr/bin/env lua\n" + `
+			-- line 2 comment
+			local long = [==[
+				hello \n world
+				multiline text
+			]==]
+			local escaped = "a\tb\x41\u{1F600}\z
+			   continued"
+			local sum = 0
+			for i = 1, 10 do
+				sum = sum + i
+			end
+			return sum, #long, escaped
+		`
+		pFast, err := compiler.Compile("@stream.lua", src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pStream, err := compiler.CompileReader("@stream.lua", &tinyChunkReader{data: []byte(src), step: 3})
+		if err != nil {
+			t.Fatalf("CompileReader failed: %v", err)
+		}
+		b1, err := bytecode.Dump(pFast, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b2, err := bytecode.Dump(pStream, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(b1, b2) {
+			t.Fatalf("CompileReader bytecode diverged from Compile (%d vs %d bytes)", len(b2), len(b1))
+		}
+	})
+
+	// 3. load(reader) streams lazily (early stop on mode mismatch / syntax error, low memory on large comment stream)
+	// and loadfile streams text and binary files with BOM/shebang headers.
+	t.Run("vm_streaming_load_and_loadfile", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+
+		// Early stop on mode mismatch & syntax error:
+		cl, err := s.LoadChunk([]byte(`
+			local calls1 = 0
+			local f1, e1 = load(function()
+				calls1 = calls1 + 1
+				if calls1 == 1 then return "return 1" end
+				return " + 2"
+			end, "=m", "b")
+			assert(f1 == nil and calls1 == 1 and string.find(e1, "text chunk", 1, true),
+				"expected 1 reader call on mode mismatch, got calls=" .. calls1 .. " err=" .. tostring(e1))
+
+			local calls2 = 0
+			local f2, e2 = load(function()
+				calls2 = calls2 + 1
+				if calls2 == 1 then return "local = ???\n" end
+				return "return 1\n"
+			end, "=syn")
+			assert(f2 == nil and calls2 == 1, "expected 1 reader call on early syntax error, got calls=" .. calls2)
+
+			-- Streaming binary chunk through load(reader) in 5-byte slices:
+			local dumped = string.dump(function(x) return x * 6 end)
+			local pos = 1
+			local bf = assert(load(function()
+				if pos > #dumped then return nil end
+				local piece = string.sub(dumped, pos, pos + 4)
+				pos = pos + 5
+				return piece
+			end, "=bin_stream", "b"))
+			assert(bf(7) == 42)
+			return "ok"
+		`), "=stream_early_stop")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+
+		// Streaming 1.5 MiB of Lua comments + code via load(reader) under a 131 KiB memory limit succeeds
+		// (would immediately OOM if load(reader) buffered the entire source before compiling!).
+		sMem := NewState()
+		defer sMem.Close()
+		clMem, err := sMem.LoadChunk([]byte(`
+			local comment = "-- " .. string.rep("x", 3000) .. "\n"
+			local i = 0
+			local fn = assert(load(function()
+				i = i + 1
+				if i <= 500 then return comment end
+				if i == 501 then return "return 12345" end
+				return nil
+			end, "=big_stream", "t"))
+			return fn()
+		`), "=stream_low_mem")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sMem.SetMemoryLimit(131072)
+		if res, err := sMem.Call(clMem); err != nil || len(res) != 1 || res[0].Int() != 12345 {
+			t.Fatalf("streaming large source under 128KiB memLimit failed: res=%v err=%v", res, err)
+		}
+
+		// loadfile streaming with BOM + shebang + binary payload & directory error:
+		dir := t.TempDir()
+		p, err := compiler.Compile("@shebang_bin.lua", "return 99")
+		if err != nil {
+			t.Fatal(err)
+		}
+		binChunk, err := bytecode.Dump(p, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binFile := filepath.Join(dir, "shebang_bin.luac")
+		header := append([]byte("\xef\xbb\xbf#!/usr/bin/env lua\n"), binChunk...)
+		if err := os.WriteFile(binFile, header, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		clFile, err := s.LoadChunk([]byte(fmt.Sprintf(`
+			local fn = assert(loadfile(%q, "b"))
+			assert(fn() == 99)
+			return "ok"
+		`, binFile)), "=loadfile_stream_bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(clFile); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("loadfile binary shebang failed: res=%v err=%v", res, err)
+		}
+		if runtime.GOOS != "windows" {
+			clDir, err := s.LoadChunk([]byte(fmt.Sprintf(`
+				local fn, msg = loadfile(%q)
+				assert(fn == nil and string.find(tostring(msg), "cannot read", 1, true), "got " .. tostring(fn) .. "," .. tostring(msg))
+				return "ok"
+			`, dir)), "=loadfile_dir")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res, err := s.Call(clDir); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+				t.Fatalf("loadfile dir check failed: res=%v err=%v", res, err)
+			}
 		}
 	})
 }
