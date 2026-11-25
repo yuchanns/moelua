@@ -391,7 +391,9 @@ func formatHexFloat(b *strings.Builder, pf parsedFormat, f float64) {
 	var exp int
 	var frac52 uint64
 	if rawExp == 0 {
-		// Subnormal: normalize leading 1 to bit 52.
+		// Subnormal: normalize leading 1 to bit 52 (per ISO C99 §7.21.6.1 ¶8, leading digit
+		// for subnormals is implementation-defined; normalizing matches macOS/BSD C Lua 5.5.1
+		// and Go's strconv.FormatFloat(..., 'x')).
 		shift := bits.LeadingZeros64(rawFrac) - 11
 		mant := rawFrac << shift
 		exp = -1022 - shift

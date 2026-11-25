@@ -1644,3 +1644,28 @@ func TestFormatLazyToString(t *testing.T) {
 		t.Fatalf("%%s format failed lazy ToString: got=%q err=%v called=%d", got, err, called)
 	}
 }
+
+func TestPackNULTerminationAndSizeLimit(t *testing.T) {
+	packed, err := Pack("B\x00B", PackIntVal(42), PackIntVal(99))
+	if err != nil || packed != "\x2a" {
+		t.Fatalf("Pack NUL termination = (%x, %v), want 2a", packed, err)
+	}
+	sz, err := PackSize("B\x00B")
+	if err != nil || sz != 1 {
+		t.Fatalf("PackSize NUL termination = (%d, %v), want 1", sz, err)
+	}
+	vals, nextPos, err := Unpack("B\x00B", "\x2a\x63", 1)
+	if err != nil || len(vals) != 1 || vals[0].Int != 42 || nextPos != 2 {
+		t.Fatalf("Unpack NUL termination = (%v, %d, %v)", vals, nextPos, err)
+	}
+
+	limitErr := fmt.Errorf("pack limit exceeded")
+	if _, err := PackWithLimits("c1073741824", func(n int64) error {
+		if n > 4096 {
+			return limitErr
+		}
+		return nil
+	}, PackStringVal("")); err != limitErr {
+		t.Fatalf("PackWithLimits huge c-format expected limitErr, got %v", err)
+	}
+}

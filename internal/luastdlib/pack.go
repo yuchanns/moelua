@@ -343,8 +343,22 @@ func packArgToString(v PackValue, argIdx int) (string, error) {
 	}
 }
 
+func trimAtNUL(s string) string {
+	if idx := strings.IndexByte(s, 0); idx >= 0 {
+		return s[:idx]
+	}
+	return s
+}
+
 // Pack implements Lua 5.5.1 string.pack(fmt, v1, v2, ...).
 func Pack(fmtStr string, args ...PackValue) (string, error) {
+	return PackWithLimits(fmtStr, nil, args...)
+}
+
+// PackWithLimits implements Lua 5.5.1 string.pack with an optional output size-limit
+// callback invoked before appending any bytes to the output buffer.
+func PackWithLimits(fmtStr string, checkSize func(int64) error, args ...PackValue) (string, error) {
+	fmtStr = trimAtNUL(fmtStr)
 	h := initPackHeader()
 	var buf []byte
 	var totalSize uint64
@@ -360,7 +374,13 @@ func Pack(fmtStr string, args ...PackValue) (string, error) {
 		if size > packMaxSize-nToAlign || size+nToAlign > packMaxSize-totalSize {
 			return "", errors.New("result too long")
 		}
-		totalSize += nToAlign + size
+		nextTotal := totalSize + nToAlign + size
+		if checkSize != nil && nextTotal > totalSize {
+			if err := checkSize(int64(nextTotal)); err != nil {
+				return "", err
+			}
+		}
+		totalSize = nextTotal
 		for i := uint64(0); i < nToAlign; i++ {
 			buf = append(buf, packPadByte)
 		}
@@ -443,8 +463,8 @@ func Pack(fmtStr string, args ...PackValue) (string, error) {
 				return "", fmt.Errorf("bad argument #%d to 'pack' (string longer than given size)", argNum)
 			}
 			buf = append(buf, s...)
-			for pad := size - uint64(len(s)); pad > 0; pad-- {
-				buf = append(buf, packPadByte)
+			if pad := size - uint64(len(s)); pad > 0 {
+				buf = append(buf, make([]byte, pad)...)
 			}
 
 		case kString:
@@ -458,6 +478,11 @@ func Pack(fmtStr string, args ...PackValue) (string, error) {
 			}
 			if slen > packMaxSize-totalSize {
 				return "", errors.New("result too long")
+			}
+			if checkSize != nil && slen > 0 {
+				if err := checkSize(int64(totalSize + slen)); err != nil {
+					return "", err
+				}
 			}
 			packIntBytes(&buf, slen, h.isLittle, int(size), false)
 			buf = append(buf, s...)
@@ -475,6 +500,11 @@ func Pack(fmtStr string, args ...PackValue) (string, error) {
 			if slen > packMaxSize-totalSize {
 				return "", errors.New("result too long")
 			}
+			if checkSize != nil {
+				if err := checkSize(int64(totalSize + slen)); err != nil {
+					return "", err
+				}
+			}
 			buf = append(buf, s...)
 			buf = append(buf, 0)
 			totalSize += slen
@@ -485,6 +515,7 @@ func Pack(fmtStr string, args ...PackValue) (string, error) {
 
 // PackSize implements Lua 5.5.1 string.packsize(fmt).
 func PackSize(fmtStr string) (int64, error) {
+	fmtStr = trimAtNUL(fmtStr)
 	h := initPackHeader()
 	var totalSize uint64
 	pos := 0
@@ -513,6 +544,7 @@ func PackSize(fmtStr string) (int64, error) {
 // init is a 1-based Lua byte position (negative counts from end; 0 clips to 1).
 // Returns the unpacked values and the 1-based index of the first unread byte.
 func Unpack(fmtStr, data string, init int64) ([]PackValue, int64, error) {
+	fmtStr = trimAtNUL(fmtStr)
 	pos := posrelatI(init, len(data)) - 1
 	if pos > len(data) {
 		return nil, 0, errors.New("initial position out of string")
