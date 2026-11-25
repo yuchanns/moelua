@@ -973,6 +973,105 @@ func TestNewMetatableMemoryLimitEnforcement(t *testing.T) {
 	}
 }
 
+func TestLookupBeforeInsertPreservesMemoryLimit(t *testing.T) {
+	const limit = int64(65536)
+
+	t.Run("GetGlobal_before_TrySetGlobal", func(t *testing.T) {
+		s := moelua.New(moelua.WithMemoryLimit(limit))
+		defer s.Close()
+		s.CollectGarbage()
+		hit := false
+		for i := range 500 {
+			name := fmt.Sprintf("g%039d", i)
+			if !s.GetGlobal(name).IsNil() {
+				t.Fatalf("unexpected existing global %q", name)
+			}
+			// Deleting unseen key must also avoid interning it.
+			if err := s.TrySetGlobal(name, moelua.Nil()); err != nil {
+				t.Fatalf("unexpected error deleting unseen global: %v", err)
+			}
+			if err := s.TrySetGlobal(name, moelua.Int(int64(i))); err != nil {
+				if !strings.Contains(err.Error(), "not enough memory") {
+					t.Fatalf("unexpected TrySetGlobal error: %v", err)
+				}
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			t.Fatalf("expected GetGlobal+TrySetGlobal loop to hit 64KiB memory limit")
+		}
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > limit {
+			t.Fatalf("recounted MemoryUsage()=%d exceeded %d after GetGlobal+TrySetGlobal", usage, limit)
+		}
+	})
+
+	t.Run("TableGetString_before_SetString", func(t *testing.T) {
+		s := moelua.New(moelua.WithMemoryLimit(limit))
+		defer s.Close()
+		tbl, err := s.TryNewTable(0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.TrySetGlobal("t", tbl.Value()); err != nil {
+			t.Fatal(err)
+		}
+		s.CollectGarbage()
+		hit := false
+		for i := range 500 {
+			key := fmt.Sprintf("k%039d", i)
+			if !tbl.GetString(key).IsNil() {
+				t.Fatalf("unexpected existing key %q", key)
+			}
+			if err := tbl.SetString(key, moelua.Nil()); err != nil {
+				t.Fatalf("unexpected error deleting unseen key: %v", err)
+			}
+			if err := tbl.SetString(key, moelua.Int(int64(i))); err != nil {
+				if !strings.Contains(err.Error(), "not enough memory") {
+					t.Fatalf("unexpected Table.SetString error: %v", err)
+				}
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			t.Fatalf("expected Table.GetString+SetString loop to hit 64KiB memory limit")
+		}
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > limit {
+			t.Fatalf("recounted MemoryUsage()=%d exceeded %d after Table.GetString+SetString", usage, limit)
+		}
+	})
+
+	t.Run("GetMetatableByName_before_TryNewMetatable", func(t *testing.T) {
+		s := moelua.New(moelua.WithMemoryLimit(limit))
+		defer s.Close()
+		s.CollectGarbage()
+		hit := false
+		for i := range 300 {
+			name := fmt.Sprintf("m%039d", i)
+			if s.GetMetatableByName(name) != nil {
+				t.Fatalf("unexpected existing metatable %q", name)
+			}
+			if _, _, err := s.TryNewMetatable(name); err != nil {
+				if !strings.Contains(err.Error(), "not enough memory") {
+					t.Fatalf("unexpected TryNewMetatable error: %v", err)
+				}
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			t.Fatalf("expected GetMetatableByName+TryNewMetatable loop to hit 64KiB memory limit")
+		}
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > limit {
+			t.Fatalf("recounted MemoryUsage()=%d exceeded %d after GetMetatableByName+TryNewMetatable", usage, limit)
+		}
+	})
+}
+
 func TestTableSetStringMemoryLimitEnforcement(t *testing.T) {
 	s := moelua.New(moelua.WithMemoryLimit(131072))
 	defer s.Close()

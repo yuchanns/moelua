@@ -247,7 +247,11 @@ func (s *State) Preload(name string, loader GoFunc) error {
 			return err
 		}
 	} else {
-		ls = s.vm.Intern(name)
+		var ok bool
+		ls, ok = s.vm.LookupString(name)
+		if !ok {
+			return nil
+		}
 	}
 	s.vm.PreloadTable().RawSetStr(s.vm, ls, v)
 	return s.vm.ConsumeMemErr()
@@ -509,7 +513,11 @@ func (s *State) GetMetatableByName(name string) *Table {
 	if !s.ready() {
 		return nil
 	}
-	if existing := s.vm.Registry().RawGetStr(s.vm.Intern(name)); existing.IsTable() {
+	ls, ok := s.vm.LookupString(name)
+	if !ok {
+		return nil
+	}
+	if existing := s.vm.Registry().RawGetStr(ls); existing.IsTable() {
 		return &Table{state: s, raw: existing.AsTable()}
 	}
 	return nil
@@ -665,7 +673,11 @@ func (s *State) TrySetGlobal(name string, v Value) error {
 	}
 	var ls *vm.LuaString
 	if v.IsNil() {
-		ls = s.vm.Intern(name)
+		var ok bool
+		ls, ok = s.vm.LookupString(name)
+		if !ok {
+			return nil
+		}
 	} else {
 		var err error
 		ls, err = s.vm.TryIntern(name)
@@ -919,7 +931,11 @@ func (t *Table) GetString(key string) Value {
 	if !t.ready() {
 		return vm.NilValue()
 	}
-	return t.raw.RawGetStr(t.state.vm.Intern(key))
+	ls, ok := t.state.vm.LookupString(key)
+	if !ok {
+		return vm.NilValue()
+	}
+	return t.raw.RawGetStr(ls)
 }
 
 // SetString performs rawset(t, key, val), returning an error if the State is closed or memory limit is exceeded.
@@ -929,7 +945,11 @@ func (t *Table) SetString(key string, val Value) error {
 	}
 	var ls *vm.LuaString
 	if val.IsNil() {
-		ls = t.state.vm.Intern(key)
+		var ok bool
+		ls, ok = t.state.vm.LookupString(key)
+		if !ok {
+			return nil
+		}
 	} else {
 		var err error
 		ls, err = t.state.vm.TryIntern(key)
