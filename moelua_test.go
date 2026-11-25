@@ -1095,3 +1095,37 @@ func TestCallbackFactoryMemoryLimitAccounting(t *testing.T) {
 		t.Fatalf("expected NewFunc1 to return Nil when over memory limit, got %v", v)
 	}
 }
+
+func TestUserdataMemoryLimitAccounting(t *testing.T) {
+	s := moelua.New(moelua.WithMemoryLimit(65536))
+	defer s.Close()
+
+	var pinned []*moelua.Handle
+	defer func() {
+		for _, h := range pinned {
+			h.Release()
+		}
+	}()
+
+	var hitErr error
+	for i := range 3000 {
+		u, err := s.TryNewUserdata(i)
+		if err != nil {
+			hitErr = err
+			break
+		}
+		pinned = append(pinned, s.Pin(u))
+	}
+	if hitErr == nil || !strings.Contains(hitErr.Error(), "not enough memory") {
+		t.Fatalf("expected TryNewUserdata to enforce 64KiB memory limit, pinned=%d err=%v", len(pinned), hitErr)
+	}
+	if usage := s.MemoryUsage(); usage < int64(len(pinned))*64 {
+		t.Fatalf("expected MemoryUsage (%d) to account for %d pinned userdata (>= %d)", usage, len(pinned), int64(len(pinned))*64)
+	}
+	if u := s.NewUserdata("over"); !u.IsNil() {
+		t.Fatalf("expected NewUserdata to return Nil when over memory limit, got %v", u)
+	}
+	if u, err := s.NewUserdataWithMeta("over", nil); !u.IsNil() || err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected NewUserdataWithMeta to fail with memory error, got u=%v err=%v", u, err)
+	}
+}

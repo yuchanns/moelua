@@ -379,12 +379,24 @@ func (s *State) String(str string) Value {
 	return v
 }
 
-// NewUserdata creates a full Lua userdata carrying arbitrary Go data.
-func (s *State) NewUserdata(data any) Value {
+// TryNewUserdata creates a full Lua userdata carrying arbitrary Go data after checking and
+// accounting for its wrapper storage against the State's memory limit.
+func (s *State) TryNewUserdata(data any) (Value, error) {
 	if !s.ready() {
+		return vm.NilValue(), ErrStateClosed
+	}
+	return s.vm.TryNewUserdata(data, 0)
+}
+
+// NewUserdata creates a full Lua userdata carrying arbitrary Go data.
+// Returns Nil if the State is closed or allocation exceeds the configured memory limit
+// (use TryNewUserdata to inspect allocation errors).
+func (s *State) NewUserdata(data any) Value {
+	u, err := s.TryNewUserdata(data)
+	if err != nil {
 		return vm.NilValue()
 	}
-	return vm.UserdataValue(&vm.Userdata{Data: data})
+	return u
 }
 
 // NewUserdataWithMeta creates a full Lua userdata carrying arbitrary Go data and
@@ -401,7 +413,10 @@ func (s *State) NewUserdataWithMeta(data any, mt *Table) (Value, error) {
 			return vm.NilValue(), fmt.Errorf("moelua: metatable belongs to another State")
 		}
 	}
-	u := s.NewUserdata(data)
+	u, err := s.TryNewUserdata(data)
+	if err != nil {
+		return vm.NilValue(), err
+	}
 	if mt != nil {
 		s.vm.SetMetatableOf(u, mt.raw)
 		if err := s.vm.ConsumeMemErr(); err != nil {
