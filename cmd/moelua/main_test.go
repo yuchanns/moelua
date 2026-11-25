@@ -315,4 +315,57 @@ func TestCLIFlagsREPLAndStdinParity(t *testing.T) {
 			}
 		})
 	}
+
+	// 14. -l assigns nil when require returns zero values (matching lua.c:dolibrary).
+	t.Run("library_nil_return_assigns_nil", func(t *testing.T) {
+		out, stderr, err := run("", "", nil, "-E",
+			"-e", `X = 123; require = function() end`,
+			"-l", "X=foo",
+			"-e", `print("X=" .. tostring(X))`,
+		)
+		if err != nil {
+			t.Fatalf("err=%v stderr=%s", err, stderr)
+		}
+		if strings.TrimSpace(out) != "X=nil" {
+			t.Fatalf("expected 'X=nil', got %q", out)
+		}
+	})
+
+	// 15. Warnings enabled by LUA_INIT are reset off before CLI args unless -W is passed (lua.c:runargs).
+	t.Run("lua_init_warnings_reset_before_runargs", func(t *testing.T) {
+		_, stderr1, err1 := run("", "", []string{"LUA_INIT_5_5=warn('@on')"}, "-e", `warn("hidden_warn")`)
+		if err1 != nil {
+			t.Fatalf("err=%v stderr=%s", err1, stderr1)
+		}
+		if strings.Contains(stderr1, "hidden_warn") {
+			t.Fatalf("expected LUA_INIT warnings to be reset off before -e, got stderr=%q", stderr1)
+		}
+
+		_, stderr2, err2 := run("", "", []string{"LUA_INIT_5_5=warn('@on')"}, "-W", "-e", `warn("shown_warn")`)
+		if err2 != nil {
+			t.Fatalf("err=%v stderr=%s", err2, stderr2)
+		}
+		if !strings.Contains(stderr2, "shown_warn") {
+			t.Fatalf("expected -W to enable warnings, got stderr=%q", stderr2)
+		}
+	})
+
+	// 16. Non-string error objects still include stack traceback (matching lua.c:msghandler).
+	t.Run("non_string_error_preserves_traceback", func(t *testing.T) {
+		_, stderr, err := run("", "", nil, "-E", "-e", `error({})`)
+		if err == nil {
+			t.Fatalf("expected error exit for error({})")
+		}
+		if !strings.Contains(stderr, "(error object is a table value)") || !strings.Contains(stderr, "stack traceback:") {
+			t.Fatalf("expected '(error object is a table value)' with stack traceback, got stderr=%q", stderr)
+		}
+
+		_, stderr2, err2 := run("", "", nil, "-E", "-e", `error(setmetatable({}, {__tostring=function() return {} end}))`)
+		if err2 == nil {
+			t.Fatalf("expected error exit for non-string __tostring result")
+		}
+		if !strings.Contains(stderr2, "(error object is a table value)") || !strings.Contains(stderr2, "stack traceback:") {
+			t.Fatalf("expected '(error object is a table value)' with stack traceback, got stderr=%q", stderr2)
+		}
+	})
 }

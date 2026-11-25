@@ -174,7 +174,7 @@ local function msgh(err)
 			return _tb(_tostring(r), 2)
 		end
 	end
-	return "error object is a " .. t .. " value"
+	return _tb("(error object is a " .. t .. " value)", 2)
 end
 return function(fn, ...)
 	return _xpcall(fn, msgh, ...)
@@ -313,11 +313,13 @@ func (c *cliState) doLibrary(progName, spec string) bool {
 	if !ok {
 		return false
 	}
+	val := vm.NilValue()
 	if len(res) > 0 {
-		if serr := c.s.SetGlobalMM(globName, res[0]); serr != nil {
-			fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(serr))
-			return false
-		}
+		val = res[0]
+	}
+	if serr := c.s.SetGlobalMM(globName, val); serr != nil {
+		fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(serr))
+		return false
 	}
 	return true
 }
@@ -339,6 +341,8 @@ func (c *cliState) handleLuaInit(progName string) bool {
 }
 
 func (c *cliState) runArgs(progName string, argv []string, n int) bool {
+	// Match lua.c:runargs: reset warnings off after LUA_INIT before processing CLI options.
+	c.s.SetWarnings(false)
 	for i := 1; i < n; i++ {
 		arg := argv[i]
 		if !strings.HasPrefix(arg, "-") {
