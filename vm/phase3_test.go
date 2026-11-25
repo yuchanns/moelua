@@ -6433,3 +6433,78 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound28VMRegressions(t *testing.T) {
+	t.Run("gmatch_userdata_accounts_retained_strings_under_memlimit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(131072)
+
+		cl, err := s.LoadChunk([]byte(`
+			local keep = {}
+			local ok, err = pcall(function()
+				for i = 1, 100 do
+					local iter = string.gmatch(string.rep("a", 32768) .. tostring(i), ".")
+					local _, ud = debug.getupvalue(iter, 3)
+					assert(type(ud) == "userdata")
+					assert(debug.getuservalue(ud, 1) == nil, "gmatch state userdata must have 0 Lua uservalues")
+					keep[i] = ud
+					iter = nil
+					collectgarbage("collect")
+				end
+			end)
+			assert(not ok and tostring(err):find("not enough memory", 1, true), "expected OOM retaining gmatch userdata, got ok=" .. tostring(ok) .. " err=" .. tostring(err))
+			assert(#keep < 10, "expected OOM after <10 retained 32KiB gmatch userdata, kept=" .. tostring(#keep))
+			return #keep
+		`), "=gmatch_ud_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].Int() >= 10 {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("tbc_close_arity_matches_lua55", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+
+		cl, err := s.LoadChunk([]byte(`
+			local got = {}
+			local function mk(tag)
+				return setmetatable({}, {
+					__close = function(...)
+						got[tag] = select("#", ...)
+					end
+				})
+			end
+			do
+				local _ <close> = mk("normal")
+			end
+			pcall(function()
+				local _ <close> = mk("err")
+				error("boom")
+			end)
+			local co = coroutine.create(function()
+				local _ <close> = mk("coro_normal")
+				coroutine.yield()
+			end)
+			assert(coroutine.resume(co))
+			assert(coroutine.resume(co))
+			local co2 = coroutine.create(function()
+				local _ <close> = mk("coro_close")
+				coroutine.yield()
+			end)
+			assert(coroutine.resume(co2))
+			assert(coroutine.close(co2))
+			assert(got.normal == 1 and got.coro_normal == 1 and got.coro_close == 1 and got.err == 2)
+			return "ok"
+		`), "=tbc_arity")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+}
