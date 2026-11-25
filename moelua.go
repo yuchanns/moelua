@@ -315,12 +315,28 @@ func Int(i int64) Value { return vm.IntValue(i) }
 // Float returns a Lua 64-bit floating-point value.
 func Float(f float64) Value { return vm.FloatValue(f) }
 
-// String interns or wraps a Go string as a Lua string Value owned by s.
-func (s *State) String(str string) Value {
+// TryString interns or wraps a Go string as a Lua string Value owned by s after checking
+// and accounting for newly allocated string storage against the State's memory limit.
+func (s *State) TryString(str string) (Value, error) {
 	if !s.ready() {
+		return vm.NilValue(), ErrStateClosed
+	}
+	ls, err := s.vm.TryIntern(str)
+	if err != nil {
+		return vm.NilValue(), err
+	}
+	return vm.StringValue(ls), nil
+}
+
+// String interns or wraps a Go string as a Lua string Value owned by s.
+// Returns Nil() if the State is closed or if allocating the string would exceed the
+// configured memory limit (use TryString to inspect allocation errors).
+func (s *State) String(str string) Value {
+	v, err := s.TryString(str)
+	if err != nil {
 		return vm.NilValue()
 	}
-	return vm.StringValue(s.vm.Intern(str))
+	return v
 }
 
 // NewUserdata creates a full Lua userdata carrying arbitrary Go data.

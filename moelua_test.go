@@ -862,11 +862,11 @@ func TestDynamicGoFuncsCollectableInWeakTables(t *testing.T) {
 }
 
 func TestNewTableMemoryLimitEnforcement(t *testing.T) {
-	s := moelua.New(moelua.WithMemoryLimit(65536))
+	s := moelua.New(moelua.WithMemoryLimit(131072))
 	defer s.Close()
 
 	if tbl := s.NewTable(0, 100000); tbl != nil {
-		t.Fatalf("expected nil from NewTable(0, 100000) under 64KiB memory limit")
+		t.Fatalf("expected nil from NewTable(0, 100000) under 128KiB memory limit")
 	}
 	if tbl, err := s.TryNewTable(0, 100000); tbl != nil || err == nil || !strings.Contains(err.Error(), "not enough memory") {
 		t.Fatalf("expected memory error from TryNewTable(0, 100000), got tbl=%v err=%v", tbl, err)
@@ -878,6 +878,27 @@ func TestNewTableMemoryLimitEnforcement(t *testing.T) {
 	}
 	if after := s.MemoryUsage(); after <= before {
 		t.Fatalf("expected MemoryUsage to increase after TryNewTable(0, 200): before=%d after=%d", before, after)
+	}
+}
+
+func TestStringMemoryLimitEnforcement(t *testing.T) {
+	s := moelua.New(moelua.WithMemoryLimit(131072))
+	defer s.Close()
+
+	huge := strings.Repeat("x", 1_000_000)
+	if v := s.String(huge); !v.IsNil() {
+		t.Fatalf("expected Nil from String(1MB) under 128KiB memory limit, got %v", v)
+	}
+	if v, err := s.TryString(huge); !v.IsNil() || err == nil || !strings.Contains(err.Error(), "not enough memory") {
+		t.Fatalf("expected memory error from TryString(1MB), got v=%v err=%v", v, err)
+	}
+	before := s.MemoryUsage()
+	med, err := s.TryString(strings.Repeat("a", 8192))
+	if err != nil || !med.IsString() {
+		t.Fatalf("expected TryString(8KiB) to succeed, got v=%v err=%v", med, err)
+	}
+	if after := s.MemoryUsage(); after < before+8192 {
+		t.Fatalf("expected MemoryUsage to include 8KiB string: before=%d after=%d", before, after)
 	}
 }
 
