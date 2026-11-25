@@ -5,7 +5,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -247,7 +246,7 @@ func (c *cliState) doChunkFile(progName, path string, literalFile, passArgs bool
 	var err error
 	chunkName := "=stdin"
 	if path == "" || (path == "-" && !literalFile) {
-		data, err = io.ReadAll(os.Stdin)
+		data, err = c.s.ReadAllStdin()
 	} else {
 		chunkName = "@" + path
 		data, err = os.ReadFile(path)
@@ -268,11 +267,21 @@ func (c *cliState) doChunkFile(progName, path string, literalFile, passArgs bool
 			fmt.Fprintf(os.Stderr, "%s: 'arg' is not a table\n", progName)
 			return false
 		}
-		argTbl := argVal.AsTable()
-		n := argTbl.Len()
-		args = make([]vm.Value, n)
-		for i := int64(1); i <= n; i++ {
-			args[i-1] = argTbl.RawGetInt(i)
+		n, lerr := c.s.TableLen(argVal)
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(lerr))
+			return false
+		}
+		if n > 1_000_000 {
+			fmt.Fprintf(os.Stderr, "%s: too many arguments to script\n", progName)
+			return false
+		}
+		if n > 0 {
+			argTbl := argVal.AsTable()
+			args = make([]vm.Value, n)
+			for i := int64(1); i <= n; i++ {
+				args[i-1] = argTbl.RawGetInt(i)
+			}
 		}
 	}
 	_, ok := c.doCall(progName, fn, args...)

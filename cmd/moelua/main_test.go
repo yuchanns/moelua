@@ -194,4 +194,50 @@ func TestCLIFlagsREPLAndStdinParity(t *testing.T) {
 			}
 		})
 	}
+
+	// 8. Stdin script (`-`) consumes remaining bytes from the shared VM stdin buffer after `-e io.read()`.
+	t.Run("stdin_script_shares_buffer_with_earlier_ioread", func(t *testing.T) {
+		in := "HEADER\nprint('SCRIPT')\n"
+		out, stderr, err := run("", in, nil, "-e", "print(io.read())", "-")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%s", err, stderr)
+		}
+		lines := strings.Fields(strings.TrimSpace(out))
+		if len(lines) != 2 || lines[0] != "HEADER" || lines[1] != "SCRIPT" {
+			t.Fatalf("expected HEADER and SCRIPT, got %q", out)
+		}
+	})
+
+	// 9. REPL continues reading stdin even after Lua code redirects default input via io.input(file).
+	t.Run("repl_independent_of_io_input", func(t *testing.T) {
+		dir := t.TempDir()
+		dataPath := filepath.Join(dir, "data.txt")
+		if err := os.WriteFile(dataPath, []byte("FROM_DATA_FILE\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		in := "io.input('data.txt')\nprint('DATA:' .. tostring(io.read()))\nprint('STILL_STDIN')\n"
+		out, stderr, err := run(dir, in, nil, "-i")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%s", err, stderr)
+		}
+		if !strings.Contains(out, "DATA:FROM_DATA_FILE") || !strings.Contains(out, "STILL_STDIN") {
+			t.Fatalf("expected DATA:FROM_DATA_FILE and STILL_STDIN, got %q", out)
+		}
+	})
+
+	// 10. Script argument forwarding honors __len metamethod on `arg` (lua.c:pushargs).
+	t.Run("script_args_honor_arg_len_metamethod", func(t *testing.T) {
+		dir := t.TempDir()
+		script := filepath.Join(dir, "echoargs.lua")
+		if err := os.WriteFile(script, []byte(`print(select("#", ...), ...)`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, stderr, err := run(dir, "", nil, "-e", `setmetatable(arg, {__len = function() return 1 end})`, script, "first", "second")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%s", err, stderr)
+		}
+		if strings.TrimSpace(out) != "1\tfirst" {
+			t.Fatalf("expected '1\\tfirst', got %q", out)
+		}
+	})
 }

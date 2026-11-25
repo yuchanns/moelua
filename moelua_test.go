@@ -828,3 +828,35 @@ func TestGoDrivenCoroutines(t *testing.T) {
 		t.Fatalf("expected ErrInstructionLimit from Thread.Resume, got yielded=%v err=%v", yielded, err)
 	}
 }
+
+func TestDynamicGoFuncsCollectableInWeakTables(t *testing.T) {
+	s := moelua.New()
+	defer s.Close()
+
+	s.RegisterFunc("make_fn", func(s *moelua.State, _ []moelua.Value) ([]moelua.Value, error) {
+		return []moelua.Value{
+			s.NewFunc("dyn", func(_ *moelua.State, _ []moelua.Value) ([]moelua.Value, error) {
+				return []moelua.Value{moelua.Int(1)}, nil
+			}),
+		}, nil
+	})
+	s.RegisterFunc("make_fn1", func(s *moelua.State, _ []moelua.Value) ([]moelua.Value, error) {
+		return []moelua.Value{
+			s.NewFunc1("dyn1", func(_ *moelua.State, _ []moelua.Value) (moelua.Value, error) {
+				return moelua.Int(2), nil
+			}),
+		}, nil
+	})
+
+	if _, err := s.DoString(`
+		local w = setmetatable({}, {__mode = "v"})
+		w.f = make_fn()
+		w.f1 = make_fn1()
+		assert(w.f() == 1 and w.f1() == 2)
+		collectgarbage("collect")
+		assert(w.f == nil, "NewFunc callback should be collected from weak-value table")
+		assert(w.f1 == nil, "NewFunc1 callback should be collected from weak-value table")
+	`); err != nil {
+		t.Fatalf("weak table collection test failed: %v", err)
+	}
+}

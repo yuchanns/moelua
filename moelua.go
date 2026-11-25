@@ -220,7 +220,8 @@ func (s *State) AddSearcher(name string, fn GoFunc) {
 		return
 	}
 	s.vm.AddSearcher(&vm.NativeFunc{
-		Name: name,
+		Name:        name,
+		Collectable: true,
 		Fn: func(_ *vm.State, args []vm.Value) ([]vm.Value, error) {
 			return fn(s, args)
 		},
@@ -482,7 +483,8 @@ func (s *State) NewFunc(name string, fn GoFunc) Value {
 		return vm.NilValue()
 	}
 	return vm.NativeValue(&vm.NativeFunc{
-		Name: name,
+		Name:        name,
+		Collectable: true,
 		Fn: func(_ *vm.State, args []vm.Value) ([]vm.Value, error) {
 			return fn(s, args)
 		},
@@ -495,7 +497,8 @@ func (s *State) NewFunc1(name string, fn GoFunc1) Value {
 		return vm.NilValue()
 	}
 	return vm.NativeValue(&vm.NativeFunc{
-		Name: name,
+		Name:        name,
+		Collectable: true,
 		FastFn: func(_ *vm.State, args []vm.Value) (vm.Value, error) {
 			return fn(s, args)
 		},
