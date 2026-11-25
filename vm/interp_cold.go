@@ -1474,6 +1474,7 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 		dirty:    true,
 	}
 	th.nframe++
+	outerDepth := th.nframe
 	var extraDepth uint8
 	if !targetVal.IsClosure() && !targetVal.IsNative() {
 		cur := targetVal
@@ -1519,19 +1520,37 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 	if targetVal.IsNative() {
 		nf := targetVal.AsNative()
 		intr := nf.Intrinsic
-		if intr == intrPCall && calleeArgs >= 1 && isFlatProtectedTarget(th.stack[calleeIdx+1]) {
-			ok, err := s.pushProtectedCall(th, calleeIdx, calleeArgs, -1, false)
+		if (intr == intrPCall && calleeArgs >= 1 && isFlatProtectedTarget(th.stack[calleeIdx+1])) ||
+			(intr == intrXPCall && calleeArgs >= 2 && isFlatProtectedTarget(th.stack[calleeIdx+1]) && th.stack[calleeIdx+2].IsFunction()) {
+			ok, err := s.pushProtectedCall(th, calleeIdx, calleeArgs, -1, intr == intrXPCall)
 			if err != nil {
-				th.nframe--
+				if errors.Is(err, errYieldSentinel) {
+					return false, errYieldSentinel
+				}
+				if th.nframe == outerDepth {
+					if s.handleError(th, 0, err) {
+						return th.nframe != outerDepth-1, nil
+					}
+				}
+				if s.abortErr != nil {
+					return false, s.abortErr
+				}
 				return false, err
 			}
-			return ok, nil
-		}
-		if intr == intrXPCall && calleeArgs >= 2 && isFlatProtectedTarget(th.stack[calleeIdx+1]) && th.stack[calleeIdx+2].IsFunction() {
-			ok, err := s.pushProtectedCall(th, calleeIdx, calleeArgs, -1, true)
-			if err != nil {
-				th.nframe--
-				return false, err
+			// If the nested protected call completed synchronously (either via a normal native
+			// return or by catching an error at its own inner frame), our outer framePCall/frameXPCall
+			// is back on top of th.frames with the inner results at calleeIdx..th.top. Complete it now!
+			if th.nframe == outerDepth && th.frames[outerDepth-1].kind != frameLua {
+				if _, ferr := s.finishPCallReturn(th, 0); ferr != nil {
+					if s.handleError(th, 0, ferr) {
+						return true, nil
+					}
+					if s.abortErr != nil {
+						return false, s.abortErr
+					}
+					return false, ferr
+				}
+				return false, nil
 			}
 			return ok, nil
 		}
@@ -2669,7 +2688,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			if err != nil {
 				return coldContinue, pc, err
 			}
-			if th.nframe <= entryDepth {
+			if done, ferr := s.prepareLuaFrame(th, entryDepth); ferr != nil {
+				return coldContinue, pc, ferr
+			} else if done {
 				return coldReturn, 0, nil
 			}
 			return coldReload, 0, nil
@@ -2685,7 +2706,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			if err != nil {
 				return coldContinue, pc, err
 			}
-			if th.nframe <= entryDepth {
+			if done, ferr := s.prepareLuaFrame(th, entryDepth); ferr != nil {
+				return coldContinue, pc, ferr
+			} else if done {
 				return coldReturn, 0, nil
 			}
 			return coldReload, 0, nil

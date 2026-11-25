@@ -731,7 +731,9 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		ev, _, _ = th.closeAllSync(funcIdx, ev, true)
 		if s.abortErr != nil {
 			uerr := s.abortErr
-			th.discardTBCAtOrAbove(funcIdx)
+			if !errors.Is(uerr, errCoroCloseSelf) {
+				th.discardTBCAtOrAbove(funcIdx)
+			}
 			th.closeUpvals(funcIdx)
 			th.nframe = entryDepth
 			clearTopStack()

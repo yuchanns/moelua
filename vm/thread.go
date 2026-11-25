@@ -346,6 +346,10 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 				// Yielding inside sync close path: propagate cleanly via errVal marker handled by caller.
 				return errVal, hasErr, raised
 			}
+			if errors.Is(err, errCoroCloseSelf) {
+				th.state.abortErr = err
+				return errVal, hasErr, raised
+			}
 			if isUncatchableErr(err) {
 				th.state.abortErr = err
 				th.discardTBCAtOrAbove(level)

@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 	"weak"
 
 	"github.com/yuchanns/moelua/bytecode"
@@ -315,13 +316,22 @@ func (r *luaFuncReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+func (s *State) undumpBytes(data []byte) (*bytecode.Proto, error) {
+	if s.memLimit > 0 {
+		return bytecode.UndumpWithLimit(data, func(n int64) error {
+			return s.checkMem(n)
+		})
+	}
+	return bytecode.Undump(data)
+}
+
 func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv bool) (Value, error) {
 	isBin := len(src) > 0 && src[0] == 0x1b
 	if isBin {
 		if !strings.ContainsRune(mode, 'b') {
 			return NilValue(), fmt.Errorf("attempt to load a binary chunk (mode is '%s')", mode)
 		}
-		p, err := bytecode.Undump([]byte(src))
+		p, err := s.undumpBytes(unsafe.Slice(unsafe.StringData(src), len(src)))
 		if err != nil {
 			return NilValue(), err
 		}
@@ -373,7 +383,7 @@ func (s *State) loadChunkBytes(data []byte, chunkName, mode string, env Value, h
 		if !strings.ContainsRune(mode, 'b') {
 			return NilValue(), fmt.Errorf("attempt to load a binary chunk (mode is '%s')", mode)
 		}
-		p, err := bytecode.Undump(data)
+		p, err := s.undumpBytes(data)
 		if err != nil {
 			return NilValue(), err
 		}

@@ -47,6 +47,12 @@ func Undump(data []byte) (*Proto, error) {
 	return undumpWithLoader(&loader{data: data})
 }
 
+// UndumpWithLimit parses and verifies a PUC-Rio Lua 5.5.1 binary chunk from data,
+// invoking checkMem(totalBytes) before allocating decoded Proto buffers when checkMem != nil.
+func UndumpWithLimit(data []byte, checkMem func(int64) error) (*Proto, error) {
+	return undumpWithLoader(&loader{data: data, checkMem: checkMem})
+}
+
 // UndumpReader streams and verifies a PUC-Rio Lua 5.5.1 binary chunk from r without
 // materializing the entire input buffer in memory first.
 func UndumpReader(r io.Reader) (*Proto, error) {
@@ -362,8 +368,8 @@ func (l *loader) readString() (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	if l.br != nil {
-		if slen+1 <= len(l.scratch) {
+	if l.checkMem != nil {
+		if l.br == nil || slen+1 <= len(l.scratch) {
 			if err := l.accountMem(int64(slen) + 48); err != nil {
 				return "", false, err
 			}
@@ -417,6 +423,9 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		if ncode > (len(l.data)-l.off)/4 {
 			return nil, fmt.Errorf("undump: truncated chunk reading %d instructions", ncode)
 		}
+		if err := l.accountMem(int64(ncode) * 4); err != nil {
+			return nil, err
+		}
 		codeBytes, err := l.readBytes(ncode * 4)
 		if err != nil {
 			return nil, err
@@ -458,6 +467,9 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	if l.br == nil {
 		if nconst > len(l.data)-l.off {
 			return nil, fmt.Errorf("undump: truncated chunk reading %d constants", nconst)
+		}
+		if err := l.accountMem(int64(nconst) * 32); err != nil {
+			return nil, err
 		}
 		p.Consts = make([]Constant, nconst)
 	} else {
@@ -525,6 +537,9 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		if nup > (len(l.data)-l.off)/3 {
 			return nil, fmt.Errorf("undump: truncated chunk reading %d upvalues", nup)
 		}
+		if err := l.accountMem(int64(nup) * 24); err != nil {
+			return nil, err
+		}
 		p.Upvalues = make([]UpvalDesc, nup)
 	} else {
 		p.Upvalues = make([]UpvalDesc, 0, min(nup, 256))
@@ -559,6 +574,9 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		if np > len(l.data)-l.off {
 			return nil, fmt.Errorf("undump: truncated chunk reading %d protos", np)
 		}
+		if err := l.accountMem(int64(np) * 8); err != nil {
+			return nil, err
+		}
 		p.Protos = make([]*Proto, np)
 	} else {
 		p.Protos = make([]*Proto, 0, min(np, 64))
@@ -590,6 +608,12 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	}
 	if nline > 0 {
 		if l.br == nil {
+			if nline > len(l.data)-l.off {
+				return nil, fmt.Errorf("undump: truncated chunk reading %d lineinfo bytes", nline)
+			}
+			if err := l.accountMem(int64(nline)); err != nil {
+				return nil, err
+			}
 			lb, err := l.readBytes(nline)
 			if err != nil {
 				return nil, err
@@ -634,6 +658,9 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 		if l.br == nil {
 			if nabs > (len(l.data)-l.off)/8 {
 				return nil, fmt.Errorf("undump: truncated chunk reading %d abslineinfo entries", nabs)
+			}
+			if err := l.accountMem(int64(nabs) * 8); err != nil {
+				return nil, err
 			}
 			ab, err := l.readBytes(nabs * 8)
 			if err != nil {
@@ -681,6 +708,9 @@ func (l *loader) readFunction(depth int) (*Proto, error) {
 	if l.br == nil {
 		if nloc > len(l.data)-l.off {
 			return nil, fmt.Errorf("undump: truncated chunk reading %d locals", nloc)
+		}
+		if err := l.accountMem(int64(nloc) * 32); err != nil {
+			return nil, err
 		}
 		p.LocVars = make([]LocVar, nloc)
 	} else {

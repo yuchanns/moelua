@@ -182,6 +182,12 @@ func Codepoint(s string, i, j int64, lax bool) ([]int64, error) {
 // byte position of the first invalid byte.
 // On out-of-bounds indices, returns a non-nil error.
 func Len(s string, i, j int64, lax bool) (count int64, errPos int64, err error) {
+	return LenWithCancel(s, i, j, lax, nil)
+}
+
+// LenWithCancel implements Lua 5.5.1 utf8.len while polling cancelFn every 1024
+// decoded characters when cancelFn != nil.
+func LenWithCancel(s string, i, j int64, lax bool, cancelFn func() error) (count int64, errPos int64, err error) {
 	posi := uPosrelat(i, len(s))
 	posj := uPosrelat(j, len(s))
 	if posi < 1 || posi-1 > int64(len(s)) {
@@ -194,6 +200,11 @@ func Len(s string, i, j int64, lax bool) (count int64, errPos int64, err error) 
 	posj--
 	var n int64
 	for posi <= posj {
+		if cancelFn != nil && n > 0 && (n&1023) == 0 {
+			if cerr := cancelFn(); cerr != nil {
+				return 0, 0, cerr
+			}
+		}
 		_, next, ok := utf8Decode(s, int(posi), !lax)
 		if !ok {
 			return 0, posi + 1, nil
@@ -239,6 +250,12 @@ func Next(s string, pos int64, lax bool) (nextPos int64, cp int64, ok bool, err 
 // (or the character containing byte i when n == 0).
 // If the requested character does not exist, ok is false and err is nil.
 func Offset(s string, n int64, i int64) (start int64, end int64, ok bool, err error) {
+	return OffsetWithCancel(s, n, i, nil)
+}
+
+// OffsetWithCancel implements Lua 5.5.1 utf8.offset while polling cancelFn every 1024
+// steps when cancelFn != nil.
+func OffsetWithCancel(s string, n int64, i int64, cancelFn func() error) (start int64, end int64, ok bool, err error) {
 	length := int64(len(s))
 	posi := uPosrelat(i, len(s))
 	if posi < 1 || posi-1 > length {
@@ -246,8 +263,15 @@ func Offset(s string, n int64, i int64) (start int64, end int64, ok bool, err er
 	}
 	posi--
 
+	var steps uint64
 	if n == 0 {
 		for posi > 0 && posi < length && isUTF8Cont(s[posi]) {
+			steps++
+			if cancelFn != nil && (steps&1023) == 0 {
+				if cerr := cancelFn(); cerr != nil {
+					return 0, 0, false, cerr
+				}
+			}
 			posi--
 		}
 	} else {
@@ -256,6 +280,12 @@ func Offset(s string, n int64, i int64) (start int64, end int64, ok bool, err er
 		}
 		if n < 0 {
 			for n < 0 && posi > 0 {
+				steps++
+				if cancelFn != nil && (steps&1023) == 0 {
+					if cerr := cancelFn(); cerr != nil {
+						return 0, 0, false, cerr
+					}
+				}
 				for {
 					posi--
 					if posi <= 0 || !isUTF8Cont(s[posi]) {
@@ -267,6 +297,12 @@ func Offset(s string, n int64, i int64) (start int64, end int64, ok bool, err er
 		} else {
 			n-- // do not move for 1st character
 			for n > 0 && posi < length {
+				steps++
+				if cancelFn != nil && (steps&1023) == 0 {
+					if cerr := cancelFn(); cerr != nil {
+						return 0, 0, false, cerr
+					}
+				}
 				for {
 					posi++
 					if posi >= length || !isUTF8Cont(s[posi]) {

@@ -188,6 +188,15 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				co.top = 1 + len(args)
 				if _, err := s.pushProtectedCall(co, 0, len(args), -1, false); err != nil {
+					if errors.Is(err, errYieldSentinel) {
+						co.status = ThreadSuspended
+						out := co.yieldVals
+						co.yieldVals = nil
+						return true, out, nil
+					}
+					if errors.Is(err, errCoroCloseSelf) || errors.Is(s.abortErr, errCoroCloseSelf) {
+						return s.finishCoroCloseSelf(co)
+					}
 					co.status = ThreadDead
 					if isUncatchableErr(err) {
 						return false, nil, err
@@ -210,6 +219,15 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				co.top = 1 + len(args)
 				if _, err := s.pushProtectedCall(co, 0, len(args), -1, true); err != nil {
+					if errors.Is(err, errYieldSentinel) {
+						co.status = ThreadSuspended
+						out := co.yieldVals
+						co.yieldVals = nil
+						return true, out, nil
+					}
+					if errors.Is(err, errCoroCloseSelf) || errors.Is(s.abortErr, errCoroCloseSelf) {
+						return s.finishCoroCloseSelf(co)
+					}
 					co.status = ThreadDead
 					if isUncatchableErr(err) {
 						return false, nil, err

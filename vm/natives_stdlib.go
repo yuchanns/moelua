@@ -650,9 +650,15 @@ func nativeUTF8Codepoint(s *State, args []Value) ([]Value, error) {
 	lax := len(args) >= 4 && !args[3].IsFalsy()
 	// Pass 1: validate UTF-8 and count codepoints with zero allocations, stopping early
 	// before any slice allocation if the final []Value result would exceed memLimit.
+	cancelFn := s.nativeCancelFunc()
 	var count int64
 	if err := luastdlib.CodepointEach(str, i, j, lax, func(_ int64) error {
 		count++
+		if cancelFn != nil && (count&1023) == 0 {
+			if cerr := cancelFn(); cerr != nil {
+				return cerr
+			}
+		}
 		if s.memLimit > 0 && count&63 == 0 {
 			if err := s.checkMem(count * 16); err != nil {
 				return err
@@ -681,7 +687,7 @@ func nativeUTF8Codepoint(s *State, args []Value) ([]Value, error) {
 	return out, nil
 }
 
-func nativeUTF8Len(_ *State, args []Value) ([]Value, error) {
+func nativeUTF8Len(s *State, args []Value) ([]Value, error) {
 	str, err := checkStringArg(args, 0, "len")
 	if err != nil {
 		return nil, err
@@ -703,7 +709,7 @@ func nativeUTF8Len(_ *State, args []Value) ([]Value, error) {
 		}
 	}
 	lax := len(args) >= 4 && !args[3].IsFalsy()
-	cnt, errPos, err := luastdlib.Len(str, i, j, lax)
+	cnt, errPos, err := luastdlib.LenWithCancel(str, i, j, lax, s.nativeCancelFunc())
 	if err != nil {
 		return nil, err
 	}
@@ -760,7 +766,7 @@ func nativeUTF8Codes(s *State, args []Value) ([]Value, error) {
 }
 
 // nativeUTF8Offset implements Lua 5.5.1 two-return utf8.offset(s, n [, i]) -> start, end!
-func nativeUTF8Offset(_ *State, args []Value) ([]Value, error) {
+func nativeUTF8Offset(s *State, args []Value) ([]Value, error) {
 	str, err := checkStringArg(args, 0, "offset")
 	if err != nil {
 		return nil, err
@@ -772,17 +778,17 @@ func nativeUTF8Offset(_ *State, args []Value) ([]Value, error) {
 	if !ok {
 		return nil, fmt.Errorf("bad argument #2 to 'offset' (number expected)")
 	}
-	var start, end int64
-	var found bool
+	i := int64(1)
+	if n < 0 {
+		i = int64(len(str)) + 1
+	}
 	if len(args) >= 3 && !args[2].IsNil() {
-		i, ok := args[2].CoerceInt()
+		i, ok = args[2].CoerceInt()
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'offset' (number expected)")
 		}
-		start, end, found, err = luastdlib.Offset(str, n, i)
-	} else {
-		start, end, found, err = luastdlib.OffsetDefault(str, n)
 	}
+	start, end, found, err := luastdlib.OffsetWithCancel(str, n, i, s.nativeCancelFunc())
 	if err != nil {
 		return nil, err
 	}
