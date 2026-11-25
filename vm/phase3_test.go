@@ -992,20 +992,29 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 		_ = parent
 	})
 
-	// 5. next(t, k) normalizes integral float keys in hash tables (e.g. -1.0 -> -1).
+	// 5. next(t, k) matches PUC-Rio ltable.c:findindex/equalkey raw tag semantics:
+	// integral float keys (normalized to integer on insert) raise "invalid key to 'next'",
+	// while genuine integer keys and non-integral/out-of-int64 floats succeed.
 	t.Run("next_integral_float_hash_key", func(t *testing.T) {
 		s := NewState()
 		defer s.Close()
 		cl, err := s.LoadChunk([]byte(`
-			local t = { [-1] = "a", [-2] = "b" }
-			local k1, v1 = next(t, -1.0)
-			local k2, v2 = next(t, -2.0)
-			assert((k1 == -2 and v1 == "b" and k2 == nil) or (k2 == -1 and v2 == "a" and k1 == nil),
-				string.format("unexpected next results: (%s,%s) (%s,%s)", tostring(k1), tostring(v1), tostring(k2), tostring(v2)))
+			local t = { [-1] = "a", [-2] = "b", [1.5] = "half", [1e20] = "big" }
+			assert(t[-1.0] == "a" and t[-2.0] == "b")
+			local ok1, err1 = pcall(next, t, -1.0)
+			assert(not ok1 and tostring(err1):find("invalid key to 'next'", 1, true), tostring(err1))
+			local k1, v1 = next(t, -1)
+			assert(k1 ~= nil or v1 == nil)
+			local okf1 = pcall(next, t, 1.5)
+			local okf2 = pcall(next, t, 1e20)
+			assert(okf1 and okf2)
 			local t2 = { [0] = "z", [1] = "one" }
-			local nk, nv = next(t2, 0.0)
-			assert(nk == nil or nk == 1)
-			local nk2, nv2 = next(t2, 1.0)
+			assert(t2[0.0] == "z" and t2[1.0] == "one")
+			local ok2, err2 = pcall(next, t2, 0.0)
+			local ok3, err3 = pcall(next, t2, 1.0)
+			assert(not ok2 and tostring(err2):find("invalid key to 'next'", 1, true), tostring(err2))
+			assert(not ok3 and tostring(err3):find("invalid key to 'next'", 1, true), tostring(err3))
+			local nk2, nv2 = next(t2, 1)
 			assert(nk2 == 0 and nv2 == "z", tostring(nk2) .. "," .. tostring(nv2))
 			return "ok"
 		`), "=next_float_key")
@@ -5349,6 +5358,589 @@ func TestCodexReviewRound23VMRegressions(t *testing.T) {
 		}
 		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
 			t.Fatalf("protected call frame identity check failed: res=%v err=%v", res, err)
+		}
+	})
+}
+
+func TestCodexReviewRound24VMRegressions(t *testing.T) {
+	t.Run("streamed_local_names_charge_compile_budget", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local piece = string.rep("n", 4096)
+			local parts = {}
+			for b = 1, 100 do
+				parts[#parts + 1] = "do local "
+				for k = 1, 8 do parts[#parts + 1] = piece end
+				parts[#parts + 1] = " = 1 end "
+			end
+			local i = 0
+			local function reader()
+				i = i + 1
+				return parts[i]
+			end
+			local f, e = load(reader)
+			assert(f == nil and tostring(e):find("not enough memory", 1, true), "got " .. tostring(e))
+			return "ok"
+		`), "=locvar_mem")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res, err := s.Call(cl)
+		runtime.ReadMemStats(&after)
+		if err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+		if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+			t.Fatalf("load allocated %d bytes under a 128 KiB limit", got)
+		}
+	})
+
+	t.Run("load_polls_execution_controls_during_scan", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		loadFn := s.GetGlobal("load")
+		src := StringValue(s.Intern(strings.Repeat(" ", 32<<20)))
+		s.SetInstructionLimit(100)
+		_, err := s.Call(loadFn, src)
+		if !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("expected ErrInstructionLimit, got %v", err)
+		}
+
+		s2 := NewState()
+		defer s2.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		defer cancel()
+		time.Sleep(2 * time.Millisecond)
+		s2.SetContext(ctx)
+		_, err = s2.Call(s2.GetGlobal("load"), StringValue(s2.Intern(strings.Repeat(" ", 32<<20))))
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected DeadlineExceeded, got %v", err)
+		}
+	})
+}
+
+func TestAuditAndRound25VMRegressions(t *testing.T) {
+	t.Run("p0_forloop_setlocal_type_safety", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function corrupt(bad)
+				local n = 0
+				for i = 1, 5 do
+					n = n + 1
+					debug.setlocal(1, 2, bad)
+					debug.setlocal(1, 3, bad)
+					if n > 2 then break end
+				end
+				return n
+			end
+			local function corruptFloat(bad)
+				local n = 0
+				for i = 1.0, 5.0, 1.0 do
+					n = n + 1
+					debug.setlocal(1, 2, bad)
+					debug.setlocal(1, 3, bad)
+					if n > 2 then break end
+				end
+				return n
+			end
+			for _, bad in ipairs({"x", {}, true}) do
+				pcall(corrupt, bad)
+				pcall(corruptFloat, bad)
+			end
+			return "ok"
+		`), "=forloop_safety")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("p0_xpcall_wrap_cstack_overflow", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function f() return coroutine.wrap(f)() end
+			local ok, msg = xpcall(f, function() return coroutine.wrap(f)() end)
+			assert(ok == false and msg == "error in error handling", "got: " .. tostring(msg))
+			return "ok"
+		`), "=xpcall_wrap_overflow")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("p0_coro_close_normal_and_no_reentry", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local co
+			local sawNormal, closeErr, resumeOk, resumeErr
+			co = coroutine.create(function()
+				local x <close> = setmetatable({}, {__close = function()
+					assert(coroutine.status(co) == "running")
+					local c2 = coroutine.create(function()
+						sawNormal = coroutine.status(co)
+						local ok1, e1 = pcall(coroutine.close, co)
+						assert(not ok1)
+						closeErr = e1
+						resumeOk, resumeErr = coroutine.resume(co)
+					end)
+					local ok2, e2 = coroutine.resume(c2)
+					assert(ok2, tostring(e2))
+				end})
+				coroutine.yield(1)
+			end)
+			assert(coroutine.resume(co))
+			local ok, msg = coroutine.close(co)
+			assert(ok == true and msg == nil, "got " .. tostring(ok) .. " " .. tostring(msg))
+			assert(sawNormal == "normal", "sawNormal=" .. tostring(sawNormal))
+			assert(tostring(closeErr):find("normal", 1, true), "closeErr=" .. tostring(closeErr))
+			assert(resumeOk == false and tostring(resumeErr):find("non-suspended", 1, true), "resume=" .. tostring(resumeErr))
+			return "ok"
+		`), "=coro_close_normal")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("p0_bytecode_vararg_flags_and_abslineinfo", func(t *testing.T) {
+		badFlags := &bytecode.Proto{
+			Flag:         bytecode.PFVarargHidden | bytecode.PFVarargTable,
+			MaxStackSize: 2,
+			Code:         []bytecode.Instruction{bytecode.Instruction(bytecode.OP_VARARGPREP), bytecode.Instruction(bytecode.OP_RETURN0)},
+		}
+		if err := bytecode.Verify(badFlags); err == nil {
+			t.Fatal("expected conflicting vararg flags to be rejected")
+		}
+		badUnknownFlag := &bytecode.Proto{
+			Flag:         0x80,
+			MaxStackSize: 2,
+			Code:         []bytecode.Instruction{bytecode.Instruction(bytecode.OP_RETURN0)},
+		}
+		if err := bytecode.Verify(badUnknownFlag); err == nil {
+			t.Fatal("expected unknown proto flag bits to be rejected")
+		}
+		badNegAbs := &bytecode.Proto{
+			MaxStackSize: 2,
+			Code:         []bytecode.Instruction{bytecode.Instruction(bytecode.OP_RETURN0)},
+			LineInfo:     []int8{0},
+			AbsLineInfo:  []bytecode.AbsLineInfo{{PC: -5, Line: 1}},
+		}
+		if err := bytecode.Verify(badNegAbs); err == nil {
+			t.Fatal("expected negative AbsLineInfo.PC to be rejected")
+		}
+		badNonMonoAbs := &bytecode.Proto{
+			MaxStackSize: 2,
+			Code:         []bytecode.Instruction{bytecode.Instruction(bytecode.OP_RETURN0), bytecode.Instruction(bytecode.OP_RETURN0)},
+			LineInfo:     []int8{0, 0},
+			AbsLineInfo:  []bytecode.AbsLineInfo{{PC: 1, Line: 1}, {PC: 1, Line: 2}},
+		}
+		if err := bytecode.Verify(badNonMonoAbs); err == nil {
+			t.Fatal("expected non-monotonic AbsLineInfo.PC to be rejected")
+		}
+		badLineLen := &bytecode.Proto{
+			MaxStackSize: 2,
+			Code:         []bytecode.Instruction{bytecode.Instruction(bytecode.OP_RETURN0)},
+			LineInfo:     []int8{0, 0},
+		}
+		if err := bytecode.Verify(badLineLen); err == nil {
+			t.Fatal("expected mismatched LineInfo length to be rejected")
+		}
+	})
+
+	t.Run("p0_string_pack_huge_c_catchable_without_memlimit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local ok, msg = pcall(string.pack, "c9223372036854775807", "")
+			assert(ok == false and tostring(msg):find("not enough memory", 1, true), "got: " .. tostring(msg))
+			return "ok"
+		`), "=pack_huge_c")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("codex25_emergency_gc_closes_orphaned_upvals", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function make()
+				local co = coroutine.create(function()
+					local secret = "captured-value"
+					coroutine.yield(function() return secret end)
+				end)
+				local ok, fn = coroutine.resume(co)
+				assert(ok)
+				return co, fn
+			end
+			local co, fn = make()
+			return co, fn
+		`), "=emerg_upval")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 2 {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+		wco := weak.Make(res[0].AsThread())
+		fn := res[1]
+		res = nil
+		s.SetGlobal("kept_fn", fn)
+		// Stay in Tier 0 and trigger emergency GC via memory pressure.
+		if s.gc.tier1 {
+			t.Fatal("expected Tier 0 before emergency GC")
+		}
+		s.collectEmergency()
+		// Verify open upvalue was closed and captured value survived.
+		got, err := s.Call(fn)
+		if err != nil || len(got) != 1 || got[0].AsString().S != "captured-value" {
+			t.Fatalf("captured value corrupted: got=%v err=%v", got, err)
+		}
+		for range 10 {
+			runtime.GC()
+			if wco.Value() == nil {
+				break
+			}
+		}
+		if wco.Value() != nil {
+			t.Fatal("dead coroutine was still pinned by open upvalue after emergency GC")
+		}
+	})
+
+	t.Run("codex25_string_dump_cancellation", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		bigSrc := "return '" + strings.Repeat("a", 512*1024) + "'"
+		fn, err := s.LoadChunk([]byte(bigSrc), "=big_dump")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dumpFn := s.GetGlobal("string").AsTable().RawGetStr(s.Intern("dump"))
+		s.SetInstructionLimit(100)
+		_, err = s.Call(dumpFn, fn)
+		if !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("expected ErrInstructionLimit from string.dump, got %v", err)
+		}
+
+		s2 := NewState()
+		defer s2.Close()
+		fn2, err := s2.LoadChunk([]byte(bigSrc), "=big_dump_ctx")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		s2.SetContext(ctx)
+		_, err = s2.Call(s2.GetGlobal("string").AsTable().RawGetStr(s2.Intern("dump")), fn2)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled from string.dump, got %v", err)
+		}
+	})
+
+	t.Run("codex25_table_create_gc_pacing", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local finalized = 0
+			setmetatable({}, {__gc = function() finalized = finalized + 1 end})
+			for i = 1, 200 do
+				local _ = table.create(10000, 0)
+			end
+			assert(finalized == 1, "expected automatic GC pacing on table.create, finalized=" .. tostring(finalized))
+			return "ok"
+		`), "=table_create_gc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("hash_update_and_delete_mid_pairs_stability", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local t = {}
+			for i = 1, 200 do t["k" .. i] = i end
+			for i = 1, 150 do t["k" .. i] = nil end
+			-- Updating remaining existing keys during pairs must not rehash or lose iteration order.
+			local seen = 0
+			for k, v in pairs(t) do
+				seen = seen + 1
+				t[k] = v + 1
+			end
+			assert(seen == 50, "expected 50, got " .. seen)
+			-- Existing hash integer key update must stay in place without rehash.
+			local h = {}
+			h[100000] = 1
+			for i = 1, 50 do h["s" .. i] = i end
+			for i = 1, 40 do h["s" .. i] = nil end
+			local sawInt = false
+			for k, v in pairs(h) do
+				if k == 100000 then
+					sawInt = true
+					h[100000] = 2
+				end
+			end
+			assert(sawInt and h[100000] == 2)
+			return "ok"
+		`), "=hash_inplace")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("ephemeron_chain_linear_convergence", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local e = setmetatable({}, {__mode = "k"})
+			local first = {}
+			local prev = first
+			for i = 1, 2000 do
+				local nxt = {i}
+				e[prev] = nxt
+				prev = nxt
+			end
+			local lastWeak = setmetatable({v = prev}, {__mode = "v"})
+			prev = nil
+			collectgarbage("collect")
+			assert(lastWeak.v ~= nil and lastWeak.v[1] == 2000)
+			first = nil
+			collectgarbage("collect")
+			assert(lastWeak.v == nil)
+			return "ok"
+		`), "=ephem_chain")
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("ephemeron chain took too long (%v); expected linear convergence", elapsed)
+		}
+	})
+
+	t.Run("math_log_tostring_native_frames_and_tailcall_hooks", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			assert(math.log(1000, 10) == 3.0)
+			assert(math.log(1e15, 10) == 15.0)
+			assert(math.log(8, 2) == 3.0)
+			local t = setmetatable({}, {__tostring = function() return 42 end})
+			assert(tostring(t) == "42")
+
+			-- Native frame visible inside table.sort comparator
+			local info2, info3
+			local function doSort()
+				table.sort({2, 1}, function(a, b)
+					info2 = debug.getinfo(2, "nS")
+					info3 = debug.getinfo(3, "nS")
+					return a < b
+				end)
+			end
+			doSort()
+			assert(info2 and info2.what == "C" and info2.name == "sort", "info2=" .. tostring(info2 and info2.what) .. "/" .. tostring(info2 and info2.name))
+			assert(info3 and info3.what == "Lua" and info3.name == "doSort", "info3=" .. tostring(info3 and info3.name))
+
+			-- Tailcall to native and pcall fires caller return hook
+			local ev = {}
+			debug.sethook(function(e)
+				local info = debug.getinfo(2, "nS")
+				ev[#ev + 1] = e .. ":" .. (info.name or info.what)
+			end, "cr")
+			local function f() return tonumber("1") end
+			f()
+			local function g() return pcall(function() return 1 end) end
+			g()
+			debug.sethook()
+			local joined = table.concat(ev, ",")
+			assert(joined:find("return:f", 1, true), "missing return:f in " .. joined)
+			assert(joined:find("return:g", 1, true), "missing return:g in " .. joined)
+			assert(joined:find("return:pcall", 1, true), "missing return:pcall in " .. joined)
+			return "ok"
+		`), "=parity_core")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("debug_hooks_iterators_and_unpack_caps", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			-- debug.gethook returns 1 value when no hook is set
+			assert(select("#", debug.gethook()) == 1 and debug.gethook() == nil)
+			-- debug.sethook with empty mask clears hook; invalid mask type errors
+			debug.sethook(function() end, "")
+			assert(select("#", debug.gethook()) == 1)
+			local okBadMask = pcall(debug.sethook, function() end, {})
+			assert(not okBadMask)
+			-- Hook cannot yield
+			local co = coroutine.create(function() local x = 1; x = x + 1; return x end)
+			debug.sethook(co, function() coroutine.yield() end, "l")
+			local rok, rmsg = coroutine.resume(co)
+			assert(not rok and tostring(rmsg):find("C-call boundary", 1, true), "got " .. tostring(rmsg))
+
+			-- utf8.codes singleton iterator + 0 return values when exhausted
+			local f1 = utf8.codes("a")
+			local f2 = utf8.codes("b")
+			assert(f1 == f2)
+			local g = string.gmatch("a", "a")
+			assert(g() == "a")
+			assert(select("#", g()) == 0)
+			assert(select("#", f1("a", 1)) == 0)
+
+			-- string.unpack & utf8.codepoint 1M result cap
+			local big = string.rep("a", 1000001)
+			local uok = pcall(string.unpack, string.rep("b", 1000001), big)
+			assert(not uok)
+			local cok = pcall(utf8.codepoint, big, 1, -1)
+			assert(not cok)
+			return "ok"
+		`), "=hooks_iters_caps")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("load_searchpath_gc_params_and_stdlib_edge_parity", func(t *testing.T) {
+		var warnBuf bytes.Buffer
+		s := NewState()
+		defer s.Close()
+		s.SetErrOutput(&warnBuf)
+		s.SetWarnings(true)
+
+		// expandDefaultPath replaces only first ;; and preserves leading/trailing ;
+		if got := expandDefaultPath(";a;;b;;c;", "DEF"); got != ";a;DEF;b;;c;" {
+			t.Fatalf("expandDefaultPath got %q", got)
+		}
+
+		cl, err := s.LoadChunk([]byte(`
+			-- load(string) does NOT strip BOM or shebang
+			assert(load("\xef\xbb\xbfreturn 1") == nil)
+			assert(load("#!/usr/bin/env lua\nreturn 1") == nil)
+			assert(not pcall(loadfile, "nonexistent.lua", "B"))
+
+			-- package.searchpath expands ? BEFORE splitting ;
+			local p, em = package.searchpath("q;r", "?.lua")
+			assert(p == nil and em == "no file 'q'\n\tno file 'r.lua'", "em=" .. tostring(em))
+
+			-- Deep Lua recursion > 10000 frames succeeds
+			local function rec(n)
+				if n == 0 then return 1 end
+				return rec(n - 1) + 0
+			end
+			assert(rec(12000) == 1)
+
+			-- next({10,20,30}, 1.0) raises invalid key to 'next'
+			local nok, nerr = pcall(next, {10, 20, 30}, 1.0)
+			assert(not nok and tostring(nerr):find("invalid key to 'next'", 1, true), "nerr=" .. tostring(nerr))
+
+			-- Integer for-loop with NaN limit and negative step executes
+			local cnt = 0
+			for i = 1, 0/0, -1 do
+				cnt = cnt + 1
+				if cnt == 3 then break end
+			end
+			assert(cnt == 3)
+
+			-- ipairs fires call/return hooks when active
+			local hits = 0
+			debug.sethook(function(e) if e == "call" then hits = hits + 1 end end, "c")
+			for i, v in ipairs({10, 20}) do end
+			debug.sethook()
+			assert(hits >= 3, "expected ipairs hooks, got " .. hits)
+
+			-- String metatable IC invalidation
+			local function getFoo(str) return str.foo end
+			assert(getFoo("a") == nil and getFoo("b") == nil)
+			string.foo = 99
+			assert(getFoo("a") == 99)
+			string.foo = nil
+
+			-- collectgarbage param defaults & luaO_codeparam encoding
+			assert(collectgarbage("param", "stepsize") == 9600)
+			local oldPause = collectgarbage("param", "pause", 12345)
+			assert(collectgarbage("param", "pause") == 12000)
+			collectgarbage("param", "pause", oldPause)
+
+			-- __gc preserves hookMask (allowHook) and warns on non-callable __gc
+			local hookSaved = function() end
+			debug.sethook(hookSaved, "c")
+			local hookSeenInGC
+			setmetatable({}, {__gc = function() hookSeenInGC = debug.gethook() end})
+			setmetatable({}, {__gc = 42})
+			collectgarbage("collect")
+			debug.sethook()
+			assert(hookSeenInGC == hookSaved)
+
+			-- io.close() returns 2 values on standard file
+			assert(select("#", io.close(io.stdout)) == 2)
+
+			-- os.date rejects out-of-range timestamps; os.setlocale rejects invalid category
+			assert(not pcall(os.date, "*t", 1 << 60))
+			assert(not pcall(os.setlocale, "C", "bogus"))
+			assert(os.date("!%EY", 0) == "1970")
+
+			-- Arg validation parity
+			local okE, errE = pcall(error, "x", 2.5)
+			assert(not okE and tostring(errE):find("integer", 1, true))
+			local okTN, errTN = pcall(tonumber, 10, 99)
+			assert(not okTN and tostring(errTN):find("#1", 1, true))
+			local okRG, errRG = pcall(rawget, {})
+			assert(not okRG and tostring(errRG):find("#2", 1, true))
+			local prot = setmetatable({}, {__metatable = "locked"})
+			local okSM, errSM = pcall(setmetatable, prot, 5)
+			assert(not okSM and tostring(errSM):find("#2", 1, true))
+			table.sort({}, 5) -- n <= 1 succeeds
+			assert(not pcall(table.sort, {2, 1}, 5))
+
+			-- coroutine.wrap prepends caller location
+			local w = coroutine.wrap(function() error("wrapped-boom") end)
+			local wok, werr = pcall(w)
+			assert(not wok and tostring(werr):find("edge_parity", 1, true), "werr=" .. tostring(werr))
+			return "ok"
+		`), "=edge_parity")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+		if !strings.Contains(warnBuf.String(), "error in __gc (attempt to call a number value") {
+			t.Fatalf("expected non-callable __gc warning, got %q", warnBuf.String())
 		}
 	})
 }
