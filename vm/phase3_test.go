@@ -1509,6 +1509,9 @@ func TestCodexReviewRound6VMRegressions(t *testing.T) {
 func TestCodexReviewRound7VMRegressions(t *testing.T) {
 	// 1. Promoting specialized arrays (arrBool/arrInt/arrFloat -> arrGeneric) enforces State memory limits.
 	t.Run("specialized_array_promotion_memlimit", func(t *testing.T) {
+		if !OptimizeEnabled {
+			t.Skip("specialized arrays are only active when OptimizeEnabled")
+		}
 		for _, tc := range []struct {
 			name  string
 			count int
@@ -1665,6 +1668,194 @@ func TestCodexReviewRound7VMRegressions(t *testing.T) {
 				string.format("ok=%s calls=%d msg=%s", tostring(ok), calls, tostring(msg)))
 			return "ok"
 		`), "=xpcall_callable_msgh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+}
+
+func TestCodexReviewRound8VMRegressions(t *testing.T) {
+	// 1. table.create accounts for actual power-of-two hash backing capacity before allocating.
+	t.Run("table_create_actual_hash_capacity_memlimit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(65536)
+		cl, err := s.LoadChunk([]byte(`
+			local ok, err = pcall(table.create, 0, 1000)
+			assert(not ok and tostring(err):find("not enough memory", 1, true),
+				"expected memory error for table.create(0, 1000), got ok=" .. tostring(ok) .. " err=" .. tostring(err))
+			return "ok"
+		`), "=table_create_hash_mem")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+
+		// Also verify huge nrec hits hardSingleAllocLimit even without memLimit.
+		s2 := NewState()
+		defer s2.Close()
+		cl2, err := s2.LoadChunk([]byte(`
+			local ok, err = pcall(table.create, 0, 50000000)
+			assert(not ok and tostring(err):find("not enough memory", 1, true), tostring(err))
+			return "ok"
+		`), "=table_create_hard_cap")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. Native return hooks advance th.top past all return values so hook frames do not clobber results.
+	t.Run("native_return_hook_preserves_multi_returns", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local seen = 0
+			debug.sethook(function() seen = seen + 1 end, "r")
+			local a, b, c, d, e = table.unpack({10, 20, 30, 40, 50})
+			debug.sethook()
+			assert(seen >= 1)
+			assert(a == 10 and b == 20 and c == 30 and d == 40 and e == 50,
+				string.format("got %s %s %s %s %s", tostring(a), tostring(b), tostring(c), tostring(d), tostring(e)))
+			return "ok"
+		`), "=ret_hook_multi")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. pcall and xpcall on callable tables (including chained __call) remain yieldable.
+	t.Run("yieldable_pcall_and_xpcall_callable_table", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local inner = setmetatable({ tag = "in" }, {
+				__call = function(self, outer, x)
+					local v = coroutine.yield("pause", self.tag, outer.tag, x)
+					return v * 2
+				end,
+			})
+			local outer = setmetatable({ tag = "out" }, { __call = inner })
+
+			local co1 = coroutine.create(function()
+				return pcall(outer, 7)
+			end)
+			local ok1, y1, y2, y3, y4 = coroutine.resume(co1)
+			assert(ok1 and y1 == "pause" and y2 == "in" and y3 == "out" and y4 == 7,
+				string.format("%s %s %s %s %s", tostring(ok1), tostring(y1), tostring(y2), tostring(y3), tostring(y4)))
+			local ok2, pok, res = coroutine.resume(co1, 21)
+			assert(ok2 and pok and res == 42)
+
+			local co2 = coroutine.create(function()
+				return xpcall(outer, function(e) return "handled:" .. tostring(e) end, 9)
+			end)
+			local x1, xy1, xy2, xy3, xy4 = coroutine.resume(co2)
+			assert(x1 and xy1 == "pause" and xy2 == "in" and xy3 == "out" and xy4 == 9)
+			local x2, xok, xres = coroutine.resume(co2, 11)
+			assert(x2 and xok and xres == 22)
+			return "ok"
+		`), "=yield_callable_pcall")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. require roots searcher loader data (extra) across loader execution so GC does not finalize it early.
+	t.Run("require_roots_searcher_loader_data", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local fin = 0
+			table.insert(package.searchers, 1, function(name)
+				if name == "rooted_extra_mod" then
+					local extra = setmetatable({ id = 77 }, { __gc = function() fin = fin + 1 end })
+					return function(modname)
+						collectgarbage("collect")
+						return { loaded = modname }
+					end, extra
+				end
+			end)
+			local mod, extra = require("rooted_extra_mod")
+			assert(fin == 0, "loader data was finalized prematurely: fin=" .. fin)
+			assert(mod.loaded == "rooted_extra_mod" and extra.id == 77)
+			return "ok"
+		`), "=require_root_extra")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 5. string.pack rejects unsupported argument types when consumed without rejecting unused trailing args.
+	t.Run("string_pack_rejects_invalid_types_only_when_consumed", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			for _, tc in ipairs({
+				{"z", false},
+				{"s", {}},
+				{"c4", nil},
+				{"i4", true},
+				{"d", {}},
+			}) do
+				local ok, e = pcall(string.pack, tc[1], tc[2])
+				assert(not ok and type(e) == "string",
+					"expected pack error for fmt=" .. tc[1] .. " val=" .. tostring(tc[2]))
+			end
+			-- Unused trailing invalid arguments must be ignored
+			assert(string.pack("b", 42, false, {}, nil) == string.char(42))
+			return "ok"
+		`), "=pack_invalid_types")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 6. table.move uses metamethod-aware equality (__eq) when deciding copy direction and propagates errors.
+	t.Run("table_move_honors_eq_metamethod", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local backing = {1, 2, 3}
+			local mt = {
+				__index = backing,
+				__newindex = backing,
+				__eq = function() return true end,
+			}
+			local src = setmetatable({}, mt)
+			local dst = setmetatable({}, mt)
+			table.move(src, 1, 3, 2, dst)
+			assert(backing[1] == 1 and backing[2] == 1 and backing[3] == 2 and backing[4] == 3,
+				string.format("got {%s,%s,%s,%s}", tostring(backing[1]), tostring(backing[2]), tostring(backing[3]), tostring(backing[4])))
+
+			-- Error raised by __eq propagates cleanly
+			local errMT = {
+				__index = backing,
+				__newindex = backing,
+				__eq = function() error("eq_boom") end,
+			}
+			local ok, e = pcall(table.move, setmetatable({}, errMT), 1, 3, 2, setmetatable({}, errMT))
+			assert(not ok and tostring(e):find("eq_boom", 1, true), tostring(e))
+			return "ok"
+		`), "=move_eq_mm")
 		if err != nil {
 			t.Fatal(err)
 		}
