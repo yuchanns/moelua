@@ -679,6 +679,10 @@ func (s *State) TrySetGlobal(name string, v Value) error {
 			return nil
 		}
 	} else {
+		// Root v (held only by Go) across key allocation so an emergency GC triggered by
+		// TryIntern recounts it against the memory limit.
+		ref := s.vm.Ref(v)
+		defer s.vm.Unref(ref)
 		var err error
 		ls, err = s.vm.TryIntern(name)
 		if err != nil {
@@ -951,6 +955,12 @@ func (t *Table) SetString(key string, val Value) error {
 			return nil
 		}
 	} else {
+		// Root val and t (possibly held only by Go) across key allocation so an emergency GC
+		// triggered by TryIntern recounts them against the memory limit.
+		vref := t.state.vm.Ref(val)
+		defer t.state.vm.Unref(vref)
+		tref := t.state.vm.Ref(vm.TableValue(t.raw))
+		defer t.state.vm.Unref(tref)
 		var err error
 		ls, err = t.state.vm.TryIntern(key)
 		if err != nil {

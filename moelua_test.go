@@ -1322,3 +1322,52 @@ func TestStateCompileEnforcesSandboxControls(t *testing.T) {
 		t.Fatalf("State unusable after compile abort: res=%v err=%v", res, err)
 	}
 }
+
+func TestRootValueBeforeKeyAllocationPreservesMemoryLimit(t *testing.T) {
+	const limit = int64(65536)
+	// Size value and key at 60% of the remaining headroom each: the value alone fits, but
+	// value+key cannot, so an unrooted value would let the assignment exceed the limit.
+	sizes := func(s *moelua.State) (string, string) {
+		n := int((limit - s.MemoryUsage()) * 3 / 5)
+		return strings.Repeat("v", n), strings.Repeat("k", n)
+	}
+
+	t.Run("TrySetGlobal", func(t *testing.T) {
+		s := moelua.New(moelua.WithMemoryLimit(limit))
+		defer s.Close()
+		s.CollectGarbage()
+		big, name := sizes(s)
+		v, err := s.TryString(big)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.TrySetGlobal(name, v)
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > limit {
+			t.Fatalf("TrySetGlobal err=%v but recounted MemoryUsage()=%d exceeded %d", err, usage, limit)
+		}
+	})
+
+	t.Run("Table.SetString", func(t *testing.T) {
+		s := moelua.New(moelua.WithMemoryLimit(limit))
+		defer s.Close()
+		tbl, err := s.TryNewTable(0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.TrySetGlobal("t", tbl.Value()); err != nil {
+			t.Fatal(err)
+		}
+		s.CollectGarbage()
+		big, name := sizes(s)
+		v, err := s.TryString(big)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = tbl.SetString(name, v)
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > limit {
+			t.Fatalf("SetString err=%v but recounted MemoryUsage()=%d exceeded %d", err, usage, limit)
+		}
+	})
+}
