@@ -6185,3 +6185,251 @@ return "ok"
 		}
 	})
 }
+
+func TestCodexReviewRound27VMRegressions(t *testing.T) {
+	t.Run("coallocated_stdlib_tables_release_payloads_on_gc", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(131072)
+
+		var watched []weak.Pointer[LuaString]
+		s.SetGlobal("watch_str", NativeValue(&NativeFunc{
+			Name: "watch_str",
+			Fn: func(_ *State, args []Value) ([]Value, error) {
+				if len(args) > 0 && args[0].IsString() {
+					watched = append(watched, weak.Make(args[0].AsString()))
+				}
+				return args, nil
+			},
+		}))
+
+		cl, err := s.LoadChunk([]byte(`
+			local rep, char = string.rep, string.char
+			local libs = {"math", "table", "utf8", "coroutine", "os", "io", "debug"}
+			for i = 1, #libs do
+				local name = libs[i]
+				local lib = _G[name]
+				-- Store both a new key and overwrite an existing slot with a large payload.
+				local payload = watch_str(rep(char(64 + i), 50000))
+				lib._big_payload = payload
+				for k in pairs(lib) do
+					if k ~= "_big_payload" then
+						lib[k] = payload
+						break
+					end
+				end
+				payload = nil
+				lib = nil
+				_G[name] = nil
+				package.loaded[name] = nil
+				collectgarbage("collect")
+			end
+			return "ok"
+		`), "=coalloc_sweep")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+		if len(watched) != 7 {
+			t.Fatalf("expected 7 watched payloads, got %d", len(watched))
+		}
+		for range 5 {
+			runtime.GC()
+		}
+		alive := 0
+		for _, wp := range watched {
+			if wp.Value() != nil {
+				alive++
+			}
+		}
+		if alive != 0 {
+			t.Fatalf("expected Go GC to reclaim all 7 removed stdlib payloads, %d still alive", alive)
+		}
+	})
+
+	t.Run("tonumber_polls_ctx_and_instruction_limit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+
+		// 1. Huge base-2 numeral aborts promptly under instruction limit and deadline.
+		bigBin := StringValue(s.Intern(strings.Repeat("10", 16*1024*1024)))
+		toNumFn := s.GetGlobal("tonumber")
+		s.SetInstructionLimit(100)
+		start := time.Now()
+		_, err := s.Call(toNumFn, bigBin, IntValue(2))
+		if !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("expected ErrInstructionLimit from tonumber(32MiB, 2), got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("tonumber(32MiB, 2) took too long to cancel: %v", elapsed)
+		}
+		if s.InstructionsExecuted() <= 0 {
+			t.Fatalf("expected InstructionsExecuted > 0 after canceled tonumber")
+		}
+
+		s.SetInstructionLimit(0)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		s.SetContext(ctx)
+		_, err = s.Call(toNumFn, bigBin, IntValue(2))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled from tonumber(32MiB, 2), got %v", err)
+		}
+
+		// 2. No-base huge decimal and hex numerals also poll cancellation controls.
+		bigDec := StringValue(s.Intern(strings.Repeat("0", 16*1024*1024) + "42"))
+		bigHex := StringValue(s.Intern("0x" + strings.Repeat("0", 16*1024*1024) + "ff"))
+		s.SetContext(nil)
+		s.SetInstructionLimit(100)
+		if _, err := s.Call(toNumFn, bigDec); !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("expected ErrInstructionLimit from no-base decimal tonumber, got %v", err)
+		}
+		s.SetInstructionLimit(100)
+		if _, err := s.Call(toNumFn, bigHex); !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("expected ErrInstructionLimit from no-base hex tonumber, got %v", err)
+		}
+		s.SetInstructionLimit(100)
+		mathToInt := s.GetGlobal("math").AsTable().RawGetStr(s.Intern("tointeger"))
+		if _, err := s.Call(mathToInt, bigDec); !errors.Is(err, ErrInstructionLimit) {
+			t.Fatalf("expected ErrInstructionLimit from math.tointeger, got %v", err)
+		}
+
+		// 3. Valid long numerals (> 4096 bytes) under a generous budget match exact Lua 5.5.1 values.
+		s.SetInstructionLimit(1_000_000)
+		cl, err := s.LoadChunk([]byte(`
+			local z = string.rep("0", 5000)
+			local sp = string.rep(" ", 5000)
+			assert(tonumber(z .. "42") == 42 and math.type(tonumber(z .. "42")) == "integer")
+			assert(tonumber("-" .. z .. "1.5" .. z) == -1.5)
+			assert(tonumber("0x" .. z .. "ff") == 255 and math.type(tonumber("0x" .. z .. "ff")) == "integer")
+			assert(tonumber("0x" .. z .. "1.8p+1") == 3.0)
+			assert(tonumber(z .. "101010", 2) == 42)
+			local nz = tonumber(sp .. "-" .. z .. ".0" .. sp)
+			assert(nz == 0.0 and 1/nz == -math.huge, "expected -0.0")
+			return "ok"
+		`), "=long_tonumber_parity")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("custom_file_gc_survives_go_gc_before_vm_collect", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+
+		s.SetGlobal("force_go_gc", NativeValue(&NativeFunc{
+			Name: "force_go_gc",
+			Fn: func(_ *State, _ []Value) ([]Value, error) {
+				for range 4 {
+					runtime.GC()
+				}
+				return nil, nil
+			},
+		}))
+
+		cl, err := s.LoadChunk([]byte(`
+			local count = 0
+			-- Create one tmpfile BEFORE customizing fileMeta.__gc to test promotion of existing handles.
+			local pre = assert(io.tmpfile())
+			local mt = debug.getmetatable(io.stdout)
+			local orig_gc = mt.__gc
+			mt.__gc = function(f)
+				count = count + 1
+				return orig_gc(f)
+			end
+			do
+				local post = assert(io.tmpfile())
+				local _ = post
+			end
+			pre = nil
+			force_go_gc()
+			collectgarbage("collect")
+			assert(count == 2, "expected both pre- and post-customization file __gc to run, got " .. tostring(count))
+			return "ok"
+		`), "=custom_file_gc_go_gc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("upvalueid_does_not_root_captured_objects", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		s.SetMemoryLimit(131072)
+
+		var watched []weak.Pointer[LuaString]
+		s.SetGlobal("watch_str", NativeValue(&NativeFunc{
+			Name: "watch_str",
+			Fn: func(_ *State, args []Value) ([]Value, error) {
+				if len(args) > 0 && args[0].IsString() {
+					watched = append(watched, weak.Make(args[0].AsString()))
+				}
+				return args, nil
+			},
+		}))
+		s.SetGlobal("null_lud", LightUDValue(nil))
+
+		cl, err := s.LoadChunk([]byte(`
+			local ids = {}
+			local seen = {}
+			for i = 1, 50 do
+				local big = watch_str(string.rep("z", 32768) .. tostring(i))
+				local fn = function() return big end
+				local id = debug.upvalueid(fn, 1)
+				assert(type(id) == "userdata")
+				assert(id ~= null_lud)
+				assert(tostring(id):find("^userdata: 0x"))
+				assert(seen[id] == nil, "duplicate upvalueid")
+				seen[id] = i
+				ids[i] = id
+				big = nil
+				fn = nil
+				collectgarbage("collect")
+			end
+			-- Verify identity preservation across shared upvalues and upvaluejoin.
+			local x = 1
+			local f1 = function() return x end
+			local f2 = function() return x end
+			local y = 2
+			local f3 = function() return y end
+			assert(debug.upvalueid(f1, 1) == debug.upvalueid(f2, 1))
+			assert(debug.upvalueid(f1, 1) ~= debug.upvalueid(f3, 1))
+			debug.upvaluejoin(f3, 1, f1, 1)
+			assert(debug.upvalueid(f3, 1) == debug.upvalueid(f1, 1))
+			-- Verify native closure upvalueid doesn't pin captured strings either.
+			local g = string.gmatch(watch_str(string.rep("q", 32768)), ".")
+			local gid = debug.upvalueid(g, 1)
+			assert(type(gid) == "userdata" and gid ~= debug.upvalueid(g, 2))
+			ids[#ids + 1] = gid
+			g = nil
+			collectgarbage("collect")
+			return #ids
+		`), "=upvalueid_non_owning")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].Int() != 51 {
+			t.Fatalf("res=%v err=%v", res, err)
+		}
+		for range 5 {
+			runtime.GC()
+		}
+		alive := 0
+		for _, wp := range watched {
+			if wp.Value() != nil {
+				alive++
+			}
+		}
+		if alive != 0 {
+			t.Fatalf("expected Go GC to reclaim all %d strings captured by discarded closures despite retaining upvalueids, %d still alive", len(watched), alive)
+		}
+	})
+}
