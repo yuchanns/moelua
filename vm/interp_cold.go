@@ -1043,7 +1043,6 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			}
 		}
 		th.top = funcIdx + 1 + nargs
-		args := th.stack[funcIdx+1 : funcIdx+1+nargs]
 		hookedNative := false
 		if th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook {
 			hookedNative = true
@@ -1069,6 +1068,8 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				}
 			}
 		}
+		// Slice arguments after any call hook in case the hook grew th.stack or modified locals via debug.setlocal.
+		args := th.stack[funcIdx+1 : funcIdx+1+nargs]
 		if nf.FastFn != nil && !hookedNative {
 			rv, err := nf.FastFn(s, args)
 			if err == nil && (th.hookMask == 0 || th.hookMask&HookMaskRet == 0 || th.inHook) {
@@ -1134,6 +1135,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			if herr != nil {
 				return s.catchSlow(th, ev, false, herr)
 			}
+			rv = th.stack[funcIdx+1]
 			if err := th.placeResults(funcIdx, []Value{rv}, nresults); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
@@ -1157,6 +1159,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 						th.frames[th.nframe-1].ftransfer = 1
 						th.frames[th.nframe-1].ntransfer = uint16(len(res))
 						hookErr = s.fireHook(th, "return", NilValue())
+						if hookErr == nil && len(res) > 0 {
+							copy(res, th.stack[funcIdx+1:funcIdx+1+len(res)])
+						}
 					}
 				}
 				th.nframe--
@@ -1182,6 +1187,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					}
 					th.nframe++
 					hookErr = s.fireHook(th, "return", NilValue())
+					if hookErr == nil && len(res) > 0 {
+						copy(res, th.stack[funcIdx+1:funcIdx+1+len(res)])
+					}
 					th.nframe--
 				}
 			}

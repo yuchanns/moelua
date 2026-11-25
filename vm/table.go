@@ -489,7 +489,23 @@ func (t *Table) RawGetInt(i int64) Value {
 	return NilValue()
 }
 
-func (t *Table) promoteArrToGeneric() {
+func (t *Table) promoteArrToGeneric(s *State) bool {
+	if s != nil && s.memLimit > 0 {
+		var oldElem int64
+		switch t.arrKind {
+		case arrInt, arrFloat:
+			oldElem = 8
+		case arrBool:
+			oldElem = 1
+		}
+		if oldElem > 0 && t.arrCap > 0 {
+			delta := int64(t.arrCap) * (16 - oldElem)
+			if err := s.checkMemAndAccount(delta); err != nil {
+				s.memExceeded = true
+				return false
+			}
+		}
+	}
 	switch t.arrKind {
 	case arrEmpty:
 		t.arrKind = arrGeneric
@@ -515,6 +531,18 @@ func (t *Table) promoteArrToGeneric() {
 		}
 		t.setArrVal(g)
 	}
+	return true
+}
+
+func (t *Table) checkGenericArrGrowth(s *State, idx int64) bool {
+	if s != nil && s.memLimit > 0 && int(idx)+1 > int(t.arrCap) {
+		nc := nextCap(int(t.arrCap), int(idx)+1)
+		if err := s.checkMemAndAccount(int64(nc-int(t.arrCap)) * 16); err != nil {
+			s.memExceeded = true
+			return false
+		}
+	}
+	return true
 }
 
 func nextCap(cur, need int) int {
@@ -652,7 +680,9 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						return
 					}
 					// Promote on nil (including last element) or type change so next(t, k) never invalidates keys.
-					t.promoteArrToGeneric()
+					if !t.promoteArrToGeneric(s) {
+						return
+					}
 					t.arrValSlice()[idx] = val
 					return
 				}
@@ -677,7 +707,9 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 					return
 				}
 				if !val.IsNil() && idx < n*2 && idx < 1<<24 {
-					t.promoteArrToGeneric()
+					if !t.promoteArrToGeneric(s) || !t.checkGenericArrGrowth(s, idx) {
+						return
+					}
 					t.setArrGeneric(idx, val)
 					return
 				}
@@ -688,7 +720,9 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						t.arrFloatSlice()[idx] = val.Float()
 						return
 					}
-					t.promoteArrToGeneric()
+					if !t.promoteArrToGeneric(s) {
+						return
+					}
 					t.arrValSlice()[idx] = val
 					return
 				}
@@ -713,7 +747,9 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 					return
 				}
 				if !val.IsNil() && idx < n*2 && idx < 1<<24 {
-					t.promoteArrToGeneric()
+					if !t.promoteArrToGeneric(s) || !t.checkGenericArrGrowth(s, idx) {
+						return
+					}
 					t.setArrGeneric(idx, val)
 					return
 				}
@@ -724,7 +760,9 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						t.arrBoolSlice()[idx] = val.IsTrue()
 						return
 					}
-					t.promoteArrToGeneric()
+					if !t.promoteArrToGeneric(s) {
+						return
+					}
 					t.arrValSlice()[idx] = val
 					return
 				}
@@ -749,7 +787,9 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 					return
 				}
 				if !val.IsNil() && idx < n*2 && idx < 1<<24 {
-					t.promoteArrToGeneric()
+					if !t.promoteArrToGeneric(s) || !t.checkGenericArrGrowth(s, idx) {
+						return
+					}
 					t.setArrGeneric(idx, val)
 					return
 				}
@@ -760,12 +800,8 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 					return
 				}
 				if !val.IsNil() && (idx == n || (idx < max(n*2, 16) && idx < 1<<24)) {
-					if int(idx)+1 > int(t.arrCap) && s.memLimit > 0 {
-						nc := nextCap(int(t.arrCap), int(idx)+1)
-						if err := s.checkMemAndAccount(int64(nc-int(t.arrCap)) * 16); err != nil {
-							s.memExceeded = true
-							return
-						}
+					if !t.checkGenericArrGrowth(s, idx) {
+						return
 					}
 					t.setArrGeneric(idx, val)
 					return

@@ -303,17 +303,11 @@ func nativeXPCall(s *State, args []Value) ([]Value, error) {
 		if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 			return nil, err
 		}
-		hres, herr := s.Call(args[1], errorToLuaValue(s, err))
-		if herr != nil {
-			if isUncatchableErr(herr) {
-				return nil, herr
-			}
-			return []Value{FalseValue(), StringValue(s.intern.Intern("error in error handling"))}, nil
+		errVal, uerr := s.callXPCallHandler(s.cur, args[1], errorToLuaValue(s, err))
+		if uerr != nil {
+			return nil, uerr
 		}
-		if len(hres) == 0 || hres[0].IsNil() {
-			return []Value{FalseValue(), StringValue(s.intern.Intern("<no error object>"))}, nil
-		}
-		return []Value{FalseValue(), hres[0]}, nil
+		return []Value{FalseValue(), errVal}, nil
 	}
 	out := make([]Value, 1+len(res))
 	out[0] = TrueValue()
@@ -1009,7 +1003,7 @@ func (s *State) tableSetInt(v Value, idx int64, val Value) error {
 		t := v.AsTable()
 		if !t.RawGetInt(idx).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 			t.RawSetInt(s, idx, val)
-			return nil
+			return s.ConsumeMemErr()
 		}
 	}
 	cur := v
@@ -1126,8 +1120,14 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 					}
 				}
 				t.RawSetInt(s, i, t.RawGetInt(i+1))
+				if err := s.ConsumeMemErr(); err != nil {
+					return nil, err
+				}
 			}
 			t.RawSetInt(s, size, NilValue())
+			if err := s.ConsumeMemErr(); err != nil {
+				return nil, err
+			}
 		}
 		return []Value{res}, nil
 	}
@@ -1151,20 +1151,45 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 		return nil, err
 	}
 	if pos <= size {
+		// Root res on the active thread stack across subsequent __index/__newindex callbacks
+		// so GC cannot prematurely finalize or clear the removed value before return.
+		th := s.cur
+		savedTop := th.top
+		baseTop := savedTop
+		for fi := range th.nframe {
+			cf := &th.frames[fi]
+			if cf.cl != nil {
+				if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+					baseTop = end
+				}
+			}
+		}
+		if err := th.ensureStack(baseTop + 4); err != nil {
+			return nil, err
+		}
+		th.stack[baseTop] = res
+		th.top = baseTop + 1
+		defer func() {
+			th.stack[baseTop] = NilValue()
+			th.top = savedTop
+		}()
 		for i := pos; i < size; i++ {
 			if cancelFn != nil && ((i-pos)&1023) == 0 {
 				if err := cancelFn(); err != nil {
 					return nil, err
 				}
 			}
+			th.top = baseTop + 1
 			v, err := s.tableGetInt(args[0], i+1)
 			if err != nil {
 				return nil, err
 			}
+			th.top = baseTop + 1
 			if err := s.tableSetInt(args[0], i, v); err != nil {
 				return nil, err
 			}
 		}
+		th.top = baseTop + 1
 		if err := s.tableSetInt(args[0], size, NilValue()); err != nil {
 			return nil, err
 		}

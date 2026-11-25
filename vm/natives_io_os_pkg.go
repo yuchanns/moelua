@@ -1036,23 +1036,68 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		if n < 0 {
 			return NilValue(), false, fmt.Errorf("invalid read count")
 		}
+		const maxReadBytes = int64(1 << 30)
+		if n > maxReadBytes {
+			if s.memLimit > 0 {
+				return NilValue(), false, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+			}
+			return NilValue(), false, fmt.Errorf("resulting string too large")
+		}
 		if s.memLimit > 0 {
-			if err := s.checkMemAndAccount(n + 64); err != nil {
+			if err := s.checkMem(n + 64); err != nil {
 				return NilValue(), false, err
 			}
 		}
-		buf := make([]byte, n)
-		got, err := io.ReadFull(r, buf)
-		if s.memLimit > 0 && int64(got) < n {
-			s.gc.allocBytes -= n - int64(got)
-		}
-		if got == 0 && err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return NilValue(), false, nil
+		if n <= 65536 {
+			buf := make([]byte, n)
+			got, err := io.ReadFull(r, buf)
+			if got == 0 && err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					return NilValue(), false, nil
+				}
+				return NilValue(), false, ioReadErr{err}
 			}
-			return NilValue(), false, ioReadErr{err}
+			if s.memLimit > 0 || s.gc.tier1 {
+				s.gc.allocBytes += int64(got) + 64
+			}
+			return StringValue(s.intern.Intern(string(buf[:got]))), true, nil
 		}
-		return StringValue(s.intern.Intern(string(buf[:got]))), true, nil
+		var out bytes.Buffer
+		var readBytes int64
+		defer func() {
+			s.gc.tempBytes -= readBytes
+		}()
+		var chunk [32768]byte
+		rem := n
+		for rem > 0 {
+			want := min(rem, int64(len(chunk)))
+			got, err := r.Read(chunk[:want])
+			if got > 0 {
+				if merr := s.checkMem(int64(got)); merr != nil {
+					return NilValue(), false, merr
+				}
+				out.Write(chunk[:got])
+				readBytes += int64(got)
+				s.gc.tempBytes += int64(got)
+				rem -= int64(got)
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if out.Len() == 0 {
+					return NilValue(), false, ioReadErr{err}
+				}
+				break
+			}
+		}
+		if out.Len() == 0 {
+			return NilValue(), false, nil
+		}
+		if s.memLimit > 0 || s.gc.tier1 {
+			s.gc.allocBytes += int64(out.Len()) + 64
+		}
+		return StringValue(s.intern.Intern(out.String())), true, nil
 	}
 	spec := strings.TrimPrefix(FormatValue(fmtArg), "*")
 	if len(spec) == 0 {
