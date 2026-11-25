@@ -168,6 +168,9 @@ func (s *State) initStringArithMetamethods(mt *Table) {
 	s.registerFunc(mt, "__div", intrNone, binArith(TMDiv, "div", nil, func(a, b float64) float64 { return a / b }, true))
 	s.registerFunc(mt, "__idiv", intrNone, binArith(TMIDiv, "idiv", IntDiv, func(a, b float64) float64 { return math.Floor(a / b) }, false))
 	s.registerFunc(mt, "__unm", intrNone, func(st *State, args []Value) ([]Value, error) {
+		if len(args) < 1 {
+			return nil, fmt.Errorf("attempt to negate a 'nil' value")
+		}
 		n, ok := strToNum(st, args[0])
 		if !ok {
 			return nil, fmt.Errorf("attempt to negate a '%s' value", args[0].TypeName())
@@ -1502,15 +1505,48 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 			return nil, err
 		}
 	}
-	vals := make([]Value, n)
+	// Root buffered sort elements on the active thread stack across __index, comparator,
+	// and __newindex callbacks so GC cannot prematurely finalize or clear them.
+	// Always index th.stack[baseTop+...] directly in case callbacks grow th.stack.
+	th := s.cur
+	savedTop := th.top
+	baseTop := savedTop
+	for fi := range th.nframe {
+		cf := &th.frames[fi]
+		if cf.cl != nil {
+			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+				baseTop = end
+			}
+		}
+	}
+	if err := th.ensureStack(baseTop + n + 4); err != nil {
+		return nil, err
+	}
+	written := 0
+	defer func() {
+		if written > 0 {
+			fillNil(th.stack[baseTop : baseTop+written])
+		}
+		th.top = savedTop
+	}()
+	cancelFn := s.nativeCancelFunc()
 	for i := range n {
+		if cancelFn != nil && (i&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
+		th.top = baseTop + i
 		v, err := s.tableGetInt(args[0], int64(i+1))
 		if err != nil {
 			return nil, err
 		}
-		vals[i] = v
+		th.stack[baseTop+i] = v
+		written = i + 1
+		th.top = baseTop + written
 	}
 	comp := func(a, b Value) (bool, error) {
+		th.top = baseTop + n
 		if hasComp {
 			res, err := s.Call(args[1], a, b)
 			if err != nil {
@@ -1520,49 +1556,51 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 		}
 		return s.lessThan(a, b)
 	}
+	swap := func(i, j int) {
+		th.stack[baseTop+i], th.stack[baseTop+j] = th.stack[baseTop+j], th.stack[baseTop+i]
+	}
 	// Port of PUC-Rio Lua 5.5 ltablib.c:auxsort — detects invalid order functions!
 	var auxSort func(lo, up int) error
 	auxSort = func(lo, up int) error {
 		for lo < up {
 			// Sort a[lo], a[up]
-			lt, err := comp(vals[up], vals[lo])
+			lt, err := comp(th.stack[baseTop+up], th.stack[baseTop+lo])
 			if err != nil {
 				return err
 			}
 			if lt {
-				vals[lo], vals[up] = vals[up], vals[lo]
+				swap(lo, up)
 			}
 			if up-lo == 1 {
 				return nil
 			}
 			// Choose pivot (middle element; randomized on large subarrays).
 			p := lo + (up-lo)/2
-			lt, err = comp(vals[p], vals[lo])
+			lt, err = comp(th.stack[baseTop+p], th.stack[baseTop+lo])
 			if err != nil {
 				return err
 			}
 			if lt {
-				vals[p], vals[lo] = vals[lo], vals[p]
+				swap(p, lo)
 			} else {
-				lt, err = comp(vals[up], vals[p])
+				lt, err = comp(th.stack[baseTop+up], th.stack[baseTop+p])
 				if err != nil {
 					return err
 				}
 				if lt {
-					vals[p], vals[up] = vals[up], vals[p]
+					swap(p, up)
 				}
 			}
 			if up-lo == 2 {
 				return nil
 			}
-			pivot := vals[p]
-			vals[p], vals[up-1] = vals[up-1], vals[p]
-			// Partition [lo+1 .. up-2] around pivot
+			swap(p, up-1)
+			// Partition [lo+1 .. up-2] around pivot (rooted at th.stack[baseTop+up-1])
 			i, j := lo, up-1
 			for {
 				for {
 					i++
-					lt, err = comp(vals[i], pivot)
+					lt, err = comp(th.stack[baseTop+i], th.stack[baseTop+up-1])
 					if err != nil {
 						return err
 					}
@@ -1575,7 +1613,7 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 				}
 				for {
 					j--
-					lt, err = comp(pivot, vals[j])
+					lt, err = comp(th.stack[baseTop+up-1], th.stack[baseTop+j])
 					if err != nil {
 						return err
 					}
@@ -1589,9 +1627,9 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 				if j < i {
 					break
 				}
-				vals[i], vals[j] = vals[j], vals[i]
+				swap(i, j)
 			}
-			vals[up-1], vals[i] = vals[i], vals[up-1]
+			swap(up-1, i)
 			// Recurse on smaller half, tail-iterate on larger half (O(log n) stack).
 			if i-lo < up-i {
 				if err := auxSort(lo, i-1); err != nil {
@@ -1610,8 +1648,14 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 	if err := auxSort(0, n-1); err != nil {
 		return nil, err
 	}
-	for i, v := range vals {
-		if err := s.tableSetInt(args[0], int64(i+1), v); err != nil {
+	for i := range n {
+		if cancelFn != nil && (i&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
+		th.top = baseTop + n
+		if err := s.tableSetInt(args[0], int64(i+1), th.stack[baseTop+i]); err != nil {
 			return nil, err
 		}
 	}

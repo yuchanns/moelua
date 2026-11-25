@@ -1012,6 +1012,9 @@ reloadFrame:
 						regs[a+3].SetInt(ni)
 						if c >= 2 {
 							regs[a+4] = v
+							for k := 2; k < c; k++ {
+								regs[int(a)+3+k].SetNil()
+							}
 						}
 					}
 					w2 := ev.insns.at(pc)

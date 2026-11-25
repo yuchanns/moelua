@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"weak"
 
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/internal/luastdlib"
@@ -437,11 +438,37 @@ func (s *State) newFileUD(lf *luaFile) Value {
 		lf.inner = fi
 		runtime.AddCleanup(lf, cleanupFileInner, fi)
 		s.openFiles = append(s.openFiles, fi)
-		// Register for explicit collectgarbage() finalization WITHOUT activating automatic Tier 1 debt triggers!
-		u.gcInFnz = true
-		s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: v})
+		// Track weakly so Go GC + runtime.AddCleanup automatically reclaims discarded
+		// descriptors in Tier 0, while explicit collectgarbage()/Close() still runs __gc.
+		s.gc.weakFiles = append(s.gc.weakFiles, gcWeakFileEntry{u: weak.Make(u), fi: fi})
+		if len(s.gc.weakFiles)&63 == 0 {
+			s.compactWeakFiles()
+			s.compactOpenFiles()
+		}
 	}
 	return v
+}
+
+func (s *State) compactWeakFiles() {
+	if len(s.gc.weakFiles) == 0 {
+		return
+	}
+	kept := s.gc.weakFiles[:0]
+	for _, wf := range s.gc.weakFiles {
+		u := wf.u.Value()
+		if u == nil {
+			if wf.fi != nil {
+				_ = wf.fi.flushAndClose()
+			}
+			continue
+		}
+		if u.gcInFnz || u.gcFnzed {
+			continue
+		}
+		kept = append(kept, wf)
+	}
+	clear(s.gc.weakFiles[len(kept):])
+	s.gc.weakFiles = kept
 }
 
 func (s *State) compactOpenFiles() {

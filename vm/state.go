@@ -584,6 +584,12 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		th.top = funcIdx
 		return nil, herr
 	}
+	clearTopStack := func() {
+		th.top = funcIdx
+		if entryDepth == 0 && th.openUpvals == nil && funcIdx < len(th.stack) {
+			fillNil(th.stack[funcIdx:])
+		}
+	}
 	err := s.runThread(th, entryDepth)
 	if err == nil && s.abortErr != nil {
 		err = s.abortErr
@@ -597,7 +603,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			th.discardTBCAtOrAbove(funcIdx)
 			th.closeUpvals(funcIdx)
 			th.nframe = entryDepth
-			th.top = funcIdx
+			clearTopStack()
 			return nil, err
 		}
 		ev := errorToLuaValue(s, err)
@@ -607,21 +613,21 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			th.discardTBCAtOrAbove(funcIdx)
 			th.closeUpvals(funcIdx)
 			th.nframe = entryDepth
-			th.top = funcIdx
+			clearTopStack()
 			return nil, uerr
 		}
 		th.nframe = entryDepth
-		th.top = funcIdx
+		clearTopStack()
 		return nil, &LuaError{Val: ev}
 	}
 	nres := th.top - funcIdx
 	if nres <= 0 {
-		th.top = funcIdx
+		clearTopStack()
 		return nil, nil
 	}
 	res := make([]Value, nres)
 	copy(res, th.stack[funcIdx:th.top])
-	th.top = funcIdx
+	clearTopStack()
 	return res, nil
 }
 

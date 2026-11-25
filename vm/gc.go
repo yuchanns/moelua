@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"strings"
+	"weak"
 )
 
 // Two-Tier GC Semantics Engine ("Go frees, VM decides reachability"):
@@ -23,6 +24,11 @@ import (
 
 type gcFinalEntry struct {
 	obj Value // *Table or *Userdata
+}
+
+type gcWeakFileEntry struct {
+	u  weak.Pointer[Userdata]
+	fi *fileInner
 }
 
 type gcMode uint8
@@ -47,6 +53,9 @@ type gcState struct {
 
 	// Objects marked for finalization at setmetatable time (registration order; scanned in reverse LIFO).
 	finalizable []gcFinalEntry
+	// Weakly-tracked standard file userdata so Go GC + runtime.AddCleanup reclaims discarded
+	// handles automatically in Tier 0, while explicit collectgarbage()/Close() closes live ones.
+	weakFiles []gcWeakFileEntry
 	// Queue of unreachable objects pending __gc invocation in LIFO order.
 	toBeFnz []Value
 	// Host-pinned references (analog of luaL_ref) so Tier 1 marker keeps host-held Lua values alive.
@@ -630,7 +639,7 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		return // non-reentrant inside __gc (gc.lua:698-705)
 	}
 	countStr := s.memLimit > 0
-	if emergency || (!s.gc.tier1 && len(s.gc.finalizable) == 0) {
+	if emergency || (!s.gc.tier1 && len(s.gc.finalizable) == 0 && len(s.gc.weakFiles) == 0) {
 		// Tier 0 (with no open finalizable handles) or emergency allocation-time recount:
 		// nil-fill dead stack/frame slack and recompute exact live VM bytes without running
 		// __gc finalizers or mutating weak-table slots mid-operation!
@@ -755,6 +764,32 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		kept[i], kept[j] = kept[j], kept[i]
 	}
 	s.gc.finalizable = kept
+	var keptFiles []gcWeakFileEntry
+	for i := len(s.gc.weakFiles) - 1; i >= 0; i-- {
+		wf := s.gc.weakFiles[i]
+		u := wf.u.Value()
+		if u == nil {
+			// Go GC already collected the userdata; ensure flush+close completes synchronously now.
+			if wf.fi != nil {
+				_ = wf.fi.flushAndClose()
+			}
+			continue
+		}
+		if u.gcInFnz || u.gcFnzed {
+			continue
+		}
+		obj := UserdataValue(u)
+		if !tr.isMarked(obj) {
+			u.gcFnzed = true
+			newlySep = append(newlySep, obj)
+		} else {
+			keptFiles = append(keptFiles, wf)
+		}
+	}
+	for i, j := 0, len(keptFiles)-1; i < j; i, j = i+1, j-1 {
+		keptFiles[i], keptFiles[j] = keptFiles[j], keptFiles[i]
+	}
+	s.gc.weakFiles = keptFiles
 	s.gc.toBeFnz = append(s.gc.toBeFnz, newlySep...)
 
 	// Step 4: markBeingFnz + propagate (resurrection: keeps dying object & its refs alive during __gc!).
@@ -871,6 +906,22 @@ func (s *State) Close() {
 			s.gc.toBeFnz = append(s.gc.toBeFnz, obj)
 		}
 		s.gc.finalizable = nil
+		for i := len(s.gc.weakFiles) - 1; i >= 0; i-- {
+			wf := s.gc.weakFiles[i]
+			u := wf.u.Value()
+			if u == nil {
+				if wf.fi != nil {
+					_ = wf.fi.flushAndClose()
+				}
+				continue
+			}
+			if u.gcInFnz || u.gcFnzed {
+				continue
+			}
+			u.gcFnzed = true
+			s.gc.toBeFnz = append(s.gc.toBeFnz, UserdataValue(u))
+		}
+		s.gc.weakFiles = nil
 	}
 	if s.gc.inGCTM {
 		// Re-entrant Close (e.g. os.exit(0, true) inside a __gc finalizer, main.lua:349):
