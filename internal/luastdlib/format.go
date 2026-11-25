@@ -34,12 +34,13 @@ const (
 
 // FormatArg represents a typed Lua value for Format.
 type FormatArg struct {
-	Kind FormatArgKind
-	Bool bool
-	Int  int64
-	Flt  float64
-	Str  string
-	Ptr  uintptr // 0 represents NULL ("(null)")
+	Kind     FormatArgKind
+	Bool     bool
+	Int      int64
+	Flt      float64
+	Str      string
+	Ptr      uintptr // 0 represents NULL ("(null)")
+	ToString func() (string, error)
 }
 
 // Convenience constructors for FormatArg.
@@ -723,7 +724,16 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 			}
 
 		case 's':
-			s := formatArgToString(arg)
+			var s string
+			if arg.ToString != nil {
+				var err error
+				s, err = arg.ToString()
+				if err != nil {
+					return "", err
+				}
+			} else {
+				s = formatArgToString(arg)
+			}
 			if len(form) == 2 {
 				b.WriteString(s)
 			} else {

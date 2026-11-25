@@ -1623,3 +1623,24 @@ func TestGSubWithLimitsBoundsOutput(t *testing.T) {
 		t.Fatalf("GSubWithLimits expected limitErr, got %v", err)
 	}
 }
+
+func TestFormatLazyToString(t *testing.T) {
+	called := 0
+	arg := FormatArg{
+		Kind: ArgPointer,
+		Ptr:  0x1234,
+		ToString: func() (string, error) {
+			called++
+			return "custom", nil
+		},
+	}
+	if got, err := Format("plain", []FormatArg{arg}); err != nil || got != "plain" || called != 0 {
+		t.Fatalf("plain format invoked ToString: got=%q err=%v called=%d", got, err, called)
+	}
+	if got, err := Format("%p", []FormatArg{arg}); err != nil || got != "0x1234" || called != 0 {
+		t.Fatalf("%%p format invoked ToString: got=%q err=%v called=%d", got, err, called)
+	}
+	if got, err := Format("%s", []FormatArg{arg}); err != nil || got != "custom" || called != 1 {
+		t.Fatalf("%%s format failed lazy ToString: got=%q err=%v called=%d", got, err, called)
+	}
+}
