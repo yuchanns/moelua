@@ -4139,3 +4139,188 @@ func TestCodexReviewRound17VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound18VMRegressions(t *testing.T) {
+	// 1. Obsolete Table.inlineSlots are cleared when growing record slots or demoting to dict.
+	t.Run("table_inline_slots_cleared_on_growth_and_demotion", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local kept = {}
+			for i = 1, 60 do
+				local t = {}
+				t.a = string.rep(string.char(65 + (i % 26)), 32768)
+				t.b = 1
+				t.c = 2
+				t.a = nil
+				kept[i] = t
+			end
+			-- Also exercise demotion from inline record slots to dictionary via long string key.
+			local d = {}
+			d.a = string.rep("Z", 32768)
+			d[string.rep("k", 64)] = 9
+			d.a = nil
+			kept[#kept + 1] = d
+			_G._kept_inline_tables = kept
+			return #kept
+		`), "=inline_slots_clear")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].Int() != 61 {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		keptVal := s.GetGlobal("_kept_inline_tables")
+		if !keptVal.IsTable() {
+			t.Fatalf("expected kept table")
+		}
+		keptTbl := keptVal.AsTable()
+		for i := int64(1); i <= 61; i++ {
+			tv := keptTbl.RawGetInt(i)
+			if !tv.IsTable() {
+				t.Fatalf("entry %d not a table", i)
+			}
+			tbl := tv.AsTable()
+			if (!tbl.inlineSlots[0].IsNil() && tbl.inlineSlots[0].ptr != nil) || (!tbl.inlineSlots[1].IsNil() && tbl.inlineSlots[1].ptr != nil) {
+				t.Fatalf("table %d retained stale inlineSlots pointer after growth/demotion: %v", i, tbl.inlineSlots)
+			}
+		}
+	})
+
+	// 2. Converted captures are rooted across subsequent captureToValue allocations in match/find/gmatch/gsub.
+	t.Run("string_captures_rooted_across_allocation_checks", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local subj = string.rep("x", 32768) .. ";"
+			local pat = string.rep("(", 16) .. "x+" .. string.rep(")", 16)
+
+			local ok1, e1 = pcall(string.match, subj, pat)
+			assert(not ok1 and string.find(tostring(e1), "not enough memory", 1, true),
+				"expected match OOM, got " .. tostring(ok1) .. "," .. tostring(e1))
+
+			local ok2, e2 = pcall(string.find, subj, pat)
+			assert(not ok2 and string.find(tostring(e2), "not enough memory", 1, true),
+				"expected find OOM, got " .. tostring(ok2) .. "," .. tostring(e2))
+
+			local ok3, e3 = pcall(function()
+				local it = string.gmatch(subj, pat)
+				return it()
+			end)
+			assert(not ok3 and string.find(tostring(e3), "not enough memory", 1, true),
+				"expected gmatch OOM, got " .. tostring(ok3) .. "," .. tostring(e3))
+
+			local ok4, e4 = pcall(string.gsub, subj, pat, function(...) return "ok" end)
+			assert(not ok4 and string.find(tostring(e4), "not enough memory", 1, true),
+				"expected gsub OOM, got " .. tostring(ok4) .. "," .. tostring(e4))
+
+			-- Small multi-capture patterns within budget still work normally.
+			local a, b = string.match("hello world", "(%w+) (%w+)")
+			assert(a == "hello" and b == "world")
+			return "ok"
+		`), "=capture_root_oom")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(131072)
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("capture rooting OOM failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. coroutine.close() inside an xpcall message handler propagates immediately and runs once.
+	t.Run("xpcall_handler_coro_close_self_terminates_cleanly", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local calls = 0
+			local closed = false
+			local co = coroutine.create(function()
+				local guard <close> = setmetatable({}, {
+					__close = function() closed = true end,
+				})
+				return pcall(function()
+					return xpcall(function()
+						error("boom")
+					end, function(err)
+						calls = calls + 1
+						assert(calls == 1, "handler must not re-enter on self-close")
+						coroutine.close(coroutine.running())
+						return "unreachable"
+					end)
+				end)
+			end)
+			local ok, r = coroutine.resume(co)
+			assert(ok == true and r == nil, "expected resume true, nil; got " .. tostring(ok) .. "," .. tostring(r))
+			assert(coroutine.status(co) == "dead")
+			assert(calls == 1, "expected handler called once, got " .. tostring(calls))
+			assert(closed == true, "expected <close> var finalized on self-close")
+			-- Main thread must remain completely unaffected afterwards.
+			local sum = 0
+			for i = 1, 10 do sum = sum + i end
+			assert(sum == 55)
+			return "ok"
+		`), "=xpcall_self_close")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("xpcall self-close failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. Surviving strings in weak-value, weak-key, and all-weak tables are counted in liveBytes.
+	t.Run("weak_tables_account_for_surviving_strings", func(t *testing.T) {
+		for _, mode := range []string{"v", "k", "kv"} {
+			s := NewState()
+			defer s.Close()
+			s.SetMemoryLimit(131072)
+			cl, err := s.LoadChunk([]byte(fmt.Sprintf(`
+				local w = setmetatable({}, { __mode = %q })
+				local ok, err = pcall(function()
+					for i = 1, 40 do
+						local str = string.rep(string.char(65 + (i %% 26)), 32768) .. tostring(i)
+						if %q == "k" then
+							w[str] = i
+						else
+							w[i] = str
+						end
+						str = nil
+						collectgarbage("collect")
+					end
+				end)
+				w = nil
+				collectgarbage("collect")
+				assert(not ok and string.find(tostring(err), "not enough memory", 1, true),
+					"expected OOM for __mode=%s weak table strings, got " .. tostring(ok) .. "," .. tostring(err))
+				return "ok"
+			`, mode, mode, mode)), "=weak_strings_"+mode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+				t.Fatalf("weak table __mode=%s string accounting failed: res=%v err=%v", mode, res, err)
+			}
+		}
+
+		// Verify dead collectable keys/values in all-weak tables are still cleared and do NOT pin strings.
+		s2 := NewState()
+		defer s2.Close()
+		s2.SetMemoryLimit(131072)
+		cl2, err := s2.LoadChunk([]byte(`
+			local w = setmetatable({}, { __mode = "kv" })
+			for i = 1, 20 do
+				w[{}] = string.rep(string.char(65 + (i % 26)), 32768) .. tostring(i)
+				collectgarbage("collect")
+			end
+			assert(next(w) == nil, "dead table keys in __mode='kv' must still be cleared")
+			return "ok"
+		`), "=weak_kv_dead_keys_cleared")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("weak kv dead keys check failed: res=%v err=%v", res, err)
+		}
+	})
+}
