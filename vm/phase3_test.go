@@ -2081,3 +2081,229 @@ func TestCodexReviewRound9VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound10VMRegressions(t *testing.T) {
+	// 1. Compiled chunk/Proto storage is checked on Load and retained in GC recounting.
+	t.Run("compiled_chunk_storage_memlimit", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local src = string.rep("x=x+1\n", 1000)
+			local kept = {}
+			local failed = false
+			local errMsg = ""
+			for i = 1, 100 do
+				local fn, err = load(src)
+				if not fn then
+					failed = true
+					errMsg = tostring(err)
+					break
+				end
+				kept[i] = fn
+				collectgarbage("collect")
+			end
+			local count = #kept
+			kept = nil
+			src = nil
+			collectgarbage("collect")
+			assert(failed and string.find(errMsg, "not enough memory", 1, true),
+				"expected OOM loading repeated compiled chunks, got failed=" .. tostring(failed) .. " count=" .. count .. " err=" .. errMsg)
+			local okFn = assert(load("return 42"))
+			assert(okFn() == 42)
+			return "ok"
+		`), "=chunk_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(65536)
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. Live file setvbuf buffers are included in GC memory recounting.
+	t.Run("file_setvbuf_recounted_by_gc", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local kept = {}
+			local failed = false
+			local errMsg = ""
+			for i = 1, 100 do
+				local okOpen, f, ferr = pcall(io.tmpfile)
+				if not okOpen or not f then
+					failed = true
+					errMsg = tostring(not okOpen and f or ferr)
+					break
+				end
+				local ok, err = pcall(f.setvbuf, f, "full", 32768)
+				if not ok then
+					f:close()
+					failed = true
+					errMsg = tostring(err)
+					break
+				end
+				kept[i] = f
+				collectgarbage("collect")
+			end
+			local count = #kept
+			for i = 1, count do
+				kept[i]:close()
+			end
+			kept = nil
+			collectgarbage("collect")
+			assert(failed and count >= 1 and count < 4 and string.find(errMsg, "not enough memory", 1, true),
+				"expected OOM retaining 32KiB file buffers, got failed=" .. tostring(failed) .. " count=" .. count .. " err=" .. errMsg)
+			return "ok"
+		`), "=file_buf_memlimit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(98304)
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 3. Immediate comparisons resolve metamethods from both operands in logical order (luaT_callorderiTM).
+	t.Run("immediate_comparisons_both_operands_and_precedence", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local calls = {}
+			local plain = {}
+			debug.setmetatable(0, {
+				__lt = function(a, b)
+					calls[#calls + 1] = "num_lt(" .. type(a) .. "," .. type(b) .. ")"
+					return true
+				end,
+				__le = function(a, b)
+					calls[#calls + 1] = "num_le(" .. type(a) .. "," .. type(b) .. ")"
+					return true
+				end,
+			})
+			assert((plain < 1) == true)
+			assert((plain <= 1) == true)
+			assert((plain > 1) == true)
+			assert((plain >= 1) == true)
+			assert((plain < 1.0) == true)
+			assert((plain >= 1.0) == true)
+			local expected1 = "num_lt(table,number);num_le(table,number);num_lt(number,table);num_le(number,table);num_lt(table,number);num_le(number,table)"
+			assert(table.concat(calls, ";") == expected1, "unexpected plain calls: " .. table.concat(calls, ";"))
+
+			-- Operand-order precedence when both operands have metamethods:
+			calls = {}
+			local both = setmetatable({}, {
+				__lt = function(a, b)
+					calls[#calls + 1] = "tbl_lt(" .. type(a) .. "," .. type(b) .. ")"
+					return false
+				end,
+				__le = function(a, b)
+					calls[#calls + 1] = "tbl_le(" .. type(a) .. "," .. type(b) .. ")"
+					return false
+				end,
+			})
+			assert((both < 1) == false)
+			assert((both <= 1) == false)
+			assert((both > 1) == true)
+			assert((both >= 1) == true)
+			local n = 1
+			assert((both < n) == false)
+			assert((both <= n) == false)
+			assert((both > n) == true)
+			assert((both >= n) == true)
+			local expected2 = "tbl_lt(table,number);tbl_le(table,number);num_lt(number,table);num_le(number,table);tbl_lt(table,number);tbl_le(table,number);num_lt(number,table);num_le(number,table)"
+			assert(table.concat(calls, ";") == expected2, "unexpected precedence calls: " .. table.concat(calls, ";"))
+
+			-- Lua 5.5 does not fall back from __le to __lt.
+			debug.setmetatable(0, nil)
+			local onlyLt = setmetatable({}, { __lt = function() return false end })
+			assert(not pcall(function() return onlyLt <= 1 end))
+			assert(not pcall(function() return onlyLt <= n end))
+			return "ok"
+		`), "=imm_cmp_mm")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 4. os.tmpname keeps the reserved file on POSIX systems until removed by caller.
+	t.Run("os_tmpname_reserves_posix_file", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local name = os.tmpname()
+			assert(type(name) == "string" and #name > 0)
+			return name
+		`), "=tmpname_reserve")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 1 {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+		name := res[0].AsString().S
+		defer os.Remove(name)
+		if runtime.GOOS != "windows" {
+			if _, err := os.Stat(name); err != nil {
+				t.Fatalf("expected os.tmpname path %q to remain reserved on POSIX: %v", name, err)
+			}
+		}
+	})
+
+	// 5. file:write failures return the 4th result containing total written bytes.
+	t.Run("file_write_failure_returns_byte_count", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		roPath := filepath.Join(t.TempDir(), "readonly.txt")
+		if err := os.WriteFile(roPath, []byte("hello"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cl, err := s.LoadChunk([]byte(fmt.Sprintf(`
+			local function checkFail4(r1, r2, r3, r4, n, expectBytes, label)
+				assert(n == 4, label .. ": expected 4 return values, got " .. tostring(n))
+				assert(r1 == nil and type(r2) == "string" and type(r3) == "number", label .. ": bad ioFail prefix")
+				assert(r4 == expectBytes, label .. ": expected written=" .. expectBytes .. ", got " .. tostring(r4))
+			end
+			-- Unbuffered read-only file:
+			local ro = assert(io.open(%q, "r"))
+			local a, b, c, d = ro:write("abc", "def")
+			checkFail4(a, b, c, d, select("#", ro:write("abc", "def")), 0, "ro_unbuf")
+			-- Line-buffered flush error:
+			assert(ro:setvbuf("line", 16))
+			a, b, c, d = ro:write("abc\n")
+			checkFail4(a, b, c, d, select("#", ro:write("abc\n")), 0, "ro_line")
+			-- Full-buffered overflow error:
+			assert(ro:setvbuf("full", 8))
+			a, b, c, d = ro:write("1234", "567890123456")
+			checkFail4(a, b, c, d, select("#", ro:write("1234", "567890123456")), 0, "ro_full")
+			ro:close()
+
+			-- Also verify /dev/full when available (e.g. Linux):
+			local full = io.open("/dev/full", "w")
+			if full then
+				assert(full:setvbuf("no"))
+				a, b, c, d = full:write("abc", "def")
+				checkFail4(a, b, c, d, select("#", full:write("abc", "def")), 0, "devfull_no")
+				assert(full:setvbuf("line", 16))
+				a, b, c, d = full:write("abc\n")
+				checkFail4(a, b, c, d, select("#", full:write("abc\n")), 0, "devfull_line")
+				assert(full:setvbuf("full", 8))
+				a, b, c, d = full:write("1234", "567890123456")
+				checkFail4(a, b, c, d, select("#", full:write("1234", "567890123456")), 0, "devfull_full")
+				full:close()
+			end
+			return "ok"
+		`, roPath)), "=file_write_err_count")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("Call failed: res=%v err=%v", res, err)
+		}
+	})
+}
