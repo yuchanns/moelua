@@ -382,4 +382,23 @@ func TestCLIFlagsREPLAndStdinParity(t *testing.T) {
 			t.Fatalf("expected original table error with traceback, got stderr=%q", stderr)
 		}
 	})
+
+	// 18. REPL anchors expression results across metamethod-aware _G.print lookup.
+	t.Run("repl_anchors_results_across_print_lookup", func(t *testing.T) {
+		in := strings.Join([]string{
+			`finalized = false`,
+			`orig_print = print`,
+			`print = nil`,
+			`setmetatable(_G, { __index = function(_, k) if k == "print" then collectgarbage("collect"); return function(v) orig_print("FINALIZED=" .. tostring(finalized) .. " TAG=" .. tostring(v.tag)) end end end })`,
+			`setmetatable({ tag = "alive" }, { __gc = function() finalized = true end })`,
+			"",
+		}, "\n")
+		out, stderr, err := run("", in, nil, "-E", "-i")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%s", err, stderr)
+		}
+		if !strings.Contains(out, "FINALIZED=false TAG=alive") {
+			t.Fatalf("expected REPL result to remain anchored across _G.__index print lookup, got stdout=%q stderr=%q", out, stderr)
+		}
+	})
 }

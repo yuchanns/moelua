@@ -1048,3 +1048,50 @@ func TestStreamingPublicAPI(t *testing.T) {
 		t.Fatalf("DoFile(binary) failed: res=%v err=%v", resBin, err)
 	}
 }
+
+func TestCallbackFactoryMemoryLimitAccounting(t *testing.T) {
+	s := moelua.New(moelua.WithMemoryLimit(65536))
+	defer s.Close()
+
+	var pinned []*moelua.Handle
+	defer func() {
+		for _, h := range pinned {
+			h.Release()
+		}
+	}()
+
+	var hitErr error
+	for i := range 3000 {
+		var (
+			fn  moelua.Value
+			err error
+		)
+		if i%2 == 0 {
+			fn, err = s.TryNewFunc("cb", func(_ *moelua.State, args []moelua.Value) ([]moelua.Value, error) {
+				return args, nil
+			})
+		} else {
+			fn, err = s.TryNewFunc1("cb1", func(_ *moelua.State, _ []moelua.Value) (moelua.Value, error) {
+				return moelua.Int(1), nil
+			})
+		}
+		if err != nil {
+			hitErr = err
+			break
+		}
+		pinned = append(pinned, s.Pin(fn))
+	}
+	if hitErr == nil || !strings.Contains(hitErr.Error(), "not enough memory") {
+		t.Fatalf("expected TryNewFunc/TryNewFunc1 to enforce 64KiB memory limit, pinned=%d err=%v", len(pinned), hitErr)
+	}
+	if usage := s.MemoryUsage(); usage < int64(len(pinned))*48 {
+		t.Fatalf("expected MemoryUsage (%d) to account for %d pinned callbacks (>= %d)", usage, len(pinned), int64(len(pinned))*48)
+	}
+	// Non-erroring NewFunc / NewFunc1 must return Nil rather than bypassing the limit.
+	if v := s.NewFunc("over", func(_ *moelua.State, _ []moelua.Value) ([]moelua.Value, error) { return nil, nil }); !v.IsNil() {
+		t.Fatalf("expected NewFunc to return Nil when over memory limit, got %v", v)
+	}
+	if v := s.NewFunc1("over1", func(_ *moelua.State, _ []moelua.Value) (moelua.Value, error) { return moelua.Nil(), nil }); !v.IsNil() {
+		t.Fatalf("expected NewFunc1 to return Nil when over memory limit, got %v", v)
+	}
+}

@@ -219,13 +219,12 @@ func (s *State) AddSearcher(name string, fn GoFunc) {
 	if !s.ready() || fn == nil {
 		return
 	}
-	s.vm.AddSearcher(&vm.NativeFunc{
-		Name:        name,
-		Collectable: true,
-		Fn: func(_ *vm.State, args []vm.Value) ([]vm.Value, error) {
-			return fn(s, args)
-		},
-	})
+	v, err := s.TryNewFunc(name, fn)
+	if err != nil {
+		return
+	}
+	s.vm.AddSearcher(v.AsNative())
+	_ = s.vm.ConsumeMemErr()
 }
 
 // Preload registers a Go module loader into package.preload[name] so Lua require(name)
@@ -243,7 +242,10 @@ func (s *State) Preload(name string, loader GoFunc) error {
 		if err != nil {
 			return err
 		}
-		v = s.NewFunc(name, loader)
+		v, err = s.TryNewFunc(name, loader)
+		if err != nil {
+			return err
+		}
 	} else {
 		ls = s.vm.Intern(name)
 	}
@@ -558,12 +560,16 @@ type GoFunc func(s *State, args []Value) ([]Value, error)
 // GoFunc1 is a zero-allocation single-return Go function callable from Lua.
 type GoFunc1 func(s *State, args []Value) (Value, error)
 
-// NewFunc wraps a GoFunc as a Lua callable Value.
-func (s *State) NewFunc(name string, fn GoFunc) Value {
-	if !s.ready() || fn == nil {
-		return vm.NilValue()
+// TryNewFunc wraps a GoFunc as a Lua callable Value after checking and accounting for
+// the dynamically allocated native closure against the State's memory limit.
+func (s *State) TryNewFunc(name string, fn GoFunc) (Value, error) {
+	if !s.ready() {
+		return vm.NilValue(), ErrStateClosed
 	}
-	return vm.NativeValue(&vm.NativeFunc{
+	if fn == nil {
+		return vm.NilValue(), nil
+	}
+	return s.vm.TryAllocNative(&vm.NativeFunc{
 		Name:        name,
 		Collectable: true,
 		Fn: func(_ *vm.State, args []vm.Value) ([]vm.Value, error) {
@@ -572,12 +578,27 @@ func (s *State) NewFunc(name string, fn GoFunc) Value {
 	})
 }
 
-// NewFunc1 wraps a single-return GoFunc1 as a Lua callable Value with zero per-call return-slice allocation.
-func (s *State) NewFunc1(name string, fn GoFunc1) Value {
-	if !s.ready() || fn == nil {
+// NewFunc wraps a GoFunc as a Lua callable Value.
+// Returns Nil if the State is closed, fn is nil, or allocation exceeds the configured
+// memory limit (use TryNewFunc to inspect allocation errors).
+func (s *State) NewFunc(name string, fn GoFunc) Value {
+	v, err := s.TryNewFunc(name, fn)
+	if err != nil {
 		return vm.NilValue()
 	}
-	return vm.NativeValue(&vm.NativeFunc{
+	return v
+}
+
+// TryNewFunc1 wraps a single-return GoFunc1 as a Lua callable Value with zero per-call
+// return-slice allocation after checking and accounting against the State's memory limit.
+func (s *State) TryNewFunc1(name string, fn GoFunc1) (Value, error) {
+	if !s.ready() {
+		return vm.NilValue(), ErrStateClosed
+	}
+	if fn == nil {
+		return vm.NilValue(), nil
+	}
+	return s.vm.TryAllocNative(&vm.NativeFunc{
 		Name:        name,
 		Collectable: true,
 		FastFn: func(_ *vm.State, args []vm.Value) (vm.Value, error) {
@@ -586,12 +607,27 @@ func (s *State) NewFunc1(name string, fn GoFunc1) Value {
 	})
 }
 
+// NewFunc1 wraps a single-return GoFunc1 as a Lua callable Value with zero per-call return-slice allocation.
+// Returns Nil if the State is closed, fn is nil, or allocation exceeds the configured
+// memory limit (use TryNewFunc1 to inspect allocation errors).
+func (s *State) NewFunc1(name string, fn GoFunc1) Value {
+	v, err := s.TryNewFunc1(name, fn)
+	if err != nil {
+		return vm.NilValue()
+	}
+	return v
+}
+
 // RegisterFunc installs a GoFunc as a global variable in _G.
 func (s *State) RegisterFunc(name string, fn GoFunc) {
 	if !s.ready() || fn == nil {
 		return
 	}
-	s.SetGlobal(name, s.NewFunc(name, fn))
+	v, err := s.TryNewFunc(name, fn)
+	if err != nil {
+		return
+	}
+	s.SetGlobal(name, v)
 }
 
 // RegisterFunc1 installs a zero-allocation single-return GoFunc1 as a global variable in _G.
@@ -599,7 +635,11 @@ func (s *State) RegisterFunc1(name string, fn GoFunc1) {
 	if !s.ready() || fn == nil {
 		return
 	}
-	s.SetGlobal(name, s.NewFunc1(name, fn))
+	v, err := s.TryNewFunc1(name, fn)
+	if err != nil {
+		return
+	}
+	s.SetGlobal(name, v)
 }
 
 // TrySetGlobal sets a global variable in _G after checking and accounting for the key string

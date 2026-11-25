@@ -465,14 +465,25 @@ func (c *cliState) doREPL(progName string, noEnv bool) {
 			continue
 		}
 		if len(res) > 0 {
-			printFn, gerr := s.GetGlobalMM("print")
-			if gerr != nil {
-				fmt.Fprintf(os.Stderr, "%s: error calling 'print' (%s)\n", progName, s.FormatError(gerr))
-				continue
-			}
-			if _, perr := s.Call(printFn, res...); perr != nil {
-				fmt.Fprintf(os.Stderr, "%s: error calling 'print' (%s)\n", progName, s.FormatError(perr))
-			}
+			func() {
+				refs := make([]int, len(res))
+				for i, v := range res {
+					refs[i] = s.Ref(v)
+				}
+				defer func() {
+					for _, id := range refs {
+						s.Unref(id)
+					}
+				}()
+				printFn, gerr := s.GetGlobalMM("print")
+				if gerr != nil {
+					fmt.Fprintf(os.Stderr, "%s: error calling 'print' (%s)\n", progName, s.FormatError(gerr))
+					return
+				}
+				if _, perr := s.Call(printFn, res...); perr != nil {
+					fmt.Fprintf(os.Stderr, "%s: error calling 'print' (%s)\n", progName, s.FormatError(perr))
+				}
+			}()
 		}
 	}
 }
