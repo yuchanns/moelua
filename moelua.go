@@ -227,6 +227,21 @@ func (s *State) AddSearcher(name string, fn GoFunc) {
 	})
 }
 
+// Preload registers a Go module loader into package.preload[name] so Lua require(name)
+// invokes loader lazily and caches its result in package.loaded[name].
+// Passing a nil loader removes any existing preload entry for name.
+func (s *State) Preload(name string, loader GoFunc) error {
+	if !s.ready() {
+		return ErrStateClosed
+	}
+	v := vm.NilValue()
+	if loader != nil {
+		v = s.NewFunc(name, loader)
+	}
+	s.vm.PreloadTable().RawSetStr(s.vm, s.vm.Intern(name), v)
+	return s.vm.ConsumeMemErr()
+}
+
 // CollectGarbage executes a full deterministic Lua 5.5 GC cycle (including weak-table
 // clearing and synchronous __gc finalizers in Tier 1 mode).
 func (s *State) CollectGarbage() {
@@ -313,6 +328,105 @@ func (s *State) NewUserdata(data any) Value {
 		return vm.NilValue()
 	}
 	return vm.UserdataValue(&vm.Userdata{Data: data})
+}
+
+// NewUserdataWithMeta creates a full Lua userdata carrying arbitrary Go data and
+// attaches mt as its metatable (registering __gc finalization if present on mt).
+func (s *State) NewUserdataWithMeta(data any, mt *Table) (Value, error) {
+	if !s.ready() {
+		return vm.NilValue(), ErrStateClosed
+	}
+	if mt != nil {
+		if !mt.ready() {
+			return vm.NilValue(), ErrStateClosed
+		}
+		if mt.state != s {
+			return vm.NilValue(), fmt.Errorf("moelua: metatable belongs to another State")
+		}
+	}
+	u := s.NewUserdata(data)
+	if mt != nil {
+		s.vm.SetMetatableOf(u, mt.raw)
+		if err := s.vm.ConsumeMemErr(); err != nil {
+			return vm.NilValue(), err
+		}
+	}
+	return u, nil
+}
+
+// GetMetatable returns the metatable of v (table, userdata, string, or type metatable), or nil.
+func (s *State) GetMetatable(v Value) *Table {
+	if !s.ready() {
+		return nil
+	}
+	mt := s.vm.GetMetatableOf(v)
+	if mt == nil {
+		return nil
+	}
+	return &Table{state: s, raw: mt}
+}
+
+// SetMetatable sets the metatable of v (table, userdata, string, or type metatable).
+// Passing a nil mt clears the metatable.
+func (s *State) SetMetatable(v Value, mt *Table) error {
+	if !s.ready() {
+		return ErrStateClosed
+	}
+	var rawMT *vm.Table
+	if mt != nil {
+		if !mt.ready() {
+			return ErrStateClosed
+		}
+		if mt.state != s {
+			return fmt.Errorf("moelua: metatable belongs to another State")
+		}
+		rawMT = mt.raw
+	}
+	s.vm.SetMetatableOf(v, rawMT)
+	return s.vm.ConsumeMemErr()
+}
+
+// NewMetatable creates and registers a named metatable in the Lua registry (analogous to
+// luaL_newmetatable). If a table is already registered under name, it returns (existing, false);
+// otherwise it creates a new table with __name = name, stores it in the registry, and returns (mt, true).
+func (s *State) NewMetatable(name string) (*Table, bool) {
+	if !s.ready() {
+		return nil, false
+	}
+	reg := s.vm.Registry()
+	key := s.vm.Intern(name)
+	if existing := reg.RawGetStr(key); existing.IsTable() {
+		return &Table{state: s, raw: existing.AsTable()}, false
+	}
+	mt := s.vm.NewTable(0, 4)
+	mt.RawSetStr(s.vm, s.vm.Intern("__name"), vm.StringValue(key))
+	reg.RawSetStr(s.vm, key, vm.TableValue(mt))
+	return &Table{state: s, raw: mt}, true
+}
+
+// GetMetatableByName retrieves a named metatable previously created with NewMetatable
+// (analogous to luaL_getmetatable), or nil if none exists.
+func (s *State) GetMetatableByName(name string) *Table {
+	if !s.ready() {
+		return nil
+	}
+	if existing := s.vm.Registry().RawGetStr(s.vm.Intern(name)); existing.IsTable() {
+		return &Table{state: s, raw: existing.AsTable()}
+	}
+	return nil
+}
+
+// CheckUserdata verifies that v is a userdata whose metatable matches the registry
+// metatable named name (analogous to luaL_testudata) and returns its Go payload.
+func (s *State) CheckUserdata(v Value, name string) (any, bool) {
+	if !s.ready() || !v.IsUserdata() {
+		return nil, false
+	}
+	mt := s.GetMetatableByName(name)
+	if mt == nil || s.vm.GetMetatableOf(v) != mt.raw {
+		return nil, false
+	}
+	return v.AsUserdata().Data, true
 }
 
 // Handle is a GC-anchored host reference to a Lua Value (analogous to luaL_ref).
@@ -590,6 +704,162 @@ func (t *Table) SetString(key string, val Value) error {
 	}
 	t.raw.RawSetStr(t.state.vm, t.state.vm.Intern(key), val)
 	return t.state.vm.ConsumeMemErr()
+}
+
+// Metatable returns t's metatable, or nil if none is set (or t/State is closed).
+func (t *Table) Metatable() *Table {
+	if !t.ready() {
+		return nil
+	}
+	mt := t.raw.Metatable()
+	if mt == nil {
+		return nil
+	}
+	return &Table{state: t.state, raw: mt}
+}
+
+// SetMetatable sets or clears (when mt == nil) t's metatable.
+func (t *Table) SetMetatable(mt *Table) error {
+	if !t.ready() {
+		return ErrStateClosed
+	}
+	return t.state.SetMetatable(t.Value(), mt)
+}
+
+// Next returns the next (key, value) pair after key in t, matching Lua next(t, key).
+// Pass Nil() for key to start iteration. When no more entries exist, ok is false and err is nil.
+func (t *Table) Next(key Value) (nextKey, nextVal Value, ok bool, err error) {
+	if !t.ready() {
+		return vm.NilValue(), vm.NilValue(), false, ErrStateClosed
+	}
+	nk, nv, err := t.raw.Next(key)
+	if err != nil {
+		return vm.NilValue(), vm.NilValue(), false, err
+	}
+	if nk.IsNil() {
+		return vm.NilValue(), vm.NilValue(), false, nil
+	}
+	return nk, nv, true, nil
+}
+
+// ForEach iterates over all raw entries in t using Lua next() traversal order,
+// stopping early and returning the error if fn returns a non-nil error.
+func (t *Table) ForEach(fn func(key, val Value) error) error {
+	if !t.ready() {
+		return ErrStateClosed
+	}
+	if fn == nil {
+		return nil
+	}
+	k := vm.NilValue()
+	for {
+		nk, nv, ok, err := t.Next(k)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if err := fn(nk, nv); err != nil {
+			return err
+		}
+		k = nk
+	}
+}
+
+// ThreadStatus identifies the lifecycle state of a Lua coroutine Thread.
+type ThreadStatus = vm.ThreadStatus
+
+const (
+	ThreadOK        ThreadStatus = vm.ThreadOK        // fresh coroutine (ready to start) or running
+	ThreadSuspended ThreadStatus = vm.ThreadSuspended // suspended via coroutine.yield
+	ThreadNormal    ThreadStatus = vm.ThreadNormal    // active coroutine resuming another coroutine
+	ThreadDead      ThreadStatus = vm.ThreadDead      // finished, errored, or closed
+)
+
+// Thread is a handle to a Lua 5.5 coroutine bound to a State.
+// Hold a Pin(th.Value()) handle if a Go-created Thread must stay alive across
+// Tier 1 CollectGarbage() without being referenced from Lua globals/tables.
+type Thread struct {
+	state *State
+	raw   *vm.Thread
+}
+
+func (th *Thread) ready() bool {
+	return th != nil && th.raw != nil && th.state.ready()
+}
+
+// NewThread creates a new suspended coroutine ready to execute fn (analogous to coroutine.create).
+func (s *State) NewThread(fn Value) (*Thread, error) {
+	if !s.ready() {
+		return nil, ErrStateClosed
+	}
+	raw, err := s.vm.NewThread(fn)
+	if err != nil {
+		return nil, err
+	}
+	return &Thread{state: s, raw: raw}, nil
+}
+
+// ThreadOf wraps a Lua thread Value into a *Thread handle (returns nil if v is not a thread or s is closed).
+func (s *State) ThreadOf(v Value) *Thread {
+	if !s.ready() || !v.IsThread() {
+		return nil
+	}
+	return &Thread{state: s, raw: v.AsThread()}
+}
+
+// Value returns the underlying Lua thread Value (Nil if th is nil or its State is closed).
+func (th *Thread) Value() Value {
+	if !th.ready() {
+		return vm.NilValue()
+	}
+	return vm.ThreadValue(th.raw)
+}
+
+// Raw returns the underlying *vm.Thread (nil if th is nil or its State is closed).
+func (th *Thread) Raw() *vm.Thread {
+	if !th.ready() {
+		return nil
+	}
+	return th.raw
+}
+
+// Status returns the internal ThreadStatus of th (ThreadDead if nil or closed).
+// Note that a freshly created Thread has internal status ThreadOK before its first
+// Resume, while StatusString reports "suspended" per Lua's coroutine.status().
+func (th *Thread) Status() ThreadStatus {
+	if !th.ready() {
+		return ThreadDead
+	}
+	return th.raw.Status()
+}
+
+// StatusString returns Lua's coroutine.status(co) string ("suspended", "running", "normal", or "dead").
+func (th *Thread) StatusString() string {
+	if !th.ready() {
+		return "dead"
+	}
+	return th.raw.StatusString()
+}
+
+// Resume starts or resumes th with args. When err is nil, yielded is true if th suspended
+// via coroutine.yield(results...) and false if th returned normally with results.
+// Uncatchable cancellation (WithContext / WithInstructionLimit) propagates directly as err.
+func (th *Thread) Resume(args ...Value) (results []Value, yielded bool, err error) {
+	if !th.ready() {
+		return nil, false, ErrStateClosed
+	}
+	return th.state.vm.Resume(th.raw, args...)
+}
+
+// Close closes a suspended or dead coroutine and executes any pending <close>
+// to-be-closed variable metamethods (analogous to coroutine.close).
+func (th *Thread) Close() error {
+	if !th.ready() {
+		return ErrStateClosed
+	}
+	return th.state.vm.CloseThread(th.raw)
 }
 
 // FormatValue formats any Lua Value as a Go string (matching tostring without metamethods).

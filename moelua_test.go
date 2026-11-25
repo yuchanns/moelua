@@ -536,4 +536,295 @@ func TestPublicAPINilAndPostCloseSafety(t *testing.T) {
 		t.Fatalf("expected Nil from Table/Handle after State.Close")
 	}
 	h.Release() // safe after Close
+
+	// Nil/closed guards on Thread and new metatable/preload/iteration methods.
+	var nilTh *moelua.Thread
+	if !nilTh.Value().IsNil() || nilTh.Raw() != nil || nilTh.Status() != moelua.ThreadDead || nilTh.StatusString() != "dead" {
+		t.Fatalf("unexpected nil Thread getters")
+	}
+	if _, _, err := nilTh.Resume(); !errors.Is(err, moelua.ErrStateClosed) {
+		t.Fatalf("expected ErrStateClosed on nil Thread.Resume, got %v", err)
+	}
+	if err := nilTh.Close(); !errors.Is(err, moelua.ErrStateClosed) {
+		t.Fatalf("expected ErrStateClosed on nil Thread.Close, got %v", err)
+	}
+	if err := s.Preload("m", nil); !errors.Is(err, moelua.ErrStateClosed) {
+		t.Fatalf("expected ErrStateClosed on closed State.Preload, got %v", err)
+	}
+	if _, err := s.NewThread(moelua.Nil()); !errors.Is(err, moelua.ErrStateClosed) {
+		t.Fatalf("expected ErrStateClosed on closed State.NewThread, got %v", err)
+	}
+	if err := tbl.ForEach(func(_, _ moelua.Value) error { return nil }); !errors.Is(err, moelua.ErrStateClosed) {
+		t.Fatalf("expected ErrStateClosed on closed Table.ForEach, got %v", err)
+	}
+}
+
+func TestMetatablesAndTypedUserdata(t *testing.T) {
+	type counter struct{ n int64 }
+
+	s := moelua.New()
+	defer s.Close()
+
+	mt, created := s.NewMetatable("moelua.Counter")
+	if !created || mt == nil {
+		t.Fatalf("expected new metatable created=true")
+	}
+	mt2, created2 := s.NewMetatable("moelua.Counter")
+	if created2 || mt2.Raw() != mt.Raw() {
+		t.Fatalf("expected second NewMetatable to return existing table")
+	}
+	if got := s.GetMetatableByName("moelua.Counter"); got == nil || got.Raw() != mt.Raw() {
+		t.Fatalf("GetMetatableByName mismatch")
+	}
+	if name := mt.GetString("__name"); !name.IsString() || name.AsString().S != "moelua.Counter" {
+		t.Fatalf("expected __name='moelua.Counter', got %v", name)
+	}
+
+	methods := s.NewTable(0, 2)
+	_ = methods.SetString("inc", s.NewFunc1("inc", func(st *moelua.State, args []moelua.Value) (moelua.Value, error) {
+		raw, ok := st.CheckUserdata(args[0], "moelua.Counter")
+		if !ok {
+			return moelua.Nil(), errors.New("expected Counter")
+		}
+		c := raw.(*counter)
+		delta := int64(1)
+		if len(args) >= 2 {
+			if d, ok := args[1].ToInt(); ok {
+				delta = d
+			}
+		}
+		c.n += delta
+		return moelua.Int(c.n), nil
+	}))
+	_ = mt.SetString("__index", methods.Value())
+
+	finalized := int64(0)
+	_ = mt.SetString("__gc", s.NewFunc1("gc", func(st *moelua.State, args []moelua.Value) (moelua.Value, error) {
+		if raw, ok := st.CheckUserdata(args[0], "moelua.Counter"); ok {
+			finalized = raw.(*counter).n
+		}
+		return moelua.Nil(), nil
+	}))
+
+	ud, err := s.NewUserdataWithMeta(&counter{n: 10}, mt)
+	if err != nil {
+		t.Fatalf("NewUserdataWithMeta: %v", err)
+	}
+	if gotMT := s.GetMetatable(ud); gotMT == nil || gotMT.Raw() != mt.Raw() {
+		t.Fatalf("GetMetatable(ud) mismatch")
+	}
+	if _, ok := s.CheckUserdata(ud, "other.Type"); ok {
+		t.Fatalf("CheckUserdata should reject mismatched metatable name")
+	}
+	s.SetGlobal("c", ud)
+
+	res, err := s.DoString(`return c:inc(), c:inc(5), tostring(c):find("moelua.Counter", 1, true) ~= nil`)
+	if err != nil {
+		t.Fatalf("DoString: %v", err)
+	}
+	if res[0].Int() != 11 || res[1].Int() != 16 || !res[2].IsTrue() {
+		t.Fatalf("unexpected userdata method results: %v", res)
+	}
+
+	// Verify __gc triggers on CollectGarbage once unreferenced.
+	s.SetGlobal("c", moelua.Nil())
+	s.CollectGarbage()
+	if finalized != 16 {
+		t.Fatalf("expected __gc finalizer to observe counter=16, got %d", finalized)
+	}
+
+	// Verify Table.SetMetatable / Table.Metatable and cross-State rejection.
+	tbl := s.NewTable(0, 1)
+	if err := tbl.SetMetatable(mt); err != nil {
+		t.Fatalf("Table.SetMetatable: %v", err)
+	}
+	if tbl.Metatable() == nil || tbl.Metatable().Raw() != mt.Raw() {
+		t.Fatalf("Table.Metatable mismatch")
+	}
+	if err := tbl.SetMetatable(nil); err != nil || tbl.Metatable() != nil {
+		t.Fatalf("clearing Table metatable failed: err=%v mt=%v", err, tbl.Metatable())
+	}
+
+	other := moelua.New()
+	defer other.Close()
+	otherMT := other.NewTable(0, 1)
+	if err := s.SetMetatable(tbl.Value(), otherMT); err == nil {
+		t.Fatalf("expected cross-State SetMetatable error")
+	}
+}
+
+func TestTableNextAndForEach(t *testing.T) {
+	s := moelua.New()
+	defer s.Close()
+
+	res, err := s.DoString(`return { 10, 20, 30, a = "alpha", b = "beta" }`)
+	if err != nil {
+		t.Fatalf("DoString: %v", err)
+	}
+	tbl := s.TableOf(res[0])
+	if tbl == nil {
+		t.Fatalf("expected table")
+	}
+
+	seen := map[string]string{}
+	if err := tbl.ForEach(func(k, v moelua.Value) error {
+		seen[moelua.FormatValue(k)] = moelua.FormatValue(v)
+		return nil
+	}); err != nil {
+		t.Fatalf("ForEach: %v", err)
+	}
+	want := map[string]string{"1": "10", "2": "20", "3": "30", "a": "alpha", "b": "beta"}
+	if len(seen) != len(want) {
+		t.Fatalf("ForEach count=%d want=%d: %v", len(seen), len(want), seen)
+	}
+	for k, w := range want {
+		if seen[k] != w {
+			t.Fatalf("ForEach[%q]=%q want %q", k, seen[k], w)
+		}
+	}
+
+	// Early stop propagates caller error.
+	sentinel := errors.New("stop-early")
+	visits := 0
+	err = tbl.ForEach(func(_, _ moelua.Value) error {
+		visits++
+		if visits == 2 {
+			return sentinel
+		}
+		return nil
+	})
+	if !errors.Is(err, sentinel) || visits != 2 {
+		t.Fatalf("expected early stop sentinel at 2 visits, got err=%v visits=%d", err, visits)
+	}
+
+	// Invalid key to Next returns an error.
+	if _, _, _, err := tbl.Next(s.String("nonexistent-key")); err == nil {
+		t.Fatalf("expected invalid key error from Next")
+	}
+}
+
+func TestPreloadModule(t *testing.T) {
+	s := moelua.New()
+	defer s.Close()
+
+	loads := 0
+	if err := s.Preload("native.mathx", func(st *moelua.State, args []moelua.Value) ([]moelua.Value, error) {
+		loads++
+		mod := st.NewTable(0, 1)
+		_ = mod.SetString("triple", st.NewFunc1("triple", func(_ *moelua.State, a []moelua.Value) (moelua.Value, error) {
+			return moelua.Int(a[0].Int() * 3), nil
+		}))
+		return []moelua.Value{mod.Value()}, nil
+	}); err != nil {
+		t.Fatalf("Preload: %v", err)
+	}
+
+	res, err := s.DoString(`
+		local m1 = require("native.mathx")
+		local m2 = require("native.mathx")
+		return m1 == m2, m1.triple(14)
+	`)
+	if err != nil {
+		t.Fatalf("DoString: %v", err)
+	}
+	if !res[0].IsTrue() || res[1].Int() != 42 || loads != 1 {
+		t.Fatalf("unexpected preload behavior: res=%v loads=%d", res, loads)
+	}
+}
+
+func TestGoDrivenCoroutines(t *testing.T) {
+	s := moelua.New()
+	defer s.Close()
+
+	res, err := s.DoString(`
+		closed = false
+		return function(init)
+			local guard <close> = setmetatable({}, {
+				__close = function() closed = true end
+			})
+			local a = coroutine.yield("step1", init + 1)
+			local b = coroutine.yield("step2", a * 10)
+			return "done", b + 5
+		end
+	`)
+	if err != nil {
+		t.Fatalf("DoString: %v", err)
+	}
+	th, err := s.NewThread(res[0])
+	if err != nil {
+		t.Fatalf("NewThread: %v", err)
+	}
+	if th.StatusString() != "suspended" || th.Status() != moelua.ThreadOK {
+		t.Fatalf("fresh thread status=%v (%q)", th.Status(), th.StatusString())
+	}
+	if wrapped := s.ThreadOf(th.Value()); wrapped == nil || wrapped.Raw() != th.Raw() {
+		t.Fatalf("ThreadOf roundtrip failed")
+	}
+
+	r1, yielded, err := th.Resume(moelua.Int(4))
+	if err != nil || !yielded || len(r1) != 2 || r1[0].AsString().S != "step1" || r1[1].Int() != 5 {
+		t.Fatalf("Resume 1: res=%v yielded=%v err=%v", r1, yielded, err)
+	}
+	if th.Status() != moelua.ThreadSuspended || th.StatusString() != "suspended" {
+		t.Fatalf("after yield status=%v (%q)", th.Status(), th.StatusString())
+	}
+
+	r2, yielded, err := th.Resume(moelua.Int(7))
+	if err != nil || !yielded || len(r2) != 2 || r2[0].AsString().S != "step2" || r2[1].Int() != 70 {
+		t.Fatalf("Resume 2: res=%v yielded=%v err=%v", r2, yielded, err)
+	}
+
+	r3, yielded, err := th.Resume(moelua.Int(100))
+	if err != nil || yielded || len(r3) != 2 || r3[0].AsString().S != "done" || r3[1].Int() != 105 {
+		t.Fatalf("Resume 3: res=%v yielded=%v err=%v", r3, yielded, err)
+	}
+	if th.Status() != moelua.ThreadDead || th.StatusString() != "dead" {
+		t.Fatalf("after return status=%v (%q)", th.Status(), th.StatusString())
+	}
+	if !s.GetGlobal("closed").IsTrue() {
+		t.Fatalf("expected <close> variable to run on coroutine completion")
+	}
+
+	// Test Close() running <close> metamethod on a suspended coroutine.
+	res2, err := s.DoString(`
+		aborted_closed = false
+		return function()
+			local guard <close> = setmetatable({}, {
+				__close = function() aborted_closed = true end
+			})
+			coroutine.yield("waiting")
+		end
+	`)
+	if err != nil {
+		t.Fatalf("DoString 2: %v", err)
+	}
+	th2, err := s.NewThread(res2[0])
+	if err != nil {
+		t.Fatalf("NewThread 2: %v", err)
+	}
+	if _, y, err := th2.Resume(); err != nil || !y {
+		t.Fatalf("Resume th2: yielded=%v err=%v", y, err)
+	}
+	if err := th2.Close(); err != nil {
+		t.Fatalf("th2.Close: %v", err)
+	}
+	if th2.Status() != moelua.ThreadDead || !s.GetGlobal("aborted_closed").IsTrue() {
+		t.Fatalf("expected th2 dead and <close> executed; status=%v closed=%v", th2.Status(), s.GetGlobal("aborted_closed"))
+	}
+
+	// Test instruction limit propagation out of Thread.Resume.
+	limState := moelua.New(moelua.WithInstructionLimit(5000))
+	defer limState.Close()
+	fnRes, err := limState.DoString(`return function() while true do end end`)
+	if err != nil {
+		t.Fatalf("DoString lim: %v", err)
+	}
+	limTh, err := limState.NewThread(fnRes[0])
+	if err != nil {
+		t.Fatalf("NewThread lim: %v", err)
+	}
+	_, yielded, err = limTh.Resume()
+	if yielded || !errors.Is(err, moelua.ErrInstructionLimit) {
+		t.Fatalf("expected ErrInstructionLimit from Thread.Resume, got yielded=%v err=%v", yielded, err)
+	}
 }
