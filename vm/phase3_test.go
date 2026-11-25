@@ -4687,3 +4687,179 @@ func TestCodexReviewRound20VMRegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestCodexReviewRound21VMRegressions(t *testing.T) {
+	// 1. table.insert / table.remove fast paths honor instruction limits and context timeouts
+	// even when invoked directly through State.Call without executing Lua bytecode.
+	t.Run("table_insert_and_remove_fast_path_honor_execution_controls", func(t *testing.T) {
+		const n = 500_000
+		for _, op := range []string{"insert", "remove"} {
+			s := NewState()
+			defer s.Close()
+			tbl := s.NewTable(n, 0)
+			for i := int64(1); i <= n; i++ {
+				tbl.RawSetInt(s, i, IntValue(i))
+			}
+			tableLib := s.GetGlobal("table").AsTable()
+			fn := tableLib.RawGetStr(s.Intern(op))
+			callArgs := []Value{TableValue(tbl), IntValue(1)}
+			if op == "insert" {
+				callArgs = append(callArgs, IntValue(0))
+			}
+
+			s.SetInstructionLimit(2000)
+			_, err := s.Call(fn, callArgs...)
+			if !errors.Is(err, ErrInstructionLimit) {
+				t.Fatalf("table.%s expected ErrInstructionLimit, got %v", op, err)
+			}
+			if s.InstructionsExecuted() <= 2000 {
+				t.Fatalf("table.%s expected InstructionsExecuted > 2000, got %d", op, s.InstructionsExecuted())
+			}
+
+			// Context timeout without instruction limit aborts promptly rather than shifting the full array.
+			s.SetInstructionLimit(0)
+			s.ResetInstructionCount()
+			bigTbl := s.NewTable(2_000_000, 0)
+			for i := int64(1); i <= 2_000_000; i++ {
+				bigTbl.RawSetInt(s, i, IntValue(i))
+			}
+			bigArgs := []Value{TableValue(bigTbl), IntValue(1)}
+			if op == "insert" {
+				bigArgs = append(bigArgs, IntValue(0))
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+			defer cancel()
+			s.SetContext(ctx)
+			_, err = s.Call(fn, bigArgs...)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("table.%s expected context.DeadlineExceeded, got %v", op, err)
+			}
+		}
+
+		// Small table.insert/remove must NOT falsely fail a modest instruction limit.
+		s := NewState()
+		defer s.Close()
+		s.SetInstructionLimit(500)
+		cl, err := s.LoadChunk([]byte(`
+			local t = {10, 20, 30}
+			table.insert(t, 1, 5)
+			assert(#t == 4 and t[1] == 5 and t[2] == 10 and t[4] == 30)
+			local r = table.remove(t, 1)
+			assert(r == 5 and #t == 3 and t[1] == 10 and t[3] == 30)
+			return "ok"
+		`), "=small_table_ops")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("small table.insert/remove under insnLimit=500 failed: res=%v err=%v", res, err)
+		}
+	})
+
+	// 2. Bulk string and os.date native loops also honor instruction limits and context cancellation.
+	t.Run("bulk_string_and_date_loops_honor_execution_controls", func(t *testing.T) {
+		bigStr := strings.Repeat("AbCdEfGh", 128*1024) // 1 MiB
+		bigFmt := strings.Repeat("%Y", 200_000)
+		cases := []struct {
+			name string
+			fn   func(s *State) (Value, []Value)
+		}{
+			{
+				name: "string.rep_plain",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("rep")),
+						[]Value{StringValue(s.Intern("a")), IntValue(2_000_000)}
+				},
+			},
+			{
+				name: "string.rep_sep",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("rep")),
+						[]Value{StringValue(s.Intern("a")), IntValue(2_000_000), StringValue(s.Intern(","))}
+				},
+			},
+			{
+				name: "string.byte",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("byte")),
+						[]Value{StringValue(s.Intern(bigStr)), IntValue(1), IntValue(500_000)}
+				},
+			},
+			{
+				name: "string.reverse",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("reverse")),
+						[]Value{StringValue(s.Intern(bigStr))}
+				},
+			},
+			{
+				name: "string.lower",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("lower")),
+						[]Value{StringValue(s.Intern(bigStr))}
+				},
+			},
+			{
+				name: "string.upper",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("upper")),
+						[]Value{StringValue(s.Intern(bigStr))}
+				},
+			},
+			{
+				name: "os.date",
+				fn: func(s *State) (Value, []Value) {
+					return s.GetGlobal("os").AsTable().RawGetStr(s.Intern("date")),
+						[]Value{StringValue(s.Intern(bigFmt)), IntValue(1_700_000_000)}
+				},
+			},
+		}
+		for _, tc := range cases {
+			s := NewState()
+			defer s.Close()
+			fn, args := tc.fn(s)
+			s.SetInstructionLimit(100)
+			_, err := s.Call(fn, args...)
+			if !errors.Is(err, ErrInstructionLimit) {
+				t.Fatalf("%s expected ErrInstructionLimit, got %v", tc.name, err)
+			}
+			if s.InstructionsExecuted() <= 100 {
+				t.Fatalf("%s expected InstructionsExecuted > 100, got %d", tc.name, s.InstructionsExecuted())
+			}
+
+			s.SetInstructionLimit(0)
+			s.ResetInstructionCount()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+			defer cancel()
+			time.Sleep(time.Millisecond)
+			s.SetContext(ctx)
+			_, err = s.Call(fn, args...)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%s expected context.DeadlineExceeded, got %v", tc.name, err)
+			}
+		}
+
+		// Verify normal outputs under active instruction limit (correctness of cancelable paths).
+		s := NewState()
+		defer s.Close()
+		s.SetInstructionLimit(500_000)
+		cl, err := s.LoadChunk([]byte(`
+			assert(string.rep("ab", 3) == "ababab")
+			assert(string.rep("ab", 3, "-") == "ab-ab-ab")
+			assert(string.rep("", 1000000) == "")
+			assert(string.reverse("hello") == "olleh")
+			assert(string.lower("AbC123") == "abc123")
+			assert(string.upper("AbC123") == "ABC123")
+			local b1, b2, b3 = string.byte("XYZ", 1, 3)
+			assert(b1 == 88 and b2 == 89 and b3 == 90)
+			assert(string.char(88, 89, 90) == "XYZ")
+			return "ok"
+		`), "=small_string_ops")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
+			t.Fatalf("small string ops under insnLimit failed: res=%v err=%v", res, err)
+		}
+	})
+}
