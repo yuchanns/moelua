@@ -992,3 +992,59 @@ func TestTableSetStringMemoryLimitEnforcement(t *testing.T) {
 		t.Fatalf("unexpected Lua readback: res=%v err=%v", res, err)
 	}
 }
+
+func TestStreamingPublicAPI(t *testing.T) {
+	// 1. CompileReader + Chunk.DumpTo + LoadChunkReader round-trip.
+	src := "\xef\xbb\xbf#!/usr/bin/env lua\nreturn 6 * 7\n"
+	ch, err := moelua.CompileReader("@stream_api.lua", strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("CompileReader failed: %v", err)
+	}
+	var binBuf bytes.Buffer
+	if err := ch.DumpTo(&binBuf, false); err != nil {
+		t.Fatalf("Chunk.DumpTo failed: %v", err)
+	}
+	ch2, err := moelua.LoadChunkReader(bytes.NewReader(binBuf.Bytes()))
+	if err != nil {
+		t.Fatalf("LoadChunkReader failed: %v", err)
+	}
+
+	s := moelua.New()
+	defer s.Close()
+	fn, err := s.Load(ch2)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	res, err := s.Call(fn)
+	if err != nil || len(res) != 1 || res[0].Int() != 42 {
+		t.Fatalf("unexpected Call result: res=%v err=%v", res, err)
+	}
+
+	// 2. State.DoReader streams both text and binary chunks (including large comments under a tight memLimit).
+	sMem := moelua.New(moelua.WithMemoryLimit(131072))
+	defer sMem.Close()
+	bigSrc := strings.Repeat("-- "+strings.Repeat("x", 1020)+"\n", 512) + "return 9876\n"
+	resMem, err := sMem.DoReader("=big_stream_api", strings.NewReader(bigSrc))
+	if err != nil || len(resMem) != 1 || resMem[0].Int() != 9876 {
+		t.Fatalf("DoReader large source under 128KiB memLimit failed: res=%v err=%v", resMem, err)
+	}
+
+	// 3. State.DoFile streams text (with BOM/shebang) and binary files.
+	dir := t.TempDir()
+	textPath := filepath.Join(dir, "script.lua")
+	if err := os.WriteFile(textPath, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resText, err := s.DoFile(textPath)
+	if err != nil || len(resText) != 1 || resText[0].Int() != 42 {
+		t.Fatalf("DoFile(text) failed: res=%v err=%v", resText, err)
+	}
+	binPath := filepath.Join(dir, "script.luac")
+	if err := os.WriteFile(binPath, binBuf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resBin, err := s.DoFile(binPath)
+	if err != nil || len(resBin) != 1 || resBin[0].Int() != 42 {
+		t.Fatalf("DoFile(binary) failed: res=%v err=%v", resBin, err)
+	}
+}

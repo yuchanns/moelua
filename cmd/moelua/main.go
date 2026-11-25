@@ -244,20 +244,19 @@ func (c *cliState) doChunkString(progName, chunkName, src string) bool {
 }
 
 func (c *cliState) doChunkFile(progName, path string, literalFile, passArgs bool) bool {
-	var data []byte
+	var fn vm.Value
 	var err error
-	chunkName := "=stdin"
 	if path == "-" && !literalFile {
-		data, err = c.s.ReadAllStdin()
+		fn, err = c.s.LoadChunkReader(c.s.StdinReader(), "=stdin")
 	} else {
-		chunkName = "@" + path
-		data, err = os.ReadFile(path)
+		f, oerr := os.Open(path)
+		if oerr != nil {
+			fmt.Fprintf(os.Stderr, "%s: cannot open %s\n", progName, oerr.Error())
+			return false
+		}
+		fn, err = c.s.LoadChunkReader(f, "@"+path)
+		_ = f.Close()
 	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: cannot open %s\n", progName, err.Error())
-		return false
-	}
-	fn, err := c.s.LoadChunk(data, chunkName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(err))
 		return false

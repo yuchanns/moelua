@@ -265,7 +265,8 @@ type Chunk struct {
 	proto *bytecode.Proto
 }
 
-// Compile compiles Lua 5.5.1 source text into a verified immutable *Chunk.
+// Compile compiles Lua 5.5.1 source text into a verified immutable *Chunk
+// using the zero-copy string fast path.
 func Compile(name, src string) (*Chunk, error) {
 	p, err := compiler.Compile(name, src)
 	if err != nil {
@@ -274,10 +275,30 @@ func Compile(name, src string) (*Chunk, error) {
 	return &Chunk{proto: p}, nil
 }
 
-// LoadChunk decodes and verifies a PUC-Rio Lua 5.5.1 binary chunk.
+// CompileReader streams Lua 5.5.1 source text from r into a verified immutable *Chunk
+// without reading the entire input into memory first.
+func CompileReader(name string, r io.Reader) (*Chunk, error) {
+	p, err := compiler.CompileReader(name, r)
+	if err != nil {
+		return nil, err
+	}
+	return &Chunk{proto: p}, nil
+}
+
+// LoadChunk decodes and verifies a PUC-Rio Lua 5.5.1 binary chunk using the slice fast path.
 // Binary chunks are trusted input; verification provides panic-freedom defense in depth.
 func LoadChunk(binary []byte) (*Chunk, error) {
 	p, err := bytecode.Undump(binary)
+	if err != nil {
+		return nil, err
+	}
+	return &Chunk{proto: p}, nil
+}
+
+// LoadChunkReader streams and verifies a PUC-Rio Lua 5.5.1 binary chunk from r without
+// materializing the full input buffer first.
+func LoadChunkReader(r io.Reader) (*Chunk, error) {
+	p, err := bytecode.UndumpReader(r)
 	if err != nil {
 		return nil, err
 	}
@@ -291,6 +312,15 @@ func (c *Chunk) Dump(strip bool) ([]byte, error) {
 		return nil, fmt.Errorf("moelua: nil chunk")
 	}
 	return bytecode.Dump(c.proto, strip)
+}
+
+// DumpTo streams the chunk in PUC-Rio Lua 5.5.1 binary bytecode format directly to w
+// without allocating a full-size intermediate buffer.
+func (c *Chunk) DumpTo(w io.Writer, strip bool) error {
+	if c == nil || c.proto == nil {
+		return fmt.Errorf("moelua: nil chunk")
+	}
+	return bytecode.DumpTo(w, c.proto, strip)
 }
 
 // Proto returns the underlying *bytecode.Proto for read-only inspection.
@@ -612,6 +642,11 @@ func (s *State) Compile(name, src string) (*Chunk, error) {
 	return Compile(name, src)
 }
 
+// CompileReader streams Lua 5.5.1 source text from r into a *Chunk.
+func (s *State) CompileReader(name string, r io.Reader) (*Chunk, error) {
+	return CompileReader(name, r)
+}
+
 // Load instantiates an immutable *Chunk as a Lua closure bound to this State's _ENV.
 func (s *State) Load(chunk *Chunk) (Value, error) {
 	if !s.ready() {
@@ -625,6 +660,15 @@ func (s *State) Load(chunk *Chunk) (Value, error) {
 		return vm.NilValue(), err
 	}
 	return vm.ClosureValue(cl), nil
+}
+
+// LoadReader streams a Lua 5.5.1 text or binary chunk from r (stripping UTF-8 BOM and
+// leading '#' line) and binds it as a closure against this State's _ENV.
+func (s *State) LoadReader(chunkName string, r io.Reader) (Value, error) {
+	if !s.ready() {
+		return vm.NilValue(), ErrStateClosed
+	}
+	return s.vm.LoadChunkReader(r, chunkName)
 }
 
 // Call invokes a Lua function, GoFunc, or callable table/userdata with args.
@@ -656,16 +700,30 @@ func (s *State) DoStringNamed(name, src string) ([]Value, error) {
 	return s.Call(fn)
 }
 
-// DoFile loads and executes a Lua 5.5.1 source or binary file (handling UTF-8 BOM and initial '#' comment).
+// DoReader streams and executes a Lua 5.5.1 text or binary chunk from r (handling UTF-8 BOM
+// and initial '#' comment line) without buffering the entire input in memory first.
+func (s *State) DoReader(chunkName string, r io.Reader) ([]Value, error) {
+	if !s.ready() {
+		return nil, ErrStateClosed
+	}
+	fn, err := s.vm.LoadChunkReader(r, chunkName)
+	if err != nil {
+		return nil, err
+	}
+	return s.Call(fn)
+}
+
+// DoFile streams and executes a Lua 5.5.1 source or binary file (handling UTF-8 BOM and initial '#' comment).
 func (s *State) DoFile(path string) ([]Value, error) {
 	if !s.ready() {
 		return nil, ErrStateClosed
 	}
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open %s: %w", path, err)
 	}
-	return s.DoBytes("@"+path, data)
+	defer f.Close()
+	return s.DoReader("@"+path, f)
 }
 
 // DoBytes loads and executes raw Lua text or binary bytes (stripping UTF-8 BOM and leading '#' line).
