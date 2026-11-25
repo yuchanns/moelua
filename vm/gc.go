@@ -397,8 +397,8 @@ func (tr *gcTracer) mark(v Value) {
 			return
 		}
 		nf.gcMark = tr.epoch
-		tr.liveBytes += 48 + int64(len(nf.gcChildren))*16
-		if (!nf.gcChild.IsNil() && nf.gcChild.ptr != nil) || len(nf.gcChildren) > 0 {
+		tr.liveBytes += 48 + int64(len(nf.upvals))*16
+		if len(nf.upvals) > 0 {
 			tr.gray = append(tr.gray, v)
 		}
 	case v.IsUserdata():
@@ -448,11 +448,8 @@ func (tr *gcTracer) propagateAll() {
 			}
 		case v.IsNative():
 			nf := v.AsNative()
-			if nf.gcChild.ptr != nil {
-				tr.mark(nf.gcChild)
-			}
-			for _, ch := range nf.gcChildren {
-				tr.mark(ch)
+			for _, uv := range nf.upvals {
+				tr.mark(uv)
 			}
 		case v.IsUserdata():
 			u := v.AsUserdata()

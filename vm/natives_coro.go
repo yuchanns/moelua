@@ -482,19 +482,25 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsFunction() {
 		return nil, fmt.Errorf("bad argument #1 to 'wrap' (function expected)")
 	}
-	if s.memLimit > 0 {
-		if err := s.checkMemAndAccount(threadInitMemBytes(128, defaultFrameCap) + 48); err != nil {
+	if s.memLimit > 0 || s.gc.tier1 {
+		if err := s.checkMemAndAccount(threadInitMemBytes(128, defaultFrameCap) + 48 + 16); err != nil {
 			return nil, err
 		}
 	}
 	co := newThread(s, 128)
 	co.stack[0] = args[0]
 	co.top = 1
-	wrapper := &NativeFunc{
+	var wrapper *NativeFunc
+	wrapper = &NativeFunc{
 		Name:        "coroutine.wrap",
+		NumUpvals:   1,
 		Collectable: true,
-		gcChild:     ThreadValue(co),
+		upvals:      []Value{ThreadValue(co)},
 		Fn: func(s *State, callArgs []Value) ([]Value, error) {
+			if !wrapper.upvals[0].IsThread() {
+				return nil, fmt.Errorf("thread expected, got %s", s.objTypeName(wrapper.upvals[0]))
+			}
+			co := wrapper.upvals[0].AsThread()
 			wasActive := co == s.cur || co.status == ThreadNormal
 			ok, res, uerr := s.resumeThread(co, callArgs)
 			if uerr != nil {

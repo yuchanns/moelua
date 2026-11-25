@@ -132,30 +132,46 @@ func Char(codepoints []int64, lax bool) (string, error) {
 	return string(buf), nil
 }
 
-// Codepoint implements Lua 5.5.1 utf8.codepoint(s [, i [, j [, lax]]]).
-// Returns codepoints for all UTF-8 characters starting in the 1-based byte range [i, j].
-func Codepoint(s string, i, j int64, lax bool) ([]int64, error) {
+// CodepointEach implements Lua 5.5.1 utf8.codepoint(s [, i [, j [, lax]]]),
+// invoking emit(codepoint) for each decoded character in [i, j] without allocating
+// an intermediate []int64 slice. Decoding stops immediately if emit returns an error.
+func CodepointEach(s string, i, j int64, lax bool, emit func(cp int64) error) error {
 	posi := uPosrelat(i, len(s))
 	pose := uPosrelat(j, len(s))
 	if posi < 1 {
-		return nil, errUTF8OutOfBounds
+		return errUTF8OutOfBounds
 	}
 	if pose > int64(len(s)) {
-		return nil, errUTF8OutOfBounds
+		return errUTF8OutOfBounds
 	}
 	if posi > pose {
-		return nil, nil
+		return nil
 	}
 	pos := int(posi - 1)
 	se := int(pose)
-	var out []int64
 	for pos < se {
 		code, next, ok := utf8Decode(s, pos, !lax)
 		if !ok {
-			return nil, errInvalidUTF8
+			return errInvalidUTF8
 		}
-		out = append(out, int64(code))
+		if err := emit(int64(code)); err != nil {
+			return err
+		}
 		pos = next
+	}
+	return nil
+}
+
+// Codepoint implements Lua 5.5.1 utf8.codepoint(s [, i [, j [, lax]]]).
+// Returns codepoints for all UTF-8 characters starting in the 1-based byte range [i, j].
+func Codepoint(s string, i, j int64, lax bool) ([]int64, error) {
+	var out []int64
+	err := CodepointEach(s, i, j, lax, func(cp int64) error {
+		out = append(out, cp)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

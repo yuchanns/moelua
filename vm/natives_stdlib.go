@@ -173,17 +173,18 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 		patVal = StringValue(ls)
 		pat = ls.S
 	}
-	if s.memLimit > 0 {
-		if err := s.checkMemAndAccount(48 + 32); err != nil {
+	if s.memLimit > 0 || s.gc.tier1 {
+		if err := s.checkMemAndAccount(48 + 3*16 + 64); err != nil {
 			return nil, err
 		}
 	}
 	it := luastdlib.GMatchWithCancel(str, pat, initPos, s.dynamicNativeCancelFunc())
+	stateUD := UserdataValue(&Userdata{Data: it})
 	fn := &NativeFunc{
 		Name:        "gmatch_iter",
 		NumUpvals:   3,
 		Collectable: true,
-		gcChildren:  []Value{strVal, patVal},
+		upvals:      []Value{strVal, patVal, stateUD},
 		Fn: func(s *State, _ []Value) ([]Value, error) {
 			caps, ok, err := it.Next()
 			if err != nil {
@@ -473,6 +474,12 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 // --- utf8 library ---
 
 func nativeUTF8Char(s *State, args []Value) ([]Value, error) {
+	if s.memLimit > 0 && len(args) > 0 {
+		// Check budget before allocating the transient []int64 and encoded UTF-8 buffer.
+		if err := s.checkMem(int64(len(args))*9 + 48); err != nil {
+			return nil, err
+		}
+	}
 	cps := make([]int64, len(args))
 	for i, a := range args {
 		cp, ok := a.CoerceInt()
@@ -485,10 +492,11 @@ func nativeUTF8Char(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkMemAndAccount(int64(len(res)) + 48); err != nil {
+	ls, err := s.TryIntern(res)
+	if err != nil {
 		return nil, err
 	}
-	return []Value{StringValue(s.intern.Intern(res))}, nil
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeUTF8Codepoint(s *State, args []Value) ([]Value, error) {
@@ -513,18 +521,35 @@ func nativeUTF8Codepoint(s *State, args []Value) ([]Value, error) {
 		}
 	}
 	lax := len(args) >= 4 && !args[3].IsFalsy()
-	cps, err := luastdlib.Codepoint(str, i, j, lax)
-	if err != nil {
+	// Pass 1: validate UTF-8 and count codepoints with zero allocations, stopping early
+	// before any slice allocation if the final []Value result would exceed memLimit.
+	var count int64
+	if err := luastdlib.CodepointEach(str, i, j, lax, func(_ int64) error {
+		count++
+		if s.memLimit > 0 && count&63 == 0 {
+			if err := s.checkMem(count * 16); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
+	if count == 0 {
+		return nil, nil
+	}
 	if s.memLimit > 0 {
-		if err := s.checkMem(int64(len(cps)) * 16); err != nil {
+		if err := s.checkMem(count * 16); err != nil {
 			return nil, err
 		}
 	}
-	out := make([]Value, len(cps))
-	for k, cp := range cps {
-		out[k] = IntValue(cp)
+	// Pass 2: fill a single exact-sized []Value slice with no transient []int64 allocation.
+	out := make([]Value, 0, count)
+	if err := luastdlib.CodepointEach(str, i, j, lax, func(cp int64) error {
+		out = append(out, IntValue(cp))
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

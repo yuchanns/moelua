@@ -819,6 +819,17 @@ func (s *State) flushOpenFiles() {
 	for i := len(s.openFiles) - 1; i >= 0; i-- {
 		_ = s.openFiles[i].flush()
 	}
+	if lf, ok := asLuaFile(s.defaultOutput); ok && !lf.closed {
+		_ = lf.flushWriter()
+	}
+	if ioVal := s.env.RawGetStr(s.intern.Intern("io")); ioVal.IsTable() {
+		ioTbl := ioVal.AsTable()
+		for _, name := range [...]string{"stdout", "stderr"} {
+			if lf, ok := asLuaFile(ioTbl.RawGetStr(s.intern.Intern(name))); ok && !lf.closed {
+				_ = lf.flushWriter()
+			}
+		}
+	}
 }
 
 func (s *State) closeOpenFiles() {
@@ -1082,6 +1093,9 @@ func nativeIOPopen(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #2 to 'popen' (invalid mode)")
 		}
 	}
+	// Flush buffered output streams before spawning the child process
+	// (matches Lua 5.5 liolib.c:l_popen calling fflush(NULL) before popen).
+	s.flushOpenFiles()
 	cmd := shellCommand(prog)
 	s.inheritedStdStreams(cmd)
 	var f *os.File
@@ -1789,25 +1803,38 @@ func nativeFileWrite(s *State, args []Value) ([]Value, error) {
 }
 
 func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) ([]Value, error) {
-	if s.memLimit > 0 {
-		if err := s.checkMemAndAccount(48 + int64(len(fmts))*16); err != nil {
+	// Match Lua 5.5 liolib.c:aux_lines upvalue layout:
+	//   1) file handle
+	//   2) number of format arguments
+	//   3) boolean indicating whether to close on EOF
+	//   4..3+n) format arguments
+	upvals := make([]Value, 3+len(fmts))
+	upvals[0] = fileVal
+	upvals[1] = IntValue(int64(len(fmts)))
+	upvals[2] = BoolValue(autoClose)
+	copy(upvals[3:], fmts)
+	if s.memLimit > 0 || s.gc.tier1 {
+		if err := s.checkMemAndAccount(48 + int64(len(upvals))*16); err != nil {
 			return nil, err
 		}
 	}
-	savedFmts := append([]Value(nil), fmts...)
-	iter := &NativeFunc{
+	var iter *NativeFunc
+	iter = &NativeFunc{
 		Name:        "io.lines_iter",
+		NumUpvals:   uint8(len(upvals)),
 		Collectable: true,
-		gcChild:     fileVal,
-		gcChildren:  savedFmts,
+		upvals:      upvals,
 		Fn: func(s *State, _ []Value) ([]Value, error) {
-			lf, ok := asLuaFile(fileVal)
+			curFileVal := iter.upvals[0]
+			curAutoClose := !iter.upvals[2].IsFalsy()
+			curFmts := iter.upvals[3:]
+			lf, ok := asLuaFile(curFileVal)
 			if !ok || lf.closed {
 				return nil, fmt.Errorf("file is already closed")
 			}
-			callArgs := make([]Value, 1+len(savedFmts))
-			callArgs[0] = fileVal
-			copy(callArgs[1:], savedFmts)
+			callArgs := make([]Value, 1+len(curFmts))
+			callArgs[0] = curFileVal
+			copy(callArgs[1:], curFmts)
 			res, err := nativeFileRead(s, callArgs)
 			if err != nil {
 				return nil, err
@@ -1817,7 +1844,7 @@ func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) ([]Val
 				return nil, fmt.Errorf("%s", res[1].AsString().S)
 			}
 			if len(res) == 0 || res[0].IsNil() {
-				if autoClose && !lf.closed && !lf.isStd {
+				if curAutoClose && !lf.closed && !lf.isStd {
 					_ = lf.closeFile()
 				}
 				return []Value{NilValue()}, nil
@@ -2061,22 +2088,41 @@ func findLocalOffsetForDST(base time.Time, wantDST bool) (int, bool) {
 	return 0, false
 }
 
-func nativeOSDiffTime(_ *State, args []Value) ([]Value, error) {
-	if len(args) < 1 {
-		return nil, fmt.Errorf("bad argument #1 to 'difftime' (number expected, got no value)")
+func checkTimeArg(s *State, args []Value, idx int, fnName string) (int64, error) {
+	if idx >= len(args) {
+		return 0, fmt.Errorf("bad argument #%d to '%s' (number expected, got no value)", idx+1, fnName)
 	}
-	t2, ok := args[0].CoerceFloat()
-	if !ok {
-		return nil, fmt.Errorf("bad argument #1 to 'difftime' (number expected, got %s)", args[0].TypeName())
+	a := args[idx]
+	if i, ok := a.CoerceInt(); ok {
+		return i, nil
 	}
-	if len(args) < 2 {
-		return nil, fmt.Errorf("bad argument #2 to 'difftime' (number expected, got no value)")
+	if a.IsNumber() {
+		return 0, fmt.Errorf("bad argument #%d to '%s' (number has no integer representation)", idx+1, fnName)
 	}
-	t1, ok := args[1].CoerceFloat()
-	if !ok {
-		return nil, fmt.Errorf("bad argument #2 to 'difftime' (number expected, got %s)", args[1].TypeName())
+	if a.IsString() {
+		if _, ok := luastdlib.StrToFloat(a.AsString().S); ok {
+			return 0, fmt.Errorf("bad argument #%d to '%s' (number has no integer representation)", idx+1, fnName)
+		}
 	}
-	return []Value{FloatValue(t2 - t1)}, nil
+	return 0, fmt.Errorf("bad argument #%d to '%s' (number expected, got %s)", idx+1, fnName, s.objTypeName(a))
+}
+
+func nativeOSDiffTime(s *State, args []Value) ([]Value, error) {
+	t1, err := checkTimeArg(s, args, 0, "os.difftime")
+	if err != nil {
+		return nil, err
+	}
+	t2, err := checkTimeArg(s, args, 1, "os.difftime")
+	if err != nil {
+		return nil, err
+	}
+	var diff float64
+	if t1 >= t2 {
+		diff = float64(uint64(t1) - uint64(t2))
+	} else {
+		diff = -float64(uint64(t2) - uint64(t1))
+	}
+	return []Value{FloatValue(diff)}, nil
 }
 
 func nativeOSDate(s *State, args []Value) ([]Value, error) {
@@ -2097,7 +2143,10 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 		fmtStr = fmtStr[1:]
 	}
 	if fmtStr == "*t" {
-		tbl := s.NewTable(0, 10)
+		tbl, err := s.TryNewTable(0, 10)
+		if err != nil {
+			return nil, err
+		}
 		tbl.RawSetStr(s, s.intern.Intern("year"), IntValue(int64(tm.Year())))
 		tbl.RawSetStr(s, s.intern.Intern("month"), IntValue(int64(tm.Month())))
 		tbl.RawSetStr(s, s.intern.Intern("day"), IntValue(int64(tm.Day())))
@@ -2110,106 +2159,145 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 		return []Value{TableValue(tbl)}, nil
 	}
 	var sb strings.Builder
+	checkGrow := func(add int) error {
+		if s.memLimit > 0 {
+			nextLen := sb.Len() + add
+			need := int64(nextLen) + 48
+			if sb.Cap() < nextLen {
+				if doubled := sb.Cap() * 2; doubled > nextLen {
+					need = int64(doubled) + 48
+				}
+			}
+			if err := s.checkMem(need); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	writeByte := func(b byte) error {
+		if err := checkGrow(1); err != nil {
+			return err
+		}
+		sb.WriteByte(b)
+		return nil
+	}
+	writeStr := func(chunk string) error {
+		if err := checkGrow(len(chunk)); err != nil {
+			return err
+		}
+		sb.WriteString(chunk)
+		return nil
+	}
 	for i := 0; i < len(fmtStr); i++ {
 		if fmtStr[i] != '%' {
-			sb.WriteByte(fmtStr[i])
+			if err := writeByte(fmtStr[i]); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		i++
 		if i >= len(fmtStr) {
 			return nil, fmt.Errorf("invalid conversion specifier '%%'")
 		}
+		var err error
 		switch fmtStr[i] {
 		case '%':
-			sb.WriteByte('%')
+			err = writeByte('%')
 		case 'Y':
-			sb.WriteString(fmt.Sprintf("%04d", tm.Year()))
+			err = writeStr(fmt.Sprintf("%04d", tm.Year()))
 		case 'y':
-			sb.WriteString(fmt.Sprintf("%02d", tm.Year()%100))
+			err = writeStr(fmt.Sprintf("%02d", tm.Year()%100))
 		case 'C':
-			sb.WriteString(fmt.Sprintf("%02d", tm.Year()/100))
+			err = writeStr(fmt.Sprintf("%02d", tm.Year()/100))
 		case 'm':
-			sb.WriteString(fmt.Sprintf("%02d", tm.Month()))
+			err = writeStr(fmt.Sprintf("%02d", tm.Month()))
 		case 'd':
-			sb.WriteString(fmt.Sprintf("%02d", tm.Day()))
+			err = writeStr(fmt.Sprintf("%02d", tm.Day()))
 		case 'e':
-			sb.WriteString(fmt.Sprintf("%2d", tm.Day()))
+			err = writeStr(fmt.Sprintf("%2d", tm.Day()))
 		case 'H':
-			sb.WriteString(fmt.Sprintf("%02d", tm.Hour()))
+			err = writeStr(fmt.Sprintf("%02d", tm.Hour()))
 		case 'I':
 			h12 := tm.Hour() % 12
 			if h12 == 0 {
 				h12 = 12
 			}
-			sb.WriteString(fmt.Sprintf("%02d", h12))
+			err = writeStr(fmt.Sprintf("%02d", h12))
 		case 'p':
 			if tm.Hour() < 12 {
-				sb.WriteString("AM")
+				err = writeStr("AM")
 			} else {
-				sb.WriteString("PM")
+				err = writeStr("PM")
 			}
 		case 'M':
-			sb.WriteString(fmt.Sprintf("%02d", tm.Minute()))
+			err = writeStr(fmt.Sprintf("%02d", tm.Minute()))
 		case 'S':
-			sb.WriteString(fmt.Sprintf("%02d", tm.Second()))
+			err = writeStr(fmt.Sprintf("%02d", tm.Second()))
 		case 'a':
-			sb.WriteString(tm.Format("Mon"))
+			err = writeStr(tm.Format("Mon"))
 		case 'A':
-			sb.WriteString(tm.Format("Monday"))
+			err = writeStr(tm.Format("Monday"))
 		case 'b', 'h':
-			sb.WriteString(tm.Format("Jan"))
+			err = writeStr(tm.Format("Jan"))
 		case 'B':
-			sb.WriteString(tm.Format("January"))
+			err = writeStr(tm.Format("January"))
 		case 'c':
-			sb.WriteString(tm.Format("Mon Jan _2 15:04:05 2006"))
+			err = writeStr(tm.Format("Mon Jan _2 15:04:05 2006"))
 		case 'D', 'x':
-			sb.WriteString(tm.Format("01/02/06"))
+			err = writeStr(tm.Format("01/02/06"))
 		case 'F':
-			sb.WriteString(fmt.Sprintf("%04d-%02d-%02d", tm.Year(), tm.Month(), tm.Day()))
+			err = writeStr(fmt.Sprintf("%04d-%02d-%02d", tm.Year(), tm.Month(), tm.Day()))
 		case 'r':
-			sb.WriteString(tm.Format("03:04:05 PM"))
+			err = writeStr(tm.Format("03:04:05 PM"))
 		case 'R':
-			sb.WriteString(fmt.Sprintf("%02d:%02d", tm.Hour(), tm.Minute()))
+			err = writeStr(fmt.Sprintf("%02d:%02d", tm.Hour(), tm.Minute()))
 		case 'T', 'X':
-			sb.WriteString(tm.Format("15:04:05"))
+			err = writeStr(tm.Format("15:04:05"))
 		case 'j':
-			sb.WriteString(fmt.Sprintf("%03d", tm.YearDay()))
+			err = writeStr(fmt.Sprintf("%03d", tm.YearDay()))
 		case 'w':
-			sb.WriteString(fmt.Sprintf("%d", tm.Weekday()))
+			err = writeStr(fmt.Sprintf("%d", tm.Weekday()))
 		case 'u':
 			u := int(tm.Weekday())
 			if u == 0 {
 				u = 7
 			}
-			sb.WriteString(fmt.Sprintf("%d", u))
+			err = writeStr(fmt.Sprintf("%d", u))
 		case 'U':
-			sb.WriteString(fmt.Sprintf("%02d", (tm.YearDay()-1+7-int(tm.Weekday()))/7))
+			err = writeStr(fmt.Sprintf("%02d", (tm.YearDay()-1+7-int(tm.Weekday()))/7))
 		case 'W':
 			monWday := (int(tm.Weekday()) + 6) % 7
-			sb.WriteString(fmt.Sprintf("%02d", (tm.YearDay()-1+7-monWday)/7))
+			err = writeStr(fmt.Sprintf("%02d", (tm.YearDay()-1+7-monWday)/7))
 		case 'g':
 			isoY, _ := tm.ISOWeek()
-			sb.WriteString(fmt.Sprintf("%02d", isoY%100))
+			err = writeStr(fmt.Sprintf("%02d", isoY%100))
 		case 'G':
 			isoY, _ := tm.ISOWeek()
-			sb.WriteString(fmt.Sprintf("%04d", isoY))
+			err = writeStr(fmt.Sprintf("%04d", isoY))
 		case 'V':
 			_, isoW := tm.ISOWeek()
-			sb.WriteString(fmt.Sprintf("%02d", isoW))
+			err = writeStr(fmt.Sprintf("%02d", isoW))
 		case 'n':
-			sb.WriteByte('\n')
+			err = writeByte('\n')
 		case 't':
-			sb.WriteByte('\t')
+			err = writeByte('\t')
 		case 'Z':
 			zone, _ := tm.Zone()
-			sb.WriteString(zone)
+			err = writeStr(zone)
 		case 'z':
-			sb.WriteString(tm.Format("-0700"))
+			err = writeStr(tm.Format("-0700"))
 		default:
 			return nil, fmt.Errorf("invalid conversion specifier '%%%c'", fmtStr[i])
 		}
+		if err != nil {
+			return nil, err
+		}
 	}
-	return []Value{StringValue(s.intern.Intern(sb.String()))}, nil
+	ls, err := s.TryIntern(sb.String())
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeOSGetEnv(s *State, args []Value) ([]Value, error) {

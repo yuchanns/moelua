@@ -71,8 +71,7 @@ type NativeFunc struct {
 	NumUpvals   uint8   // logical C closure upvalue count (e.g. string.gmatch = 3)
 	Collectable bool    // true for dynamic C closures (coroutine.wrap, gmatch, io.lines, utf8.codes); false for immutable light builtins
 	gcMark      uint64  // Tier 1 GC mark epoch (only mutated when Collectable == true)
-	gcChild     Value   // optional referenced Lua object kept alive by this closure (e.g. wrapped Thread / FILE*)
-	gcChildren  []Value // optional additional referenced Lua values kept alive by this closure (e.g. gmatch subject/pattern, io.lines formats)
+	upvals      []Value // captured C closure upvalues (traced by Tier 1 GC and exposed to debug.getupvalue/setupvalue)
 }
 
 func (nf *NativeFunc) callMulti(s *State, args []Value) ([]Value, error) {

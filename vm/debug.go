@@ -256,11 +256,19 @@ func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
 	return []Value{StringValue(s.intern.Intern(tb))}, nil
 }
 
+func nativeUpvalueCount(nf *NativeFunc) int {
+	n := len(nf.upvals)
+	if int(nf.NumUpvals) > n {
+		n = int(nf.NumUpvals)
+	}
+	return n
+}
+
 func fillCFrameInfo(s *State, what string, cfunc Value, cname, namewhat string, ftransfer, ntransfer int64) *Table {
 	info := s.NewTable(0, 10)
 	nups := int64(0)
 	if cfunc.IsNative() {
-		nups = int64(cfunc.AsNative().NumUpvals)
+		nups = int64(nativeUpvalueCount(cfunc.AsNative()))
 	}
 	if strings.ContainsRune(what, 'S') {
 		info.RawSetStr(s, s.intern.Intern("what"), StringValue(s.intern.Intern("C")))
@@ -477,7 +485,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		if strings.ContainsRune(what, 'u') {
 			nups := int64(0)
 			if fn.IsNative() {
-				nups = int64(fn.AsNative().NumUpvals)
+				nups = int64(nativeUpvalueCount(fn.AsNative()))
 			}
 			info.RawSetStr(s, s.intern.Intern("nups"), IntValue(nups))
 			info.RawSetStr(s, s.intern.Intern("nparams"), IntValue(0))
@@ -921,8 +929,14 @@ func nativeDebugGetUpvalue(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #2 to 'getupvalue'")
 	}
 	if args[0].IsNative() {
-		if idx >= 1 && int(idx) <= int(args[0].AsNative().NumUpvals) {
-			return []Value{StringValue(s.intern.Intern("")), NilValue()}, nil
+		nf := args[0].AsNative()
+		n := nativeUpvalueCount(nf)
+		if idx >= 1 && int(idx) <= n {
+			val := NilValue()
+			if int(idx)-1 < len(nf.upvals) {
+				val = nf.upvals[idx-1]
+			}
+			return []Value{StringValue(s.intern.Intern("")), val}, nil
 		}
 		return []Value{NilValue()}, nil
 	}
@@ -952,8 +966,13 @@ func nativeDebugSetUpvalue(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #2 to 'setupvalue'")
 	}
 	if args[0].IsNative() {
-		if idx >= 1 && int(idx) <= int(args[0].AsNative().NumUpvals) {
-			return []Value{StringValue(s.intern.Intern("")), NilValue()}, nil
+		nf := args[0].AsNative()
+		n := nativeUpvalueCount(nf)
+		if idx >= 1 && int(idx) <= n {
+			if int(idx)-1 < len(nf.upvals) {
+				nf.upvals[idx-1] = args[2]
+			}
+			return []Value{StringValue(s.intern.Intern(""))}, nil
 		}
 		return []Value{NilValue()}, nil
 	}
@@ -986,8 +1005,12 @@ func nativeDebugUpvalueID(_ *State, args []Value) ([]Value, error) {
 	}
 	if args[0].IsNative() {
 		nf := args[0].AsNative()
-		if idx < 1 || int(idx) > int(nf.NumUpvals) {
+		n := nativeUpvalueCount(nf)
+		if idx < 1 || int(idx) > n {
 			return []Value{NilValue()}, nil
+		}
+		if int(idx)-1 < len(nf.upvals) {
+			return []Value{LightUDValue(unsafe.Pointer(&nf.upvals[idx-1]))}, nil
 		}
 		return []Value{LightUDValue(unsafe.Pointer(uintptr(unsafe.Pointer(nf)) + uintptr(idx)))}, nil
 	}
