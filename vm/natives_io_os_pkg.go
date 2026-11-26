@@ -3124,7 +3124,7 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 			}
 		}
 	}
-	if err := th.ensureStack(baseTop + 4); err != nil {
+	if err := s.ensureStackWithRoots(th, baseTop+4, sv, []Value{StringValue(key)}); err != nil {
 		return nil, err
 	}
 	th.stack[baseTop] = sv

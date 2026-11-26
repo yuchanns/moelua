@@ -293,3 +293,162 @@ func TestDeletedCollectableHashKeyReclaimedInTier0(t *testing.T) {
 		t.Fatalf("deleted collectable hash key remained strongly retained by tombstone in Tier 0")
 	}
 }
+
+// TestNativeResultRootedAcrossStackGrowthEmergencyGC verifies that values returned by a native
+// callback remain rooted if growing the result stack triggers emergency GC under a memory limit,
+// covering both direct State.Call and Lua-side placeResults (MULTRET).
+func TestNativeResultRootedAcrossStackGrowthEmergencyGC(t *testing.T) {
+	runCase := func(t *testing.T, viaLua bool) {
+		t.Helper()
+		s := vm.NewState()
+		defer s.Close()
+
+		// Enable Tier 1 via a weak-value table W and hold 512 KiB of droppable garbage G
+		// plus a canary table C so we can prove emergency GC ran during stack growth.
+		setup, err := s.LoadChunk([]byte(`
+			collectgarbage("param", "pause", 100)
+			W = setmetatable({}, { __mode = "v" })
+			G = string.rep("g", 512 * 1024)
+			C = {}
+			W.c = C
+		`), "=setup")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(setup); err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(64 << 20)
+		s.CollectFull()
+		baseMem := s.MemoryUsage()
+
+		kStr := s.Intern("k")
+		cStr := s.Intern("c")
+		wTbl := s.GetGlobal("W").AsTable()
+		cb := vm.NativeValue(&vm.NativeFunc{
+			Name: "make_many",
+			Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
+				// Release 512 KiB garbage + canary so emergency GC during stack growth succeeds
+				// and clears W.c.
+				st.SetGlobal("G", vm.NilValue())
+				st.SetGlobal("C", vm.NilValue())
+				// Allocate a fresh table reachable only via the returned slice and weak W.k.
+				tbl, err := st.TryNewTable(8, 0)
+				if err != nil {
+					return nil, err
+				}
+				tbl.RawSetInt(st, 1, vm.IntValue(42))
+				if err := st.ConsumeMemErr(); err != nil {
+					return nil, err
+				}
+				wTbl.RawSetStr(st, kStr, vm.TableValue(tbl))
+				if err := st.ConsumeMemErr(); err != nil {
+					return nil, err
+				}
+				// Push Tier-1 debt past 64 KiB threshold without tripping baseMem+96 KiB yet,
+				// so State.Call enters its post-native GC check and grows th.stack for 5000 values.
+				if _, err := st.TryIntern(string(bytes.Repeat([]byte{'d'}, 70*1024))); err != nil {
+					return nil, err
+				}
+				res := make([]vm.Value, 5000)
+				for i := range res {
+					res[i] = vm.TableValue(tbl)
+				}
+				return res, nil
+			},
+		})
+		s.SetGlobal("make_many", cb)
+
+		// Tight memory limit: 70 KiB debt allocation fits, but growing th.stack for 5000
+		// results (>= 64 KiB) exceeds baseMem+96 KiB and forces emergency GC while res is
+		// still a Go-local slice.
+		s.SetMemoryLimit(baseMem + 96*1024)
+
+		if !viaLua {
+			res, err := s.Call(cb)
+			if err != nil {
+				t.Fatalf("State.Call(cb) failed: %v", err)
+			}
+			if len(res) != 5000 || !res[0].IsTable() {
+				t.Fatalf("unexpected result slice len=%d type=%s", len(res), res[0].TypeName())
+			}
+			if !wTbl.RawGetStr(cStr).IsNil() {
+				t.Fatalf("expected stack growth to trigger emergency GC and clear canary W.c")
+			}
+			gotWeak := wTbl.RawGetStr(kStr)
+			if !gotWeak.IsTable() || gotWeak.AsTable() != res[0].AsTable() {
+				t.Fatalf("weak-value entry cleared during stack-growth emergency GC in State.Call: got %s", gotWeak.TypeName())
+			}
+		} else {
+			// Stop automatic GC so ONLY emergency GC during th.placeResults stack growth can clear W.c.
+			// select(1, make_many()) compiles make_many() as MULTRET (nresults = -1), forcing
+			// th.placeResults to grow th.stack for all 5000 return values.
+			caller, err := s.LoadChunk([]byte(`
+				collectgarbage("stop")
+				local t = select(1, make_many())
+				assert(type(t) == "table" and t[1] == 42)
+				assert(W.c == nil, "expected stack growth to trigger emergency GC and clear canary W.c")
+				assert(W.k == t, "weak-value entry cleared during stack-growth emergency GC in Lua call")
+				return t
+			`), "=lua_call")
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetMemoryLimit(64 << 20)
+			s.CollectFull()
+			baseMem = s.MemoryUsage()
+			s.SetMemoryLimit(baseMem + 96*1024)
+			if _, err := s.Call(caller); err != nil {
+				t.Fatalf("Lua call failed: %v", err)
+			}
+		}
+	}
+
+	t.Run("state_call_direct", func(t *testing.T) { runCase(t, false) })
+	t.Run("lua_call_place_results", func(t *testing.T) { runCase(t, true) })
+}
+
+// TestStringFormatResolvesToStringMetamethodSequentially verifies that string.format("%s", ...)
+// resolves primitive __tostring metamethods lazily when each %s specifier is consumed, matching
+// Lua 5.5.1 luaL_tolstring sequential evaluation.
+func TestStringFormatResolvesToStringMetamethodSequentially(t *testing.T) {
+	src := `
+local savedStrMT = getmetatable("")
+local savedStrToStr = savedStrMT.__tostring
+
+local installer = setmetatable({}, {
+  __tostring = function()
+    debug.setmetatable(0, { __tostring = function(x) return "NUM:" .. (x + 1) end })
+    debug.setmetatable(true, { __tostring = function(x) return x and "YES" or "NO" end })
+    debug.setmetatable(nil, { __tostring = function() return "EMPTY" end })
+    savedStrMT.__tostring = function(x) return "S(" .. x .. ")" end
+    return "first"
+  end
+})
+local a = string.format("%s|%s|%s|%s|%s|%s", installer, 7, 1.5, true, nil, "abc")
+
+local remover = setmetatable({}, {
+  __tostring = function()
+    debug.setmetatable(0, nil)
+    debug.setmetatable(true, nil)
+    debug.setmetatable(nil, nil)
+    savedStrMT.__tostring = savedStrToStr
+    return "clear"
+  end
+})
+local b = string.format("%s|%s|%s|%s|%s", remover, 7, true, nil, "abc")
+print(a)
+print(b)
+`
+	got := runMoeLua(t, src)
+	want := "first|NUM:8|NUM:2.5|YES|EMPTY|S(abc)\nclear|7|true|nil|abc\n"
+	if got != want {
+		t.Fatalf("string.format sequential __tostring mismatch:\nwant:\n%s\ngot:\n%s", want, got)
+	}
+	if hasCLua55(t) {
+		cWant := runCLua55(t, src)
+		if got != cWant {
+			t.Fatalf("mismatch vs C Lua 5.5.1:\nwant:\n%s\ngot:\n%s", cWant, got)
+		}
+	}
+}

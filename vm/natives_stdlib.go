@@ -85,7 +85,7 @@ func (s *State) capturesToValuesRooted(caps []luastdlib.CaptureVal, srcLen int, 
 				}
 			}
 		}
-		if err := th.ensureStack(baseTop + total + 2); err != nil {
+		if err := s.ensureStackWithRoots(th, baseTop+total+2, NilValue(), prefix); err != nil {
 			return nil, err
 		}
 		written := 0
@@ -570,44 +570,35 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
+	hasStrSpec := strings.IndexByte(fmtStr, 's') >= 0
 	fargs := make([]luastdlib.FormatArg, len(args)-1)
 	for i, a := range args[1:] {
-		val := a
-		lazyToStr := func() (string, error) {
-			return s.toStringValue(val)
+		var lazyToStr func() (string, error)
+		if hasStrSpec {
+			val := a
+			lazyToStr = func() (string, error) {
+				return s.toStringValue(val)
+			}
 		}
-		hasToStrTM := !s.getTMByObj(a, TMToString).IsNil()
 		switch {
 		case a.IsNil():
 			fa := luastdlib.NilArg()
-			if hasToStrTM {
-				fa.ToString = lazyToStr
-			}
+			fa.ToString = lazyToStr
 			fargs[i] = fa
 		case a.IsBool():
 			fa := luastdlib.BoolArg(a.IsTrue())
-			if hasToStrTM {
-				fa.ToString = lazyToStr
-			}
+			fa.ToString = lazyToStr
 			fargs[i] = fa
 		case a.IsInt():
 			fa := luastdlib.IntArg(a.Int())
-			if hasToStrTM {
-				fa.ToString = lazyToStr
-			}
+			fa.ToString = lazyToStr
 			fargs[i] = fa
 		case a.IsFloat():
 			fa := luastdlib.FloatArg(a.Float())
-			if hasToStrTM {
-				fa.ToString = lazyToStr
-			}
+			fa.ToString = lazyToStr
 			fargs[i] = fa
 		case a.IsString():
-			fa := luastdlib.FormatArg{Kind: luastdlib.ArgString, Str: a.AsString().S, Ptr: uintptr(a.ptr)}
-			if hasToStrTM {
-				fa.ToString = lazyToStr
-			}
-			fargs[i] = fa
+			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgString, Str: a.AsString().S, Ptr: uintptr(a.ptr), ToString: lazyToStr}
 		default:
 			// Defer __tostring / __name evaluation until a %s conversion actually consumes this argument.
 			// Use logical pointer identity for encoded light userdata (debug.upvalueid tokens / NULL lightud).

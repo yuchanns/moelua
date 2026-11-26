@@ -154,7 +154,7 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 			}
 		}
 		funcIdx := base
-		if err := th.ensureStack(funcIdx + 3 + int(p.MaxStackSize) + 8); err != nil {
+		if err := s.ensureStackWithRoots(th, funcIdx+3+int(p.MaxStackSize)+8, line, nil); err != nil {
 			th.top = savedTop
 			return err
 		}

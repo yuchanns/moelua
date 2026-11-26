@@ -166,7 +166,7 @@ func (s *State) callXPCallHandler(th *Thread, xpFrameIdx int, msgh Value, errVal
 	defer func() { th.inErrHandler = prevErrH }()
 	invokeMsgh := func(arg Value) ([]Value, error) {
 		if msgh.IsNative() && (th.hookMask == 0 || th.inHook || th.suppressHook) {
-			if ferr := th.ensureFrameCap(th.nframe+1, maxFrames+128); ferr == nil {
+			if ferr := s.ensureFrameCapWithRoots(th, th.nframe+1, maxFrames+128, msgh, []Value{arg}); ferr == nil {
 				savedN := th.nframe
 				th.frames[savedN] = callFrame{
 					kind:     frameNative,
@@ -592,13 +592,14 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 		slot = th.top
 	}
 	if tm.IsClosure() {
-		if err := th.ensureStack(slot + 1 + len(args) + 8); err != nil {
+		if err := s.ensureStackWithRoots(th, slot+1+len(args)+8, tm, args); err != nil {
 			return false, err
 		}
 		th.stack[slot] = tm
 		for i, a := range args {
 			th.stack[slot+1+i] = a
 		}
+		th.top = slot + 1 + len(args)
 		cf.dirty = true
 		cf.oldTop = slot
 		cf.finish = fk
@@ -606,6 +607,8 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 		cf.finishFlag = flag
 		cl := tm.AsClosure()
 		if err := th.pushLuaFrame(cl, slot, len(args), 1); err != nil {
+			fillNil(th.stack[slot : slot+1+len(args)])
+			th.top = slot
 			cf.finish = finishNone
 			return false, err
 		}
@@ -616,7 +619,7 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 		return true, nil
 	}
 	// Yieldable native metamethod invocation (supports coroutine.yield as a metamethod and debug hooks!).
-	if err := th.ensureStack(slot + 1 + len(args) + 8); err != nil {
+	if err := s.ensureStackWithRoots(th, slot+1+len(args)+8, tm, args); err != nil {
 		return false, err
 	}
 	th.stack[slot] = tm
@@ -1328,7 +1331,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					th.stack[funcIdx] = rv
 					th.top = funcIdx + 1
 				default:
-					if err := th.ensureStack(funcIdx + nresults + 4); err != nil {
+					if err := s.ensureStackWithRoots(th, funcIdx+nresults+4, rv, nil); err != nil {
 						return s.catchSlow(th, ev, false, err)
 					}
 					th.stack[funcIdx] = rv
@@ -1361,7 +1364,11 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				// Temporarily push frameNative while handling error so xpcall tracebacks
 				// include the failing FastFn C frame (e.g. [C]: in field 'floor').
 				var pushedTemp bool
-				if ferr := th.ensureFrameCap(th.nframe+1, maxFrames+128); ferr == nil {
+				var errRoot Value
+				if le, ok := err.(*LuaError); ok {
+					errRoot = le.Val
+				}
+				if ferr := s.ensureFrameCapWithRoots(th, th.nframe+1, maxFrames+128, errRoot, nil); ferr == nil {
 					th.frames[th.nframe] = callFrame{
 						kind:      frameNative,
 						base:      funcIdx + 1,
@@ -1381,11 +1388,11 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				return handled, cerr
 			}
 			// Hook was enabled during FastFn call: fire return hook and place result.
-			if err := th.ensureFrameCap(th.nframe+1, maxFrames+128); err != nil {
+			if err := s.ensureFrameCapWithRoots(th, th.nframe+1, maxFrames+128, rv, nil); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
 			resSlot := funcIdx + 1 + nargs
-			if err := th.ensureStack(resSlot + 1 + 4); err != nil {
+			if err := s.ensureStackWithRoots(th, resSlot+1+4, rv, nil); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
 			th.stack[resSlot] = rv
@@ -1455,7 +1462,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
 					// Place returned results above args (ftransfer = nargs+1) matching ldo.c:rethook!
 					resStart := funcIdx + 1 + nargs
-					if serr := th.ensureStack(resStart + len(res) + 4); serr != nil {
+					if serr := s.ensureStackWithRoots(th, resStart+len(res)+4, NilValue(), res); serr != nil {
 						hookErr = serr
 					} else {
 						copy(th.stack[resStart:resStart+len(res)], res)
@@ -1476,9 +1483,9 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			} else {
 				// Hook was enabled during this native call (e.g. debug.sethook(hook, "r") in locals.lua:842)!
 				resStart := funcIdx + 1 + nargs
-				if ferr := th.ensureFrameCap(th.nframe+1, maxFrames+128); ferr != nil {
+				if ferr := s.ensureFrameCapWithRoots(th, th.nframe+1, maxFrames+128, NilValue(), res); ferr != nil {
 					hookErr = ferr
-				} else if serr := th.ensureStack(resStart + len(res) + 4); serr != nil {
+				} else if serr := s.ensureStackWithRoots(th, resStart+len(res)+4, NilValue(), res); serr != nil {
 					hookErr = serr
 				} else {
 					copy(th.stack[resStart:resStart+len(res)], res)
@@ -1545,13 +1552,16 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		if tm.IsNil() {
 			return s.catchSlow(th, ev, false, fmt.Errorf("attempt to call a %s value%s", fn.TypeName(), varInfo(ev.bp.proto, th.frames[ev.ci].pc-1, a)))
 		}
-		if err := th.ensureStack(funcIdx + nargs + 4); err != nil {
+		if err := s.ensureStackWithRoots(th, funcIdx+nargs+4, tm, nil); err != nil {
 			return s.catchSlow(th, ev, false, err)
 		}
 		copy(th.stack[funcIdx+2:funcIdx+2+nargs], th.stack[funcIdx+1:funcIdx+1+nargs])
 		th.stack[funcIdx+1] = fn
 		th.stack[funcIdx] = tm
 		nargs++
+		if end := funcIdx + 1 + nargs; th.top < end {
+			th.top = end
+		}
 		fn = tm
 		if fn.IsClosure() {
 			cl := fn.AsClosure()
@@ -1639,7 +1649,7 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 		if pushedFrame {
 			if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
 				resStart := funcIdx + 1 + nargs
-				if serr := th.ensureStack(resStart + len(res) + 4); serr != nil {
+				if serr := s.ensureStackWithRoots(th, resStart+len(res)+4, NilValue(), res); serr != nil {
 					hookErr = serr
 				} else {
 					copy(th.stack[resStart:resStart+len(res)], res)
@@ -1659,9 +1669,9 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 			th.nframe--
 		} else {
 			resStart := funcIdx + 1 + nargs
-			if ferr := th.ensureFrameCap(th.nframe+1, frameLimit); ferr != nil {
+			if ferr := s.ensureFrameCapWithRoots(th, th.nframe+1, frameLimit, NilValue(), res); ferr != nil {
 				hookErr = ferr
-			} else if serr := th.ensureStack(resStart + len(res) + 4); serr != nil {
+			} else if serr := s.ensureStackWithRoots(th, resStart+len(res)+4, NilValue(), res); serr != nil {
 				hookErr = serr
 			} else {
 				copy(th.stack[resStart:resStart+len(res)], res)
@@ -1802,7 +1812,7 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 			return false, uncaught(err)
 		}
 		k := len(prepended)
-		if err := th.ensureStack(calleeIdx + 1 + k + calleeArgs + 8); err != nil {
+		if err := s.ensureStackWithRoots(th, calleeIdx+1+k+calleeArgs+8, cur, prepended); err != nil {
 			if s.handleError(th, entryDepth, err) {
 				return true, nil
 			}
@@ -1815,6 +1825,9 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 		th.stack[calleeIdx] = cur
 		targetVal = cur
 		calleeArgs += k
+		if end := calleeIdx + 1 + calleeArgs; th.top < end {
+			th.top = end
+		}
 	}
 	if targetVal.IsNative() {
 		nf := targetVal.AsNative()
@@ -1897,7 +1910,11 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 			}
 			// Keep targetVal's C frame visible to xpcall message handlers (e.g. xpcall(error, debug.traceback, "x")).
 			var pushedTemp bool
-			if ferr := th.ensureFrameCap(th.nframe+1, frameLimit); ferr == nil {
+			var errRoot Value
+			if le, ok := err.(*LuaError); ok {
+				errRoot = le.Val
+			}
+			if ferr := s.ensureFrameCapWithRoots(th, th.nframe+1, frameLimit, errRoot, nil); ferr == nil {
 				th.frames[th.nframe] = callFrame{
 					kind:      frameNative,
 					base:      calleeIdx + 1,
@@ -1979,6 +1996,9 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 	th.stack[fnIdx+2] = th.stack[base+int(a)+3] // control var
 	th.stack[fnIdx+1] = th.stack[base+int(a)+1] // state
 	th.stack[fnIdx] = fn                        // iterator fn
+	if end := fnIdx + 3; th.top < end {
+		th.top = end
+	}
 	if fn.IsNative() {
 		res, _, err := s.callNativeHooked(th, fn, fnIdx, 2, 0, maxFrames+128)
 		if err != nil {
@@ -2075,18 +2095,21 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 			if th.top > slot {
 				slot = th.top
 			}
-			if err := th.ensureStack(slot + 1 + len(cargs) + 4); err != nil {
+			if err := s.ensureStackWithRoots(th, slot+1+len(cargs)+4, tm, cargs); err != nil {
 				return false, err
 			}
 			th.stack[slot] = tm
 			for i, ca := range cargs {
 				th.stack[slot+1+i] = ca
 			}
+			th.top = slot + 1 + len(cargs)
 			cf.dirty = true
 			cf.oldTop = slot
 			cf.finish = finishClose
 			cl := tm.AsClosure()
 			if err := th.pushLuaFrame(cl, slot, len(cargs), 0); err != nil {
+				fillNil(th.stack[slot : slot+1+len(cargs)])
+				th.top = slot
 				cf.finish = finishNone
 				return false, err
 			}
@@ -2100,7 +2123,7 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 		if th.top > slot {
 			slot = th.top
 		}
-		if err := th.ensureStack(slot + 1 + len(cargs) + 8); err != nil {
+		if err := s.ensureStackWithRoots(th, slot+1+len(cargs)+8, tm, cargs); err != nil {
 			return false, err
 		}
 		th.stack[slot] = tm
@@ -2963,13 +2986,16 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				if tm.IsNil() {
 					return coldContinue, pc, fmt.Errorf("attempt to call a %s value%s", fn.TypeName(), varInfo(ev.bp.proto, ipc, int(a)))
 				}
-				if err := th.ensureStack(srcStart + nargs + 4); err != nil {
+				if err := s.ensureStackWithRoots(th, srcStart+nargs+4, tm, nil); err != nil {
 					return coldContinue, pc, err
 				}
 				copy(th.stack[srcStart+2:srcStart+2+nargs], th.stack[srcStart+1:srcStart+1+nargs])
 				th.stack[srcStart+1] = fn
 				th.stack[srcStart] = tm
 				nargs++
+				if end := srcStart + 1 + nargs; th.top < end {
+					th.top = end
+				}
 				fn = tm
 				extraDepth = uint8(depth)
 				if fn.IsClosure() || fn.IsNative() {
@@ -3136,7 +3162,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			var hookErr error
 			if pushedFrame {
 				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
-					if serr := th.ensureStack(srcStart + 1 + len(res) + 4); serr != nil {
+					if serr := s.ensureStackWithRoots(th, srcStart+1+len(res)+4, NilValue(), res); serr != nil {
 						hookErr = serr
 					} else {
 						copy(th.stack[srcStart+1:srcStart+1+len(res)], res)
@@ -3153,9 +3179,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				}
 				th.nframe--
 			} else {
-				if ferr := th.ensureFrameCap(th.nframe+1, maxFrames+128); ferr != nil {
+				if ferr := s.ensureFrameCapWithRoots(th, th.nframe+1, maxFrames+128, NilValue(), res); ferr != nil {
 					hookErr = ferr
-				} else if serr := th.ensureStack(srcStart + 1 + len(res) + 4); serr != nil {
+				} else if serr := s.ensureStackWithRoots(th, srcStart+1+len(res)+4, NilValue(), res); serr != nil {
 					hookErr = serr
 				} else {
 					copy(th.stack[srcStart+1:srcStart+1+len(res)], res)
@@ -3209,7 +3235,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		}
 		// Fire caller Lua frame's return hook before popping it (matching Lua 5.5 lvm.c OP_TAILCALL + OP_RETURN).
 		if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
-			if serr := th.ensureStack(srcStart + len(res) + 4); serr != nil {
+			if serr := s.ensureStackWithRoots(th, srcStart+len(res)+4, NilValue(), res); serr != nil {
 				return coldContinue, pc, serr
 			}
 			copy(th.stack[srcStart:srcStart+len(res)], res)
@@ -3807,13 +3833,14 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			slot = th.top
 		}
 		if tm.IsClosure() {
-			if err := th.ensureStack(slot + 1 + len(cargs) + 8); err != nil {
+			if err := s.ensureStackWithRoots(th, slot+1+len(cargs)+8, tm, cargs); err != nil {
 				return false, err
 			}
 			th.stack[slot] = tm
 			for i, ca := range cargs {
 				th.stack[slot+1+i] = ca
 			}
+			th.top = slot + 1 + len(cargs)
 			cf.dirty = true
 			cf.oldTop = slot
 			cf.finish = finishConcat
@@ -3821,6 +3848,8 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			cf.concatIdx = cur - 1
 			cl := tm.AsClosure()
 			if err := th.pushLuaFrame(cl, slot, len(cargs), 1); err != nil {
+				fillNil(th.stack[slot : slot+1+len(cargs)])
+				th.top = slot
 				cf.finish = finishNone
 				return false, err
 			}
@@ -3830,7 +3859,7 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			}
 			return true, nil
 		}
-		if err := th.ensureStack(slot + 1 + len(cargs) + 8); err != nil {
+		if err := s.ensureStackWithRoots(th, slot+1+len(cargs)+8, tm, cargs); err != nil {
 			return false, err
 		}
 		th.stack[slot] = tm

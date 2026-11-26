@@ -1338,7 +1338,7 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 			}
 		}
 	}
-	if err := th.ensureStack(baseTop + 4); err != nil {
+	if err := s.ensureStackWithRoots(th, baseTop+4, res, nil); err != nil {
 		return nil, err
 	}
 	th.stack[baseTop] = res

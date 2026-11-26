@@ -354,6 +354,10 @@ func (s *State) checkMemAndAccountWithRoots(delta int64, r1, r2, r3 Value) error
 	return s.checkMemAndAccount(delta)
 }
 
+func isGCRootable(v Value) bool {
+	return !v.IsNil() && !v.IsBool() && !v.IsInt() && !v.IsFloat() && !v.IsLightUD()
+}
+
 // ensureStackWithRoots grows th.stack to hold need slots while rooting extra and args
 // across any emergency GC triggered when s.memLimit > 0. Zero overhead when stack fits.
 func (s *State) ensureStackWithRoots(th *Thread, need int, extra Value, args []Value) error {
@@ -362,11 +366,11 @@ func (s *State) ensureStackWithRoots(th *Thread, need int, extra Value, args []V
 	}
 	if s.memLimit > 0 {
 		var ids []int
-		if !extra.IsNil() {
+		if isGCRootable(extra) {
 			ids = append(ids, s.Ref(extra))
 		}
 		for _, a := range args {
-			if !a.IsNil() {
+			if isGCRootable(a) {
 				ids = append(ids, s.Ref(a))
 			}
 		}
@@ -387,11 +391,11 @@ func (s *State) ensureFrameCapWithRoots(th *Thread, need, limit int, extra Value
 	}
 	if s.memLimit > 0 {
 		var ids []int
-		if !extra.IsNil() {
+		if isGCRootable(extra) {
 			ids = append(ids, s.Ref(extra))
 		}
 		for _, a := range args {
-			if !a.IsNil() {
+			if isGCRootable(a) {
 				ids = append(ids, s.Ref(a))
 			}
 		}
@@ -971,26 +975,25 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			res = cp
 		}
 		if err == nil && s.gcNeedsCheck() {
-			// Root all native return values before running Tier-1 GC / finalizers so
-			// newly created values in res cannot be collected before State.Call returns.
+			// Clear finished callee/args before growing the stack and root all native return
+			// values across both stack growth (emergency GC) and Tier-1 debt collection.
+			fillNil(th.stack[base:cleanupEnd])
+			th.top = base
 			if len(res) > 0 {
-				if serr := th.ensureStack(base + len(res) + 4); serr == nil {
+				if serr := s.ensureStackWithRoots(th, base+len(res)+4, NilValue(), res); serr == nil {
 					copy(th.stack[base:base+len(res)], res)
 					if end := base + len(res); end > cleanupEnd {
 						cleanupEnd = end
 					}
-					if base+len(res) < cleanupEnd {
-						fillNil(th.stack[base+len(res) : cleanupEnd])
-					}
 					th.top = base + len(res)
 					s.gcCheckDebt(th.top)
-				} else {
+				} else if s.abortErr == nil {
 					// Stack growth hit memLimit: pin res transiently via Ref handles.
-					fillNil(th.stack[base:cleanupEnd])
-					th.top = base
-					refs := make([]int, len(res))
-					for i, v := range res {
-						refs[i] = s.Ref(v)
+					var refs []int
+					for _, v := range res {
+						if isGCRootable(v) {
+							refs = append(refs, s.Ref(v))
+						}
 					}
 					s.gcCheckDebt(th.top)
 					for _, id := range refs {
@@ -998,8 +1001,6 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 					}
 				}
 			} else {
-				fillNil(th.stack[base:cleanupEnd])
-				th.top = base
 				s.gcCheckDebt(th.top)
 			}
 			if s.abortErr != nil {

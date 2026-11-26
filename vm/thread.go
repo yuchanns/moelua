@@ -442,17 +442,25 @@ func (th *Thread) pushLuaFrame(cl *Closure, funcIdx, nargs, nresults int) error 
 
 func (th *Thread) placeResults(dst int, res []Value, nresults int) error {
 	if nresults < 0 {
-		if err := th.ensureStack(dst + len(res) + 4); err != nil {
+		if th.state != nil {
+			if err := th.state.ensureStackWithRoots(th, dst+len(res)+4, NilValue(), res); err != nil {
+				return err
+			}
+		} else if err := th.ensureStack(dst + len(res) + 4); err != nil {
 			return err
 		}
 		copy(th.stack[dst:dst+len(res)], res)
 		th.top = dst + len(res)
 		return nil
 	}
-	if err := th.ensureStack(dst + nresults + 4); err != nil {
+	n := min(len(res), nresults)
+	if th.state != nil {
+		if err := th.state.ensureStackWithRoots(th, dst+nresults+4, NilValue(), res[:n]); err != nil {
+			return err
+		}
+	} else if err := th.ensureStack(dst + nresults + 4); err != nil {
 		return err
 	}
-	n := min(len(res), nresults)
 	copy(th.stack[dst:dst+n], res[:n])
 	if n < nresults {
 		fillNil(th.stack[dst+n : dst+nresults])
