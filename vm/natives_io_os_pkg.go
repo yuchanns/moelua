@@ -1159,7 +1159,9 @@ func openFileWithMode(filename, mode string) (*luaFile, error) {
 	default:
 		return nil, fmt.Errorf("invalid mode '%s'", mode)
 	}
-	f, err := os.OpenFile(filename, flag, 0o666)
+	// Clone filename because os.File retains the Go string for later PathError diagnostics
+	// independently of Lua Arena string lifetimes.
+	f, err := os.OpenFile(strings.Clone(filename), flag, 0o666)
 	if err != nil {
 		return nil, err
 	}
@@ -1397,7 +1399,8 @@ func nativeIOPopen(s *State, args []Value) ([]Value, error) {
 	// Flush buffered output streams before spawning the child process
 	// (matches Lua 5.5 liolib.c:l_popen calling fflush(NULL) before popen).
 	s.flushOpenFiles()
-	cmd := shellCommand(s.ctx, prog)
+	// Clone prog because exec.Cmd persists on luaFile across GC cycles.
+	cmd := shellCommand(s.ctx, strings.Clone(prog))
 	s.inheritedStdStreams(cmd)
 	var f *os.File
 	if mode[0] == 'w' {

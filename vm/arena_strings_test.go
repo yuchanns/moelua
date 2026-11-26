@@ -2,6 +2,8 @@ package vm_test
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -341,5 +343,49 @@ func TestArenaStringAutoPaceInNativeCallLoops(t *testing.T) {
 	}
 	if peakGMatch > maxAllowed {
 		t.Fatalf("string.gmatch iterator loop exceeded bounded Arena memory: peak=%d bytes", peakGMatch)
+	}
+}
+
+func TestIOOpenClonesArenaFilename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "arena_open_test.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := vm.NewState()
+	defer s.Close()
+	s.SetGlobal("test_dir", vm.StringValue(s.Intern(dir)))
+	s.SetGlobal("test_sep", vm.StringValue(s.Intern(string(filepath.Separator))))
+
+	cl, err := s.LoadChunk([]byte(`
+		local p = test_dir .. test_sep .. "arena_open_test.txt"
+		local plen = #p
+		local f, oerr = io.open(p, "r")
+		assert(f, oerr)
+		p = nil
+		collectgarbage("collect")
+		-- Allocate equal-length dynamic strings to overwrite freed Arena slots.
+		for i = 1, 128 do
+			local _ = string.rep("X", plen - 3) .. string.format("%03d", i)
+		end
+		local ok, werr = f:write("fail")
+		f:close()
+		assert(not ok, "expected write to read-only file to fail")
+		return werr
+	`), "=io_open_clone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Call(cl)
+	if err != nil || len(res) != 1 || !res[0].IsString() {
+		t.Fatalf("io.open test failed: res=%v err=%v", res, err)
+	}
+	got := vm.FormatValue(res[0])
+	if !strings.Contains(got, path) {
+		t.Fatalf("expected file write error to retain real path %q, got %q", path, got)
+	}
+	if strings.Contains(got, "XXXXX") {
+		t.Fatalf("file handle path was overwritten by reused Arena slot: %q", got)
 	}
 }
