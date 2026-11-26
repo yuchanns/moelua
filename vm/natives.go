@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
-
-	"github.com/yuchanns/moelua/bytecode"
 )
 
 func (s *State) registerFunc(tbl *Table, name string, intr uint8, fn func(*State, []Value) ([]Value, error)) *NativeFunc {
@@ -1229,7 +1227,7 @@ const (
 
 // checkTab mirrors Lua 5.5 ltablib.c:checktab, verifying that v is a table or
 // has a metatable defining the required raw metamethods (strings satisfy tabL natively).
-func (s *State) checkTab(v Value, what int, argNum int, fnName string) error {
+func (s *State) checkTab(v Value, what int, argNum int, globalName string) error {
 	if v.IsTable() {
 		return nil
 	}
@@ -1240,7 +1238,7 @@ func (s *State) checkTab(v Value, what int, argNum int, fnName string) error {
 		(what&tabL == 0 || v.IsString() || !s.getTM(mt, TMLen).IsNil()) {
 		return nil
 	}
-	return fmt.Errorf("bad argument #%d to '%s' (table expected, got %s)", argNum, fnName, s.objTypeName(v))
+	return s.badArgErr(argNum, globalName, fmt.Sprintf("table expected, got %s", s.objTypeName(v)))
 }
 
 func (s *State) tableLen(v Value) (int64, error) {
@@ -1338,7 +1336,7 @@ func (s *State) tableSetInt(v Value, idx int64, val Value) error {
 
 func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 	if len(args) < 1 {
-		return nil, fmt.Errorf("bad argument #1 to 'insert' (table expected, got no value)")
+		return nil, s.badArgErr(1, "table.insert", "table expected, got no value")
 	}
 	if args[0].IsTable() && args[0].AsTable().meta == nil {
 		if len(args) < 2 || len(args) > 3 {
@@ -1374,7 +1372,7 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 		t.RawSetInt(s, pos, args[2])
 		return nil, s.ConsumeMemErr()
 	}
-	if err := s.checkTab(args[0], tabRW|tabL, 1, "insert"); err != nil {
+	if err := s.checkTab(args[0], tabRW|tabL, 1, "table.insert"); err != nil {
 		return nil, err
 	}
 	n, err := s.tableLen(args[0])
@@ -1417,7 +1415,7 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 
 func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("bad argument #1 to 'remove' (table expected)")
+		return nil, s.badArgErr(1, "table.remove", "table expected, got no value")
 	}
 	cancelFn := s.nativeCancelFunc()
 	if args[0].IsTable() && args[0].AsTable().meta == nil {
@@ -1458,7 +1456,7 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{res}, nil
 	}
-	if err := s.checkTab(args[0], tabRW|tabL, 1, "remove"); err != nil {
+	if err := s.checkTab(args[0], tabRW|tabL, 1, "table.remove"); err != nil {
 		return nil, err
 	}
 	size, err := s.tableLen(args[0])
@@ -1532,12 +1530,12 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 
 func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("bad argument #1 to 'concat' (table expected, got no value)")
+		return nil, s.badArgErr(1, "table.concat", "table expected, got no value")
 	}
 	rawFast := args[0].IsTable() && args[0].AsTable().meta == nil
 	var defaultLast int64
 	if !rawFast {
-		if err := s.checkTab(args[0], tabR|tabL, 1, "concat"); err != nil {
+		if err := s.checkTab(args[0], tabR|tabL, 1, "table.concat"); err != nil {
 			return nil, err
 		}
 		var err error
@@ -1641,7 +1639,7 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 
 func nativeTableMove(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("bad argument #1 to 'move' (table expected, got no value)")
+		return nil, s.badArgErr(1, "table.move", "table expected, got no value")
 	}
 	src := args[0]
 	checkMoveInt := func(argIdx int) (int64, error) {
@@ -1678,10 +1676,10 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 		dst = args[4]
 		dstArg = 5
 	}
-	if err := s.checkTab(src, tabR, 1, "move"); err != nil {
+	if err := s.checkTab(src, tabR, 1, "table.move"); err != nil {
 		return nil, err
 	}
-	if err := s.checkTab(dst, tabW, dstArg, "move"); err != nil {
+	if err := s.checkTab(dst, tabW, dstArg, "table.move"); err != nil {
 		return nil, err
 	}
 	if e >= f {
@@ -1804,12 +1802,12 @@ func nativeTablePack(s *State, args []Value) ([]Value, error) {
 
 func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("bad argument #1 to 'unpack' (table expected, got no value)")
+		return nil, s.badArgErr(1, "table.unpack", "table expected, got no value")
 	}
 	rawFast := args[0].IsTable() && args[0].AsTable().meta == nil
 	var defaultLen int64
 	if !rawFast {
-		if err := s.checkTab(args[0], tabR|tabL, 1, "unpack"); err != nil {
+		if err := s.checkTab(args[0], tabR|tabL, 1, "table.unpack"); err != nil {
 			return nil, err
 		}
 		var err error
@@ -2052,9 +2050,9 @@ func sortOrderedCancelable[T cmp.Ordered](a []T, cancelFn func() error) error {
 
 func nativeTableSort(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("bad argument #1 to 'sort' (table expected, got no value)")
+		return nil, s.badArgErr(1, "table.sort", "table expected, got no value")
 	}
-	if err := s.checkTab(args[0], tabRW|tabL, 1, "sort"); err != nil {
+	if err := s.checkTab(args[0], tabRW|tabL, 1, "table.sort"); err != nil {
 		return nil, err
 	}
 	hasComp := len(args) >= 2 && !args[1].IsNil()
@@ -2123,7 +2121,7 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 		return nil, nil
 	}
 	if hasComp && !args[1].IsFunction() {
-		return nil, fmt.Errorf("bad argument #2 to 'sort' (function expected, got %s)", s.objTypeName(args[1]))
+		return nil, s.badArgErr(2, "table.sort", fmt.Sprintf("function expected, got %s", s.objTypeName(args[1])))
 	}
 	if s.memLimit > 0 {
 		if err := s.checkMem(int64(n) * 16); err != nil {
@@ -2451,41 +2449,30 @@ func nativeStringChar(s *State, args []Value) ([]Value, error) {
 	return []Value{StringValue(s.intern.Intern(string(buf)))}, nil
 }
 
-// callerIsMethod reports whether the current native function was invoked via Lua method syntax (OP_SELF).
-func (s *State) callerIsMethod() bool {
-	if s.cur == nil || s.cur.nframe == 0 {
-		return false
-	}
-	idx := s.cur.nframe - 1
-	if s.cur.frames[idx].kind == frameNative {
-		idx--
-	}
-	if idx < 0 {
-		return false
-	}
-	cf := &s.cur.frames[idx]
-	if cf.kind == frameLua && cf.cl != nil {
-		p := cf.cl.bp.proto
-		pc := cf.pc - 1
-		if pc >= 0 && pc < len(p.Code) {
-			w := p.Code[pc]
-			if w.Op() == bytecode.OP_CALL || w.Op() == bytecode.OP_TAILCALL {
-				_, kind := findObjectName(p, int(w.A()), pc)
-				return kind == "method"
+// badArgErr mirrors Lua 5.5 lauxlib.c:luaL_argerror: resolves the callee name from the
+// immediate Lua call site (handling colon method self adjustments), falling back to
+// globalName (e.g. "table.sort") when invoked from a C frame or callback where no
+// immediate Lua call-site name exists.
+func (s *State) badArgErr(argNum int, globalName, detail string) error {
+	name := globalName
+	if s.cur != nil && !s.cur.inCCallback && s.cur.nframe > 0 {
+		idx := s.cur.nframe - 1
+		if s.cur.frames[idx].kind == frameNative {
+			idx--
+		}
+		if idx >= 0 && s.cur.frames[idx].kind == frameLua {
+			if n, nw := funcNameFromCallerFrame(&s.cur.frames[idx]); nw != "" {
+				name = n
+				if nw == "method" {
+					if argNum == 1 {
+						return fmt.Errorf("calling '%s' on bad self (%s)", name, detail)
+					}
+					argNum--
+				}
 			}
 		}
 	}
-	return false
-}
-
-func (s *State) badArgErr(argNum int, fname, detail string) error {
-	if s.callerIsMethod() {
-		if argNum == 1 {
-			return fmt.Errorf("calling '%s' on bad self (%s)", fname, detail)
-		}
-		argNum--
-	}
-	return fmt.Errorf("bad argument #%d to '%s' (%s)", argNum, fname, detail)
+	return fmt.Errorf("bad argument #%d to '%s' (%s)", argNum, name, detail)
 }
 
 func nativeStringSub(s *State, args []Value) ([]Value, error) {

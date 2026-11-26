@@ -2913,3 +2913,46 @@ func TestRegistryLayoutAndDynamicGlobalsParity(t *testing.T) {
 		})
 	}
 }
+
+func TestTableArgErrorGlobalAndCallSiteNames(t *testing.T) {
+	run := func(t *testing.T, hooked bool) {
+		s := vm.NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local function check(code, want)
+				local ok, err = pcall(assert(load(code)))
+				assert(not ok, "expected error for " .. code)
+				assert(string.find(tostring(err), want, 1, true),
+					"code=" .. code .. " got=" .. tostring(err) .. " want substring=" .. want)
+			end
+			check("table.sort(1)", "to 'sort'")
+			check("local f = table.sort; f(1)", "to 'f'")
+			check("local function g() return table.sort(1) end; g()", "to 'sort'")
+			check("table.sort({1,2,3}, table.sort)", "to 'table.sort'")
+			check("table.sort({1,2,3}, table.insert)", "to 'table.insert'")
+			check("local ok, e = pcall(table.sort, 1); assert(not ok); error(e, 0)", "to 'table.sort'")
+			local aaa = setmetatable({}, {__index = string})
+			_G._aaa = aaa
+			check("_aaa:sub()", "calling 'sub' on bad self")
+			check("('a'):sub{}", "bad argument #1 to 'sub'")
+			_G._aaa = nil
+		`), "=argerr_names")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hooked {
+			setup, err := s.LoadChunk([]byte(`debug.sethook(function() end, "cr")`), "=hook")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Call(setup); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s.Call(cl); err != nil {
+			t.Fatalf("arg error name test failed (hooked=%v): %v", hooked, err)
+		}
+	}
+	t.Run("unhooked", func(t *testing.T) { run(t, false) })
+	t.Run("hooked", func(t *testing.T) { run(t, true) })
+}

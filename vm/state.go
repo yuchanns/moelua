@@ -1101,11 +1101,17 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 				}
 			}
 		} else if th.hookMask == 0 || th.inHook || th.suppressHook {
+			prevCB := th.inCCallback
+			th.inCCallback = true
 			th.nativeArgsDepth++
 			res, err = nf.callMulti(s, th.stack[base+1:base+1+len(args)])
 			res = th.finishNativeArgs(res)
+			th.inCCallback = prevCB
 		} else {
+			prevCB := th.inCCallback
+			th.inCCallback = true
 			res, _, err = s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
+			th.inCCallback = prevCB
 		}
 		if err == nil && len(res) > 0 && (slicesOverlapValues(res, th.stack) || slicesOverlapValues(res, th.initStack)) {
 			cp := make([]Value, len(res))
@@ -1147,6 +1153,12 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		}
 		return res, err
 	}
+
+	prevCB := th.inCCallback
+	th.inCCallback = false
+	defer func() {
+		th.inCCallback = prevCB
+	}()
 
 	cl := fn.AsClosure()
 	p := cl.bp.proto

@@ -139,6 +139,7 @@ type Thread struct {
 	hookCount     int
 	oldPC         int
 	inHook        bool
+	inCCallback   bool // true while a native callee is running directly inside callOnThread (C callback boundary)
 	suppressHook  bool // true inside __gc finalizers (matching L->allowhook = 0 without clobbering hookMask)
 
 	// Window generation counter for -tags moeluaregcheck verification.
