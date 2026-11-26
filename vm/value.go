@@ -81,11 +81,16 @@ type Userdata struct {
 // LuaError wraps any Lua Value raised via error(v) so pcall/xpcall preserve non-string errors verbatim.
 type LuaError struct {
 	Val       Value
+	msg       string // pre-formatted Go string cached when escaping to Go host (safe across GC / State.Close)
+	hasMsg    bool
 	xpHandled bool // true once an enclosing xpcall message handler has already run for this error
 	isMemErr  bool // true for LUA_ERRMEM allocation failures (bypass xpcall message handlers per Lua 5.5 §2.3)
 }
 
 func (e *LuaError) Error() string {
+	if e.hasMsg {
+		return e.msg
+	}
 	return FormatValue(e.Val)
 }
 

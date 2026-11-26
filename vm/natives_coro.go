@@ -63,7 +63,7 @@ func (s *State) Resume(co *Thread, args ...Value) ([]Value, bool, error) {
 	}
 	if !ok {
 		if len(res) > 0 {
-			return nil, false, &LuaError{Val: res[0]}
+			return nil, false, s.materializeLuaError(&LuaError{Val: res[0]})
 		}
 		return nil, false, fmt.Errorf("coroutine error")
 	}
@@ -109,7 +109,7 @@ func (s *State) CloseThread(co *Thread) error {
 			return uerr
 		}
 		if hasErr {
-			return &LuaError{Val: errVal}
+			return s.materializeLuaError(&LuaError{Val: errVal})
 		}
 		return nil
 	default:

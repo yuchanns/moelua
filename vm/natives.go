@@ -223,14 +223,14 @@ func (s *State) toStringValue(v Value) (string, error) {
 			return "", err
 		}
 		if len(res) > 0 && (res[0].IsString() || res[0].IsNumber()) {
-			return FormatValue(res[0]), nil
+			return s.FormatValue(res[0]), nil
 		}
 		return "", fmt.Errorf("'__tostring' must return a string")
 	}
 	// Per Lua 5.5 lauxlib.c:luaL_tolstring, numbers, strings, booleans, and nil always
 	// format as their primitive representation even if their metatable defines __name.
 	if v.IsNumber() || v.IsString() || v.IsBool() || v.IsNil() {
-		return FormatValue(v), nil
+		return s.FormatValue(v), nil
 	}
 	if mt := s.getMetatableOf(v); mt != nil {
 		if nm := mt.RawGetStr(s.intern.Intern("__name")); nm.IsString() {
@@ -240,7 +240,7 @@ func (s *State) toStringValue(v Value) (string, error) {
 			return s.joinStringsWithCancel(nm.AsString().Str(), ": ", fmt.Sprintf("%p", v.ptr))
 		}
 	}
-	return FormatValue(v), nil
+	return s.FormatValue(v), nil
 }
 
 func nativeAssert(s *State, args []Value) ([]Value, error) {
@@ -1549,7 +1549,7 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 		if !args[1].IsString() && !args[1].IsNumber() {
 			return nil, fmt.Errorf("bad argument #2 to 'concat' (string expected)")
 		}
-		sep = FormatValue(args[1])
+		sep = s.FormatValue(args[1])
 	}
 	i := int64(1)
 	if len(args) >= 3 && !args[2].IsNil() {
@@ -1617,7 +1617,7 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 		if !v.IsString() && !v.IsNumber() {
 			return nil, fmt.Errorf("invalid value (%s) at index %d in table for 'concat'", v.TypeName(), k)
 		}
-		piece := FormatValue(v)
+		piece := s.FormatValue(v)
 		if s.memLimit > 0 {
 			if err := s.checkMem(int64(sb.Len()) + int64(len(piece)) + 48); err != nil {
 				return nil, err
@@ -2295,8 +2295,8 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 
 // --- string ---
 
-func nativeStringLen(_ *State, args []Value) ([]Value, error) {
-	str, err := checkStringArg(args, 0, "len")
+func nativeStringLen(s *State, args []Value) ([]Value, error) {
+	str, err := s.checkStringArg(args, 0, "len")
 	if err != nil {
 		return nil, err
 	}
@@ -2311,7 +2311,7 @@ func nativeStringByte(s *State, args []Value) ([]Value, error) {
 	if args[0].IsString() {
 		str = args[0].AsString().Str()
 	} else if args[0].IsNumber() {
-		str = FormatValue(args[0])
+		str = s.FormatValue(args[0])
 	} else {
 		return nil, s.badArgErr(1, "byte", fmt.Sprintf("string expected, got %s", s.objTypeName(args[0])))
 	}
@@ -2483,7 +2483,7 @@ func nativeStringSub(s *State, args []Value) ([]Value, error) {
 	if args[0].IsString() {
 		str = args[0].AsString().Str()
 	} else if args[0].IsNumber() {
-		str = FormatValue(args[0])
+		str = s.FormatValue(args[0])
 	} else {
 		return nil, s.badArgErr(1, "sub", fmt.Sprintf("string expected, got %s", s.objTypeName(args[0])))
 	}
@@ -2564,7 +2564,7 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 	if args[0].IsString() {
 		str = args[0].AsString().Str()
 	} else if args[0].IsNumber() {
-		str = FormatValue(args[0])
+		str = s.FormatValue(args[0])
 	} else {
 		return nil, fmt.Errorf("bad argument #1 to 'rep' (string expected, got %s)", s.objTypeName(args[0]))
 	}
@@ -2589,7 +2589,7 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 		if args[2].IsString() {
 			sep = args[2].AsString().Str()
 		} else if args[2].IsNumber() {
-			sep = FormatValue(args[2])
+			sep = s.FormatValue(args[2])
 		} else {
 			return nil, fmt.Errorf("bad argument #3 to 'rep' (string expected, got %s)", args[2].TypeName())
 		}
@@ -2720,7 +2720,7 @@ func nativeStringReverse(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'reverse' (string expected)")
 	}
-	str := FormatValue(args[0])
+	str := s.FormatValue(args[0])
 	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
 		if s.memLimit > 0 {
 			if err := s.checkMem(int64(len(str)) + 48); err != nil {
@@ -2757,7 +2757,7 @@ func nativeStringLower(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'lower' (string expected)")
 	}
 	// ASCII-only tolower matching C locale (Lua 5.5 default locale)
-	str := FormatValue(args[0])
+	str := s.FormatValue(args[0])
 	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
 		if s.memLimit > 0 {
 			if err := s.checkMem(int64(len(str)) + 48); err != nil {
@@ -2799,7 +2799,7 @@ func nativeStringUpper(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'upper' (string expected)")
 	}
-	str := FormatValue(args[0])
+	str := s.FormatValue(args[0])
 	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
 		if s.memLimit > 0 {
 			if err := s.checkMem(int64(len(str)) + 48); err != nil {

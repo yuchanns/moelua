@@ -31,7 +31,7 @@ func (s *State) initStringExtraAndUTF8(strTbl *Table) {
 	s.SetGlobal("utf8", TableValue(utf8Tbl))
 }
 
-func checkStringArg(args []Value, idx int, fnName string) (string, error) {
+func (s *State) checkStringArg(args []Value, idx int, fnName string) (string, error) {
 	if idx >= len(args) {
 		return "", fmt.Errorf("bad argument #%d to '%s' (string expected, got no value)", idx+1, fnName)
 	}
@@ -40,7 +40,7 @@ func checkStringArg(args []Value, idx int, fnName string) (string, error) {
 		return v.AsString().Str(), nil
 	}
 	if v.IsNumber() {
-		return FormatValue(v), nil
+		return s.FormatValue(v), nil
 	}
 	return "", fmt.Errorf("bad argument #%d to '%s' (string expected, got %s)", idx+1, fnName, v.TypeName())
 }
@@ -130,11 +130,11 @@ func (s *State) capturesToValuesRooted(caps []luastdlib.CaptureVal, srcLen int, 
 }
 
 func nativeStringFind(s *State, args []Value) ([]Value, error) {
-	str, err := checkStringArg(args, 0, "find")
+	str, err := s.checkStringArg(args, 0, "find")
 	if err != nil {
 		return nil, err
 	}
-	pat, err := checkStringArg(args, 1, "find")
+	pat, err := s.checkStringArg(args, 1, "find")
 	if err != nil {
 		return nil, err
 	}
@@ -161,11 +161,11 @@ func nativeStringFind(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeStringMatch(s *State, args []Value) ([]Value, error) {
-	str, err := checkStringArg(args, 0, "match")
+	str, err := s.checkStringArg(args, 0, "match")
 	if err != nil {
 		return nil, err
 	}
-	pat, err := checkStringArg(args, 1, "match")
+	pat, err := s.checkStringArg(args, 1, "match")
 	if err != nil {
 		return nil, err
 	}
@@ -197,11 +197,11 @@ type gmatchState struct {
 }
 
 func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
-	str, err := checkStringArg(args, 0, "gmatch")
+	str, err := s.checkStringArg(args, 0, "gmatch")
 	if err != nil {
 		return nil, err
 	}
-	pat, err := checkStringArg(args, 1, "gmatch")
+	pat, err := s.checkStringArg(args, 1, "gmatch")
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +272,7 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 	fn.Fn = func(s *State, _ []Value) ([]Value, error) {
 		var gs *gmatchState
 		if len(fn.upvals) > 2 && fn.upvals[2].IsUserdata() {
-			gs, _ = fn.upvals[2].AsUserdata().Data.(*gmatchState)
+			gs, _ = s.UserdataData(fn.upvals[2].AsUserdata()).(*gmatchState)
 		}
 		if gs == nil {
 			return nil, fmt.Errorf("bad gmatch iterator state")
@@ -290,11 +290,11 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeStringGSub(s *State, args []Value) ([]Value, error) {
-	str, err := checkStringArg(args, 0, "gsub")
+	str, err := s.checkStringArg(args, 0, "gsub")
 	if err != nil {
 		return nil, err
 	}
-	pat, err := checkStringArg(args, 1, "gsub")
+	pat, err := s.checkStringArg(args, 1, "gsub")
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +330,7 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 	}
 	switch {
 	case repl.IsString() || repl.IsNumber():
-		outStr, count, err = luastdlib.GSubStringWithLimits(str, pat, FormatValue(repl), maxRepl, cancelFn, checkSize)
+		outStr, count, err = luastdlib.GSubStringWithLimits(str, pat, s.FormatValue(repl), maxRepl, cancelFn, checkSize)
 		replaced = count > 0
 	case repl.IsTable():
 		outStr, count, err = luastdlib.GSubTableWithLimits(str, pat, func(key luastdlib.CaptureVal) (string, bool, error) {
@@ -356,7 +356,7 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 			}
 			if val.IsString() || val.IsNumber() {
 				replaced = true
-				return FormatValue(val), true, nil
+				return s.FormatValue(val), true, nil
 			}
 			return "", false, fmt.Errorf("invalid replacement value (a %s)", val.TypeName())
 		}, maxRepl, cancelFn, checkSize)
@@ -375,7 +375,7 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 			}
 			if res[0].IsString() || res[0].IsNumber() {
 				replaced = true
-				return FormatValue(res[0]), true, nil
+				return s.FormatValue(res[0]), true, nil
 			}
 			return "", false, fmt.Errorf("invalid replacement value (a %s)", res[0].TypeName())
 		}, maxRepl, cancelFn, checkSize)
@@ -396,7 +396,7 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeStringPack(s *State, args []Value) ([]Value, error) {
-	fmtStr, err := checkStringArg(args, 0, "pack")
+	fmtStr, err := s.checkStringArg(args, 0, "pack")
 	if err != nil {
 		return nil, err
 	}
@@ -437,11 +437,11 @@ func nativeStringPack(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
-	fmtStr, err := checkStringArg(args, 0, "unpack")
+	fmtStr, err := s.checkStringArg(args, 0, "unpack")
 	if err != nil {
 		return nil, err
 	}
-	data, err := checkStringArg(args, 1, "unpack")
+	data, err := s.checkStringArg(args, 1, "unpack")
 	if err != nil {
 		return nil, err
 	}
@@ -592,7 +592,7 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeStringPackSize(s *State, args []Value) ([]Value, error) {
-	fmtStr, err := checkStringArg(args, 0, "packsize")
+	fmtStr, err := s.checkStringArg(args, 0, "packsize")
 	if err != nil {
 		return nil, err
 	}
@@ -615,7 +615,7 @@ func nativeStringPackSize(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
-	fmtStr, err := checkStringArg(args, 0, "format")
+	fmtStr, err := s.checkStringArg(args, 0, "format")
 	if err != nil {
 		return nil, err
 	}
@@ -721,7 +721,7 @@ func nativeUTF8Char(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeUTF8Codepoint(s *State, args []Value) ([]Value, error) {
-	str, err := checkStringArg(args, 0, "codepoint")
+	str, err := s.checkStringArg(args, 0, "codepoint")
 	if err != nil {
 		return nil, err
 	}
@@ -796,7 +796,7 @@ func nativeUTF8Codepoint(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeUTF8Len(s *State, args []Value) ([]Value, error) {
-	str, err := checkStringArg(args, 0, "len")
+	str, err := s.checkStringArg(args, 0, "len")
 	if err != nil {
 		return nil, err
 	}
@@ -846,7 +846,7 @@ var (
 
 func makeUTF8CodesIterFn(lax bool) func(*State, []Value) ([]Value, error) {
 	return func(s *State, iargs []Value) ([]Value, error) {
-		sv, err := checkStringArg(iargs, 0, "codes")
+		sv, err := s.checkStringArg(iargs, 0, "codes")
 		if err != nil {
 			return nil, err
 		}
@@ -873,7 +873,7 @@ func makeUTF8CodesIterFn(lax bool) func(*State, []Value) ([]Value, error) {
 }
 
 func nativeUTF8Codes(s *State, args []Value) ([]Value, error) {
-	str, err := checkStringArg(args, 0, "codes")
+	str, err := s.checkStringArg(args, 0, "codes")
 	if err != nil {
 		return nil, err
 	}
@@ -900,7 +900,7 @@ func nativeUTF8Codes(s *State, args []Value) ([]Value, error) {
 
 // nativeUTF8Offset implements Lua 5.5.1 two-return utf8.offset(s, n [, i]) -> start, end!
 func nativeUTF8Offset(s *State, args []Value) ([]Value, error) {
-	str, err := checkStringArg(args, 0, "offset")
+	str, err := s.checkStringArg(args, 0, "offset")
 	if err != nil {
 		return nil, err
 	}

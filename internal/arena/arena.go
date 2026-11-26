@@ -105,7 +105,9 @@ type pageMeta struct {
 type Arena struct {
 	// 1-based slab page table (pages[0] == nil sentinel so page ObjRefs are always != NullRef).
 	// Every element is a noscan []byte of length PageSize (64 KiB).
+	// pagePtrs mirrors pages with cached base pointers for hot-path slab dereferencing.
 	pages       [][]byte
+	pagePtrs    []unsafe.Pointer
 	pageMeta    []pageMeta
 	freePageIDs []uint32
 	classAvail  [NumClasses]uint32 // head pid of pages with >= 1 free slot per class
@@ -126,6 +128,7 @@ type Arena struct {
 func New() *Arena {
 	return &Arena{
 		pages:      make([][]byte, 1, 8),
+		pagePtrs:   make([]unsafe.Pointer, 1, 8),
 		pageMeta:   make([]pageMeta, 1, 8),
 		largeSpans: make([][]byte, 1, 4),
 	}
@@ -183,6 +186,7 @@ func (a *Arena) CanAlloc(size int) bool {
 func (a *Arena) ensureInit() {
 	if len(a.pages) == 0 {
 		a.pages = make([][]byte, 1, 8)
+		a.pagePtrs = make([]unsafe.Pointer, 1, 8)
 		a.pageMeta = make([]pageMeta, 1, 8)
 	}
 	if len(a.largeSpans) == 0 {
@@ -322,6 +326,7 @@ func (a *Arena) allocPage(cls uint8) (uint32, error) {
 			panic("arena: slab page not 8-byte aligned")
 		}
 	}
+	basePtr := unsafe.Pointer(unsafe.SliceData(buf))
 	bitWords := (int(classSlotsPerPg[cls]) + 63) >> 6
 	pm := pageMeta{
 		liveBits: make([]uint64, bitWords),
@@ -330,9 +335,11 @@ func (a *Arena) allocPage(cls uint8) (uint32, error) {
 	}
 	if reused {
 		a.pages[pid] = buf
+		a.pagePtrs[pid] = basePtr
 		a.pageMeta[pid] = pm
 	} else {
 		a.pages = append(a.pages, buf)
+		a.pagePtrs = append(a.pagePtrs, basePtr)
 		a.pageMeta = append(a.pageMeta, pm)
 	}
 	a.activePages++
@@ -425,6 +432,7 @@ func (a *Arena) Free(ref ObjRef) {
 		a.unlinkAvail(pid)
 		buf := a.pages[pid]
 		a.pages[pid] = nil
+		a.pagePtrs[pid] = nil
 		*meta = pageMeta{}
 		a.freePageIDs = append(a.freePageIDs, pid)
 		a.activePages--
@@ -539,8 +547,43 @@ func (a *Arena) Ptr(ref ObjRef) unsafe.Pointer {
 	if pid == 0 || int(pid) >= len(a.pages) || !a.pageMeta[pid].active {
 		panic("arena: invalid slab Ptr ref")
 	}
-	byteOff := int(wordOff) << alignShift
-	return unsafe.Pointer(&a.pages[pid][byteOff])
+	byteOff := uintptr(wordOff) << alignShift
+	return unsafe.Add(a.pagePtrs[pid], byteOff)
+}
+
+// PagePtrs returns the backing slab page base pointer table for hot-loop caching.
+// Callers caching the returned slice header must reload it after any allocation that may
+// append a new slab page or after Close.
+func (a *Arena) PagePtrs() []unsafe.Pointer {
+	return a.pagePtrs
+}
+
+// PtrInPages resolves a live non-large slab ObjRef directly against a cached PagePtrs slice.
+// Caller must guarantee ref != NullRef, !ref.IsLarge(), and that ref addresses a live slab slot.
+func PtrInPages(pagePtrs []unsafe.Pointer, ref ObjRef) unsafe.Pointer {
+	return unsafe.Add(pagePtrs[ref>>wordBits], uintptr(ref&wordMask)<<alignShift)
+}
+
+// PtrSmall resolves a live non-large slab ObjRef without large-span branching or pageMeta
+// validation. Returns nil for NullRef. Caller must guarantee !ref.IsLarge() and that ref
+// addresses a live slab slot; passing a large ref panics on the pagePtrs bounds check.
+func (a *Arena) PtrSmall(ref ObjRef) unsafe.Pointer {
+	if ref == NullRef {
+		return nil
+	}
+	return unsafe.Add(a.pagePtrs[ref>>wordBits], uintptr(ref&wordMask)<<alignShift)
+}
+
+// PtrFast resolves any live slab or large ObjRef with minimal branching.
+// Returns nil for NullRef. Caller must guarantee ref addresses a live allocation.
+func (a *Arena) PtrFast(ref ObjRef) unsafe.Pointer {
+	if ref == NullRef {
+		return nil
+	}
+	if !ref.IsLarge() {
+		return unsafe.Add(a.pagePtrs[ref>>wordBits], uintptr(ref&wordMask)<<alignShift)
+	}
+	return unsafe.Pointer(unsafe.SliceData(a.largeSpans[largeRefIndex(ref)]))
 }
 
 // Header returns the 8-byte GCHeader located at offset 0 of ref.
@@ -552,6 +595,28 @@ func (a *Arena) Header(ref ObjRef) *GCHeader {
 // T must be a pointer-free (noscan) struct with alignof(T) <= 8 and sizeof(T) <= SlotSize(ref).
 func As[T any](a *Arena, ref ObjRef) *T {
 	return (*T)(a.Ptr(ref))
+}
+
+// AsSmall casts a live non-large slab ref to *T using the unchecked PtrSmall fast path.
+// T must be a pointer-free (noscan) struct with alignof(T) <= 8 and sizeof(T) <= SlotSize(ref).
+func AsSmall[T any](a *Arena, ref ObjRef) *T {
+	return (*T)(a.PtrSmall(ref))
+}
+
+// AsFast casts a live slab or large ref to *T using the PtrFast fast path.
+// T must be a pointer-free (noscan) struct with alignof(T) <= 8 and sizeof(T) <= SlotSize(ref).
+func AsFast[T any](a *Arena, ref ObjRef) *T {
+	return (*T)(a.PtrFast(ref))
+}
+
+// SliceFast returns a Go slice view of length n of pointer-free element type T starting at
+// byteOff bytes inside a live slab or large allocation without SlotSize validation.
+// Caller must guarantee ref is live, byteOff is aligned to alignof(T), and byteOff + n*sizeof(T) <= SlotSize(ref).
+func SliceFast[T any](a *Arena, ref ObjRef, byteOff, n int) []T {
+	if n == 0 {
+		return nil
+	}
+	return unsafe.Slice((*T)(unsafe.Add(a.PtrFast(ref), byteOff)), n)
 }
 
 // Slice returns a Go slice view of length n of pointer-free element type T starting at byteOff
@@ -585,9 +650,11 @@ func (a *Arena) ReleaseSpare() {
 // After Close, the Arena is empty and ready for reuse or garbage collection.
 func (a *Arena) Close() {
 	clear(a.pages)
+	clear(a.pagePtrs)
 	clear(a.pageMeta)
 	clear(a.largeSpans)
 	a.pages = nil
+	a.pagePtrs = nil
 	a.pageMeta = nil
 	a.freePageIDs = nil
 	a.classAvail = [NumClasses]uint32{}
@@ -610,8 +677,10 @@ func (a *Arena) CloneSnapshot() *Arena {
 		cp.limit = a.limit
 		return cp
 	}
+	pageLen := max(len(a.pages), 1)
 	cp := &Arena{
-		pages:       make([][]byte, max(len(a.pages), 1)),
+		pages:       make([][]byte, pageLen),
+		pagePtrs:    make([]unsafe.Pointer, pageLen),
 		pageMeta:    make([]pageMeta, max(len(a.pageMeta), 1)),
 		classAvail:  a.classAvail,
 		largeSpans:  make([][]byte, max(len(a.largeSpans), 1)),
@@ -635,6 +704,7 @@ func (a *Arena) CloneSnapshot() *Arena {
 			dst := make([]byte, len(src))
 			copy(dst, src)
 			cp.pages[pid] = dst
+			cp.pagePtrs[pid] = unsafe.Pointer(unsafe.SliceData(dst))
 		}
 		if srcBits := a.pageMeta[pid].liveBits; len(srcBits) > 0 {
 			dstBits := make([]uint64, len(srcBits))

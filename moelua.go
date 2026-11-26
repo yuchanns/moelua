@@ -552,7 +552,7 @@ func (s *State) CheckUserdata(v Value, name string) (any, bool) {
 	if mt == nil || s.vm.GetMetatableOf(v) != mt.raw {
 		return nil, false
 	}
-	return v.AsUserdata().Data, true
+	return s.vm.UserdataData(v.AsUserdata()), true
 }
 
 // Handle is a GC-anchored host reference to a Lua Value (analogous to luaL_ref).
@@ -1183,6 +1183,23 @@ func (th *Thread) Close() error {
 		return ErrStateClosed
 	}
 	return th.state.vm.CloseThread(th.raw)
+}
+
+// FormatValue formats any Lua Value owned by s as a Go string (matching tostring without metamethods).
+// Returned strings are safely cloned copies independent of Lua GC or State.Close.
+func (s *State) FormatValue(v Value) string {
+	if !s.ready() {
+		return vm.FormatValue(v)
+	}
+	return s.vm.FormatValue(v)
+}
+
+// RawEqual implements Lua 5.5 rawequal(a, b) for Values owned by s.
+func (s *State) RawEqual(a, b Value) bool {
+	if !s.ready() {
+		return false
+	}
+	return s.vm.RawEqual(a, b)
 }
 
 // FormatValue formats any Lua Value as a Go string (matching tostring without metamethods).
