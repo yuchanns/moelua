@@ -316,9 +316,13 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 	raised := false
 	prevCur := th.state.cur
 	var prevStatus ThreadStatus
+	var prevCurRef int
 	if prevCur != nil && prevCur != th {
 		prevStatus = prevCur.status
 		prevCur.status = ThreadNormal
+		// Pin the calling coroutine across synchronous closing on another thread so
+		// GC triggered inside __close cannot collect live values on prevCur's stack.
+		prevCurRef = th.state.Ref(ThreadValue(prevCur))
 	}
 	th.state.cur = th
 	errSlot := len(th.syncCloseErrs)
@@ -329,6 +333,7 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 		th.state.cur = prevCur
 		if prevCur != nil && prevCur != th {
 			prevCur.status = prevStatus
+			th.state.Unref(prevCurRef)
 		}
 	}()
 	for len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level {

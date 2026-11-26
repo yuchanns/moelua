@@ -1466,8 +1466,6 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 			}
 			obj := UserdataValue(u)
 			if !tr.isMarked(obj) {
-				u.gcFnzed = true
-				u.gcPending = true
 				newlySep = append(newlySep, obj)
 			} else {
 				keptFiles = append(keptFiles, wf)
@@ -1478,20 +1476,23 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		fi--
 		obj := entry.obj
 		if !tr.isMarked(obj) {
-			// Mark as finalized + pending so it won't fire twice or re-register before running.
-			switch {
-			case obj.IsTable():
-				t := obj.AsTable()
-				t.flags = (t.flags | tblFlagGCFnzed | tblFlagGCPending) &^ tblFlagGCInFnz
-			case obj.IsUserdata():
-				u := obj.AsUserdata()
-				u.gcFnzed = true
-				u.gcPending = true
-				u.gcInFnz = false
-			}
 			newlySep = append(newlySep, obj)
 		} else {
 			kept = append(kept, entry)
+		}
+	}
+	// Commit finalization flags only after separation completes without cancellation
+	// so an aborted collection never drops pending table/userdata/file finalizers.
+	for _, obj := range newlySep {
+		switch {
+		case obj.IsTable():
+			t := obj.AsTable()
+			t.flags = (t.flags | tblFlagGCFnzed | tblFlagGCPending) &^ tblFlagGCInFnz
+		case obj.IsUserdata():
+			u := obj.AsUserdata()
+			u.gcFnzed = true
+			u.gcPending = true
+			u.gcInFnz = false
 		}
 	}
 	// Restore ascending registration order in kept and keptFiles (since we merged backwards).
