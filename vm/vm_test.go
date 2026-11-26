@@ -1314,3 +1314,145 @@ assert(ok == true and innerOk == false and string.find(innerErr, "boom_go_xpcall
 		t.Fatalf("outer xpcall handler was erroneously invoked for error caught by Go State.Call(pcall)")
 	}
 }
+
+// TestRegistryLoadedAndRawSearchersParity verifies that require resolves _LOADED
+// dynamically from debug.getregistry()._LOADED (honoring __index/__newindex) while
+// package.searchers iteration uses raw integer indexing (lua_rawgeti, per loadlib.c:629).
+func TestRegistryLoadedAndRawSearchersParity(t *testing.T) {
+	src := `
+local origLoaded = debug.getregistry()._LOADED
+debug.getregistry()._LOADED = { virtual = 42 }
+assert(require("virtual") == 42)
+
+local stored = {}
+debug.getregistry()._LOADED = setmetatable({}, {
+	__index = function(_, k)
+		if k == "lazy_loaded" then return 99 end
+		return stored[k]
+	end,
+	__newindex = function(_, k, v)
+		stored[k] = v
+	end,
+})
+assert(require("lazy_loaded") == 99)
+
+local origPreload = package.preload.custom_reg_mod
+package.preload.custom_reg_mod = function(n) return "val:" .. n end
+local r, extra = require("custom_reg_mod")
+assert(r == "val:custom_reg_mod" and extra == ":preload:" and stored.custom_reg_mod == "val:custom_reg_mod")
+package.preload.custom_reg_mod = origPreload
+debug.getregistry()._LOADED = origLoaded
+
+-- Per Lua 5.5.1 loadlib.c:629 (lua_rawgeti), package.searchers ignores __index.
+local origSearchers = package.searchers
+package.searchers = setmetatable({}, {
+	__index = function(_, i)
+		if i == 1 then
+			return function() return function() return "should_not_run" end end
+		end
+	end
+})
+local ok, err = pcall(require, "not_found_raw_searchers")
+package.searchers = origSearchers
+assert(not ok and string.find(err, "module 'not_found_raw_searchers' not found:", 1, true), tostring(err))
+print("reg_loaded_ok")
+`
+	got := runMoeLua(t, src)
+	if got != "reg_loaded_ok\n" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+	if hasCLua55(t) {
+		if want := runCLua55(t, src); got != want {
+			t.Fatalf("mismatch vs C Lua 5.5.1:\nwant:\n%s\ngot:\n%s", want, got)
+		}
+	}
+}
+
+// TestInlineCacheDoesNotPinObjectsInTier0 verifies that stale or orphaned inline-cache
+// entries (icProtoVal, polymorphic ICs, icAddSlot, icEnvSlot) hold no strong Go pointers
+// to collectable Lua objects or Shapes, allowing Go's GC to reclaim them in Tier 0
+// without calling State.CollectFull().
+func TestInlineCacheDoesNotPinObjectsInTier0(t *testing.T) {
+	runReclaim := func(t *testing.T, src string) {
+		t.Helper()
+		s := vm.NewState()
+		defer s.Close()
+		var wp weak.Pointer[vm.Table]
+		func() {
+			cl, err := s.LoadChunk([]byte(src), "=ic_reclaim")
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := s.Call(cl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(res) != 1 || !res[0].IsTable() {
+				t.Fatalf("expected table canary, got %v", res)
+			}
+			wp = weak.Make(res[0].AsTable())
+			res[0] = vm.NilValue()
+		}()
+		reclaimed := false
+		for range 12 {
+			runtime.GC()
+			if wp.Value() == nil {
+				reclaimed = true
+				break
+			}
+		}
+		if !reclaimed {
+			t.Fatalf("inline cache retained unreachable table in Tier 0 without State.CollectFull")
+		}
+	}
+
+	t.Run("deleted_proto_field_icProtoVal", func(t *testing.T) {
+		runReclaim(t, `
+			GETTER = function(t) return t.x end
+			local payload = { data = string.rep("a", 1024 * 1024) }
+			local proto = { x = payload }
+			local mt = { __index = proto }
+			local obj = setmetatable({}, mt)
+			assert(GETTER(obj) == payload)
+			assert(GETTER(obj) == payload)
+			proto.x = nil
+			return payload
+		`)
+	})
+
+	t.Run("dropped_unmutated_proto_and_shape", func(t *testing.T) {
+		runReclaim(t, `
+			GETTER = function(t) return t.x end
+			local payload = { data = string.rep("b", 1024 * 1024) }
+			local proto = { x = payload }
+			local obj = setmetatable({}, { __index = proto })
+			assert(GETTER(obj) == payload)
+			assert(GETTER(obj) == payload)
+			return payload
+		`)
+	})
+
+	t.Run("polymorphic_proto_and_env_slot", func(t *testing.T) {
+		runReclaim(t, `
+			POLY = function(t) return t.x end
+			local p1 = { data = string.rep("c", 65536) }
+			local p2 = { data = string.rep("d", 65536) }
+			local o1 = setmetatable({ a = 1 }, { __index = { x = p1 } })
+			local o2 = setmetatable({ b = 2 }, { __index = { x = p2 } })
+			assert(POLY(o1) == p1 and POLY(o2) == p2 and POLY(o1) == p1)
+			return p2
+		`)
+	})
+
+	t.Run("swapped_env_dict_icEnvSlot", func(t *testing.T) {
+		runReclaim(t, `
+			local env1 = { GVAL = 123, BIG = { data = string.rep("e", 65536) } }
+			for i = 1, 80 do env1["k" .. i] = i end -- force dict mode (shape == nil)
+			FN = load("return GVAL", "=env_ic", "t", env1)
+			assert(FN() == 123 and FN() == 123)
+			debug.setupvalue(FN, 1, { GVAL = 456 })
+			assert(FN() == 456)
+			return env1.BIG
+		`)
+	})
+}

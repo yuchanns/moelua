@@ -63,7 +63,7 @@ type stdTemplate struct {
 	tms       [tmCount]*LuaString
 	nextStrID uint32
 
-	nextShapeID uint32
+	nextShapeID uint64
 
 	builtinNext           *NativeFunc
 	builtinIPairsIter     *NativeFunc

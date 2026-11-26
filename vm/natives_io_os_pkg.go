@@ -3033,41 +3033,42 @@ func (s *State) pkgField(name string) (Value, error) {
 	return v, nil
 }
 
+func (s *State) registryField(name string) (Value, error) {
+	key := s.intern.Intern(name)
+	v := s.registry.RawGetStr(key)
+	if v.IsNil() && s.registry.meta != nil {
+		return s.finishGet(TableValue(s.registry), StringValue(key))
+	}
+	return v, nil
+}
+
+func (s *State) tableGetStrAny(obj Value, key *LuaString) (Value, error) {
+	if obj.IsTable() {
+		t := obj.AsTable()
+		if err := s.ensureLookupStrKeyHash(t, key); err != nil {
+			return NilValue(), err
+		}
+		v := t.RawGetStr(key)
+		if !v.IsNil() || t.meta == nil {
+			return v, nil
+		}
+	}
+	return s.finishGet(obj, StringValue(key))
+}
+
 func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'searcher_preload' (string expected)")
 	}
 	name := FormatValue(args[0])
 	key := s.intern.Intern(name)
-	preloadKey := s.intern.Intern("_PRELOAD")
-	preloadVal := s.registry.RawGetStr(preloadKey)
-	if preloadVal.IsNil() && s.registry.meta != nil {
-		var gerr error
-		preloadVal, gerr = s.finishGet(TableValue(s.registry), StringValue(preloadKey))
-		if gerr != nil {
-			return nil, gerr
-		}
+	preloadVal, err := s.registryField("_PRELOAD")
+	if err != nil {
+		return nil, err
 	}
-	var v Value
-	if preloadVal.IsTable() {
-		pt := preloadVal.AsTable()
-		if err := s.ensureLookupStrKeyHash(pt, key); err != nil {
-			return nil, err
-		}
-		v = pt.RawGetStr(key)
-		if v.IsNil() && pt.meta != nil {
-			var gerr error
-			v, gerr = s.finishGet(preloadVal, StringValue(key))
-			if gerr != nil {
-				return nil, gerr
-			}
-		}
-	} else {
-		var gerr error
-		v, gerr = s.finishGet(preloadVal, StringValue(key))
-		if gerr != nil {
-			return nil, gerr
-		}
+	v, err := s.tableGetStrAny(preloadVal, key)
+	if err != nil {
+		return nil, err
 	}
 	if v.IsNil() {
 		if s.memLimit > 0 {
@@ -3150,17 +3151,39 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	}
 	name := FormatValue(args[0])
 	key := s.intern.Intern(name)
-	loadedVal := TableValue(s.loadedTbl)
-	if err := s.ensureLookupStrKeyHash(s.loadedTbl, key); err != nil {
+	loadedVal, err := s.registryField("_LOADED")
+	if err != nil {
 		return nil, err
 	}
-	existing := s.loadedTbl.RawGetStr(key)
-	if existing.IsNil() && s.loadedTbl.meta != nil {
-		var gerr error
-		existing, gerr = s.finishGet(loadedVal, StringValue(key))
-		if gerr != nil {
-			return nil, gerr
+	// Root _LOADED (and later searchers / loader / extra / result) on the active thread
+	// stack across all Lua callbacks so GC cannot prematurely finalize them while require runs.
+	th := s.cur
+	savedTop := th.top
+	baseTop := savedTop
+	for fi := range th.nframe {
+		cf := &th.frames[fi]
+		if cf.cl != nil {
+			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+				baseTop = end
+			}
 		}
+	}
+	if err := s.ensureStackWithRoots(th, baseTop+5, loadedVal, []Value{StringValue(key)}); err != nil {
+		return nil, err
+	}
+	th.stack[baseTop] = loadedVal
+	th.stack[baseTop+1] = NilValue()
+	th.stack[baseTop+2] = NilValue()
+	th.top = baseTop + 3
+	defer func() {
+		th.stack[baseTop] = NilValue()
+		th.stack[baseTop+1] = NilValue()
+		th.stack[baseTop+2] = NilValue()
+		th.top = savedTop
+	}()
+	existing, err := s.tableGetStrAny(loadedVal, key)
+	if err != nil {
+		return nil, err
 	}
 	if !existing.IsFalsy() {
 		return []Value{existing}, nil
@@ -3173,30 +3196,7 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("'package.searchers' must be a table")
 	}
 	st := sv.AsTable()
-	// Root searchers table (and later loader + extra) on the active thread stack across
-	// all Lua callbacks so GC cannot prematurely finalize them while require is running.
-	th := s.cur
-	savedTop := th.top
-	baseTop := savedTop
-	for fi := range th.nframe {
-		cf := &th.frames[fi]
-		if cf.cl != nil {
-			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
-				baseTop = end
-			}
-		}
-	}
-	if err := s.ensureStackWithRoots(th, baseTop+4, sv, []Value{StringValue(key)}); err != nil {
-		return nil, err
-	}
-	th.stack[baseTop] = sv
-	th.stack[baseTop+1] = NilValue()
-	th.top = baseTop + 2
-	defer func() {
-		th.stack[baseTop] = NilValue()
-		th.stack[baseTop+1] = NilValue()
-		th.top = savedTop
-	}()
+	th.stack[baseTop+1] = sv
 	var errs strings.Builder
 	var loader, extra Value
 	for i := int64(1); ; i++ {
@@ -3228,28 +3228,21 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 			errs.WriteString(smsg)
 		}
 	}
-	th.stack[baseTop] = loader
-	th.stack[baseTop+1] = extra
+	th.stack[baseTop+1] = loader
+	th.stack[baseTop+2] = extra
 	res, err := s.Call(loader, StringValue(key), extra)
 	if err != nil {
 		return nil, err
 	}
 	if len(res) > 0 && !res[0].IsNil() {
-		th.stack[baseTop] = res[0]
+		th.stack[baseTop+1] = res[0]
 		if err := s.tableSetStr(loadedVal, key, res[0]); err != nil {
 			return nil, err
 		}
 	}
-	if err := s.ensureLookupStrKeyHash(s.loadedTbl, key); err != nil {
+	finalVal, err := s.tableGetStrAny(loadedVal, key)
+	if err != nil {
 		return nil, err
-	}
-	finalVal := s.loadedTbl.RawGetStr(key)
-	if finalVal.IsNil() && s.loadedTbl.meta != nil {
-		var gerr error
-		finalVal, gerr = s.finishGet(loadedVal, StringValue(key))
-		if gerr != nil {
-			return nil, gerr
-		}
 	}
 	if finalVal.IsNil() {
 		finalVal = TrueValue()

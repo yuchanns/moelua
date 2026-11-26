@@ -133,20 +133,9 @@ reloadFrame:
 			if tv.IsTable() {
 				t := tv.AsTable()
 				if OptimizeEnabled {
-					ic := icAt(ev.bp.ic, ev.bp.icSlots[pc-1])
-					if ic.kind == icEnvSlot && ic.holder == t && ic.epoch == t.hash.dictGen {
-						v := t.hash.nodes[ic.slot].val
-						if !v.IsNil() || ic.noMeta {
-							regs[a] = v
-							continue
-						}
-					}
-					if ic.kind == icOwnSlot && t.shape == ic.shape {
-						v := t.slots[ic.slot]
-						if !v.IsNil() || ic.noMeta {
-							regs[a] = v
-							continue
-						}
+					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getTabUpFast(t); ok {
+						regs[a] = v
+						continue
 					}
 				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
 					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
@@ -172,18 +161,9 @@ reloadFrame:
 			if rb.IsTable() {
 				t := rb.AsTable()
 				if OptimizeEnabled {
-					ic := icAt(ev.bp.ic, ev.bp.icSlots[pc-1])
-					if t.shape == ic.shape && ic.shape != nil {
-						if ic.kind == icOwnSlot {
-							v := t.slots[ic.slot]
-							if !v.IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
-								regs[a] = v
-								continue
-							}
-						} else if ic.kind == icProtoVal && (ic.noMeta || s.protoEpoch == ic.epoch) {
-							regs[a] = ic.val
-							continue
-						}
+					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getFieldFast(t, s.protoEpoch); ok {
+						regs[a] = v
+						continue
 					}
 				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
 					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
@@ -215,22 +195,8 @@ reloadFrame:
 					val = regs[uint8(w>>bytecode.PosC)]
 				}
 				if OptimizeEnabled {
-					ic := icAt(ev.bp.ic, ev.bp.icSlots[pc-1])
-					if t.shape == ic.shape && ic.shape != nil && t.flags&tblFlagIsProto == 0 {
-						if ic.kind == icOwnSlot {
-							if !t.slots[ic.slot].IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
-								t.slots[ic.slot] = val
-								continue
-							}
-						} else if ic.kind == icAddSlot && !val.IsNil() && (ic.noMeta || s.protoEpoch == ic.epoch) {
-							slot := int(ic.slot)
-							if slot < cap(t.slots) {
-								t.slots = t.slots[:slot+1]
-								t.slots[slot] = val
-								t.shape = ic.targetShape
-								continue
-							}
-						}
+					if icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).setFieldFast(t, val, s.protoEpoch) {
+						continue
 					}
 				}
 			}
@@ -262,18 +228,9 @@ reloadFrame:
 			if rb.IsTable() {
 				t := rb.AsTable()
 				if OptimizeEnabled {
-					ic := icAt(ev.bp.ic, ev.bp.icSlots[pc-1])
-					if t.shape == ic.shape && ic.shape != nil {
-						if ic.kind == icProtoVal && (ic.noMeta || s.protoEpoch == ic.epoch) {
-							regs[a] = ic.val
-							continue
-						} else if ic.kind == icOwnSlot {
-							v := t.slots[ic.slot]
-							if !v.IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
-								regs[a] = v
-								continue
-							}
-						}
+					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getFieldFast(t, s.protoEpoch); ok {
+						regs[a] = v
+						continue
 					}
 				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
 					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {

@@ -687,7 +687,7 @@ func (s *State) getTabUpSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 				if slot := t.shape.Lookup(key); slot >= 0 {
 					v := t.slots[slot]
 					if !v.IsNil() || t.meta == nil {
-						*ic = ICEntry{kind: icOwnSlot, shape: t.shape, slot: slot, noMeta: t.meta == nil}
+						*ic = ICEntry{kind: icOwnSlot, shapeID: t.shape.id, slot: slot, noMeta: t.meta == nil}
 						regs[a] = v
 						return false, nil
 					}
@@ -696,7 +696,7 @@ func (s *State) getTabUpSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 				if slot, ok := t.hashFindStrSlot(key); ok {
 					v := t.hash.nodes[slot].val
 					if !v.IsNil() || t.meta == nil {
-						*ic = ICEntry{kind: icEnvSlot, holder: t, epoch: t.hash.dictGen, slot: int32(slot), noMeta: t.meta == nil}
+						ic.setEnvSlot(t, t.hash.dictGen, int32(slot), t.meta == nil)
 						regs[a] = v
 						return false, nil
 					}
@@ -724,7 +724,7 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 		t := rb.AsTable()
 		if OptimizeEnabled && t.shape != nil && key.Short {
 			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
-			if ic.polyLookup(t.shape) {
+			if ic.polyLookup(t.shape.id) {
 				if ic.kind == icOwnSlot {
 					v := t.slots[ic.slot]
 					if !v.IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
@@ -732,21 +732,19 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 						return false, nil
 					}
 				} else if ic.kind == icProtoVal && (ic.noMeta || s.protoEpoch == ic.epoch) {
-					regs[a] = ic.val
-					return false, nil
+					if v, ok := ic.protoValue(); ok {
+						regs[a] = v
+						return false, nil
+					}
 				}
 			}
-			if ic.shape != nil && ic.shape != t.shape {
+			if ic.shapeID != 0 && ic.shapeID != t.shape.id {
 				ic.polySavePrimary()
 			}
 			if slot := t.shape.Lookup(key); slot >= 0 {
 				v := t.slots[slot]
 				if !v.IsNil() || t.meta == nil {
-					ic.kind = icOwnSlot
-					ic.shape = t.shape
-					ic.slot = slot
-					ic.noMeta = t.meta == nil
-					ic.protoAbsent = false
+					ic.setOwnSlot(t.shape.id, slot, t.meta == nil, false, 0)
 					regs[a] = v
 					return false, nil
 				}
@@ -758,21 +756,13 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					return s.catchSlow(th, ev, p, e)
 				} else {
 					if cacheable && pv.IsNil() {
-						ic.kind = icOwnSlot
-						ic.shape = t.shape
-						ic.slot = slot
-						ic.noMeta = false
-						ic.protoAbsent = true
-						ic.epoch = s.protoEpoch
+						ic.setOwnSlot(t.shape.id, slot, false, true, s.protoEpoch)
 					}
 					regs[a] = pv
 					return false, nil
 				}
 			} else if t.meta == nil {
-				ic.kind = icProtoVal
-				ic.shape = t.shape
-				ic.noMeta = true
-				ic.val = NilValue()
+				ic.setProtoVal(t.shape.id, NilValue(), 0, true)
 				regs[a] = NilValue()
 				return false, nil
 			} else {
@@ -783,11 +773,7 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					return s.catchSlow(th, ev, p, e)
 				} else {
 					if cacheable {
-						ic.kind = icProtoVal
-						ic.shape = t.shape
-						ic.noMeta = false
-						ic.epoch = s.protoEpoch
-						ic.val = v
+						ic.setProtoVal(t.shape.id, v, s.protoEpoch, false)
 					}
 					regs[a] = v
 					return false, nil
@@ -870,7 +856,7 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 		t := ra.AsTable()
 		if OptimizeEnabled && t.shape != nil && key.Short {
 			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
-			if !t.isProto() && ic.polyLookup(t.shape) {
+			if !t.isProto() && ic.polyLookup(t.shape.id) {
 				if ic.kind == icOwnSlot {
 					if !t.slots[ic.slot].IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
 						t.slots[ic.slot] = val
@@ -878,15 +864,15 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					}
 				} else if ic.kind == icAddSlot && !val.IsNil() && (ic.noMeta || s.protoEpoch == ic.epoch) {
 					slot := int(ic.slot)
-					if slot < cap(t.slots) {
+					if ts := ic.targetShape.Value(); ts != nil && slot < cap(t.slots) {
 						t.slots = t.slots[:slot+1]
 						t.slots[slot] = val
-						t.shape = ic.targetShape
+						t.shape = ts
 						return false, nil
 					}
 				}
 			}
-			if !t.isProto() && ic.shape != nil && ic.shape != t.shape {
+			if !t.isProto() && ic.shapeID != 0 && ic.shapeID != t.shape.id {
 				ic.polySavePrimary()
 			}
 			if slot := t.shape.Lookup(key); slot >= 0 {
@@ -905,12 +891,7 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					if t.isProto() {
 						s.protoEpoch++
 					} else {
-						ic.kind = icOwnSlot
-						ic.shape = t.shape
-						ic.slot = slot
-						ic.noMeta = t.meta == nil
-						ic.protoAbsent = noNewIdx && t.meta != nil
-						ic.epoch = s.protoEpoch
+						ic.setOwnSlot(t.shape.id, slot, t.meta == nil, noNewIdx && t.meta != nil, s.protoEpoch)
 					}
 					return false, nil
 				}
@@ -943,13 +924,7 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					if t.isProto() {
 						s.protoEpoch++
 					} else {
-						ic.kind = icAddSlot
-						ic.shape = oldShape
-						ic.targetShape = next
-						ic.slot = next.slot
-						ic.epoch = s.protoEpoch
-						ic.noMeta = oldShape.meta == nil
-						ic.protoAbsent = false
+						ic.setAddSlot(oldShape.id, next, next.slot, s.protoEpoch, oldShape.meta == nil)
 					}
 					return false, nil
 				}

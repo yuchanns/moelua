@@ -8,7 +8,7 @@ const maxShapeProps = 64
 // The metatable pointer is encoded directly inside the Shape so a single pointer
 // comparison covers receiver layout, __index/__newindex, and metatable identity.
 type Shape struct {
-	id     uint32
+	id     uint64
 	parent *Shape
 	key    *LuaString // key added by this transition (nil on root shapes)
 	slot   int32      // slot index for key (-1 on root shapes)
@@ -68,9 +68,10 @@ type weakFrozenTransKey struct {
 }
 
 type shapeRegistry struct {
-	nextID    uint32
-	rootShape Shape // embedded per-State root shape (meta == nil) -> zero extra alloc
-	root      *Shape
+	nextID      uint64
+	frozenMaxID uint64
+	rootShape   Shape // embedded per-State root shape (meta == nil) -> zero extra alloc
+	root        *Shape
 	// metaRoots weakly caches root shapes per metatable so unreachable metatables are collected by Go's GC.
 	metaRoots map[weak.Pointer[Table]]weak.Pointer[Shape]
 	// metaTrans weakly caches (shape, newMeta) -> shape with same keys and newMeta.
@@ -86,15 +87,18 @@ type weakMetaTransKey struct {
 	hasMeta bool
 }
 
-func (sr *shapeRegistry) init(nextID uint32) {
-	sr.nextID = nextID
-	sr.rootShape = Shape{id: 1, slot: -1}
+func (sr *shapeRegistry) init(nextID uint64) {
+	sr.frozenMaxID = nextID
+	sr.nextID = nextID + 1
+	sr.rootShape = Shape{id: sr.nextID, slot: -1}
 	sr.root = &sr.rootShape
 }
 
 func newShapeRegistry() shapeRegistry {
 	var sr shapeRegistry
-	sr.init(1)
+	sr.nextID = 1
+	sr.rootShape = Shape{id: 1, slot: -1}
+	sr.root = &sr.rootShape
 	return sr
 }
 
@@ -362,43 +366,241 @@ type icKind uint8
 
 const (
 	icEmpty icKind = iota
-	icOwnSlot      // receiver.shape == shape => receiver.slots[slot]
-	icProtoVal     // receiver.shape == shape && (noMeta || s.protoEpoch == epoch) => val
-	icAddSlot      // SETFIELD transition: receiver.shape == shape && (noMeta || s.protoEpoch == epoch) => targetShape
-	icEnvSlot      // GETTABUP on dict table: holder == table && holder.dictGen == epoch => holder.nodes[slot].val
+	icOwnSlot      // receiver.shape.id == shapeID => receiver.slots[slot]
+	icProtoVal     // receiver.shape.id == shapeID && (noMeta || s.protoEpoch == epoch) => protoValue()
+	icAddSlot      // SETFIELD transition: receiver.shape.id == shapeID && (noMeta || s.protoEpoch == epoch) => targetShape
+	icEnvSlot      // GETTABUP on dict table: holder.Value() == table && holder.dictGen == epoch => holder.nodes[slot].val
 )
 
+// icWeakKind discriminates how an icProtoVal entry stores its cached value without
+// holding any strong Go reference to collectable Lua heap objects in Tier 0.
+type icWeakKind uint8
+
+const (
+	icWeakNone    icWeakKind = iota // immediate value stored directly in val (nil/bool/num/lightUD)
+	icWeakClosure                   // fast weak.Pointer[Closure] stored in weakCl (OOP method calls)
+	icWeakAny                       // weak.Pointer[Table|LuaString|Userdata|Thread|NativeFunc] stored in weakVal
+)
+
+func encodeICProtoVal(v Value) (val Value, weakCl weak.Pointer[Closure], weakVal any, wk icWeakKind) {
+	switch {
+	case v.IsClosure():
+		return NilValue(), weak.Make(v.AsClosure()), nil, icWeakClosure
+	case v.IsTable():
+		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsTable()), icWeakAny
+	case v.IsString():
+		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsString()), icWeakAny
+	case v.IsUserdata():
+		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsUserdata()), icWeakAny
+	case v.IsThread():
+		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsThread()), icWeakAny
+	case v.IsNative():
+		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsNative()), icWeakAny
+	default:
+		return v, weak.Pointer[Closure]{}, nil, icWeakNone
+	}
+}
+
+//go:noinline
+func loadWeakICVal(w any) (Value, bool) {
+	switch wp := w.(type) {
+	case weak.Pointer[Table]:
+		if t := wp.Value(); t != nil {
+			return TableValue(t), true
+		}
+	case weak.Pointer[LuaString]:
+		if ls := wp.Value(); ls != nil {
+			return StringValue(ls), true
+		}
+	case weak.Pointer[Userdata]:
+		if u := wp.Value(); u != nil {
+			return UserdataValue(u), true
+		}
+	case weak.Pointer[Thread]:
+		if th := wp.Value(); th != nil {
+			return ThreadValue(th), true
+		}
+	case weak.Pointer[NativeFunc]:
+		if nf := wp.Value(); nf != nil {
+			return NativeValue(nf), true
+		}
+	}
+	return NilValue(), false
+}
+
 // polyEntry is one slot in a lazily-allocated 4-way polymorphic IC (only used on polymorphic sites).
+// All cached references to Lua objects and shapes are weak or numeric IDs so Tier 0 Go GC can
+// reclaim discarded prototypes, metatables, shapes, and values without State.CollectFull.
 type polyEntry struct {
-	shape       *Shape
-	targetShape *Shape
+	shapeID     uint64
+	targetShape weak.Pointer[Shape]
 	val         Value
+	weakCl      weak.Pointer[Closure]
+	weakVal     any
 	epoch       uint64
 	slot        int32
 	kind        icKind
+	weakKind    icWeakKind
 	noMeta      bool
 	protoAbsent bool
+}
+
+func (pe *polyEntry) protoValue() (Value, bool) {
+	if pe.weakKind == icWeakNone {
+		return pe.val, true
+	}
+	if pe.weakKind == icWeakClosure {
+		if cl := pe.weakCl.Value(); cl != nil {
+			return ClosureValue(cl), true
+		}
+		return NilValue(), false
+	}
+	return loadWeakICVal(pe.weakVal)
 }
 
 // ICEntry is a per-State, per-PC inline cache entry (never shared across goroutines).
 // Monomorphic sites hit directly on the primary fields with zero extra indirection;
 // polymorphic sites (2..4 shapes, e.g. OOP method dispatch across subclasses) lazily
 // attach a 4-way poly array and promote hits to primary (MRU).
+// No field holds a strong Go pointer to any collectable Lua object or Shape.
 type ICEntry struct {
-	shape       *Shape
-	targetShape *Shape // for icAddSlot
-	holder      *Table // for icEnvSlot
+	shapeID     uint64
+	targetShape weak.Pointer[Shape] // for icAddSlot
+	holder      weak.Pointer[Table] // for icEnvSlot
 	poly        *[4]polyEntry
-	val         Value  // for icProtoVal (cached method/field from __index chain or absent nil)
-	epoch       uint64 // protoEpoch or dictGen (uint64 prevents 32-bit wraparound)
+	val         Value                 // for icProtoVal when weakKind == icWeakNone
+	weakCl      weak.Pointer[Closure] // for icProtoVal when weakKind == icWeakClosure
+	weakVal     any                   // for icProtoVal when weakKind == icWeakAny
+	epoch       uint64                // protoEpoch or dictGen (uint64 prevents 32-bit wraparound)
 	slot        int32
 	kind        icKind
+	weakKind    icWeakKind
 	noMeta      bool // true when shape.meta == nil
 	protoAbsent bool // true when nil slot / missing key verified absent in __index / __newindex at epoch
 	polyCount   uint8
 }
 
-// polyAdd inserts the displaced primary entry into the 4-way polymorphic cache.
+//go:noinline
+func (ic *ICEntry) protoValue() (Value, bool) {
+	if ic.weakKind == icWeakNone {
+		return ic.val, true
+	}
+	if ic.weakKind == icWeakClosure {
+		if cl := ic.weakCl.Value(); cl != nil {
+			return ClosureValue(cl), true
+		}
+		return NilValue(), false
+	}
+	return loadWeakICVal(ic.weakVal)
+}
+
+func (ic *ICEntry) getTabUpFast(t *Table) (Value, bool) {
+	if ic.kind == icEnvSlot && ic.holder.Value() == t && ic.epoch == t.hash.dictGen {
+		v := t.hash.nodes[ic.slot].val
+		if !v.IsNil() || ic.noMeta {
+			return v, true
+		}
+	}
+	if ic.kind == icOwnSlot && t.shape != nil && t.shape.id == ic.shapeID {
+		v := t.slots[ic.slot]
+		if !v.IsNil() || ic.noMeta {
+			return v, true
+		}
+	}
+	return NilValue(), false
+}
+
+func (ic *ICEntry) getFieldFast(t *Table, protoEpoch uint64) (Value, bool) {
+	if t.shape != nil && t.shape.id == ic.shapeID {
+		if ic.kind == icOwnSlot {
+			v := t.slots[ic.slot]
+			if !v.IsNil() || ic.noMeta || (ic.protoAbsent && protoEpoch == ic.epoch) {
+				return v, true
+			}
+		} else if ic.kind == icProtoVal && (ic.noMeta || protoEpoch == ic.epoch) {
+			return ic.protoValue()
+		}
+	}
+	return NilValue(), false
+}
+
+func (ic *ICEntry) setFieldFast(t *Table, val Value, protoEpoch uint64) bool {
+	if t.shape != nil && t.shape.id == ic.shapeID && t.flags&tblFlagIsProto == 0 {
+		if ic.kind == icOwnSlot {
+			if !t.slots[ic.slot].IsNil() || ic.noMeta || (ic.protoAbsent && protoEpoch == ic.epoch) {
+				t.slots[ic.slot] = val
+				return true
+			}
+		} else if ic.kind == icAddSlot && !val.IsNil() && (ic.noMeta || protoEpoch == ic.epoch) {
+			slot := int(ic.slot)
+			if ts := ic.targetShape.Value(); ts != nil && slot < cap(t.slots) {
+				t.slots = t.slots[:slot+1]
+				t.slots[slot] = val
+				t.shape = ts
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (ic *ICEntry) setOwnSlot(shapeID uint64, slot int32, noMeta, protoAbsent bool, epoch uint64) {
+	ic.kind = icOwnSlot
+	ic.shapeID = shapeID
+	ic.targetShape = weak.Pointer[Shape]{}
+	ic.holder = weak.Pointer[Table]{}
+	ic.val = NilValue()
+	ic.weakCl = weak.Pointer[Closure]{}
+	ic.weakVal = nil
+	ic.weakKind = icWeakNone
+	ic.slot = slot
+	ic.noMeta = noMeta
+	ic.protoAbsent = protoAbsent
+	ic.epoch = epoch
+}
+
+func (ic *ICEntry) setProtoVal(shapeID uint64, v Value, epoch uint64, noMeta bool) {
+	val, weakCl, weakVal, wk := encodeICProtoVal(v)
+	ic.kind = icProtoVal
+	ic.shapeID = shapeID
+	ic.targetShape = weak.Pointer[Shape]{}
+	ic.holder = weak.Pointer[Table]{}
+	ic.val = val
+	ic.weakCl = weakCl
+	ic.weakVal = weakVal
+	ic.weakKind = wk
+	ic.slot = 0
+	ic.noMeta = noMeta
+	ic.protoAbsent = false
+	ic.epoch = epoch
+}
+
+func (ic *ICEntry) setAddSlot(shapeID uint64, target *Shape, slot int32, epoch uint64, noMeta bool) {
+	ic.kind = icAddSlot
+	ic.shapeID = shapeID
+	ic.targetShape = weak.Make(target)
+	ic.holder = weak.Pointer[Table]{}
+	ic.val = NilValue()
+	ic.weakCl = weak.Pointer[Closure]{}
+	ic.weakVal = nil
+	ic.weakKind = icWeakNone
+	ic.slot = slot
+	ic.epoch = epoch
+	ic.noMeta = noMeta
+	ic.protoAbsent = false
+}
+
+func (ic *ICEntry) setEnvSlot(holder *Table, dictGen uint64, slot int32, noMeta bool) {
+	*ic = ICEntry{
+		kind:   icEnvSlot,
+		holder: weak.Make(holder),
+		epoch:  dictGen,
+		slot:   slot,
+		noMeta: noMeta,
+	}
+}
+
+// polySavePrimary inserts the displaced primary entry into the 4-way polymorphic cache.
 func (ic *ICEntry) polySavePrimary() {
 	if ic.kind != icOwnSlot && ic.kind != icProtoVal && ic.kind != icAddSlot {
 		return
@@ -408,9 +610,10 @@ func (ic *ICEntry) polySavePrimary() {
 	}
 	// Update existing shape entry if already present.
 	for i := range int(ic.polyCount) {
-		if ic.poly[i].shape == ic.shape {
+		if ic.poly[i].shapeID == ic.shapeID {
 			ic.poly[i] = polyEntry{
-				shape: ic.shape, targetShape: ic.targetShape, val: ic.val,
+				shapeID: ic.shapeID, targetShape: ic.targetShape,
+				val: ic.val, weakCl: ic.weakCl, weakVal: ic.weakVal, weakKind: ic.weakKind,
 				epoch: ic.epoch, slot: ic.slot, kind: ic.kind,
 				noMeta: ic.noMeta, protoAbsent: ic.protoAbsent,
 			}
@@ -424,29 +627,34 @@ func (ic *ICEntry) polySavePrimary() {
 		ic.polyCount++
 	}
 	ic.poly[idx] = polyEntry{
-		shape: ic.shape, targetShape: ic.targetShape, val: ic.val,
+		shapeID: ic.shapeID, targetShape: ic.targetShape,
+		val: ic.val, weakCl: ic.weakCl, weakVal: ic.weakVal, weakKind: ic.weakKind,
 		epoch: ic.epoch, slot: ic.slot, kind: ic.kind,
 		noMeta: ic.noMeta, protoAbsent: ic.protoAbsent,
 	}
 }
 
-// polyLookup searches the 4-way poly array for shape sh; on hit, swaps it into the primary MRU slot.
-func (ic *ICEntry) polyLookup(sh *Shape) bool {
+// polyLookup searches the 4-way poly array for shapeID; on hit, swaps it into the primary MRU slot.
+func (ic *ICEntry) polyLookup(shapeID uint64) bool {
 	if ic.poly == nil {
 		return false
 	}
 	for i := range int(ic.polyCount) {
 		pe := &ic.poly[i]
-		if pe.shape == sh {
+		if pe.shapeID == shapeID {
 			// Swap primary <-> pe (MRU promotion).
 			old := polyEntry{
-				shape: ic.shape, targetShape: ic.targetShape, val: ic.val,
+				shapeID: ic.shapeID, targetShape: ic.targetShape,
+				val: ic.val, weakCl: ic.weakCl, weakVal: ic.weakVal, weakKind: ic.weakKind,
 				epoch: ic.epoch, slot: ic.slot, kind: ic.kind,
 				noMeta: ic.noMeta, protoAbsent: ic.protoAbsent,
 			}
-			ic.shape = pe.shape
+			ic.shapeID = pe.shapeID
 			ic.targetShape = pe.targetShape
 			ic.val = pe.val
+			ic.weakCl = pe.weakCl
+			ic.weakVal = pe.weakVal
+			ic.weakKind = pe.weakKind
 			ic.epoch = pe.epoch
 			ic.slot = pe.slot
 			ic.kind = pe.kind

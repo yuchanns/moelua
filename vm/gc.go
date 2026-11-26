@@ -396,6 +396,7 @@ type gcTracer struct {
 	seenStrings      map[*LuaString]struct{}
 	seenProtos       map[*boundProto]struct{}
 	seenShapes       map[*Shape]struct{}
+	seenShapeIDs     map[uint64]struct{}
 	gray             []Value
 	hashedTables     []*Table // all marked tables with t.hash != nil (for dead hash-key clearing)
 	weakVals         []*Table // __mode="v"
@@ -443,8 +444,10 @@ func (tr *gcTracer) markShape(sh *Shape) {
 		}
 		if tr.seenShapes == nil {
 			tr.seenShapes = make(map[*Shape]struct{}, 32)
+			tr.seenShapeIDs = make(map[uint64]struct{}, 32)
 		}
 		tr.seenShapes[cur] = struct{}{}
+		tr.seenShapeIDs[cur.id] = struct{}{}
 		if cur == root {
 			if cur.transMap != nil {
 				tr.liveBytes += 48 + int64(len(cur.transMap))*32
@@ -1176,33 +1179,76 @@ func (tr *gcTracer) icShapeAlive(sh *Shape) bool {
 	return true
 }
 
-func (tr *gcTracer) icEntryAlive(kind icKind, shape, targetShape *Shape, holder *Table, val Value, epoch uint64, noMeta bool) bool {
-	switch kind {
+func (tr *gcTracer) icShapeIDAlive(id uint64) bool {
+	if id == 0 {
+		return false
+	}
+	if id <= tr.s.shapes.frozenMaxID {
+		return true
+	}
+	_, live := tr.seenShapeIDs[id]
+	return live
+}
+
+func (tr *gcTracer) icPrimaryAlive(ic *ICEntry) bool {
+	switch ic.kind {
 	case icEmpty:
 		return false
 	case icEnvSlot:
-		if holder == nil || holder.gcMark != tr.epoch || holder.hash == nil || holder.hash.dictGen != epoch {
+		h := ic.holder.Value()
+		if h == nil || h.gcMark != tr.epoch || h.hash == nil || h.hash.dictGen != ic.epoch {
 			return false
 		}
 		return true
 	case icProtoVal:
-		if !noMeta && epoch != tr.s.protoEpoch {
+		if !ic.noMeta && ic.epoch != tr.s.protoEpoch {
 			return false
 		}
-		if !tr.icShapeAlive(shape) || !tr.icValAlive(val) {
+		if !tr.icShapeIDAlive(ic.shapeID) {
 			return false
 		}
-		return true
+		v, ok := ic.protoValue()
+		return ok && tr.icValAlive(v)
 	case icAddSlot:
-		if !noMeta && epoch != tr.s.protoEpoch {
+		if !ic.noMeta && ic.epoch != tr.s.protoEpoch {
 			return false
 		}
-		return tr.icShapeAlive(shape) && tr.icShapeAlive(targetShape)
+		ts := ic.targetShape.Value()
+		return tr.icShapeIDAlive(ic.shapeID) && ts != nil && tr.icShapeAlive(ts)
 	case icOwnSlot:
-		if !noMeta && epoch != tr.s.protoEpoch {
+		if !ic.noMeta && ic.epoch != tr.s.protoEpoch {
 			return false
 		}
-		return tr.icShapeAlive(shape)
+		return tr.icShapeIDAlive(ic.shapeID)
+	default:
+		return false
+	}
+}
+
+func (tr *gcTracer) icPolyAlive(pe *polyEntry) bool {
+	switch pe.kind {
+	case icEmpty:
+		return false
+	case icProtoVal:
+		if !pe.noMeta && pe.epoch != tr.s.protoEpoch {
+			return false
+		}
+		if !tr.icShapeIDAlive(pe.shapeID) {
+			return false
+		}
+		v, ok := pe.protoValue()
+		return ok && tr.icValAlive(v)
+	case icAddSlot:
+		if !pe.noMeta && pe.epoch != tr.s.protoEpoch {
+			return false
+		}
+		ts := pe.targetShape.Value()
+		return tr.icShapeIDAlive(pe.shapeID) && ts != nil && tr.icShapeAlive(ts)
+	case icOwnSlot:
+		if !pe.noMeta && pe.epoch != tr.s.protoEpoch {
+			return false
+		}
+		return tr.icShapeIDAlive(pe.shapeID)
 	default:
 		return false
 	}
@@ -1226,10 +1272,10 @@ func (tr *gcTracer) sweepInlineCaches() {
 			if ic.poly != nil {
 				kept := 0
 				for j := range int(ic.polyCount) {
-					pe := ic.poly[j]
-					if tr.icEntryAlive(pe.kind, pe.shape, pe.targetShape, nil, pe.val, pe.epoch, pe.noMeta) {
+					pe := &ic.poly[j]
+					if tr.icPolyAlive(pe) {
 						if kept != j {
-							ic.poly[kept] = pe
+							ic.poly[kept] = *pe
 						}
 						kept++
 					}
@@ -1242,7 +1288,7 @@ func (tr *gcTracer) sweepInlineCaches() {
 					ic.poly = nil
 				}
 			}
-			if !tr.icEntryAlive(ic.kind, ic.shape, ic.targetShape, ic.holder, ic.val, ic.epoch, ic.noMeta) {
+			if !tr.icPrimaryAlive(ic) {
 				if ic.poly != nil && ic.polyCount > 0 {
 					// Promote first surviving poly entry to primary slot.
 					pe := ic.poly[0]
@@ -1254,10 +1300,13 @@ func (tr *gcTracer) sweepInlineCaches() {
 					if ic.polyCount == 0 {
 						ic.poly = nil
 					}
-					ic.shape = pe.shape
+					ic.shapeID = pe.shapeID
 					ic.targetShape = pe.targetShape
-					ic.holder = nil
+					ic.holder = ICEntry{}.holder
 					ic.val = pe.val
+					ic.weakCl = pe.weakCl
+					ic.weakVal = pe.weakVal
+					ic.weakKind = pe.weakKind
 					ic.epoch = pe.epoch
 					ic.slot = pe.slot
 					ic.kind = pe.kind
