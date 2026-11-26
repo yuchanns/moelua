@@ -1214,7 +1214,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			}
 			if nf.Intrinsic == intrDoFile {
 				th.top = funcIdx + 1 + nargs
-				loaded, lerr := nativeLoadFile(s, th.stack[funcIdx+1:funcIdx+1+nargs])
+				loaded, lerr := nativeLoadFile(s, dofileArgs(th.stack[funcIdx+1:funcIdx+1+nargs]))
 				if lerr != nil {
 					return s.catchSlow(th, ev, false, lerr)
 				}
@@ -1929,7 +1929,7 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 		}
 		if intr == intrDoFile {
 			th.top = calleeIdx + 1 + calleeArgs
-			loaded, lerr := nativeLoadFile(s, th.stack[calleeIdx+1:calleeIdx+1+calleeArgs])
+			loaded, lerr := nativeLoadFile(s, dofileArgs(th.stack[calleeIdx+1:calleeIdx+1+calleeArgs]))
 			if lerr != nil {
 				if s.handleError(th, entryDepth, lerr) {
 					return true, nil
@@ -3268,7 +3268,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		if nf.Intrinsic == intrDoFile {
 			nres := cf.nresults
 			th.top = srcStart + 1 + nargs
-			loaded, lerr := nativeLoadFile(s, th.stack[srcStart+1:srcStart+1+nargs])
+			loaded, lerr := nativeLoadFile(s, dofileArgs(th.stack[srcStart+1:srcStart+1+nargs]))
 			if lerr != nil {
 				return coldContinue, pc, lerr
 			}

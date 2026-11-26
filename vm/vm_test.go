@@ -2136,3 +2136,138 @@ func TestNativeReturningArgsAfterStackGrowthPreservesResults(t *testing.T) {
 		}
 	})
 }
+
+func TestAbortPreservesCapturedToBeClosedUpvalues(t *testing.T) {
+	src := `
+		local x <close> = setmetatable({ value = 42 }, { __close = function() end })
+		saved = function() return x.value end
+		while true do end
+	`
+	t.Run("State.Call", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(src), "=tbc_abort_call")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetInstructionLimit(200)
+		if _, err := s.Call(cl); err == nil {
+			t.Fatalf("expected instruction limit abort")
+		}
+		s.SetInstructionLimit(0)
+		saved := s.GetGlobal("saved")
+		res, err := s.Call(saved)
+		if err != nil {
+			t.Fatalf("calling saved closure after abort failed: %v", err)
+		}
+		got, ok := res[0].ToInt()
+		if !ok || got != 42 {
+			t.Fatalf("expected captured <close> upvalue 42, got %v", res[0])
+		}
+	})
+
+	t.Run("State.CallProtected", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(src), "=tbc_abort_protected")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetInstructionLimit(200)
+		if _, _, _, abortErr := s.CallProtected(cl, vm.NilValue()); abortErr == nil {
+			t.Fatalf("expected uncatchable abort from CallProtected")
+		}
+		s.SetInstructionLimit(0)
+		saved := s.GetGlobal("saved")
+		res, err := s.Call(saved)
+		if err != nil {
+			t.Fatalf("calling saved closure after CallProtected abort failed: %v", err)
+		}
+		got, ok := res[0].ToInt()
+		if !ok || got != 42 {
+			t.Fatalf("expected captured <close> upvalue 42, got %v", res[0])
+		}
+	})
+
+	t.Run("coroutine_abort", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local co = coroutine.create(function()
+				local x <close> = setmetatable({ value = 99 }, { __close = function() end })
+				saved = function() return x.value end
+				while true do end
+			end)
+			return coroutine.resume(co)
+		`), "=tbc_abort_coro")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetInstructionLimit(300)
+		if _, err := s.Call(cl); err == nil {
+			t.Fatalf("expected instruction limit abort in coroutine")
+		}
+		s.SetInstructionLimit(0)
+		saved := s.GetGlobal("saved")
+		res, err := s.Call(saved)
+		if err != nil {
+			t.Fatalf("calling saved closure after coroutine abort failed: %v", err)
+		}
+		got, ok := res[0].ToInt()
+		if !ok || got != 99 {
+			t.Fatalf("expected captured <close> upvalue 99, got %v", res[0])
+		}
+	})
+}
+
+func TestDoFileDiscardsExtraArguments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sample.lua")
+	if err := os.WriteFile(path, []byte("return marker\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := `
+marker = 7
+local p = ...
+assert(dofile(p, "b") == 7, "direct dofile failed on extra mode arg")
+assert(dofile(p, nil, { marker = 99 }) == 7, "direct dofile used extra env arg")
+local function tail() return dofile(p, "b", { marker = 99 }) end
+assert(tail() == 7, "tail-call dofile failed on extra args")
+local ok, v = pcall(dofile, p, "b", { marker = 99 })
+assert(ok and v == 7, "pcall(dofile) failed on extra args")
+local co = coroutine.create(dofile)
+local ok2, v2 = coroutine.resume(co, p, "b", { marker = 99 })
+assert(ok2 and v2 == 7, "coroutine(dofile) failed on extra args")
+print("dofile_ok")
+`
+	s := vm.NewState()
+	defer s.Close()
+	var buf bytes.Buffer
+	s.SetOutput(&buf)
+	cl, err := s.LoadChunk([]byte(script), "=dofile_extra_args")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(cl, vm.StringValue(s.Intern(path))); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != "dofile_ok\n" {
+		t.Fatalf("unexpected output: %q", buf.String())
+	}
+
+	// Direct State.Call(dofile, path, "b", {marker=99})
+	s2 := vm.NewState()
+	defer s2.Close()
+	s2.SetGlobal("marker", vm.IntValue(7))
+	envTbl := s2.NewTable(0, 1)
+	envTbl.RawSetStr(s2, s2.Intern("marker"), vm.IntValue(99))
+	dofileFn := s2.GetGlobal("dofile")
+	res, err := s2.Call(dofileFn, vm.StringValue(s2.Intern(path)), vm.StringValue(s2.Intern("b")), vm.TableValue(envTbl))
+	if err != nil {
+		t.Fatalf("direct State.Call(dofile) failed: %v", err)
+	}
+	got, ok := res[0].ToInt()
+	if !ok || got != 7 {
+		t.Fatalf("direct State.Call(dofile) expected 7, got %v", res[0])
+	}
+}

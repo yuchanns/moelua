@@ -889,8 +889,17 @@ func nativeLoadFile(s *State, args []Value) ([]Value, error) {
 	return []Value{fn}, nil
 }
 
+// dofileArgs truncates dofile arguments to the single optional filename parameter
+// matching PUC-Rio lbaselib.c:luaB_dofile (lua_settop(L, 1); luaL_loadfilex(L, fname, "bt")).
+func dofileArgs(args []Value) []Value {
+	if len(args) > 1 {
+		return args[:1]
+	}
+	return args
+}
+
 func nativeDoFile(s *State, args []Value) ([]Value, error) {
-	res, err := nativeLoadFile(s, args)
+	res, err := nativeLoadFile(s, dofileArgs(args))
 	if err != nil {
 		return nil, err
 	}

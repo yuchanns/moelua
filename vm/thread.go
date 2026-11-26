@@ -425,7 +425,10 @@ func (th *Thread) hasTBCAtOrAbove(level int) bool {
 
 // discardTBCAtOrAbove removes pending <close> entries >= level without executing user Lua
 // __close callbacks (used when unwinding after an uncatchable context/instruction-limit abort).
+// Open upvalues >= level are closed first so escaped closures capture the live values
+// before the TBC stack slots are cleared.
 func (th *Thread) discardTBCAtOrAbove(level int) {
+	th.closeUpvals(level)
 	for len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level {
 		idx := th.tbc[len(th.tbc)-1]
 		th.tbc = th.tbc[:len(th.tbc)-1]

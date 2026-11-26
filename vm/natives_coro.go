@@ -246,7 +246,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				goto runCoro
 			}
 			if nf.Intrinsic == intrDoFile {
-				loaded, lerr := nativeLoadFile(s, args)
+				loaded, lerr := nativeLoadFile(s, dofileArgs(args))
 				if lerr != nil || len(loaded) == 0 || loaded[0].IsNil() {
 					co.status = ThreadDead
 					co.stack[0] = NilValue()
