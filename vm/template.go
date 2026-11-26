@@ -85,8 +85,6 @@ type stdTemplate struct {
 	stringMetaIdx int
 	fileMetaIdx   int
 	pkgIdx        int
-	loadedIdx     int
-	preloadIdx    int
 
 	nilStack [initFastStackCap]Value
 }
@@ -143,8 +141,6 @@ func buildStdTemplate() *stdTemplate {
 	addTable(b.stringMeta)
 	addTable(b.fileMeta)
 	addTable(b.pkgTbl)
-	addTable(b.loadedTbl)
-	addTable(b.preloadTbl)
 
 	for i := 0; i < len(tableList); i++ {
 		t := tableList[i]
@@ -201,8 +197,6 @@ func buildStdTemplate() *stdTemplate {
 		stringMetaIdx:     tableIdx[b.stringMeta],
 		fileMetaIdx:       tableIdx[b.fileMeta],
 		pkgIdx:            tableIdx[b.pkgTbl],
-		loadedIdx:         tableIdx[b.loadedTbl],
-		preloadIdx:        tableIdx[b.preloadTbl],
 	}
 	fillNil(tmpl.nilStack[:])
 
@@ -451,8 +445,6 @@ func cloneFromStdTemplate(noEnv bool) *State {
 	s.stringMeta = &a.tables[tmpl.stringMetaIdx]
 	s.fileMeta = fileMeta
 	s.pkgTbl = &a.tables[tmpl.pkgIdx]
-	s.loadedTbl = &a.tables[tmpl.loadedIdx]
-	s.preloadTbl = &a.tables[tmpl.preloadIdx]
 	s.coallocTables = a.tables[:len(tmpl.tables)]
 	s.coallocHashes = a.hashes[:len(tmpl.tables)]
 	s.typeMetas[4] = s.stringMeta

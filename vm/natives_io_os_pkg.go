@@ -3060,8 +3060,6 @@ func (s *State) initPackageLib() {
 	s.registerFunc(pkg, "loadlib", intrNone, nativePackageLoadLib)
 
 	s.pkgTbl = pkg
-	s.loadedTbl = loaded
-	s.preloadTbl = preload
 	s.SetGlobal("package", TableValue(pkg))
 	s.registry.RawSetStr(s, s.intern.Intern("_LOADED"), TableValue(loaded))
 	s.registry.RawSetStr(s, s.intern.Intern("_PRELOAD"), TableValue(preload))

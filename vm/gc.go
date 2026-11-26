@@ -504,19 +504,10 @@ func (tr *gcTracer) markRoots() {
 	if s.pkgTbl != nil {
 		tr.mark(TableValue(s.pkgTbl))
 	}
-	if s.loadedTbl != nil {
-		tr.mark(TableValue(s.loadedTbl))
-	}
-	if s.preloadTbl != nil {
-		tr.mark(TableValue(s.preloadTbl))
-	}
 	for _, mt := range s.typeMetas {
 		if mt != nil {
 			tr.mark(TableValue(mt))
 		}
-	}
-	if s.stringMeta != nil {
-		tr.mark(TableValue(s.stringMeta))
 	}
 	if s.fileMeta != nil {
 		tr.mark(TableValue(s.fileMeta))

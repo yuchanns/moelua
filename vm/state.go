@@ -179,8 +179,6 @@ type State struct {
 	stringMeta        *Table
 	fileMeta          *Table
 	pkgTbl            *Table
-	loadedTbl         *Table
-	preloadTbl        *Table
 	typeMetas         [9]*Table // per-type metatables (debug.setmetatable on primitives!)
 	stdinInput        Value
 	defaultInput      Value
@@ -559,8 +557,20 @@ func (s *State) GlobalEnv() *Table { return s.env }
 // Registry returns the State's Lua registry table (LUA_REGISTRYINDEX).
 func (s *State) Registry() *Table { return s.registry }
 
-// PreloadTable returns the State's package.preload table.
-func (s *State) PreloadTable() *Table { return s.preloadTbl }
+// PreloadTable returns the State's active registry _PRELOAD table, recreating it
+// on the registry if Lua replaced or cleared debug.getregistry()._PRELOAD.
+func (s *State) PreloadTable() *Table {
+	if s.registry == nil {
+		return nil
+	}
+	key := s.intern.Intern("_PRELOAD")
+	if v := s.registry.RawGetStr(key); v.IsTable() {
+		return v.AsTable()
+	}
+	t := s.NewTable(0, 4)
+	s.registry.RawSetStr(s, key, TableValue(t))
+	return t
+}
 
 // Intern interns a Go string into this State's string table.
 func (s *State) Intern(str string) *LuaString { return s.intern.Intern(str) }

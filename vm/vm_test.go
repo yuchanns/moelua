@@ -1947,3 +1947,87 @@ func TestDebugAndOptionStringScansCancelAndBudget(t *testing.T) {
 		}
 	})
 }
+
+func TestReplacedLoadedAndPreloadCachesAreCollected(t *testing.T) {
+	script := `
+local finalized = {}
+local w = setmetatable({}, { __mode = "v" })
+
+local mod = setmetatable({ payload = string.rep("x", 1024 * 1024) }, {
+	__gc = function() finalized[#finalized + 1] = "mod" end,
+})
+local pre = setmetatable({ payload = string.rep("y", 1024 * 1024) }, {
+	__gc = function() finalized[#finalized + 1] = "pre" end,
+})
+
+package.loaded.big_mod = mod
+package.preload.big_pre = pre
+w.oldLoaded = package.loaded
+w.oldPreload = package.preload
+w.mod = mod
+w.pre = pre
+mod = nil
+pre = nil
+
+local reg = debug.getregistry()
+local newLoaded = {}
+local newPreload = {}
+package.loaded = newLoaded
+reg._LOADED = newLoaded
+package.preload = newPreload
+reg._PRELOAD = newPreload
+
+collectgarbage("collect")
+collectgarbage("collect")
+
+return w.oldLoaded == nil, w.oldPreload == nil, w.mod == nil, w.pre == nil, #finalized
+`
+	s := vm.NewState()
+	defer s.Close()
+
+	// Also retain Go weak references to a module payload stored in original package.loaded
+	// to confirm sweepCoallocTables releases Go-heap references too.
+	goMod := s.NewTable(0, 1)
+	goMod.RawSetStr(s, s.Intern("buf"), vm.StringValue(s.Intern(strings.Repeat("z", 1024*1024))))
+	wpMod := weak.Make(goMod)
+	s.Registry().RawGetStr(s.Intern("_LOADED")).AsTable().RawSetStr(s, s.Intern("go_mod"), vm.TableValue(goMod))
+	goMod = nil
+
+	cl, err := s.LoadChunk([]byte(script), "=replaced_pkg_caches")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Call(cl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nFin, okFin := res[4].ToInt()
+	if len(res) != 5 || !res[0].IsTrue() || !res[1].IsTrue() || !res[2].IsTrue() || !res[3].IsTrue() || !okFin || nFin != 2 {
+		t.Fatalf("expected replaced _LOADED/_PRELOAD caches and payloads to be collected & finalized, got %v", res)
+	}
+
+	reclaimed := false
+	for range 20 {
+		runtime.GC()
+		if wpMod.Value() == nil {
+			reclaimed = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !reclaimed {
+		t.Fatalf("replaced original package.loaded still pinned Go-heap module table after collectgarbage")
+	}
+
+	// State.PreloadTable must follow the live registry._PRELOAD replacement and recreate if cleared.
+	reg := s.Registry()
+	livePreload := reg.RawGetStr(s.Intern("_PRELOAD")).AsTable()
+	if s.PreloadTable() != livePreload {
+		t.Fatalf("PreloadTable() did not return live registry._PRELOAD replacement")
+	}
+	reg.RawSetStr(s, s.Intern("_PRELOAD"), vm.NilValue())
+	recreated := s.PreloadTable()
+	if recreated == nil || reg.RawGetStr(s.Intern("_PRELOAD")).AsTable() != recreated {
+		t.Fatalf("PreloadTable() did not recreate cleared registry._PRELOAD")
+	}
+}
