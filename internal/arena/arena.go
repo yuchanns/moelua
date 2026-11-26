@@ -584,21 +584,15 @@ func (a *Arena) ReleaseSpare() {
 // Close releases all backing slab pages, large spans, and metadata immediately back to Go.
 // After Close, the Arena is empty and ready for reuse or garbage collection.
 func (a *Arena) Close() {
-	if len(a.pages) > 0 {
-		a.pages = a.pages[:1]
-		a.pages[0] = nil
-	}
-	if len(a.pageMeta) > 0 {
-		a.pageMeta = a.pageMeta[:1]
-		a.pageMeta[0] = pageMeta{}
-	}
+	clear(a.pages)
+	clear(a.pageMeta)
+	clear(a.largeSpans)
+	a.pages = nil
+	a.pageMeta = nil
 	a.freePageIDs = nil
 	a.classAvail = [NumClasses]uint32{}
 	a.sparePage = nil
-	if len(a.largeSpans) > 0 {
-		a.largeSpans = a.largeSpans[:1]
-		a.largeSpans[0] = nil
-	}
+	a.largeSpans = nil
 	a.freeLargeIDs = nil
 	a.allocBytes = 0
 	a.liveObjects = 0

@@ -303,6 +303,56 @@ func TestCloneSnapshotIndependence(t *testing.T) {
 	}
 }
 
+func TestArenaCloseReleasesBackingSlicesWhileReachable(t *testing.T) {
+	a := arena.New()
+
+	var wpSlab, wpLarge weak.Pointer[byte]
+	func() {
+		rSmall, err := a.AllocZeroed(64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rLarge, err := a.AllocZeroed(arena.MaxSmallSize + 4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wpSlab = weak.Make(&a.Bytes(rSmall, 64)[0])
+		wpLarge = weak.Make(&a.Bytes(rLarge, 64)[0])
+	}()
+
+	// Close while keeping a reachable; Go GC must reclaim prior slab and large span buffers.
+	a.Close()
+	if a.BackingBytes() != 0 || a.LiveObjects() != 0 || a.ActivePages() != 0 || a.ActiveLargeSpans() != 0 {
+		t.Fatalf("post-Close accounting non-zero: backing=%d live=%d pages=%d large=%d",
+			a.BackingBytes(), a.LiveObjects(), a.ActivePages(), a.ActiveLargeSpans())
+	}
+
+	reclaimed := false
+	for range 20 {
+		runtime.GC()
+		if wpSlab.Value() == nil && wpLarge.Value() == nil {
+			reclaimed = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !reclaimed {
+		t.Fatalf("Close retained backing buffers while Arena stayed reachable: slabAlive=%v largeAlive=%v",
+			wpSlab.Value() != nil, wpLarge.Value() != nil)
+	}
+
+	// Reusing the closed Arena must lazily re-initialize cleanly.
+	rReuse, err := a.AllocZeroed(32)
+	if err != nil {
+		t.Fatalf("Alloc after Close failed: %v", err)
+	}
+	if !a.IsLive(rReuse) || a.LiveObjects() != 1 {
+		t.Fatalf("post-Close reuse invalid: live=%v count=%d", a.IsLive(rReuse), a.LiveObjects())
+	}
+	a.Close()
+	runtime.KeepAlive(a)
+}
+
 func TestRandomizedAllocFreeFuzzProperty(t *testing.T) {
 	a := arena.New()
 	defer a.Close()
