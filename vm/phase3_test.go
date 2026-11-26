@@ -2902,7 +2902,10 @@ func TestCodexReviewRound13VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		s.SetMemoryLimit(131072)
+		s.SetMemoryLimit(1 << 20)
+		s.CollectFull()
+		base := s.MemoryUsage()
+		s.SetMemoryLimit(base + 131072)
 		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().S != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}

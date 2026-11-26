@@ -259,7 +259,9 @@ func TestFuzzStateSandboxGuards(t *testing.T) {
 	}
 
 	// 4. Repeated print() output is discarded via io.Discard rather than retained in memory.
-	s4, err := newBoundedFuzzState(2000)
+	// Allow enough instruction budget for 50 x 256 KiB chunked print writes (~205k instructions)
+	// while still enforcing the 4 MiB memory limit.
+	s4, err := newBoundedFuzzState(500000)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -181,7 +181,7 @@ func TestMemErrSweepVM(t *testing.T) {
 				}
 
 				// 2. Subsequent unrelated no-alloc global update must not fail spuriously.
-				s.env.RawSetStr(s, s.Intern("_sentinel"), IntValue(2))
+				s.GlobalEnv().RawSetStr(s, s.Intern("_sentinel"), IntValue(2))
 				if err := s.ConsumeMemErr(); err != nil {
 					s.Close()
 					t.Fatalf("delta=%d: spurious error on no-alloc write after callErr=%v: %v", delta, callErr, err)
