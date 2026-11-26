@@ -188,10 +188,11 @@ func (s *State) initIOOSPackageLibs() {
 }
 
 func (s *State) initBaseExtra() {
-	s.registerFunc(s.env, "warn", intrNone, nativeWarn)
-	s.registerFunc(s.env, "load", intrNone, nativeLoad)
-	s.registerFunc(s.env, "loadfile", intrNone, nativeLoadFile)
-	s.registerFunc(s.env, "dofile", intrDoFile, nativeDoFile)
+	env := s.GlobalEnv()
+	s.registerFunc(env, "warn", intrNone, nativeWarn)
+	s.registerFunc(env, "load", intrNone, nativeLoad)
+	s.registerFunc(env, "loadfile", intrNone, nativeLoadFile)
+	s.registerFunc(env, "dofile", intrDoFile, nativeDoFile)
 }
 
 func (s *State) emitWarning(msg string) {
@@ -1066,11 +1067,13 @@ func (s *State) flushOpenFiles() {
 	if lf, ok := asLuaFile(s.defaultOutput); ok && !lf.closed {
 		_ = lf.flushWriter()
 	}
-	if ioVal := s.env.RawGetStr(s.intern.Intern("io")); ioVal.IsTable() {
-		ioTbl := ioVal.AsTable()
-		for _, name := range [...]string{"stdout", "stderr"} {
-			if lf, ok := asLuaFile(ioTbl.RawGetStr(s.intern.Intern(name))); ok && !lf.closed {
-				_ = lf.flushWriter()
+	if env := s.GlobalEnv(); env != nil {
+		if ioVal := env.RawGetStr(s.intern.Intern("io")); ioVal.IsTable() {
+			ioTbl := ioVal.AsTable()
+			for _, name := range [...]string{"stdout", "stderr"} {
+				if lf, ok := asLuaFile(ioTbl.RawGetStr(s.intern.Intern(name))); ok && !lf.closed {
+					_ = lf.flushWriter()
+				}
 			}
 		}
 	}
@@ -3101,7 +3104,7 @@ func (s *State) initPackageLib() {
 	s.registry.RawSetStr(s, s.intern.Intern("_LOADED"), TableValue(loaded))
 	s.registry.RawSetStr(s, s.intern.Intern("_PRELOAD"), TableValue(preload))
 
-	s.registerFunc(s.env, "require", intrNone, nativeRequire)
+	s.registerFunc(s.GlobalEnv(), "require", intrNone, nativeRequire)
 }
 
 func (s *State) pkgField(name string) (Value, error) {

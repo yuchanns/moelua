@@ -499,7 +499,6 @@ func (tr *gcTracer) markBoundProto(bp *boundProto) {
 
 func (tr *gcTracer) markRoots() {
 	s := tr.s
-	tr.mark(TableValue(s.env))
 	if s.registry != nil {
 		tr.mark(TableValue(s.registry))
 	}

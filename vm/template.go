@@ -80,7 +80,6 @@ type stdTemplate struct {
 	arr    []Value
 	relocs []tmplReloc
 
-	envIdx        int
 	registryIdx   int
 	stringMetaIdx int
 	fileMetaIdx   int
@@ -114,9 +113,11 @@ func buildStdTemplate() *stdTemplate {
 	stdinUD := b.defaultInput.AsUserdata()
 	stdoutUD := b.defaultOutput.AsUserdata()
 	var stderrUD *Userdata
-	if ioVal := b.env.RawGetStr(b.intern.Intern("io")); ioVal.IsTable() {
-		if se := ioVal.AsTable().RawGetStr(b.intern.Intern("stderr")); se.IsUserdata() {
-			stderrUD = se.AsUserdata()
+	if env := b.GlobalEnv(); env != nil {
+		if ioVal := env.RawGetStr(b.intern.Intern("io")); ioVal.IsTable() {
+			if se := ioVal.AsTable().RawGetStr(b.intern.Intern("stderr")); se.IsUserdata() {
+				stderrUD = se.AsUserdata()
+			}
 		}
 	}
 
@@ -136,7 +137,6 @@ func buildStdTemplate() *stdTemplate {
 		return idx
 	}
 
-	addTable(b.env)
 	addTable(b.registry)
 	addTable(b.stringMeta)
 	addTable(b.fileMeta)
@@ -192,7 +192,6 @@ func buildStdTemplate() *stdTemplate {
 		builtinDebugSetHook:   b.builtinDebugSetHook,
 		builtinCoroYield:      b.builtinCoroYield,
 		tables:            make([]tmplTableDesc, len(tableList)),
-		envIdx:            tableIdx[b.env],
 		registryIdx:       tableIdx[b.registry],
 		stringMetaIdx:     tableIdx[b.stringMeta],
 		fileMetaIdx:       tableIdx[b.fileMeta],
@@ -440,7 +439,6 @@ func cloneFromStdTemplate(noEnv bool) *State {
 		}
 	}
 
-	s.env = &a.tables[tmpl.envIdx]
 	s.registry = &a.tables[tmpl.registryIdx]
 	s.stringMeta = &a.tables[tmpl.stringMetaIdx]
 	s.fileMeta = fileMeta

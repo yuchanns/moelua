@@ -23,31 +23,32 @@ func (s *State) registerFunc(tbl *Table, name string, intr uint8, fn func(*State
 }
 
 func (s *State) initStdlib() {
-	s.SetGlobal("_G", TableValue(s.env))
+	env := s.GlobalEnv()
+	s.SetGlobal("_G", TableValue(env))
 	s.SetGlobal("_VERSION", StringValue(s.intern.Intern("Lua 5.5")))
 
 	// Core globals
-	s.registerFunc(s.env, "print", intrNone, nativePrint)
-	s.registerFunc(s.env, "assert", intrNone, nativeAssert)
-	s.registerFunc(s.env, "error", intrNone, nativeError)
-	s.registerFunc(s.env, "pcall", intrPCall, nativePCall)
-	s.registerFunc(s.env, "xpcall", intrXPCall, nativeXPCall)
-	s.registerFunc(s.env, "type", intrType, nativeType)
-	s.registerFunc(s.env, "tostring", intrNone, nativeToString)
-	s.registerFunc(s.env, "tonumber", intrNone, nativeToNumber)
-	s.registerFunc(s.env, "select", intrSelect, nativeSelect)
-	s.registerFunc(s.env, "rawget", intrRawGet, nativeRawGet)
-	s.registerFunc(s.env, "rawset", intrRawSet, nativeRawSet)
-	s.registerFunc(s.env, "rawequal", intrNone, nativeRawEqual)
-	s.registerFunc(s.env, "rawlen", intrRawLen, nativeRawLen)
-	s.registerFunc(s.env, "setmetatable", intrNone, nativeSetMetatable)
-	s.registerFunc(s.env, "getmetatable", intrNone, nativeGetMetatable)
-	s.registerFunc(s.env, "collectgarbage", intrNone, nativeCollectGarbage)
+	s.registerFunc(env, "print", intrNone, nativePrint)
+	s.registerFunc(env, "assert", intrNone, nativeAssert)
+	s.registerFunc(env, "error", intrNone, nativeError)
+	s.registerFunc(env, "pcall", intrPCall, nativePCall)
+	s.registerFunc(env, "xpcall", intrXPCall, nativeXPCall)
+	s.registerFunc(env, "type", intrType, nativeType)
+	s.registerFunc(env, "tostring", intrNone, nativeToString)
+	s.registerFunc(env, "tonumber", intrNone, nativeToNumber)
+	s.registerFunc(env, "select", intrSelect, nativeSelect)
+	s.registerFunc(env, "rawget", intrRawGet, nativeRawGet)
+	s.registerFunc(env, "rawset", intrRawSet, nativeRawSet)
+	s.registerFunc(env, "rawequal", intrNone, nativeRawEqual)
+	s.registerFunc(env, "rawlen", intrRawLen, nativeRawLen)
+	s.registerFunc(env, "setmetatable", intrNone, nativeSetMetatable)
+	s.registerFunc(env, "getmetatable", intrNone, nativeGetMetatable)
+	s.registerFunc(env, "collectgarbage", intrNone, nativeCollectGarbage)
 
-	s.builtinNext = s.registerFunc(s.env, "next", intrNext, nativeNext)
+	s.builtinNext = s.registerFunc(env, "next", intrNext, nativeNext)
 	s.builtinIPairsIter = &NativeFunc{Name: "ipairs_iter", Fn: nativeIPairsIter, Intrinsic: intrIPairsIter}
-	s.registerFunc(s.env, "pairs", intrPairs, nativePairs)
-	s.registerFunc(s.env, "ipairs", intrNone, nativeIPairs)
+	s.registerFunc(env, "pairs", intrPairs, nativePairs)
+	s.registerFunc(env, "ipairs", intrNone, nativeIPairs)
 
 	// math library
 	mathTbl := s.NewTable(0, 32)

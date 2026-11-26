@@ -147,12 +147,18 @@ type Closure struct {
 // CompileFunc compiles Lua 5.5 source text into a verified *bytecode.Proto.
 type CompileFunc func(name, src string) (*bytecode.Proto, error)
 
+// Predefined Lua 5.5.1 registry indices (lua.h: LUA_RIDX_*).
+const (
+	ridxRef        = 1 // reserved for the reference mechanism
+	ridxGlobals    = 2 // LUA_RIDX_GLOBALS
+	ridxMainThread = 3 // LUA_RIDX_MAINTHREAD
+)
+
 // State is a single-goroutine Lua 5.5.1 execution state (multiple States share immutable Protos).
 type State struct {
 	mainThread *Thread
 	cur        *Thread // currently executing Thread (mainThread or resumed coroutine)
 
-	env        *Table
 	registry   *Table
 	intern     stringInterner
 	shapes     shapeRegistry
@@ -246,10 +252,11 @@ func newBootstrapState() *State {
 	s.mainThread = newThread(s, initialStackSize)
 	s.mainThread.nny = 1 // main thread is never yieldable (L->nny = 1)
 	s.cur = s.mainThread
-	s.env = s.NewDictTable(64)
+	env := s.NewDictTable(64)
 	s.registry = s.NewDictTable(16)
-	s.registry.RawSetInt(s, 1, ThreadValue(s.mainThread))
-	s.registry.RawSetInt(s, 2, TableValue(s.env))
+	s.registry.RawSetInt(s, ridxRef, FalseValue())
+	s.registry.RawSetInt(s, ridxGlobals, TableValue(env))
+	s.registry.RawSetInt(s, ridxMainThread, ThreadValue(s.mainThread))
 	s.initStdlib()
 	s.gc.tier1 = false // Stdlib internal setup (e.g. fileMeta.__gc) must not activate Tier 1!
 	return s
@@ -567,8 +574,21 @@ func (s *State) FormatError(err error) string {
 	return err.Error()
 }
 
-// GlobalEnv returns _G / _ENV.
-func (s *State) GlobalEnv() *Table { return s.env }
+func (s *State) globalEnvValue() Value {
+	if s.registry == nil {
+		return NilValue()
+	}
+	return s.registry.RawGetInt(ridxGlobals)
+}
+
+// GlobalEnv returns the current global environment table at registry[LUA_RIDX_GLOBALS],
+// or nil if Lua replaced registry[2] with a non-table value.
+func (s *State) GlobalEnv() *Table {
+	if v := s.globalEnvValue(); v.IsTable() {
+		return v.AsTable()
+	}
+	return nil
+}
 
 // Registry returns the State's Lua registry table (LUA_REGISTRYINDEX).
 func (s *State) Registry() *Table { return s.registry }
@@ -601,18 +621,25 @@ func (s *State) LookupString(str string) (*LuaString, bool) {
 	return &LuaString{S: str, Short: false}, true
 }
 
-// SetGlobal installs a global variable in _ENV.
+// SetGlobal installs a global variable in the current global environment table.
 func (s *State) SetGlobal(name string, v Value) {
-	s.env.RawSetStr(s, s.intern.Intern(name), v)
+	if env := s.GlobalEnv(); env != nil {
+		env.RawSetStr(s, s.intern.Intern(name), v)
+	}
 }
 
-// GetGlobal retrieves a global variable from _ENV without interning unseen short names.
+// GetGlobal retrieves a global variable from the current global environment table
+// without interning unseen short names.
 func (s *State) GetGlobal(name string) Value {
+	env := s.GlobalEnv()
+	if env == nil {
+		return NilValue()
+	}
 	ls, ok := s.LookupString(name)
 	if !ok {
 		return NilValue()
 	}
-	return s.env.RawGetStr(ls)
+	return env.RawGetStr(ls)
 }
 
 func (s *State) bindProto(p *bytecode.Proto) *boundProto {
@@ -744,7 +771,7 @@ func (s *State) Load(p *bytecode.Proto) (*Closure, error) {
 		upvals: make([]*Upvalue, len(p.Upvalues)),
 	}
 	if len(cl.upvals) > 0 {
-		cl.upvals[0] = &Upvalue{closed: TableValue(s.env)}
+		cl.upvals[0] = &Upvalue{closed: s.globalEnvValue()}
 		for i := 1; i < len(cl.upvals); i++ {
 			cl.upvals[i] = &Upvalue{closed: NilValue()}
 		}
@@ -1303,18 +1330,10 @@ func (s *State) TableLen(v Value) (int64, error) { return s.tableLen(v) }
 // TableGetInt evaluates `v[i]` (honoring `__index` metamethods).
 func (s *State) TableGetInt(v Value, i int64) (Value, error) { return s.tableGetInt(v, i) }
 
-// GetGlobalMM retrieves a global from `_G`, honoring `_G`'s `__index` metamethod
-// (matching PUC-Rio `lua_getglobal`).
+// GetGlobalMM retrieves a global from registry[LUA_RIDX_GLOBALS], honoring `__index`
+// metamethods (matching PUC-Rio `lua_getglobal`).
 func (s *State) GetGlobalMM(name string) (Value, error) {
-	key := s.intern.Intern(name)
-	if err := s.ensureLookupStrKeyHash(s.env, key); err != nil {
-		return NilValue(), err
-	}
-	v := s.env.RawGetStr(key)
-	if !v.IsNil() || s.env.meta == nil {
-		return v, nil
-	}
-	return s.finishGet(TableValue(s.env), StringValue(key))
+	return s.tableGetStrAny(s.globalEnvValue(), s.intern.Intern(name))
 }
 
 // TryIntern interns or wraps str as a *LuaString after checking and accounting for newly
@@ -1364,10 +1383,10 @@ func (s *State) TryNewUserdata(data any, nUValues int) (Value, error) {
 	return UserdataValue(u), nil
 }
 
-// SetGlobalMM assigns a global in `_G`, honoring `_G`'s `__newindex` metamethod
-// (matching PUC-Rio `lua_setglobal`).
+// SetGlobalMM assigns a global in registry[LUA_RIDX_GLOBALS], honoring `__newindex`
+// metamethods (matching PUC-Rio `lua_setglobal`).
 func (s *State) SetGlobalMM(name string, val Value) error {
-	return s.tableSetStr(TableValue(s.env), s.intern.Intern(name), val)
+	return s.tableSetStr(s.globalEnvValue(), s.intern.Intern(name), val)
 }
 
 // tableSetStr assigns keyStr = val on a Lua table honoring `__newindex` metamethods

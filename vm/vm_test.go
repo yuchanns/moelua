@@ -2820,3 +2820,96 @@ func TestNumericForNaNStepAndBoundsParity(t *testing.T) {
 		t.Fatalf("numeric for NaN/Inf parity failed: %v", err)
 	}
 }
+
+func TestRegistryLayoutAndDynamicGlobalsParity(t *testing.T) {
+	tmpFile := t.TempDir() + "/dyn_env_chunk.lua"
+	if err := os.WriteFile(tmpFile, []byte("return marker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, noEnv := range []bool{false, true} {
+		name := "default"
+		if noEnv {
+			name = "noenv"
+		}
+		t.Run(name, func(t *testing.T) {
+			var s *vm.State
+			if noEnv {
+				s = vm.NewStateNoEnv()
+			} else {
+				s = vm.NewState()
+			}
+			defer s.Close()
+			s.SetGlobal("TMP_CHUNK_FILE", vm.StringValue(s.Intern(tmpFile)))
+
+			cl, err := s.LoadChunk([]byte(`
+				local reg = debug.getregistry()
+				-- Lua 5.5.1 lua.h / lstate.c: [1]=false (ref), [2]=_G (LUA_RIDX_GLOBALS), [3]=mainthread (LUA_RIDX_MAINTHREAD)
+				assert(reg[1] == false, "expected reg[1] == false, got " .. tostring(reg[1]))
+				assert(reg[2] == _G, "expected reg[2] == _G")
+				local main, ismain = coroutine.running()
+				assert(ismain and reg[3] == main, "expected reg[3] == main thread")
+
+				local co = coroutine.create(function()
+					local cur, isM = coroutine.running()
+					assert(not isM and reg[3] == main and reg[3] ~= cur, "reg[3] must stay main thread inside coroutine")
+				end)
+				local ok, cerr = coroutine.resume(co)
+				assert(ok, cerr)
+
+				-- Replacing reg[2] dynamically redirects load / loadfile / dofile default _ENV
+				local oldG = reg[2]
+				local collected = false
+				local replacedEnv = setmetatable({marker = 99}, {
+					__gc = function() collected = true end,
+				})
+				reg[2] = replacedEnv
+				assert(assert(load("return marker"))() == 99)
+				assert(assert(loadfile(TMP_CHUNK_FILE))() == 99)
+				assert(dofile(TMP_CHUNK_FILE) == 99)
+				-- Explicit env overrides registry[2]
+				assert(assert(load("return marker", "=exp", "t", {marker = 7}))() == 7)
+
+				-- Non-table and nil values in reg[2] are also passed verbatim as _ENV
+				reg[2] = "not_a_table"
+				assert(assert(load("return _ENV"))() == "not_a_table")
+				reg[2] = nil
+				assert(assert(load("return _ENV"))() == nil)
+
+				-- Restore and ensure replacedEnv is collectable (not pinned by any obsolete root)
+				reg[2] = oldG
+				replacedEnv = nil
+				collectgarbage("collect")
+				assert(collected, "replaced global environment table must be collected")
+				assert(assert(load("return _G == _ENV"))() == true)
+			`), "=reg_layout")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Call(cl); err != nil {
+				t.Fatalf("registry layout & dynamic globals test failed: %v", err)
+			}
+
+			// Also verify Go State.LoadChunk / GlobalEnv / GetGlobal / GetGlobalMM observe registry[2] replacement.
+			alt := s.NewTable(0, 1)
+			alt.RawSetStr(s, s.Intern("marker"), vm.IntValue(123))
+			s.Registry().RawSetInt(s, 2, vm.TableValue(alt))
+			if s.GlobalEnv() != alt {
+				t.Fatalf("GlobalEnv() did not reflect updated registry[2]")
+			}
+			if got := s.GetGlobal("marker"); !got.IsInt() || got.Int() != 123 {
+				t.Fatalf("GetGlobal(marker) = %v, want 123", got)
+			}
+			if got, err := s.GetGlobalMM("marker"); err != nil || !got.IsInt() || got.Int() != 123 {
+				t.Fatalf("GetGlobalMM(marker) = (%v, %v), want (123, nil)", got, err)
+			}
+			c2, err := s.LoadChunk([]byte(`return marker`), "=go_load")
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := s.Call(c2)
+			if err != nil || len(res) != 1 || !res[0].IsInt() || res[0].Int() != 123 {
+				t.Fatalf("LoadChunk after registry[2] swap returned (%v, %v), want (123, nil)", res, err)
+			}
+		})
+	}
+}
