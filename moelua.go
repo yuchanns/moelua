@@ -418,6 +418,7 @@ func (s *State) NewUserdataWithMeta(data any, mt *Table) (Value, error) {
 		if mt.state != s {
 			return vm.NilValue(), fmt.Errorf("moelua: metatable belongs to another State")
 		}
+		defer s.pinTemps(vm.TableValue(mt.raw))()
 	}
 	u, err := s.TryNewUserdata(data)
 	if err != nil {

@@ -1473,4 +1473,32 @@ func TestRootOperandsAcrossAllocationPreservesMemoryLimit(t *testing.T) {
 			t.Fatalf("NewThread succeeded but recounted MemoryUsage()=%d exceeded %d", usage, l)
 		}
 	})
+
+	t.Run("NewUserdataWithMeta", func(t *testing.T) {
+		s := moelua.New()
+		defer s.Close()
+		s.SetMemoryLimit(1 << 30)
+		rets, err := s.DoString(`return {payload = string.rep("m", 30000)}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mt := s.TableOf(rets[0])
+		pin := s.Pin(rets[0])
+		s.CollectGarbage()
+		pin.Release()
+		// Less headroom than the 64-byte userdata, so its allocation runs an emergency GC; that
+		// GC must still count the metatable's 30,000-byte payload.
+		l := s.MemoryUsage() + 32
+		s.SetMemoryLimit(l)
+		u, err := s.NewUserdataWithMeta(struct{}{}, mt)
+		if err != nil {
+			return
+		}
+		h := s.Pin(u)
+		defer h.Release()
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > l {
+			t.Fatalf("NewUserdataWithMeta succeeded but recounted MemoryUsage()=%d exceeded %d", usage, l)
+		}
+	})
 }
