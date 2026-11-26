@@ -157,7 +157,7 @@ type State struct {
 	registry   *Table
 	intern     stringInterner
 	shapes     shapeRegistry
-	protoEpoch uint32
+	protoEpoch uint64
 
 	out       io.Writer
 	errOut    io.Writer
@@ -168,11 +168,15 @@ type State struct {
 	compilerFn       CompileFunc
 	compilerReaderFn func(name string, r io.Reader, opts ...compiler.Option) (*bytecode.Proto, error)
 
-	// Cached builtin identities for TFORCALL / pcall / debug.getinfo fast paths & standard libs.
-	builtinNext         *NativeFunc
-	builtinIPairsIter   *NativeFunc
-	builtinDebugGetInfo *NativeFunc
-	builtinCoroYield    *NativeFunc
+	// Cached builtin identities for TFORCALL / pcall / debug fast paths & standard libs.
+	builtinNext           *NativeFunc
+	builtinIPairsIter     *NativeFunc
+	builtinDebugGetInfo   *NativeFunc
+	builtinDebugTraceback *NativeFunc
+	builtinDebugGetLocal  *NativeFunc
+	builtinDebugSetLocal  *NativeFunc
+	builtinDebugSetHook   *NativeFunc
+	builtinCoroYield      *NativeFunc
 	stringMeta        *Table
 	fileMeta          *Table
 	pkgTbl            *Table
@@ -274,8 +278,12 @@ func (s *State) MemoryUsage() int64 {
 // from table mutation.
 func (s *State) ConsumeMemErr() error {
 	if s.abortErr != nil {
+		err := s.abortErr
+		if s.nCcalls == 0 {
+			s.abortErr = nil
+		}
 		s.memExceeded = false
-		return s.abortErr
+		return err
 	}
 	if s.memExceeded {
 		s.memExceeded = false
@@ -346,6 +354,56 @@ func (s *State) checkMemAndAccountWithRoots(delta int64, r1, r2, r3 Value) error
 	return s.checkMemAndAccount(delta)
 }
 
+// ensureStackWithRoots grows th.stack to hold need slots while rooting extra and args
+// across any emergency GC triggered when s.memLimit > 0. Zero overhead when stack fits.
+func (s *State) ensureStackWithRoots(th *Thread, need int, extra Value, args []Value) error {
+	if need+stackSlack <= len(th.stack) {
+		return nil
+	}
+	if s.memLimit > 0 {
+		var ids []int
+		if !extra.IsNil() {
+			ids = append(ids, s.Ref(extra))
+		}
+		for _, a := range args {
+			if !a.IsNil() {
+				ids = append(ids, s.Ref(a))
+			}
+		}
+		err := th.ensureStack(need)
+		for _, id := range ids {
+			s.Unref(id)
+		}
+		return err
+	}
+	return th.ensureStack(need)
+}
+
+// ensureFrameCapWithRoots grows th.frames to hold need entries while rooting extra and args
+// across any emergency GC triggered when s.memLimit > 0. Zero overhead when frames fit.
+func (s *State) ensureFrameCapWithRoots(th *Thread, need, limit int, extra Value, args []Value) error {
+	if need <= len(th.frames) {
+		return nil
+	}
+	if s.memLimit > 0 {
+		var ids []int
+		if !extra.IsNil() {
+			ids = append(ids, s.Ref(extra))
+		}
+		for _, a := range args {
+			if !a.IsNil() {
+				ids = append(ids, s.Ref(a))
+			}
+		}
+		err := th.ensureFrameCap(need, limit)
+		for _, id := range ids {
+			s.Unref(id)
+		}
+		return err
+	}
+	return th.ensureFrameCap(need, limit)
+}
+
 // SetCompiler registers a source-to-bytecode compiler for load()/loadfile()/dofile()/require().
 func (s *State) SetCompiler(fn CompileFunc) {
 	s.compilerFn = fn
@@ -360,6 +418,26 @@ func (s *State) SetErrOutput(w io.Writer) { s.errOut = w }
 
 // SetWarnings enables or disables Lua warning emission (equivalent to warn("@on") / lua -W).
 func (s *State) SetWarnings(on bool) { s.warnOn = on }
+
+// EmitWarning emits a Lua warning if warnings are currently enabled (matching lua_warning).
+func (s *State) EmitWarning(msg string) { s.emitWarning(msg) }
+
+// SetGCGenerational switches this State's GC mode to generational (matching lua.c startup).
+func (s *State) SetGCGenerational() { s.gc.mode = gcModeGenerational }
+
+// ToStringValue converts v to a Go string honoring __tostring / __name metamethods
+// (matching PUC-Rio luaL_tolstring without consulting global _G.tostring).
+func (s *State) ToStringValue(v Value) (string, error) { return s.toStringValue(v) }
+
+// TracebackFromNative formats a Lua 5.5 stack traceback starting just below the given
+// native function (skipping self if a frameNative was pushed by debug hooks).
+func (s *State) TracebackFromNative(msg string, self *NativeFunc) string {
+	level := 0
+	if topFrameIsNative(s.cur, self) {
+		level = 1
+	}
+	return s.formatTraceback(s.cur, msg, true, level)
+}
 
 // SetInterruptFlag attaches an atomic interrupt flag polled periodically in runHooked
 // (used by CLI SIGINT handling; leaves fast run() completely untouched when nil).
@@ -663,6 +741,129 @@ func (s *State) Call(fn Value, args ...Value) ([]Value, error) {
 	return s.callOnThread(s.cur, fn, args)
 }
 
+// CallProtected invokes fn(args...) in protected mode with message handler msgh
+// (analogous to lua_pcall with a C message handler, without pushing a Lua xpcall wrapper frame).
+// Returns (results, errVal, ok, abortErr).
+func (s *State) CallProtected(fn Value, msgh Value, args ...Value) ([]Value, Value, bool, error) {
+	th := s.cur
+	if s.nCcalls == 0 {
+		s.abortErr = nil
+	}
+	if s.abortErr != nil {
+		err := s.abortErr
+		if s.nCcalls == 0 {
+			s.abortErr = nil
+		}
+		return nil, NilValue(), false, err
+	}
+	if s.ctx != nil {
+		if err := s.ctx.Err(); err != nil {
+			return nil, NilValue(), false, err
+		}
+	}
+	if s.insnLimit > 0 && s.insnCount > s.insnLimit {
+		return nil, NilValue(), false, ErrInstructionLimit
+	}
+	cLimit := maxCCalls
+	if th.inErrHandler {
+		cLimit = maxCCallsErrHandler
+	}
+	if s.nCcalls >= cLimit {
+		return nil, StringValue(s.intern.Intern("C stack overflow")), false, nil
+	}
+	s.nCcalls++
+	th.nny++
+	defer func() {
+		th.nny--
+		s.nCcalls--
+		if s.nCcalls == 0 {
+			s.abortErr = nil
+		}
+	}()
+	savedTop := th.top
+	base := savedTop
+	for fi := range th.nframe {
+		cf := &th.frames[fi]
+		if cf.kind == frameLua && cf.cl != nil {
+			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > base {
+				base = end
+			}
+		}
+	}
+	rootArgs := make([]Value, 1+len(args))
+	rootArgs[0] = msgh
+	copy(rootArgs[1:], args)
+	if err := s.ensureStackWithRoots(th, base+3+len(args)+8, fn, rootArgs); err != nil {
+		return nil, errorToLuaValue(s, err), false, nil
+	}
+	th.stack[base] = NilValue()
+	th.stack[base+1] = fn
+	th.stack[base+2] = msgh
+	copy(th.stack[base+3:base+3+len(args)], args)
+	th.top = base + 3 + len(args)
+	entryDepth := th.nframe
+	clearTop := func() {
+		th.nframe = entryDepth
+		th.top = savedTop
+		if entryDepth == 0 && th.openUpvals == nil && base < len(th.stack) {
+			fillNil(th.stack[base:])
+		}
+	}
+	pushed, err := s.pushProtectedCallMode(th, base, 2+len(args), -1, true, entryDepth, true)
+	if err != nil {
+		clearTop()
+		if isUncatchableErr(err) {
+			return nil, NilValue(), false, err
+		}
+		return nil, errorToLuaValue(s, err), false, nil
+	}
+	if pushed {
+		runErr := s.runThread(th, entryDepth)
+		if th.uncaughtErr != nil {
+			runErr = th.uncaughtErr
+			th.uncaughtErr = nil
+		}
+		if runErr == nil && s.abortErr != nil {
+			runErr = s.abortErr
+		}
+		if runErr != nil {
+			clearTop()
+			if isUncatchableErr(runErr) {
+				return nil, NilValue(), false, runErr
+			}
+			return nil, errorToLuaValue(s, runErr), false, nil
+		}
+	}
+	if s.gc.tier1 {
+		s.gcCheckDebt(th.top)
+		if s.abortErr != nil {
+			uerr := s.abortErr
+			clearTop()
+			return nil, NilValue(), false, uerr
+		}
+	}
+	nres := th.top - base
+	if nres <= 0 {
+		clearTop()
+		return nil, NilValue(), true, nil
+	}
+	if th.stack[base].IsFalsy() {
+		ev := NilValue()
+		if nres > 1 {
+			ev = th.stack[base+1]
+		}
+		clearTop()
+		return nil, ev, false, nil
+	}
+	var res []Value
+	if nres > 1 {
+		res = make([]Value, nres-1)
+		copy(res, th.stack[base+1:th.top])
+	}
+	clearTop()
+	return res, NilValue(), true, nil
+}
+
 func slicesOverlapValues(a, b []Value) bool {
 	if len(a) == 0 || len(b) == 0 {
 		return false
@@ -703,6 +904,9 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	defer func() {
 		th.nny--
 		s.nCcalls--
+		if s.nCcalls == 0 {
+			s.abortErr = nil
+		}
 	}()
 
 	var extraDepth uint8
@@ -739,7 +943,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 				}
 			}
 		}
-		if err := th.ensureStack(base + 1 + len(args) + 8); err != nil {
+		if err := s.ensureStackWithRoots(th, base+1+len(args)+8, fn, args); err != nil {
 			return nil, err
 		}
 		th.stack[base] = fn
@@ -818,7 +1022,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	}
 	funcIdx := base
 	argBase := funcIdx + 1
-	if err := th.ensureStack(argBase + max(len(args), int(p.MaxStackSize)) + 8); err != nil {
+	if err := s.ensureStackWithRoots(th, argBase+max(len(args), int(p.MaxStackSize))+8, fn, args); err != nil {
 		return nil, err
 	}
 	th.stack[funcIdx] = fn
@@ -862,8 +1066,15 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			clearTopStack()
 			return nil, err
 		}
+		var xpHandled bool
+		if le, ok := err.(*LuaError); ok && le.xpHandled {
+			xpHandled = true
+		}
 		ev := s.runtimeErrorToValue(th, err)
-		ev, _, _ = th.closeAllSync(funcIdx, ev, true)
+		ev, _, raised := th.closeAllSync(funcIdx, ev, true)
+		if raised {
+			xpHandled = false
+		}
 		if s.abortErr != nil {
 			uerr := s.abortErr
 			if !errors.Is(uerr, errCoroCloseSelf) {
@@ -876,7 +1087,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		}
 		th.nframe = entryDepth
 		clearTopStack()
-		return nil, &LuaError{Val: ev}
+		return nil, &LuaError{Val: ev, xpHandled: xpHandled}
 	}
 	if s.gc.tier1 {
 		s.gcCheckDebt(th.top)

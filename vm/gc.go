@@ -416,7 +416,7 @@ func (tr *gcTracer) tickCancel() bool {
 		return false
 	}
 	tr.cancelSteps++
-	if (tr.cancelSteps & 1023) == 0 {
+	if (tr.cancelSteps & 4095) == 0 {
 		if err := tr.cancelFn(); err != nil {
 			tr.aborted = true
 			return true
@@ -723,6 +723,7 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 	}
 	tr.mark(th.errObj)
 	tr.mark(th.lastErrNative)
+	tr.mark(th.yieldNativeFn)
 	tr.mark(th.hook)
 	if th.caller != nil {
 		tr.mark(ThreadValue(th.caller))
@@ -773,19 +774,6 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 		if uv.stackIdx > maxOpenUpvalIdx {
 			maxOpenUpvalIdx = uv.stackIdx
 		}
-	}
-	for _, yv := range th.yieldVals {
-		tr.mark(yv)
-	}
-	for _, ce := range th.syncCloseErrs {
-		tr.mark(ce)
-	}
-	tr.mark(th.errObj)
-	tr.mark(th.lastErrNative)
-	tr.mark(th.yieldNativeFn)
-	tr.mark(th.hook)
-	if th.caller != nil {
-		tr.mark(ThreadValue(th.caller))
 	}
 	// Shrink oversized stacks on non-running coroutines (including coroutines with open upvalues,
 	// since Upvalue tracks stackIdx rather than raw slice pointers) & release finished dead stacks.
@@ -1159,7 +1147,7 @@ func (tr *gcTracer) icShapeAlive(sh *Shape) bool {
 	return true
 }
 
-func (tr *gcTracer) icEntryAlive(kind icKind, shape, targetShape *Shape, holder *Table, val Value, epoch uint32, noMeta bool) bool {
+func (tr *gcTracer) icEntryAlive(kind icKind, shape, targetShape *Shape, holder *Table, val Value, epoch uint64, noMeta bool) bool {
 	switch kind {
 	case icEmpty:
 		return false
@@ -1459,6 +1447,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	fi := len(s.gc.finalizable) - 1
 	wi := len(s.gc.weakFiles) - 1
 	for fi >= 0 || wi >= 0 {
+		if tr.cancelFn != nil && tr.tickCancel() {
+			return
+		}
 		if wi >= 0 && (fi < 0 || s.gc.weakFiles[wi].seq > s.gc.finalizable[fi].seq) {
 			wf := s.gc.weakFiles[wi]
 			wi--
@@ -1676,6 +1667,7 @@ func (s *State) Close() {
 	if !s.gc.closing {
 		// Close any active <close> TBC variables on mainThread first (e.g. os.exit(true, true)).
 		if s.mainThread != nil {
+			s.mainThread.nframe = 0
 			s.mainThread.nny++
 			_, _, _ = s.mainThread.closeAllSync(0, NilValue(), false)
 			s.mainThread.nny--

@@ -350,7 +350,7 @@ func nativeXPCall(s *State, args []Value) ([]Value, error) {
 		} else {
 			rawErr = errorToLuaValue(s, err)
 		}
-		errVal, uerr := s.callXPCallHandler(s.cur, args[1], rawErr)
+		errVal, uerr := s.callXPCallHandler(s.cur, -1, args[1], rawErr)
 		if uerr != nil {
 			return nil, uerr
 		}
@@ -645,16 +645,16 @@ func nativeIPairs(s *State, args []Value) ([]Value, error) {
 
 // --- math ---
 
-func nativeMathFloor(_ *State, args []Value) ([]Value, error) {
+func nativeMathFloor(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("bad argument #1 to 'floor'")
+		return nil, fmt.Errorf("bad argument #1 to 'floor' (number expected, got no value)")
 	}
 	if args[0].IsInt() {
 		return []Value{args[0]}, nil
 	}
 	f, ok := args[0].CoerceFloat()
 	if !ok {
-		return nil, fmt.Errorf("bad argument #1 to 'floor' (number expected)")
+		return nil, fmt.Errorf("bad argument #1 to 'floor' (number expected, got %s)", s.objTypeName(args[0]))
 	}
 	fl := math.Floor(f)
 	if i, ok := FloatToIntExact(fl); ok {
@@ -663,16 +663,16 @@ func nativeMathFloor(_ *State, args []Value) ([]Value, error) {
 	return []Value{FloatValue(fl)}, nil
 }
 
-func nativeMathCeil(_ *State, args []Value) ([]Value, error) {
+func nativeMathCeil(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("bad argument #1 to 'ceil'")
+		return nil, fmt.Errorf("bad argument #1 to 'ceil' (number expected, got no value)")
 	}
 	if args[0].IsInt() {
 		return []Value{args[0]}, nil
 	}
 	f, ok := args[0].CoerceFloat()
 	if !ok {
-		return nil, fmt.Errorf("bad argument #1 to 'ceil' (number expected)")
+		return nil, fmt.Errorf("bad argument #1 to 'ceil' (number expected, got %s)", s.objTypeName(args[0]))
 	}
 	cl := math.Ceil(f)
 	if i, ok := FloatToIntExact(cl); ok {
@@ -1460,33 +1460,52 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeTableMove(s *State, args []Value) ([]Value, error) {
-	if len(args) < 4 {
-		return nil, fmt.Errorf("bad arguments to 'move'")
+	if len(args) == 0 {
+		return nil, fmt.Errorf("bad argument #1 to 'move' (table expected, got no value)")
 	}
 	src := args[0]
 	if !src.IsTable() && s.getMetatableOf(src) == nil {
-		return nil, fmt.Errorf("bad argument #1 to 'move' (table expected, got %s)", src.TypeName())
+		return nil, fmt.Errorf("bad argument #1 to 'move' (table expected, got %s)", s.objTypeName(src))
 	}
-	f, ok1 := args[1].CoerceInt()
-	e, ok2 := args[2].CoerceInt()
-	tpos, ok3 := args[3].CoerceInt()
-	if !ok1 || !ok2 || !ok3 {
-		return nil, fmt.Errorf("bad arguments to 'move' (number expected)")
+	checkMoveInt := func(argIdx int) (int64, error) {
+		if argIdx >= len(args) {
+			return 0, fmt.Errorf("bad argument #%d to 'move' (number expected, got no value)", argIdx+1)
+		}
+		v, ok := args[argIdx].CoerceInt()
+		if !ok {
+			if args[argIdx].IsFloat() {
+				return 0, fmt.Errorf("bad argument #%d to 'move' (number has no integer representation)", argIdx+1)
+			}
+			return 0, fmt.Errorf("bad argument #%d to 'move' (number expected, got %s)", argIdx+1, s.objTypeName(args[argIdx]))
+		}
+		return v, nil
+	}
+	f, err := checkMoveInt(1)
+	if err != nil {
+		return nil, err
+	}
+	e, err := checkMoveInt(2)
+	if err != nil {
+		return nil, err
+	}
+	tpos, err := checkMoveInt(3)
+	if err != nil {
+		return nil, err
 	}
 	dst := src
 	if len(args) >= 5 && !args[4].IsNil() {
 		dst = args[4]
 		if !dst.IsTable() && s.getMetatableOf(dst) == nil {
-			return nil, fmt.Errorf("bad argument #5 to 'move' (table expected, got %s)", dst.TypeName())
+			return nil, fmt.Errorf("bad argument #5 to 'move' (table expected, got %s)", s.objTypeName(dst))
 		}
 	}
 	if e >= f {
 		if f <= 0 && e >= math.MaxInt64+f {
-			return nil, fmt.Errorf("too many elements to move")
+			return nil, fmt.Errorf("bad argument #3 to 'move' (too many elements to move)")
 		}
 		n := e - f + 1
 		if tpos > math.MaxInt64-n+1 {
-			return nil, fmt.Errorf("destination wrap around")
+			return nil, fmt.Errorf("bad argument #4 to 'move' (destination wrap around)")
 		}
 		rawFast := src.IsTable() && src.AsTable().meta == nil && dst.IsTable() && dst.AsTable().meta == nil
 		cancelFn := s.nativeCancelFunc()
@@ -1575,7 +1594,7 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeTablePack(s *State, args []Value) ([]Value, error) {
-	if err := s.checkMemAndAccount(int64(96 + len(args)*16)); err != nil {
+	if err := s.checkMemAndAccount(tablePreallocBytes(int64(len(args)), 1)); err != nil {
 		return nil, err
 	}
 	cancelFn := s.nativeCancelFunc()
@@ -2315,8 +2334,8 @@ func nativeStringSub(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeStringRep(s *State, args []Value) ([]Value, error) {
-	if len(args) < 2 {
-		return nil, fmt.Errorf("bad argument to 'rep'")
+	if len(args) == 0 {
+		return nil, fmt.Errorf("bad argument #1 to 'rep' (string expected, got no value)")
 	}
 	var str string
 	if args[0].IsString() {
@@ -2324,14 +2343,17 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 	} else if args[0].IsNumber() {
 		str = FormatValue(args[0])
 	} else {
-		return nil, fmt.Errorf("bad argument #1 to 'rep' (string expected, got %s)", args[0].TypeName())
+		return nil, fmt.Errorf("bad argument #1 to 'rep' (string expected, got %s)", s.objTypeName(args[0]))
+	}
+	if len(args) < 2 {
+		return nil, fmt.Errorf("bad argument #2 to 'rep' (number expected, got no value)")
 	}
 	n, ok := args[1].CoerceInt()
 	if !ok {
 		if args[1].IsFloat() {
 			return nil, fmt.Errorf("bad argument #2 to 'rep' (number has no integer representation)")
 		}
-		return nil, fmt.Errorf("bad argument #2 to 'rep' (number expected)")
+		return nil, fmt.Errorf("bad argument #2 to 'rep' (number expected, got %s)", s.objTypeName(args[1]))
 	}
 	if n <= 0 {
 		return []Value{StringValue(s.intern.Intern(""))}, nil

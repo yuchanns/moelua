@@ -65,10 +65,14 @@ type stdTemplate struct {
 
 	nextShapeID uint32
 
-	builtinNext         *NativeFunc
-	builtinIPairsIter   *NativeFunc
-	builtinDebugGetInfo *NativeFunc
-	builtinCoroYield    *NativeFunc
+	builtinNext           *NativeFunc
+	builtinIPairsIter     *NativeFunc
+	builtinDebugGetInfo   *NativeFunc
+	builtinDebugTraceback *NativeFunc
+	builtinDebugGetLocal  *NativeFunc
+	builtinDebugSetLocal  *NativeFunc
+	builtinDebugSetHook   *NativeFunc
+	builtinCoroYield      *NativeFunc
 
 	tables []tmplTableDesc
 	slots  []Value
@@ -183,10 +187,14 @@ func buildStdTemplate() *stdTemplate {
 		tms:               b.intern.tms,
 		nextStrID:         b.intern.nextID,
 		nextShapeID:       b.shapes.nextID,
-		builtinNext:         b.builtinNext,
-		builtinIPairsIter:   b.builtinIPairsIter,
-		builtinDebugGetInfo: b.builtinDebugGetInfo,
-		builtinCoroYield:    b.builtinCoroYield,
+		builtinNext:           b.builtinNext,
+		builtinIPairsIter:     b.builtinIPairsIter,
+		builtinDebugGetInfo:   b.builtinDebugGetInfo,
+		builtinDebugTraceback: b.builtinDebugTraceback,
+		builtinDebugGetLocal:  b.builtinDebugGetLocal,
+		builtinDebugSetLocal:  b.builtinDebugSetLocal,
+		builtinDebugSetHook:   b.builtinDebugSetHook,
+		builtinCoroYield:      b.builtinCoroYield,
 		tables:            make([]tmplTableDesc, len(tableList)),
 		envIdx:            tableIdx[b.env],
 		registryIdx:       tableIdx[b.registry],
@@ -330,6 +338,10 @@ func cloneFromStdTemplate(noEnv bool) *State {
 	s.builtinNext = tmpl.builtinNext
 	s.builtinIPairsIter = tmpl.builtinIPairsIter
 	s.builtinDebugGetInfo = tmpl.builtinDebugGetInfo
+	s.builtinDebugTraceback = tmpl.builtinDebugTraceback
+	s.builtinDebugGetLocal = tmpl.builtinDebugGetLocal
+	s.builtinDebugSetLocal = tmpl.builtinDebugSetLocal
+	s.builtinDebugSetHook = tmpl.builtinDebugSetHook
 	s.builtinCoroYield = tmpl.builtinCoroYield
 	s.seedRNG(makeRandomSeed(s), 0)
 

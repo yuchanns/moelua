@@ -149,19 +149,46 @@ func (s *State) finishPCallReturn(th *Thread, entryDepth int) (bool, error) {
 // Returns true if caught by pcall/xpcall (caller should goto reloadFrame).
 //
 //go:noinline
-func (s *State) callXPCallHandler(th *Thread, msgh Value, errVal Value) (Value, error) {
+func (s *State) callXPCallHandler(th *Thread, xpFrameIdx int, msgh Value, errVal Value) (Value, error) {
 	if s.nCcalls >= maxCCallsErrHandler {
 		return StringValue(s.intern.Intern("error in error handling")), nil
+	}
+	if xpFrameIdx >= 0 && xpFrameIdx < len(th.frames) {
+		th.frames[xpFrameIdx].errHandling = true
+		defer func() {
+			if xpFrameIdx < len(th.frames) {
+				th.frames[xpFrameIdx].errHandling = false
+			}
+		}()
 	}
 	prevErrH := th.inErrHandler
 	th.inErrHandler = true
 	defer func() { th.inErrHandler = prevErrH }()
+	invokeMsgh := func(arg Value) ([]Value, error) {
+		if msgh.IsNative() && (th.hookMask == 0 || th.inHook || th.suppressHook) {
+			if ferr := th.ensureFrameCap(th.nframe+1, maxFrames+128); ferr == nil {
+				savedN := th.nframe
+				th.frames[savedN] = callFrame{
+					kind:     frameNative,
+					base:     th.top,
+					funcIdx:  th.top,
+					nativeFn: msgh,
+					dirty:    true,
+				}
+				th.nframe = savedN + 1
+				defer func() {
+					th.nframe = savedN
+				}()
+			}
+		}
+		return s.callOnThread(th, msgh, []Value{arg})
+	}
 	for depth := 0; depth <= maxCCalls; depth++ {
 		if depth == maxCCalls || s.nCcalls >= maxCCalls {
 			// Give msgh one last chance with "C stack overflow" (errors.lua:639) using the
 			// reserved headroom up to maxCCallsErrHandler; never lower s.nCcalls.
 			overflowMsg := StringValue(s.intern.Intern("C stack overflow"))
-			hres, herr := s.callOnThread(th, msgh, []Value{overflowMsg})
+			hres, herr := invokeMsgh(overflowMsg)
 			if herr != nil {
 				if errors.Is(herr, errCoroCloseSelf) || isUncatchableErr(herr) {
 					return NilValue(), herr
@@ -173,7 +200,7 @@ func (s *State) callXPCallHandler(th *Thread, msgh Value, errVal Value) (Value, 
 			}
 			return hres[0], nil
 		}
-		hres, herr := s.callOnThread(th, msgh, []Value{errVal})
+		hres, herr := invokeMsgh(errVal)
 		if herr != nil {
 			if errors.Is(herr, errCoroCloseSelf) || isUncatchableErr(herr) {
 				return NilValue(), herr
@@ -255,6 +282,15 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 	if err == errYieldSentinel || err == errCoroCloseSelf || errors.Is(err, errYieldSentinel) || errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 		return false
 	}
+	var alreadyXPHandled bool
+	if le, ok := err.(*LuaError); ok && le.xpHandled {
+		alreadyXPHandled = true
+	} else {
+		var le2 *LuaError
+		if errors.As(err, &le2) && le2.xpHandled {
+			alreadyXPHandled = true
+		}
+	}
 	rawErrVal := s.rawRuntimeErrorToValue(th, err)
 	// Locate nearest enclosing pcall/xpcall frame before unwinding anything.
 	catchIdx := -1
@@ -265,18 +301,38 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 		}
 	}
 	if catchIdx < 0 {
+		// If this error is escaping a nested Go->Lua callback (e.g. table.sort/string.gsub)
+		// beneath an enclosing xpcall frame, invoke that xpcall's message handler NOW while
+		// the full nested call stack (including native frames) is still intact (ldebug.c:luaG_errormsg).
+		if !alreadyXPHandled && entryDepth > 0 && th.uncaughtErr == nil {
+			outerCatch := -1
+			for j := entryDepth - 1; j >= 0; j-- {
+				if th.frames[j].kind == framePCall || th.frames[j].kind == frameXPCall {
+					outerCatch = j
+					break
+				}
+			}
+			if outerCatch >= 0 && th.frames[outerCatch].kind == frameXPCall && !th.frames[outerCatch].errHandling {
+				errVal, uerr := s.callXPCallHandler(th, outerCatch, th.frames[outerCatch].errFunc, rawErrVal)
+				if uerr != nil {
+					s.abortErr = uerr
+					return false
+				}
+				th.uncaughtErr = &LuaError{Val: errVal, xpHandled: true}
+			}
+		}
 		// Uncaught error: leave TBC open on dead coroutine (for coroutine.close) or let top Call clean up.
 		return false
 	}
 	isXP := th.frames[catchIdx].kind == frameXPCall
 	var msgh Value
 	var errVal Value
-	if isXP {
+	if isXP && !alreadyXPHandled {
 		msgh = th.frames[catchIdx].errFunc
 		// Call xpcall message handler BEFORE unwinding so debug.traceback/getinfo see full stack,
 		// passing raw error value (including nil) per ldebug.c:luaG_errormsg.
 		var uerr error
-		errVal, uerr = s.callXPCallHandler(th, msgh, rawErrVal)
+		errVal, uerr = s.callXPCallHandler(th, catchIdx, msgh, rawErrVal)
 		if uerr != nil {
 			s.abortErr = uerr
 			return false
@@ -321,7 +377,7 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 		}
 		if raised && isXP {
 			var uerr error
-			errVal, uerr = s.callXPCallHandler(th, msgh, newErr)
+			errVal, uerr = s.callXPCallHandler(th, catchIdx, th.frames[catchIdx].errFunc, newErr)
 			if uerr != nil {
 				s.abortErr = uerr
 				return false
@@ -866,13 +922,13 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					}
 				}
 				oldShape := t.shape
-				next, serr := s.shapes.Transition(s, oldShape, key)
+				next, serr := s.shapes.Transition(s, oldShape, key, TableValue(t), val)
 				if serr != nil {
 					return s.catchSlow(th, ev, false, serr)
 				}
 				if next != nil {
-					if s.memLimit > 0 && len(t.slots) == cap(t.slots) {
-						if err := s.checkMemAndAccount(int64(max(cap(t.slots), 4)) * 16); err != nil {
+					if (s.memLimit > 0 || s.gc.tier1) && len(t.slots) == cap(t.slots) {
+						if err := s.checkMemAndAccountWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(key), val); err != nil {
 							return s.catchSlow(th, ev, false, err)
 						}
 					}
@@ -894,7 +950,7 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					}
 					return false, nil
 				}
-				if !t.demoteToDict(s) {
+				if !t.demoteToDict(s, StringValue(key), val) {
 					return s.catchSlow(th, ev, false, s.ConsumeMemErr())
 				}
 				t.RawSetStr(s, key, val)
@@ -1302,17 +1358,38 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				if !errors.Is(err, errCoroCloseSelf) {
 					th.lastErrNative = fn
 				}
-				return s.catchSlow(th, ev, false, err)
+				// Temporarily push frameNative while handling error so xpcall tracebacks
+				// include the failing FastFn C frame (e.g. [C]: in field 'floor').
+				var pushedTemp bool
+				if ferr := th.ensureFrameCap(th.nframe+1, maxFrames+128); ferr == nil {
+					th.frames[th.nframe] = callFrame{
+						kind:      frameNative,
+						base:      funcIdx + 1,
+						funcIdx:   funcIdx,
+						nativeFn:  fn,
+						ftransfer: 1,
+						ntransfer: uint16(nargs),
+						dirty:     true,
+					}
+					th.nframe++
+					pushedTemp = true
+				}
+				handled, cerr := s.catchSlow(th, ev, false, err)
+				if !handled && pushedTemp {
+					th.nframe--
+				}
+				return handled, cerr
 			}
 			// Hook was enabled during FastFn call: fire return hook and place result.
 			if err := th.ensureFrameCap(th.nframe+1, maxFrames+128); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
-			if err := th.ensureStack(funcIdx + 2 + 4); err != nil {
+			resSlot := funcIdx + 1 + nargs
+			if err := th.ensureStack(resSlot + 1 + 4); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
-			th.stack[funcIdx+1] = rv
-			if end := funcIdx + 2; th.top < end {
+			th.stack[resSlot] = rv
+			if end := resSlot + 1; th.top < end {
 				th.top = end
 			}
 			th.frames[th.nframe] = callFrame{
@@ -1320,7 +1397,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				base:      funcIdx + 1,
 				funcIdx:   funcIdx,
 				nativeFn:  fn,
-				ftransfer: 1,
+				ftransfer: uint16(nargs + 1),
 				ntransfer: 1,
 				dirty:     true,
 			}
@@ -1330,7 +1407,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			if herr != nil {
 				return s.catchSlow(th, ev, false, herr)
 			}
-			rv = th.stack[funcIdx+1]
+			rv = th.stack[resSlot]
 			if err := th.placeResults(funcIdx, []Value{rv}, nresults); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
@@ -1350,61 +1427,11 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			return false, nil
 		}
 		res, err := nf.callMulti(s, args)
-		if pushedFrame || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook) {
-			var hookErr error
-			if pushedFrame {
-				if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
-					// Place returned results at cf.base so debug.getlocal(2, i) in return hook sees them (db.lua:555)!
-					if serr := th.ensureStack(funcIdx + 1 + len(res) + 4); serr != nil {
-						hookErr = serr
-					} else {
-						copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
-						if end := funcIdx + 1 + len(res); th.top < end {
-							th.top = end
-						}
-						th.frames[th.nframe-1].ftransfer = 1
-						th.frames[th.nframe-1].ntransfer = uint16(len(res))
-						hookErr = s.fireHook(th, "return", NilValue())
-						if hookErr == nil && len(res) > 0 {
-							copy(res, th.stack[funcIdx+1:funcIdx+1+len(res)])
-						}
-					}
-				}
-				th.nframe--
-			} else {
-				// Hook was enabled during this native call (e.g. debug.sethook(hook, "r") in locals.lua:842)!
-				if ferr := th.ensureFrameCap(th.nframe+1, maxFrames+128); ferr != nil {
-					hookErr = ferr
-				} else if serr := th.ensureStack(funcIdx + 1 + len(res) + 4); serr != nil {
-					hookErr = serr
-				} else {
-					copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
-					if end := funcIdx + 1 + len(res); th.top < end {
-						th.top = end
-					}
-					th.frames[th.nframe] = callFrame{
-						kind:      frameNative,
-						base:      funcIdx + 1,
-						funcIdx:   funcIdx,
-						nativeFn:  fn,
-						ftransfer: 1,
-						ntransfer: uint16(len(res)),
-						dirty:     true,
-					}
-					th.nframe++
-					hookErr = s.fireHook(th, "return", NilValue())
-					if hookErr == nil && len(res) > 0 {
-						copy(res, th.stack[funcIdx+1:funcIdx+1+len(res)])
-					}
-					th.nframe--
-				}
-			}
-			if hookErr != nil && err == nil {
-				return s.catchSlow(th, ev, false, hookErr)
-			}
-		}
 		if err != nil {
 			if err == errYieldSentinel || errors.Is(err, errYieldSentinel) {
+				if pushedFrame {
+					th.nframe--
+				}
 				th.yieldDst = funcIdx
 				th.yieldNRes = nresults
 				th.yieldedNative = true
@@ -1414,7 +1441,72 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			if !errors.Is(err, errCoroCloseSelf) {
 				th.lastErrNative = fn
 			}
-			return s.catchSlow(th, ev, false, err)
+			// Keep pushedFrame (frameNative) on th.frames during catchSlow so xpcall
+			// message handlers (debug.traceback / debug.getinfo) see the C frame!
+			handled, cerr := s.catchSlow(th, ev, false, err)
+			if !handled && pushedFrame {
+				th.nframe--
+			}
+			return handled, cerr
+		}
+		if pushedFrame || (th.hookMask != 0 && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook) {
+			var hookErr error
+			if pushedFrame {
+				if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
+					// Place returned results above args (ftransfer = nargs+1) matching ldo.c:rethook!
+					resStart := funcIdx + 1 + nargs
+					if serr := th.ensureStack(resStart + len(res) + 4); serr != nil {
+						hookErr = serr
+					} else {
+						copy(th.stack[resStart:resStart+len(res)], res)
+						if end := resStart + len(res); th.top < end {
+							th.top = end
+						}
+						th.frames[th.nframe-1].ftransfer = uint16(nargs + 1)
+						th.frames[th.nframe-1].ntransfer = uint16(len(res))
+						hookErr = s.fireHook(th, "return", NilValue())
+						if hookErr == nil && len(res) > 0 {
+							out := make([]Value, len(res))
+							copy(out, th.stack[resStart:resStart+len(res)])
+							res = out
+						}
+					}
+				}
+				th.nframe--
+			} else {
+				// Hook was enabled during this native call (e.g. debug.sethook(hook, "r") in locals.lua:842)!
+				resStart := funcIdx + 1 + nargs
+				if ferr := th.ensureFrameCap(th.nframe+1, maxFrames+128); ferr != nil {
+					hookErr = ferr
+				} else if serr := th.ensureStack(resStart + len(res) + 4); serr != nil {
+					hookErr = serr
+				} else {
+					copy(th.stack[resStart:resStart+len(res)], res)
+					if end := resStart + len(res); th.top < end {
+						th.top = end
+					}
+					th.frames[th.nframe] = callFrame{
+						kind:      frameNative,
+						base:      funcIdx + 1,
+						funcIdx:   funcIdx,
+						nativeFn:  fn,
+						ftransfer: uint16(nargs + 1),
+						ntransfer: uint16(len(res)),
+						dirty:     true,
+					}
+					th.nframe++
+					hookErr = s.fireHook(th, "return", NilValue())
+					if hookErr == nil && len(res) > 0 {
+						out := make([]Value, len(res))
+						copy(out, th.stack[resStart:resStart+len(res)])
+						res = out
+					}
+					th.nframe--
+				}
+			}
+			if hookErr != nil {
+				return s.catchSlow(th, ev, false, hookErr)
+			}
 		}
 		if nresults == 1 && len(res) >= 1 {
 			th.stack[funcIdx] = res[0]
@@ -1546,32 +1638,34 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 		var hookErr error
 		if pushedFrame {
 			if err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
-				if serr := th.ensureStack(funcIdx + 1 + len(res) + 4); serr != nil {
+				resStart := funcIdx + 1 + nargs
+				if serr := th.ensureStack(resStart + len(res) + 4); serr != nil {
 					hookErr = serr
 				} else {
-					copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
-					if end := funcIdx + 1 + len(res); th.top < end {
+					copy(th.stack[resStart:resStart+len(res)], res)
+					if end := resStart + len(res); th.top < end {
 						th.top = end
 					}
-					th.frames[th.nframe-1].ftransfer = 1
+					th.frames[th.nframe-1].ftransfer = uint16(nargs + 1)
 					th.frames[th.nframe-1].ntransfer = uint16(len(res))
 					hookErr = s.fireHook(th, "return", NilValue())
 					if hookErr == nil && len(res) > 0 {
 						out := make([]Value, len(res))
-						copy(out, th.stack[funcIdx+1:funcIdx+1+len(res)])
+						copy(out, th.stack[resStart:resStart+len(res)])
 						res = out
 					}
 				}
 			}
 			th.nframe--
 		} else {
+			resStart := funcIdx + 1 + nargs
 			if ferr := th.ensureFrameCap(th.nframe+1, frameLimit); ferr != nil {
 				hookErr = ferr
-			} else if serr := th.ensureStack(funcIdx + 1 + len(res) + 4); serr != nil {
+			} else if serr := th.ensureStack(resStart + len(res) + 4); serr != nil {
 				hookErr = serr
 			} else {
-				copy(th.stack[funcIdx+1:funcIdx+1+len(res)], res)
-				if end := funcIdx + 1 + len(res); th.top < end {
+				copy(th.stack[resStart:resStart+len(res)], res)
+				if end := resStart + len(res); th.top < end {
 					th.top = end
 				}
 				th.frames[th.nframe] = callFrame{
@@ -1579,7 +1673,7 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 					base:      funcIdx + 1,
 					funcIdx:   funcIdx,
 					nativeFn:  fn,
-					ftransfer: 1,
+					ftransfer: uint16(nargs + 1),
 					ntransfer: uint16(len(res)),
 					extraArgs: extraDepth,
 					dirty:     true,
@@ -1588,7 +1682,7 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 				hookErr = s.fireHook(th, "return", NilValue())
 				if hookErr == nil && len(res) > 0 {
 					out := make([]Value, len(res))
-					copy(out, th.stack[funcIdx+1:funcIdx+1+len(res)])
+					copy(out, th.stack[resStart:resStart+len(res)])
 					res = out
 				}
 				th.nframe--
@@ -1609,6 +1703,10 @@ func isFlatProtectedTarget(_ Value) bool {
 // callable table (__call chain), or native (including nested pcall/xpcall and coroutine.yield!)
 // directly onto th.frames so protected calls remain yieldable without a Go C-call boundary.
 func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP bool, entryDepth int) (bool, error) {
+	return s.pushProtectedCallMode(th, funcIdx, nargs, nresults, isXP, entryDepth, false)
+}
+
+func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, isXP bool, entryDepth int, topProtected bool) (bool, error) {
 	// Enforce Lua 5.5 LUAI_MAXCCALLS (200) across nested pcall/xpcall frames (calls.lua:162).
 	pcalls := 0
 	for i := 0; i < th.nframe; i++ {
@@ -1647,15 +1745,16 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 		calleeArgs = nargs - 1
 	}
 	th.frames[th.nframe] = callFrame{
-		kind:      kind,
-		base:      calleeIdx,
-		funcIdx:   funcIdx,
-		nresults:  nresults,
-		errFunc:   errFunc,
-		nativeFn:  th.stack[funcIdx],
-		ftransfer: 1,
-		ntransfer: uint16(nargs),
-		dirty:     true,
+		kind:         kind,
+		base:         calleeIdx,
+		funcIdx:      funcIdx,
+		nresults:     nresults,
+		errFunc:      errFunc,
+		nativeFn:     th.stack[funcIdx],
+		ftransfer:    1,
+		ntransfer:    uint16(nargs),
+		topProtected: topProtected,
+		dirty:        true,
 	}
 	th.nframe++
 	if th.hookMask&HookMaskCall != 0 && !th.inHook && !th.suppressHook {
@@ -1796,9 +1895,28 @@ func (s *State) pushProtectedCall(th *Thread, funcIdx, nargs, nresults int, isXP
 			if !errors.Is(err, errCoroCloseSelf) {
 				th.lastErrNative = targetVal
 			}
+			// Keep targetVal's C frame visible to xpcall message handlers (e.g. xpcall(error, debug.traceback, "x")).
+			var pushedTemp bool
+			if ferr := th.ensureFrameCap(th.nframe+1, frameLimit); ferr == nil {
+				th.frames[th.nframe] = callFrame{
+					kind:      frameNative,
+					base:      calleeIdx + 1,
+					funcIdx:   calleeIdx,
+					nativeFn:  targetVal,
+					ftransfer: 1,
+					ntransfer: uint16(calleeArgs),
+					extraArgs: extraDepth,
+					dirty:     true,
+				}
+				th.nframe++
+				pushedTemp = true
+			}
 			// Let handleError catch it at the framePCall/frameXPCall we just pushed!
 			if s.handleError(th, entryDepth, err) {
 				return true, nil
+			}
+			if pushedTemp {
+				th.nframe--
 			}
 			return false, uncaught(err)
 		}
@@ -3224,7 +3342,13 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			n = max(0, len(th.stack)-1-(ev.base+int(a)))
 		}
 		t := regs[a].AsTable()
+		cancelFn := s.nativeCancelFunc()
 		for i := 1; i <= n; i++ {
+			if cancelFn != nil && (i&1023) == 0 {
+				if cerr := cancelFn(); cerr != nil {
+					return coldContinue, pc, cerr
+				}
+			}
 			t.RawSetInt(s, int64(last+i), th.stack[ev.base+int(a)+i])
 			if s.memExceeded {
 				s.memExceeded = false
@@ -3283,13 +3407,19 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		}
 		nextra := nactual - nparams
 		if p.Flag&bytecode.PFVarargTable != 0 {
-			if s.memLimit > 0 {
-				if err := s.checkMemAndAccount(int64(96 + nextra*16)); err != nil {
+			if s.memLimit > 0 || s.gc.tier1 {
+				if err := s.checkMemAndAccount(tablePreallocBytes(int64(nextra), 1)); err != nil {
 					return coldContinue, pc, err
 				}
 			}
 			vt := s.NewTable(nextra, 1)
+			cancelFn := s.nativeCancelFunc()
 			for i := 0; i < nextra; i++ {
+				if cancelFn != nil && (i&1023) == 1023 {
+					if cerr := cancelFn(); cerr != nil {
+						return coldContinue, pc, cerr
+					}
+				}
 				vt.RawSetInt(s, int64(i+1), th.stack[cf.base+nparams+i])
 				if err := s.ConsumeMemErr(); err != nil {
 					return coldContinue, pc, err
@@ -3299,7 +3429,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			if err := s.ConsumeMemErr(); err != nil {
 				return coldContinue, pc, err
 			}
-			if err := th.ensureStack(cf.base + int(p.MaxStackSize) + 8); err != nil {
+			if err := s.ensureStackWithRoots(th, cf.base+int(p.MaxStackSize)+8, TableValue(vt), nil); err != nil {
 				return coldContinue, pc, err
 			}
 			th.stack[cf.base+nparams] = TableValue(vt)
@@ -3310,6 +3440,13 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			cf.varargTab = vt
 			cf.nextraargs = nextra
 			th.top = cf.base + int(p.MaxStackSize)
+			if s.gcNeedsCheck() {
+				s.gcCheckDebt(th.top)
+				if s.abortErr != nil {
+					return coldContinue, pc, s.abortErr
+				}
+				return coldReload, 0, nil
+			}
 			return coldContinue, pc, nil
 		}
 		if nextra > 0 {
@@ -3365,7 +3502,13 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			if open {
 				th.top = ev.base + int(a) + want
 			}
+			cancelFn := s.nativeCancelFunc()
 			for i := 0; i < want; i++ {
+				if cancelFn != nil && (i&1023) == 1023 {
+					if cerr := cancelFn(); cerr != nil {
+						return coldContinue, pc, cerr
+					}
+				}
 				if i < n {
 					th.stack[ev.base+int(a)+i] = vt.RawGetInt(int64(i + 1))
 				} else {
@@ -3389,7 +3532,13 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			th.top = ev.base + int(a) + want
 		}
 		extraStart := ev.base - nextra
+		cancelFn := s.nativeCancelFunc()
 		for i := 0; i < want; i++ {
+			if cancelFn != nil && (i&1023) == 1023 {
+				if cerr := cancelFn(); cerr != nil {
+					return coldContinue, pc, cerr
+				}
+			}
 			if i < nextra {
 				th.stack[ev.base+int(a)+i] = th.stack[extraStart+i]
 			} else {
@@ -3512,6 +3661,9 @@ func (s *State) lessThan(a, b Value) (bool, error) {
 		tm = s.getTMByObj(b, TMLt)
 	}
 	if tm.IsNil() {
+		if a.TypeName() == b.TypeName() {
+			return false, fmt.Errorf("attempt to compare two %s values", a.TypeName())
+		}
 		return false, fmt.Errorf("attempt to compare %s with %s", a.TypeName(), b.TypeName())
 	}
 	res, err := s.Call(tm, a, b)
@@ -3557,7 +3709,7 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 		}
 	}
 	if allSimple {
-		if totalLen > (1<<30) || (s.memLimit > 0 && int64(totalLen)+48 > s.memLimit-s.gc.allocBytes) {
+		if totalLen > (1<<30) || (s.memLimit > 0 && int64(totalLen)+48 > s.memLimit-s.gc.allocBytes-s.gc.tempBytes) {
 			if err := s.checkMem(int64(totalLen) + 48); err != nil {
 				return false, err
 			}
@@ -3590,12 +3742,18 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 		rhs := th.stack[cur]
 		if (lhs.IsString() || lhs.IsNumber()) && (rhs.IsString() || rhs.IsNumber()) {
 			joined := FormatValue(lhs) + FormatValue(rhs)
-			if s.memLimit > 0 {
+			if s.memLimit > 0 || s.gc.tier1 {
 				if err := s.checkMemAndAccount(int64(len(joined)) + 48); err != nil {
 					return false, err
 				}
 			}
 			th.stack[cur-1] = StringValue(s.intern.Intern(joined))
+			if s.gc.tier1 {
+				s.gcCheckDebt(cur)
+				if s.abortErr != nil {
+					return false, s.abortErr
+				}
+			}
 			cur--
 			continue
 		}

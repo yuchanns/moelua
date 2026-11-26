@@ -84,12 +84,14 @@ type callFrame struct {
 	closeEntry   int
 
 	// Debug metadata
-	dirty       bool // true if any non-fast-path field was written (cleared lazily on next fast OP_CALL)
-	isTailCall  bool
-	isHook      bool
-	isFinalizer bool // true when frame was invoked as a __gc finalizer (CIST_FIN -> db.lua:920)
-	atCurrentPC bool // true during line/count hook before instruction executes (db.lua:696)
-	extraArgs   uint8
+	dirty        bool // true if any non-fast-path field was written (cleared lazily on next fast OP_CALL)
+	isTailCall   bool
+	isHook       bool
+	isFinalizer  bool // true when frame was invoked as a __gc finalizer (CIST_FIN -> db.lua:920)
+	atCurrentPC  bool // true during line/count hook before instruction executes (db.lua:696)
+	topProtected bool // true for host CallProtected frames (rendered as "[C]: in ?" in tracebacks)
+	errHandling  bool // true while this frameXPCall's message handler is actively running
+	extraArgs    uint8
 	oldPC       int // per-frame last traced PC (-1 = fresh frame)
 	ftransfer   uint16
 	ntransfer   uint16
@@ -192,9 +194,9 @@ func (th *Thread) ensureFrameCap(need, limit int) error {
 	if newCap > limit {
 		newCap = limit
 	}
-	if th.state != nil && th.state.memLimit > 0 {
+	if th.state != nil && (th.state.memLimit > 0 || th.state.gc.tier1) {
 		delta := int64(newCap-len(th.frames)) * int64(unsafe.Sizeof(callFrame{}))
-		if err := th.state.checkMemAndAccount(delta); err != nil {
+		if err := th.state.checkMemAndAccountWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
 			return err
 		}
 	}
@@ -225,8 +227,8 @@ func (th *Thread) ensureStack(need int) error {
 		newSize = limit
 	}
 	delta := int64(newSize-len(th.stack)) * 16
-	if th.state != nil && th.state.memLimit > 0 {
-		if err := th.state.checkMemAndAccount(delta); err != nil {
+	if th.state != nil && (th.state.memLimit > 0 || th.state.gc.tier1) {
+		if err := th.state.checkMemAndAccountWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
 			return err
 		}
 	}
@@ -376,7 +378,11 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 			errVal = errorToLuaValue(th.state, err)
 			th.syncCloseErrs[errSlot] = errVal
 			hasErr = true
-			raised = true
+			if le, ok := err.(*LuaError); ok && le.xpHandled {
+				raised = false
+			} else {
+				raised = true
+			}
 		}
 	}
 	return errVal, hasErr, raised

@@ -36,10 +36,10 @@ type hashNode struct {
 // Pure record tables (Shape/slots) and pure dense arrays never allocate a tableHash.
 type tableHash struct {
 	nodes   []hashNode
+	dictGen uint64 // bumped on rehash / structure change for _ENV IC (uint64 prevents 32-bit wraparound)
 	mask    uint32
-	count   int32  // active + dead slots (for load factor)
-	live    int32  // active non-nil entries
-	dictGen uint32 // bumped on rehash / structure change for _ENV IC
+	count   int32 // active + dead slots (for load factor)
+	live    int32 // active non-nil entries
 }
 
 // Table is a Lua 5.5 table supporting both:
@@ -167,6 +167,7 @@ func (s *State) TryNewTable(nseq, nrec int) (*Table, error) {
 	t := s.NewTable(nseq, nrec)
 	if s.memLimit > 0 || s.gc.tier1 {
 		s.gc.allocBytes += checkBytes
+		s.gcAddDebt(checkBytes)
 	}
 	return t, nil
 }
@@ -228,7 +229,7 @@ func (s *State) SetMetatable(t, mt *Table) {
 	var newShape *Shape
 	if OptimizeEnabled && t.shape != nil {
 		var ok bool
-		newShape, ok = s.shapes.WithMeta(s, t.shape, mt)
+		newShape, ok = s.shapes.WithMeta(s, t.shape, mt, TableValue(t))
 		if !ok {
 			s.memExceeded = true
 			return
@@ -281,7 +282,7 @@ func (t *Table) initHash(n int) {
 }
 
 func (t *Table) checkHashMem(s *State, key, val Value) error {
-	if s.memLimit <= 0 {
+	if s == nil || (s.memLimit <= 0 && !s.gc.tier1) {
 		return nil
 	}
 	if t.hash == nil || len(t.hash.nodes) == 0 {
@@ -493,7 +494,7 @@ func (t *Table) hashSetChecked(s *State, key, val Value) (int, error) {
 
 // demoteToDict converts a Shape-mode table into a dict-mode hash table.
 // Returns false (setting s.memExceeded) if allocating the hash backing store exceeds s.memLimit.
-func (t *Table) demoteToDict(s *State) bool {
+func (t *Table) demoteToDict(s *State, key, val Value) bool {
 	if t.shape == nil {
 		return true
 	}
@@ -502,7 +503,7 @@ func (t *Table) demoteToDict(s *State) bool {
 	if n < 4 {
 		n = 4
 	}
-	if s != nil && s.memLimit > 0 {
+	if s != nil && (s.memLimit > 0 || s.gc.tier1) {
 		hashBytes := hashCapFor(int64(n)) * 40
 		var oldSlotBytes int64
 		if c := cap(t.slots); c > len(t.inlineSlots) {
@@ -510,7 +511,7 @@ func (t *Table) demoteToDict(s *State) bool {
 		}
 		delta := hashBytes - oldSlotBytes
 		if delta > 0 {
-			if err := s.checkMemAndAccountWithRoots(delta, TableValue(t), NilValue(), NilValue()); err != nil {
+			if err := s.checkMemAndAccountWithRoots(delta, TableValue(t), key, val); err != nil {
 				s.memExceeded = true
 				return false
 			}
@@ -587,13 +588,13 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 			if val.IsNil() {
 				return
 			}
-			next, serr := s.shapes.Transition(s, t.shape, k)
+			next, serr := s.shapes.Transition(s, t.shape, k, TableValue(t), val)
 			if serr != nil {
 				s.memExceeded = true
 				return
 			}
 			if next != nil {
-				if s.memLimit > 0 && len(t.slots) == cap(t.slots) {
+				if (s.memLimit > 0 || s.gc.tier1) && len(t.slots) == cap(t.slots) {
 					if err := s.checkMemAndAccountWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(k), val); err != nil {
 						s.memExceeded = true
 						return
@@ -607,7 +608,7 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 		if val.IsNil() {
 			return
 		}
-		if !t.demoteToDict(s) {
+		if !t.demoteToDict(s, StringValue(k), val) {
 			return
 		}
 	}
@@ -651,8 +652,8 @@ func (t *Table) RawGetInt(i int64) Value {
 	return NilValue()
 }
 
-func (t *Table) promoteArrToGeneric(s *State) bool {
-	if s != nil && s.memLimit > 0 {
+func (t *Table) promoteArrToGeneric(s *State, val Value) bool {
+	if s != nil && (s.memLimit > 0 || s.gc.tier1) {
 		var oldElem int64
 		switch t.arrKind {
 		case arrInt, arrFloat:
@@ -662,7 +663,7 @@ func (t *Table) promoteArrToGeneric(s *State) bool {
 		}
 		if oldElem > 0 && t.arrCap > 0 {
 			delta := int64(t.arrCap) * (16 - oldElem)
-			if err := s.checkMemAndAccount(delta); err != nil {
+			if err := s.checkMemAndAccountWithRoots(delta, TableValue(t), val, NilValue()); err != nil {
 				s.memExceeded = true
 				return false
 			}
@@ -696,10 +697,10 @@ func (t *Table) promoteArrToGeneric(s *State) bool {
 	return true
 }
 
-func (t *Table) checkGenericArrGrowth(s *State, idx int64) bool {
-	if s != nil && s.memLimit > 0 && int(idx)+1 > int(t.arrCap) {
+func (t *Table) checkGenericArrGrowth(s *State, idx int64, val Value) bool {
+	if s != nil && (s.memLimit > 0 || s.gc.tier1) && int(idx)+1 > int(t.arrCap) {
 		nc := nextCap(int(t.arrCap), int(idx)+1)
-		if err := s.checkMemAndAccount(int64(nc-int(t.arrCap)) * 16); err != nil {
+		if err := s.checkMemAndAccountWithRoots(int64(nc-int(t.arrCap))*16, TableValue(t), val, NilValue()); err != nil {
 			s.memExceeded = true
 			return false
 		}
@@ -783,8 +784,8 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				if !val.IsNil() && idx == 0 {
 					c := max(int(t.arrHint), 8)
 					if val.IsInt() {
-						if s.memLimit > 0 {
-							if err := s.checkMemAndAccount(int64(c) * 8); err != nil {
+						if s.memLimit > 0 || s.gc.tier1 {
+							if err := s.checkMemAndAccountWithRoots(int64(c)*8, TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
@@ -796,8 +797,8 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						return
 					}
 					if val.IsFloat() {
-						if s.memLimit > 0 {
-							if err := s.checkMemAndAccount(int64(c) * 8); err != nil {
+						if s.memLimit > 0 || s.gc.tier1 {
+							if err := s.checkMemAndAccountWithRoots(int64(c)*8, TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
@@ -809,8 +810,8 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						return
 					}
 					if val.IsBool() {
-						if s.memLimit > 0 {
-							if err := s.checkMemAndAccount(int64(c)); err != nil {
+						if s.memLimit > 0 || s.gc.tier1 {
+							if err := s.checkMemAndAccountWithRoots(int64(c), TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
@@ -821,8 +822,8 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						t.hashDeleteInt(1)
 						return
 					}
-					if s.memLimit > 0 {
-						if err := s.checkMemAndAccount(int64(c) * 16); err != nil {
+					if s.memLimit > 0 || s.gc.tier1 {
+						if err := s.checkMemAndAccountWithRoots(int64(c)*16, TableValue(t), val, NilValue()); err != nil {
 							s.memExceeded = true
 							return
 						}
@@ -837,8 +838,8 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				if !val.IsNil() && idx < max(int64(t.arrHint), 16) {
 					c := max(int(t.arrHint), int(idx)+1)
 					nc := nextCap(c/2, c)
-					if s.memLimit > 0 {
-						if err := s.checkMemAndAccount(int64(nc) * 16); err != nil {
+					if s.memLimit > 0 || s.gc.tier1 {
+						if err := s.checkMemAndAccountWithRoots(int64(nc)*16, TableValue(t), val, NilValue()); err != nil {
 							s.memExceeded = true
 							return
 						}
@@ -858,7 +859,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						return
 					}
 					// Promote on nil (including last element) or type change so next(t, k) never invalidates keys.
-					if !t.promoteArrToGeneric(s) {
+					if !t.promoteArrToGeneric(s, val) {
 						return
 					}
 					t.arrValSlice()[idx] = val
@@ -867,8 +868,8 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				if idx == n && val.IsInt() {
 					if uint32(n) == t.arrCap {
 						nc := nextCap(int(t.arrCap), int(n)+1)
-						if s.memLimit > 0 {
-							if err := s.checkMemAndAccount(int64(nc-int(t.arrCap)) * 8); err != nil {
+						if s.memLimit > 0 || s.gc.tier1 {
+							if err := s.checkMemAndAccountWithRoots(int64(nc-int(t.arrCap))*8, TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
@@ -885,7 +886,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 					return
 				}
 				if !val.IsNil() && idx < n*2 && idx < 1<<24 {
-					if !t.promoteArrToGeneric(s) || !t.checkGenericArrGrowth(s, idx) {
+					if !t.promoteArrToGeneric(s, val) || !t.checkGenericArrGrowth(s, idx, val) {
 						return
 					}
 					t.setArrGeneric(idx, val)
@@ -898,7 +899,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						t.arrFloatSlice()[idx] = val.Float()
 						return
 					}
-					if !t.promoteArrToGeneric(s) {
+					if !t.promoteArrToGeneric(s, val) {
 						return
 					}
 					t.arrValSlice()[idx] = val
@@ -907,8 +908,8 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				if idx == n && val.IsFloat() {
 					if uint32(n) == t.arrCap {
 						nc := nextCap(int(t.arrCap), int(n)+1)
-						if s.memLimit > 0 {
-							if err := s.checkMemAndAccount(int64(nc-int(t.arrCap)) * 8); err != nil {
+						if s.memLimit > 0 || s.gc.tier1 {
+							if err := s.checkMemAndAccountWithRoots(int64(nc-int(t.arrCap))*8, TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
@@ -925,7 +926,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 					return
 				}
 				if !val.IsNil() && idx < n*2 && idx < 1<<24 {
-					if !t.promoteArrToGeneric(s) || !t.checkGenericArrGrowth(s, idx) {
+					if !t.promoteArrToGeneric(s, val) || !t.checkGenericArrGrowth(s, idx, val) {
 						return
 					}
 					t.setArrGeneric(idx, val)
@@ -938,7 +939,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						t.arrBoolSlice()[idx] = val.IsTrue()
 						return
 					}
-					if !t.promoteArrToGeneric(s) {
+					if !t.promoteArrToGeneric(s, val) {
 						return
 					}
 					t.arrValSlice()[idx] = val
@@ -947,8 +948,8 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				if idx == n && val.IsBool() {
 					if uint32(n) == t.arrCap {
 						nc := nextCap(int(t.arrCap), int(n)+1)
-						if s.memLimit > 0 {
-							if err := s.checkMemAndAccount(int64(nc - int(t.arrCap))); err != nil {
+						if s.memLimit > 0 || s.gc.tier1 {
+							if err := s.checkMemAndAccountWithRoots(int64(nc-int(t.arrCap)), TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
@@ -965,7 +966,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 					return
 				}
 				if !val.IsNil() && idx < n*2 && idx < 1<<24 {
-					if !t.promoteArrToGeneric(s) || !t.checkGenericArrGrowth(s, idx) {
+					if !t.promoteArrToGeneric(s, val) || !t.checkGenericArrGrowth(s, idx, val) {
 						return
 					}
 					t.setArrGeneric(idx, val)
@@ -978,7 +979,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 					return
 				}
 				if !val.IsNil() && (idx == n || (idx < max(n*2, 16) && idx < 1<<24)) {
-					if !t.checkGenericArrGrowth(s, idx) {
+					if !t.checkGenericArrGrowth(s, idx, val) {
 						return
 					}
 					t.setArrGeneric(idx, val)
@@ -991,7 +992,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 			if val.IsNil() {
 				return
 			}
-			if !t.demoteToDict(s) {
+			if !t.demoteToDict(s, IntValue(i), val) {
 				return
 			}
 		}
@@ -1011,9 +1012,9 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 			return
 		}
 		if !val.IsNil() && (idx == n || (idx < max(n*2, 16) && idx < 1<<24)) {
-			if int(idx)+1 > int(t.arrCap) && s.memLimit > 0 {
+			if int(idx)+1 > int(t.arrCap) && (s.memLimit > 0 || s.gc.tier1) {
 				nc := nextCap(int(t.arrCap), int(idx)+1)
-				if err := s.checkMemAndAccount(int64(nc-int(t.arrCap)) * 16); err != nil {
+				if err := s.checkMemAndAccountWithRoots(int64(nc-int(t.arrCap))*16, TableValue(t), val, NilValue()); err != nil {
 					s.memExceeded = true
 					return
 				}
@@ -1111,7 +1112,7 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 			if val.IsNil() {
 				return nil
 			}
-			if !t.demoteToDict(s) {
+			if !t.demoteToDict(s, key, val) {
 				return s.ConsumeMemErr()
 			}
 		}
@@ -1129,7 +1130,7 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 			if val.IsNil() {
 				return nil
 			}
-			if !t.demoteToDict(s) {
+			if !t.demoteToDict(s, key, val) {
 				return s.ConsumeMemErr()
 			}
 		}

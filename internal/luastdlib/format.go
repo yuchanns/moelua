@@ -540,9 +540,14 @@ func formatDecFloat(b *strings.Builder, pf parsedFormat, f float64) {
 	writePadded(b, prefix, body, pf.width, pf.flagMinus, pf.flagZero && !pf.flagMinus)
 }
 
-func quotedStringLen(s string) int {
+func quotedStringLen(s string, checkCancel func() error) (int, error) {
 	n := 2 // opening and closing quotes
 	for i := 0; i < len(s); i++ {
+		if checkCancel != nil && (i&4095) == 4095 {
+			if err := checkCancel(); err != nil {
+				return 0, err
+			}
+		}
 		c := s[i]
 		if c == '"' || c == '\\' || c == '\n' {
 			n += 2
@@ -560,12 +565,17 @@ func quotedStringLen(s string) int {
 			n++
 		}
 	}
-	return n
+	return n, nil
 }
 
-func addQuotedString(b *strings.Builder, s string) {
+func addQuotedString(b *strings.Builder, s string, checkCancel func() error) error {
 	b.WriteByte('"')
 	for i := 0; i < len(s); i++ {
+		if checkCancel != nil && (i&4095) == 4095 {
+			if err := checkCancel(); err != nil {
+				return err
+			}
+		}
 		c := s[i]
 		if c == '"' || c == '\\' || c == '\n' {
 			b.WriteByte('\\')
@@ -584,13 +594,13 @@ func addQuotedString(b *strings.Builder, s string) {
 		}
 	}
 	b.WriteByte('"')
+	return nil
 }
 
-func addLiteral(b *strings.Builder, arg FormatArg, argIdx int) error {
+func addLiteral(b *strings.Builder, arg FormatArg, argIdx int, checkCancel func() error) error {
 	switch arg.Kind {
 	case ArgString:
-		addQuotedString(b, arg.Str)
-		return nil
+		return addQuotedString(b, arg.Str, checkCancel)
 	case ArgInt:
 		if arg.Int == math.MinInt64 {
 			b.WriteString("0x8000000000000000")
@@ -818,16 +828,25 @@ func FormatWithControls(fmtStr string, args []FormatArg, checkSize func(int64) e
 			if len(form) != 2 {
 				return "", errors.New("specifier '%q' cannot have modifiers")
 			}
+			if cancelFn != nil {
+				if err := cancelFn(); err != nil {
+					return "", err
+				}
+			}
 			if checkSize != nil {
 				est := 32
 				if arg.Kind == ArgString {
-					est = quotedStringLen(arg.Str)
+					var qerr error
+					est, qerr = quotedStringLen(arg.Str, cancelFn)
+					if qerr != nil {
+						return "", qerr
+					}
 				}
 				if err := checkGrow(est); err != nil {
 					return "", err
 				}
 			}
-			if err := addLiteral(&b, arg, argNum); err != nil {
+			if err := addLiteral(&b, arg, argNum, cancelFn); err != nil {
 				return "", err
 			}
 

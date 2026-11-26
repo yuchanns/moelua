@@ -79,7 +79,8 @@ type Userdata struct {
 
 // LuaError wraps any Lua Value raised via error(v) so pcall/xpcall preserve non-string errors verbatim.
 type LuaError struct {
-	Val Value
+	Val       Value
+	xpHandled bool // true once an enclosing xpcall message handler has already run for this error
 }
 
 func (e *LuaError) Error() string {

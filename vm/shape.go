@@ -151,7 +151,7 @@ func shapeNodeBytes(sh *Shape) int64 {
 	return n
 }
 
-func (sr *shapeRegistry) Root(s *State, meta *Table) *Shape {
+func (sr *shapeRegistry) Root(s *State, meta *Table, rootObj Value) *Shape {
 	if meta == nil {
 		return sr.root
 	}
@@ -164,7 +164,7 @@ func (sr *shapeRegistry) Root(s *State, meta *Table) *Shape {
 		}
 	}
 	if s != nil && (s.memLimit > 0 || s.gc.tier1) {
-		if err := s.checkMemAndAccount(192); err != nil {
+		if err := s.checkMemAndAccountWithRoots(192, rootObj, TableValue(meta), NilValue()); err != nil {
 			s.memExceeded = true
 			return nil
 		}
@@ -177,7 +177,7 @@ func (sr *shapeRegistry) Root(s *State, meta *Table) *Shape {
 }
 
 // Transition returns the child shape adding key k (assumed absent from sh), or (nil, nil) if maxShapeProps exceeded.
-func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString) (*Shape, error) {
+func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString, r1, r2 Value) (*Shape, error) {
 	if sh.length >= maxShapeProps {
 		return nil, nil
 	}
@@ -198,7 +198,7 @@ func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString) (*Shape, 
 			if sh.length+1 > 8 {
 				est += 48 + int64(sh.length+1)*32
 			}
-			if err := s.checkMemAndAccount(est); err != nil {
+			if err := s.checkMemAndAccountWithRoots(est, r1, StringValue(k), r2); err != nil {
 				return nil, err
 			}
 		}
@@ -253,7 +253,7 @@ func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString) (*Shape, 
 				est += 32
 			}
 		}
-		if err := s.checkMemAndAccount(est); err != nil {
+		if err := s.checkMemAndAccountWithRoots(est, r1, StringValue(k), r2); err != nil {
 			return nil, err
 		}
 	}
@@ -293,16 +293,16 @@ func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString) (*Shape, 
 
 // WithMeta returns a shape having the exact same ordered keys as sh, but with metatable meta.
 // Returns (newShape, true) on success, or (sh, false) when memory allocation fails.
-func (sr *shapeRegistry) WithMeta(s *State, sh *Shape, meta *Table) (*Shape, bool) {
+func (sr *shapeRegistry) WithMeta(s *State, sh *Shape, meta *Table, rootObj Value) (*Shape, bool) {
 	if sh == nil {
-		r := sr.Root(s, meta)
+		r := sr.Root(s, meta, rootObj)
 		return r, r != nil
 	}
 	if sh.meta == meta {
 		return sh, true
 	}
 	if sh.length == 0 {
-		if r := sr.Root(s, meta); r != nil {
+		if r := sr.Root(s, meta, rootObj); r != nil {
 			return r, true
 		}
 		if s != nil {
@@ -324,16 +324,20 @@ func (sr *shapeRegistry) WithMeta(s *State, sh *Shape, meta *Table) (*Shape, boo
 	} else {
 		sr.metaTrans = make(map[weakMetaTransKey]weak.Pointer[Shape], 16)
 	}
-	cur := sr.Root(s, meta)
+	cur := sr.Root(s, meta, rootObj)
 	if cur == nil {
 		if s != nil {
 			s.memExceeded = true
 		}
 		return sh, false
 	}
+	metaVal := NilValue()
+	if meta != nil {
+		metaVal = TableValue(meta)
+	}
 	keys := sh.Keys()
 	for _, k := range keys {
-		next, err := sr.Transition(s, cur, k)
+		next, err := sr.Transition(s, cur, k, rootObj, metaVal)
 		if err != nil {
 			if s != nil {
 				s.memExceeded = true
@@ -369,7 +373,7 @@ type polyEntry struct {
 	shape       *Shape
 	targetShape *Shape
 	val         Value
-	epoch       uint32
+	epoch       uint64
 	slot        int32
 	kind        icKind
 	noMeta      bool
@@ -386,7 +390,7 @@ type ICEntry struct {
 	holder      *Table // for icEnvSlot
 	poly        *[4]polyEntry
 	val         Value  // for icProtoVal (cached method/field from __index chain or absent nil)
-	epoch       uint32 // protoEpoch or dictGen
+	epoch       uint64 // protoEpoch or dictGen (uint64 prevents 32-bit wraparound)
 	slot        int32
 	kind        icKind
 	noMeta      bool // true when shape.meta == nil

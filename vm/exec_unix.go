@@ -5,7 +5,21 @@ package vm
 import (
 	"os/exec"
 	"syscall"
+	"time"
 )
+
+func configureCancelableCmd(cmd *exec.Cmd) {
+	// Put child shell and any subprocesses in their own process group so context
+	// cancellation kills the entire process tree instead of stranding children holding pipes.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 100 * time.Millisecond
+}
 
 func execExitInfo(ee *exec.ExitError) (kind string, code int64) {
 	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {

@@ -204,6 +204,12 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 		initPos = int(iv)
 	}
 	var strVal Value
+	var pinIDs []int
+	defer func() {
+		for _, id := range pinIDs {
+			s.Unref(id)
+		}
+	}()
 	if args[0].IsString() {
 		strVal = args[0]
 	} else {
@@ -213,6 +219,9 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 		}
 		strVal = StringValue(ls)
 		str = ls.S
+		if s.memLimit > 0 {
+			pinIDs = append(pinIDs, s.Ref(strVal))
+		}
 	}
 	var patVal Value
 	if args[1].IsString() {
@@ -224,6 +233,9 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 		}
 		patVal = StringValue(ls)
 		pat = ls.S
+		if s.memLimit > 0 {
+			pinIDs = append(pinIDs, s.Ref(patVal))
+		}
 	}
 	if s.memLimit > 0 || s.gc.tier1 {
 		if err := s.checkMemAndAccount(48 + 3*16 + 64 + 2*16); err != nil {
@@ -545,7 +557,10 @@ func nativeStringPackSize(s *State, args []Value) ([]Value, error) {
 	}
 	sz, err := luastdlib.PackSizeWithCancel(fmtStr, s.nativeCancelFunc())
 	if err != nil {
-		return nil, err
+		if isUncatchableErr(err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("bad argument #1 to 'packsize' (%s)", err.Error())
 	}
 	return []Value{IntValue(sz)}, nil
 }

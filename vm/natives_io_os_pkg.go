@@ -3,6 +3,7 @@ package vm
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -202,11 +203,15 @@ func (s *State) emitWarning(msg string) {
 
 func nativeWarn(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
-		return nil, fmt.Errorf("bad argument #1 to 'warn' (string expected)")
+		got := "no value"
+		if len(args) > 0 {
+			got = s.objTypeName(args[0])
+		}
+		return nil, fmt.Errorf("bad argument #1 to 'warn' (string expected, got %s)", got)
 	}
 	for i := 1; i < len(args); i++ {
 		if !args[i].IsString() && !args[i].IsNumber() {
-			return nil, fmt.Errorf("bad argument #%d to 'warn' (string expected)", i+1)
+			return nil, fmt.Errorf("bad argument #%d to 'warn' (string expected, got %s)", i+1, s.objTypeName(args[i]))
 		}
 	}
 	if len(args) == 1 && args[0].IsString() {
@@ -758,6 +763,12 @@ func (s *State) LoadChunk(data []byte, chunkName string) (Value, error) {
 	return s.loadChunkBytes(data, chunkName, "bt", NilValue(), false)
 }
 
+// LoadTextChunk loads a text-only Lua 5.5.1 chunk from raw bytes without stripping BOM or '#'
+// (matching PUC-Rio luaL_loadbufferx(..., "t") used by lua.c -e, LUA_INIT, and REPL).
+func (s *State) LoadTextChunk(data []byte, chunkName string) (Value, error) {
+	return s.loadChunkBytes(data, chunkName, "t", NilValue(), false)
+}
+
 // LoadChunkReader streams a text or binary Lua 5.5.1 chunk from r without materializing
 // the entire input buffer in memory, stripping UTF-8 BOM and an initial '#' comment line.
 func (s *State) LoadChunkReader(r io.Reader, chunkName string) (Value, error) {
@@ -811,7 +822,7 @@ func nativeLoadFile(s *State, args []Value) ([]Value, error) {
 		var err error
 		f, err = os.Open(fname)
 		if err != nil {
-			return []Value{NilValue(), s.internErrStr(fmt.Sprintf("cannot open %s", err.Error()))}, nil
+			return []Value{NilValue(), s.internErrStr(fmt.Sprintf("cannot open %s", formatOSErr(err)))}, nil
 		}
 		defer f.Close()
 		r = fileErrReader{r: f}
@@ -1013,13 +1024,33 @@ func asLuaFile(v Value) (*luaFile, bool) {
 	return lf, ok
 }
 
+// formatOSErr strips Go's *os.PathError / *os.LinkError operation verb prefix ("open ", "remove ", etc.)
+// to match PUC-Rio Lua's luaL_fileresult ("filename: strerror").
+func formatOSErr(err error) string {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		if pe.Path != "" {
+			return fmt.Sprintf("%s: %s", pe.Path, pe.Err.Error())
+		}
+		return pe.Err.Error()
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		if le.Old != "" {
+			return fmt.Sprintf("%s: %s", le.Old, le.Err.Error())
+		}
+		return le.Err.Error()
+	}
+	return err.Error()
+}
+
 func ioFail(s *State, err error) []Value {
 	code := int64(1)
 	var errno syscall.Errno
 	if errors.As(err, &errno) && errno != 0 {
 		code = int64(errno)
 	}
-	return []Value{NilValue(), StringValue(s.intern.Intern(err.Error())), IntValue(code)}
+	return []Value{NilValue(), StringValue(s.intern.Intern(formatOSErr(err))), IntValue(code)}
 }
 
 func isValidIOMode(mode string) bool {
@@ -1201,7 +1232,17 @@ func nativeIOType(s *State, args []Value) ([]Value, error) {
 	return []Value{StringValue(s.intern.Intern("file"))}, nil
 }
 
-func shellCommand(cmdStr string) *exec.Cmd {
+func shellCommand(ctx context.Context, cmdStr string) *exec.Cmd {
+	var cmd *exec.Cmd
+	if ctx != nil {
+		if runtime.GOOS == "windows" {
+			cmd = exec.CommandContext(ctx, "cmd", "/C", cmdStr)
+		} else {
+			cmd = exec.CommandContext(ctx, "/bin/sh", "-c", cmdStr)
+		}
+		configureCancelableCmd(cmd)
+		return cmd
+	}
 	if runtime.GOOS == "windows" {
 		return exec.Command("cmd", "/C", cmdStr)
 	}
@@ -1259,10 +1300,18 @@ func nativeIOPopen(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #2 to 'popen' (invalid mode)")
 		}
 	}
+	if err := s.checkPreCancel(); err != nil {
+		return nil, err
+	}
+	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
+		if cerr := cancelFn(); cerr != nil {
+			return nil, cerr
+		}
+	}
 	// Flush buffered output streams before spawning the child process
 	// (matches Lua 5.5 liolib.c:l_popen calling fflush(NULL) before popen).
 	s.flushOpenFiles()
-	cmd := shellCommand(prog)
+	cmd := shellCommand(s.ctx, prog)
 	s.inheritedStdStreams(cmd)
 	var f *os.File
 	if mode[0] == 'w' {
@@ -1294,6 +1343,15 @@ func nativeIOPopen(s *State, args []Value) ([]Value, error) {
 	}
 	ud, err := s.tryNewFileUD(&luaFile{f: f, cmd: cmd})
 	if err != nil {
+		_ = f.Close()
+		if cmd.Process != nil {
+			if cmd.Cancel != nil {
+				_ = cmd.Cancel()
+			} else {
+				_ = cmd.Process.Kill()
+			}
+			_ = cmd.Wait()
+		}
 		return nil, err
 	}
 	return []Value{ud}, nil
@@ -1336,6 +1394,12 @@ func nativeFileClose(s *State, args []Value) ([]Value, error) {
 			s.gc.allocBytes -= freed
 		} else {
 			s.gc.allocBytes = 0
+		}
+	}
+	if isPipe && s.ctx != nil {
+		if cerr := s.ctx.Err(); cerr != nil {
+			s.abortErr = cerr
+			return nil, cerr
 		}
 	}
 	if isPipe {
@@ -1460,6 +1524,21 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 	return []Value{TrueValue()}, nil
 }
 
+func (s *State) methodArgNum(n int) int {
+	if s.cur != nil && s.cur.nframe > 0 {
+		idx := s.cur.nframe - 1
+		if s.cur.frames[idx].kind == frameNative && idx > 0 {
+			idx--
+		}
+		if s.cur.frames[idx].kind == frameLua {
+			if _, nw := funcNameFromCallerFrame(&s.cur.frames[idx]); nw == "method" {
+				return n - 1
+			}
+		}
+	}
+	return n
+}
+
 func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'seek' (FILE* expected, got no value)")
@@ -1474,7 +1553,8 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 	whence := io.SeekCurrent
 	offset := int64(0)
 	if len(args) >= 2 && !args[1].IsNil() {
-		switch FormatValue(args[1]) {
+		opt := FormatValue(args[1])
+		switch opt {
 		case "set":
 			whence = io.SeekStart
 		case "cur":
@@ -1482,14 +1562,14 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 		case "end":
 			whence = io.SeekEnd
 		default:
-			return nil, fmt.Errorf("bad argument #1 to 'seek' (invalid option)")
+			return nil, fmt.Errorf("bad argument #%d to 'seek' (invalid option '%s')", s.methodArgNum(2), opt)
 		}
 	}
 	if len(args) >= 3 && !args[2].IsNil() {
 		var ok bool
 		offset, ok = args[2].CoerceInt()
 		if !ok {
-			return nil, fmt.Errorf("bad argument #2 to 'seek' (number expected)")
+			return nil, fmt.Errorf("bad argument #%d to 'seek' (number expected)", s.methodArgNum(3))
 		}
 	}
 	seekOffset := offset
@@ -1589,12 +1669,20 @@ func readBoundedLine(s *State, r *bufio.Reader, keepNL bool) (string, bool, erro
 			buf.Write(frag)
 		}
 		if err == nil {
+			if s.ctx != nil {
+				if cerr := s.ctx.Err(); cerr != nil {
+					s.abortErr = cerr
+					return "", false, cerr
+				}
+			}
 			line := buf.String()
 			if !keepNL {
 				line = strings.TrimSuffix(line, "\n")
 			}
 			if s.memLimit > 0 || s.gc.tier1 {
-				s.gc.allocBytes += int64(len(line)) + 64
+				sz := int64(len(line)) + 64
+				s.gc.allocBytes += sz
+				s.gcAddDebt(sz)
 			}
 			return line, true, nil
 		}
@@ -1602,6 +1690,12 @@ func readBoundedLine(s *State, r *bufio.Reader, keepNL bool) (string, bool, erro
 			continue
 		}
 		if errors.Is(err, io.EOF) {
+			if s.ctx != nil {
+				if cerr := s.ctx.Err(); cerr != nil {
+					s.abortErr = cerr
+					return "", false, cerr
+				}
+			}
 			if buf.Len() == 0 {
 				return "", false, nil
 			}
@@ -1610,9 +1704,17 @@ func readBoundedLine(s *State, r *bufio.Reader, keepNL bool) (string, bool, erro
 				line = strings.TrimSuffix(line, "\n")
 			}
 			if s.memLimit > 0 || s.gc.tier1 {
-				s.gc.allocBytes += int64(len(line)) + 64
+				sz := int64(len(line)) + 64
+				s.gc.allocBytes += sz
+				s.gcAddDebt(sz)
 			}
 			return line, true, nil
+		}
+		if s.ctx != nil {
+			if cerr := s.ctx.Err(); cerr != nil {
+				s.abortErr = cerr
+				return "", false, cerr
+			}
 		}
 		return "", false, ioReadErr{err}
 	}
@@ -1640,13 +1742,27 @@ func readBoundedAll(s *State, r *bufio.Reader) (string, error) {
 			buf.Write(chunk[:n])
 		}
 		if err == io.EOF {
+			if s.ctx != nil {
+				if cerr := s.ctx.Err(); cerr != nil {
+					s.abortErr = cerr
+					return "", cerr
+				}
+			}
 			res := buf.String()
 			if s.memLimit > 0 || s.gc.tier1 {
-				s.gc.allocBytes += int64(len(res)) + 64
+				sz := int64(len(res)) + 64
+				s.gc.allocBytes += sz
+				s.gcAddDebt(sz)
 			}
 			return res, nil
 		}
 		if err != nil {
+			if s.ctx != nil {
+				if cerr := s.ctx.Err(); cerr != nil {
+					s.abortErr = cerr
+					return "", cerr
+				}
+			}
 			return "", ioReadErr{err}
 		}
 	}
@@ -1658,6 +1774,12 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		if n == 0 {
 			_, err := r.Peek(1)
 			if err != nil {
+				if s.ctx != nil {
+					if cerr := s.ctx.Err(); cerr != nil {
+						s.abortErr = cerr
+						return NilValue(), false, cerr
+					}
+				}
 				if errors.Is(err, io.EOF) {
 					return NilValue(), false, nil
 				}
@@ -1683,6 +1805,12 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		if n <= 65536 {
 			buf := make([]byte, n)
 			got, err := io.ReadFull(r, buf)
+			if s.ctx != nil {
+				if cerr := s.ctx.Err(); cerr != nil {
+					s.abortErr = cerr
+					return NilValue(), false, cerr
+				}
+			}
 			if got == 0 && err != nil {
 				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 					return NilValue(), false, nil
@@ -1690,7 +1818,9 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 				return NilValue(), false, ioReadErr{err}
 			}
 			if s.memLimit > 0 || s.gc.tier1 {
-				s.gc.allocBytes += int64(got) + 64
+				sz := int64(got) + 64
+				s.gc.allocBytes += sz
+				s.gcAddDebt(sz)
 			}
 			return StringValue(s.intern.Intern(string(buf[:got]))), true, nil
 		}
@@ -1720,6 +1850,12 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 				rem -= int64(got)
 			}
 			if err != nil {
+				if s.ctx != nil {
+					if cerr := s.ctx.Err(); cerr != nil {
+						s.abortErr = cerr
+						return NilValue(), false, cerr
+					}
+				}
 				if errors.Is(err, io.EOF) {
 					break
 				}
@@ -1733,7 +1869,9 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 			return NilValue(), false, nil
 		}
 		if s.memLimit > 0 || s.gc.tier1 {
-			s.gc.allocBytes += int64(out.Len()) + 64
+			sz := int64(out.Len()) + 64
+			s.gc.allocBytes += sz
+			s.gcAddDebt(sz)
 		}
 		return StringValue(s.intern.Intern(out.String())), true, nil
 	}
@@ -1760,6 +1898,11 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		if spec[0] == 'l' {
 			line = strings.TrimSuffix(line, "\n")
 		}
+		if s.gc.tier1 {
+			sz := int64(len(line)) + 48
+			s.gc.allocBytes += sz
+			s.gcAddDebt(sz)
+		}
 		return StringValue(s.intern.Intern(line)), true, nil
 	case 'a':
 		if s.memLimit > 0 || s.nativeCancelFunc() != nil {
@@ -1772,6 +1915,11 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		all, err := io.ReadAll(r)
 		if err != nil {
 			return NilValue(), false, ioReadErr{err}
+		}
+		if s.gc.tier1 {
+			sz := int64(len(all)) + 48
+			s.gc.allocBytes += sz
+			s.gcAddDebt(sz)
 		}
 		return StringValue(s.intern.Intern(string(all))), true, nil
 	case 'n':
@@ -1795,6 +1943,12 @@ func readLuaNumber(s *State, r *bufio.Reader) (Value, bool, error) {
 		}
 		b, err := r.ReadByte()
 		if err != nil {
+			if s.ctx != nil {
+				if cerr := s.ctx.Err(); cerr != nil {
+					s.abortErr = cerr
+					return NilValue(), false, cerr
+				}
+			}
 			if !errors.Is(err, io.EOF) {
 				return NilValue(), false, ioReadErr{err}
 			}
@@ -2028,9 +2182,9 @@ func nativeFileWrite(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
 	var totalBytes int64
-	for _, a := range args[1:] {
+	for i, a := range args[1:] {
 		if !a.IsString() && !a.IsNumber() {
-			return nil, fmt.Errorf("bad argument to 'write' (string expected)")
+			return nil, fmt.Errorf("bad argument #%d to 'write' (string expected, got %s)", s.methodArgNum(i+2), s.objTypeName(a))
 		}
 		str := FormatValue(a)
 		if lf.w != nil {
@@ -2436,6 +2590,9 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 		tbl.RawSetStr(s, s.intern.Intern("wday"), IntValue(int64(tm.Weekday())+1))
 		tbl.RawSetStr(s, s.intern.Intern("yday"), IntValue(int64(tm.YearDay())))
 		tbl.RawSetStr(s, s.intern.Intern("isdst"), BoolValue(tm.IsDST()))
+		if err := s.ConsumeMemErr(); err != nil {
+			return nil, err
+		}
 		return []Value{TableValue(tbl)}, nil
 	}
 	var sb strings.Builder
@@ -2485,13 +2642,13 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 		}
 		i++
 		if i >= len(fmtStr) {
-			return nil, fmt.Errorf("invalid conversion specifier '%%'")
+			return nil, fmt.Errorf("bad argument #1 to 'date' (invalid conversion specifier '%%')")
 		}
 		spec := fmtStr[i]
 		// Support POSIX/C99 two-character %E / %O modifiers (loslib.c:LUA_STRFTIMEOPTIONS).
 		if spec == 'E' || spec == 'O' {
 			if i+1 >= len(fmtStr) {
-				return nil, fmt.Errorf("invalid conversion specifier '%%%c'", spec)
+				return nil, fmt.Errorf("bad argument #1 to 'date' (invalid conversion specifier '%%%c')", spec)
 			}
 			next := fmtStr[i+1]
 			validMod := false
@@ -2507,7 +2664,7 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 				}
 			}
 			if !validMod {
-				return nil, fmt.Errorf("invalid conversion specifier '%%%c%c'", spec, next)
+				return nil, fmt.Errorf("bad argument #1 to 'date' (invalid conversion specifier '%%%c%c')", spec, next)
 			}
 			i++
 			spec = next
@@ -2600,7 +2757,7 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 		case 'z':
 			err = writeStr(tm.Format("-0700"))
 		default:
-			return nil, fmt.Errorf("invalid conversion specifier '%%%c'", fmtStr[i])
+			return nil, fmt.Errorf("bad argument #1 to 'date' (invalid conversion specifier '%%%c')", fmtStr[i])
 		}
 		if err != nil {
 			return nil, err
@@ -2713,11 +2870,26 @@ func nativeOSExecute(s *State, args []Value) ([]Value, error) {
 	if !args[0].IsString() && !args[0].IsNumber() {
 		return nil, fmt.Errorf("bad argument #1 to 'os.execute' (string expected, got %s)", s.objTypeName(args[0]))
 	}
-	cmd := shellCommand(FormatValue(args[0]))
+	if err := s.checkPreCancel(); err != nil {
+		return nil, err
+	}
+	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
+		if cerr := cancelFn(); cerr != nil {
+			return nil, cerr
+		}
+	}
+	cmd := shellCommand(s.ctx, FormatValue(args[0]))
 	s.inheritedStdStreams(cmd)
 	s.childExecDepth.Add(1)
 	defer s.childExecDepth.Add(-1)
-	return execResult(s, cmd.Run()), nil
+	err := cmd.Run()
+	if s.ctx != nil {
+		if cerr := s.ctx.Err(); cerr != nil {
+			s.abortErr = cerr
+			return nil, cerr
+		}
+	}
+	return execResult(s, err), nil
 }
 
 func nativeOSExit(s *State, args []Value) ([]Value, error) {
@@ -2777,6 +2949,7 @@ func (s *State) initPackageLib() {
 	searchers.RawSetInt(s, 3, NativeValue(&NativeFunc{Name: "searcher_c", Fn: nativeSearcherC}))
 	pkg.RawSetStr(s, s.intern.Intern("searchers"), TableValue(searchers))
 	s.registerFunc(pkg, "searchpath", intrNone, nativePackageSearchPath)
+	s.registerFunc(pkg, "loadlib", intrNone, nativePackageLoadLib)
 
 	s.pkgTbl = pkg
 	s.loadedTbl = loaded
@@ -3180,6 +3353,20 @@ func nativePackageSearchPath(s *State, args []Value) ([]Value, error) {
 	return []Value{StringValue(ls)}, nil
 }
 
+func nativePackageLoadLib(s *State, args []Value) ([]Value, error) {
+	if _, err := checkStringArg(args, 0, "loadlib"); err != nil {
+		return nil, err
+	}
+	if _, err := checkStringArg(args, 1, "loadlib"); err != nil {
+		return nil, err
+	}
+	return []Value{
+		NilValue(),
+		StringValue(s.intern.Intern("dynamic libraries not enabled; check your Lua installation")),
+		StringValue(s.intern.Intern("absent")),
+	}, nil
+}
+
 // AddFS registers a Lua package.searchers loader backed by fsys (e.g. embed.FS or os.DirFS).
 // Multiple AddFS calls are searched in registration order, right after package.preload and before
 // OS filesystem searchers. Module paths honor package.path templates (with leading "./" stripped)
@@ -3193,21 +3380,45 @@ func (s *State) AddFS(fsys fs.FS) {
 		return
 	}
 	st := sv.AsTable()
-	searcher := NativeValue(&NativeFunc{
-		Name: "searcher_fs",
+	searcher, err := s.TryAllocNative(&NativeFunc{
+		Name:        "searcher_fs",
+		Collectable: true,
 		Fn: func(s *State, args []Value) ([]Value, error) {
 			return searchFSModule(s, fsys, args)
 		},
 	})
+	if err != nil {
+		_ = s.ConsumeMemErr()
+		return
+	}
+	var pinID int
+	if s.memLimit > 0 {
+		pinID = s.Ref(searcher)
+		defer s.Unref(pinID)
+	}
 	n := st.Len()
 	pos := min(int64(2+s.fsSearchers), n+1)
 	if pos < 1 {
 		pos = 1
 	}
-	for i := n; i >= pos; i-- {
-		st.RawSetInt(s, i+1, st.RawGetInt(i))
+	// Grow slot n+1 first; if allocation fails under memLimit, abort before overwriting any
+	// existing searcher slot and consume the deferred memExceeded flag cleanly.
+	if pos <= n {
+		st.RawSetInt(s, n+1, st.RawGetInt(n))
+		if err := s.ConsumeMemErr(); err != nil {
+			return
+		}
+		for i := n - 1; i >= pos; i-- {
+			st.RawSetInt(s, i+1, st.RawGetInt(i))
+			if err := s.ConsumeMemErr(); err != nil {
+				return
+			}
+		}
 	}
 	st.RawSetInt(s, pos, searcher)
+	if err := s.ConsumeMemErr(); err != nil {
+		return
+	}
 	s.fsSearchers++
 }
 
@@ -3221,7 +3432,13 @@ func (s *State) AddSearcher(fn *NativeFunc) {
 		return
 	}
 	st := sv.AsTable()
-	st.RawSetInt(s, st.Len()+1, NativeValue(fn))
+	v := NativeValue(fn)
+	if s.memLimit > 0 {
+		id := s.Ref(v)
+		defer s.Unref(id)
+	}
+	st.RawSetInt(s, st.Len()+1, v)
+	_ = s.ConsumeMemErr()
 }
 
 func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
