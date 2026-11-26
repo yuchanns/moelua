@@ -1184,4 +1184,175 @@ func TestGCCancelPreservesFinalizersAndLiveObjectsAcrossModes(t *testing.T) {
 		}
 		c.FreeAll()
 	})
+
+	t.Run("incremental_traverse_cancel_requeues_parent_and_keeps_child", func(t *testing.T) {
+		a := arena.New()
+		defer a.Close()
+
+		var (
+			parent    arena.ObjRef
+			cancelTrv bool
+		)
+		var c *arena.Collector
+		c = arena.NewCollector(a, arena.Callbacks{
+			MarkRoots: func(c *arena.Collector) {
+				c.MarkObject(parent)
+			},
+			Traverse: func(c *arena.Collector, ref arena.ObjRef) int64 {
+				if cancelTrv && ref == parent {
+					// Simulate interrupting Traverse before marking outgoing child refs.
+					c.SetCancelErr(errCanceled)
+					return 1
+				}
+				tbl := arena.As[toyTable](a, ref)
+				for i := range tbl.len {
+					c.MarkObject(tbl.entries[i].key)
+					c.MarkObject(tbl.entries[i].val)
+				}
+				return int64(tbl.len) + 1
+			},
+			FreeObject: func(a *arena.Arena, ref arena.ObjRef) {
+				a.Free(ref)
+			},
+		})
+
+		allocTbl := func() arena.ObjRef {
+			ref, err := c.Alloc(int(unsafe.Sizeof(toyTable{})), toyKindTable)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return ref
+		}
+		parent = allocTbl()
+		child := allocTbl()
+		dead := allocTbl()
+		pt := arena.As[toyTable](a, parent)
+		pt.entries[0] = toyEntry{key: child, val: child}
+		pt.len = 1
+
+		// Step into GCSPropagate and cancel parent's Traverse before it marks child.
+		cancelTrv = true
+		c.StepBytes(128)
+		if !errors.Is(c.CancelErr(), errCanceled) {
+			t.Fatalf("expected cancel error from interrupted incremental Traverse")
+		}
+
+		// Clear cancellation and resume via incremental StepBytes until cycle finishes.
+		cancelTrv = false
+		finished := false
+		for range 100 {
+			if c.StepBytes(128) {
+				finished = true
+				break
+			}
+		}
+		if !finished {
+			t.Fatalf("incremental StepBytes did not complete after Traverse cancel; state=%v", c.State())
+		}
+		if !a.IsLive(parent) || !a.IsLive(child) {
+			t.Fatalf("resumed incremental GC prematurely swept live object: parent=%v child=%v",
+				a.IsLive(parent), a.IsLive(child))
+		}
+		if a.IsLive(dead) {
+			t.Fatalf("resumed incremental GC failed to sweep unreachable dead object")
+		}
+		c.FreeAll()
+	})
+
+	t.Run("late_atomic_callback_cancel_remains_resumable", func(t *testing.T) {
+		for _, hook := range []string{"clearByValues", "clearByKeys", "preSweep"} {
+			t.Run(hook, func(t *testing.T) {
+				a := arena.New()
+				defer a.Close()
+
+				var (
+					root      arena.ObjRef
+					weakValT  arena.ObjRef
+					weakKeyT  arena.ObjRef
+					cancelNow bool
+				)
+				var c *arena.Collector
+				c = arena.NewCollector(a, arena.Callbacks{
+					MarkRoots: func(c *arena.Collector) {
+						c.MarkObject(root)
+						c.MarkObject(weakValT)
+						c.MarkObject(weakKeyT)
+					},
+					Traverse: func(c *arena.Collector, ref arena.ObjRef) int64 {
+						tbl := arena.As[toyTable](a, ref)
+						switch tbl.weak {
+						case arena.WeakValues:
+							c.MarkWeakValues(ref, true)
+						case arena.WeakKeys:
+							c.MarkEphemeron(ref, false, true)
+						}
+						return 1
+					},
+					ClearByValues: func(c *arena.Collector, ref arena.ObjRef) {
+						if hook == "clearByValues" && cancelNow {
+							c.SetCancelErr(errCanceled)
+						}
+					},
+					ClearByKeys: func(c *arena.Collector, ref arena.ObjRef) {
+						if hook == "clearByKeys" && cancelNow {
+							c.SetCancelErr(errCanceled)
+						}
+					},
+					PreSweep: func(c *arena.Collector) {
+						if hook == "preSweep" && cancelNow {
+							c.SetCancelErr(errCanceled)
+						}
+					},
+					FreeObject: func(a *arena.Arena, ref arena.ObjRef) {
+						a.Free(ref)
+					},
+				})
+
+				allocTbl := func(wk arena.WeakKind) arena.ObjRef {
+					ref, err := c.Alloc(int(unsafe.Sizeof(toyTable{})), toyKindTable)
+					if err != nil {
+						t.Fatal(err)
+					}
+					arena.As[toyTable](a, ref).weak = wk
+					return ref
+				}
+				root = allocTbl(arena.WeakNone)
+				weakValT = allocTbl(arena.WeakValues)
+				weakKeyT = allocTbl(arena.WeakKeys)
+				dead := allocTbl(arena.WeakNone)
+
+				// Cancel inside the late atomic callback via incremental StepBytes.
+				cancelNow = true
+				for range 50 {
+					c.StepBytes(128)
+					if c.HasCancelErr() {
+						break
+					}
+				}
+				if !errors.Is(c.CancelErr(), errCanceled) {
+					t.Fatalf("hook %s did not trigger expected cancel error", hook)
+				}
+				if c.State() == arena.GCSAtomic {
+					t.Fatalf("hook %s left collector stranded in GCSAtomic", hook)
+				}
+
+				// Clear cancellation and verify Full(false) finishes cleanly (no infinite loop!) and sweeps dead.
+				cancelNow = false
+				c.Full(false)
+				if err := c.CancelErr(); err != nil {
+					t.Fatalf("unexpected cancel error on resumed Full: %v", err)
+				}
+				if c.State() != arena.GCSPause {
+					t.Fatalf("expected GCSPause after resumed Full, got %v", c.State())
+				}
+				if !a.IsLive(root) || !a.IsLive(weakValT) || !a.IsLive(weakKeyT) {
+					t.Fatalf("live roots swept after %s cancel recovery", hook)
+				}
+				if a.IsLive(dead) {
+					t.Fatalf("unreachable dead object not swept after %s cancel recovery", hook)
+				}
+				c.FreeAll()
+			})
+		}
+	})
 }

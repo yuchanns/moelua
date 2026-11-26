@@ -698,6 +698,13 @@ func (c *Collector) propagateOne() int64 {
 			work = w
 		}
 	}
+	if c.cancelErr != nil {
+		// Traverse was interrupted before visiting all outgoing references;
+		// requeue ref as gray so resuming GC completes its traversal.
+		hdr.SetGray()
+		c.gray = append(c.gray, ref)
+		return work
+	}
 	if hdr.IsBlack() {
 		c.GenLink(ref)
 	}
@@ -863,9 +870,17 @@ func (c *Collector) atomic() {
 	if c.cb.ClearByValues != nil {
 		for _, ref := range c.weak {
 			c.cb.ClearByValues(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 		for _, ref := range c.allWeak {
 			c.cb.ClearByValues(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 	}
 	origWeakLen := len(c.weak)
@@ -895,12 +910,24 @@ func (c *Collector) atomic() {
 	if c.cb.ClearByKeys != nil {
 		for _, ref := range c.ephemeron {
 			c.cb.ClearByKeys(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 		for _, ref := range c.ephemeronClear {
 			c.cb.ClearByKeys(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 		for _, ref := range c.allWeak {
 			c.cb.ClearByKeys(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 	}
 
@@ -908,14 +935,26 @@ func (c *Collector) atomic() {
 	if c.cb.ClearByValues != nil {
 		for _, ref := range c.weak[origWeakLen:] {
 			c.cb.ClearByValues(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 		for _, ref := range c.allWeak[origAllWeakLen:] {
 			c.cb.ClearByValues(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 	}
 
 	if c.cb.PreSweep != nil {
 		c.cb.PreSweep(c)
+		if c.cancelErr != nil {
+			c.abortAtomic(savedGrayAgain)
+			return
+		}
 	}
 
 	// Flip current white for the upcoming sweep phase.
