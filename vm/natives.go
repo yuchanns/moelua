@@ -1089,7 +1089,7 @@ func nativeMathRandom(s *State, args []Value) ([]Value, error) {
 	// Exact PUC-Rio Lua 5.5 lmathlib.c:project unbiased rejection sampling over [0..n].
 	n := uint64(hi) - uint64(lo)
 	if n == ^uint64(0) {
-		return []Value{IntValue(int64(r))}, nil
+		return []Value{IntValue(int64(r + uint64(lo)))}, nil
 	}
 	lim := n
 	for sh := uint(1); (lim & (lim + 1)) != 0; sh *= 2 {

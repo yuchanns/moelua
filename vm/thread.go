@@ -107,8 +107,8 @@ type Thread struct {
 	frames []callFrame
 	nframe int
 
-	openUpvals *Upvalue
-	tbc        []int // ascending stack indices of active <close> variables
+	openUpvals []*Upvalue // ascending stack indices of open upvalues owned by this thread
+	tbc        []int      // ascending stack indices of active <close> variables
 
 	status        ThreadStatus
 	errObj        Value   // last error object when dead due to error
@@ -248,43 +248,42 @@ func (th *Thread) window(base int) *[256]Value {
 }
 
 func (th *Thread) findOrCreateUpval(stackIdx int) *Upvalue {
-	var prev *Upvalue
-	cur := th.openUpvals
-	for cur != nil && cur.stackIdx > stackIdx {
-		prev = cur
-		cur = cur.next
+	n := len(th.openUpvals)
+	i := n
+	for i > 0 && th.openUpvals[i-1].stackIdx > stackIdx {
+		i--
 	}
-	if cur != nil && cur.stackIdx == stackIdx {
-		return cur
+	if i > 0 && th.openUpvals[i-1].stackIdx == stackIdx {
+		return th.openUpvals[i-1]
 	}
-	uv := &Upvalue{owner: th, stackIdx: stackIdx, next: cur}
-	if prev == nil {
-		th.openUpvals = uv
-	} else {
-		prev.next = uv
-	}
+	uv := &Upvalue{owner: th, stackIdx: stackIdx}
+	th.openUpvals = append(th.openUpvals, nil)
+	copy(th.openUpvals[i+1:], th.openUpvals[i:n])
+	th.openUpvals[i] = uv
 	return uv
 }
 
 func (th *Thread) closeUpvals(level int) {
-	for th.openUpvals != nil && th.openUpvals.stackIdx >= level {
-		uv := th.openUpvals
-		th.openUpvals = uv.next
+	n := len(th.openUpvals)
+	for n > 0 && th.openUpvals[n-1].stackIdx >= level {
+		n--
+		uv := th.openUpvals[n]
+		th.openUpvals[n] = nil
 		if uv.owner == th {
 			uv.closed = th.stack[uv.stackIdx]
 			uv.owner = nil
 		}
-		uv.next = nil
 	}
+	th.openUpvals = th.openUpvals[:n]
 }
 
 // detachOpenUpvals snapshots open upvalues into uv.closed, clears uv.owner = nil, and
 // nils the shadowed stack slot while keeping th.openUpvals intact. Breaking strong
-// uv -> Thread edges while a coroutine is suspended or errored lets Go's Tier 0 GC
-// reclaim unreachable coroutines and unrelated locals/arguments even if escaped closures
-// survive.
+// uv -> Thread edges (with no sibling uv.next pointers) while a coroutine is suspended
+// or errored lets Go's Tier 0 GC reclaim unreachable coroutines and unrelated locals,
+// arguments, and sibling upvalues even if escaped closures survive.
 func (th *Thread) detachOpenUpvals() {
-	for uv := th.openUpvals; uv != nil; uv = uv.next {
+	for _, uv := range th.openUpvals {
 		if uv.owner == th {
 			uv.closed = th.stack[uv.stackIdx]
 			th.stack[uv.stackIdx] = NilValue()
@@ -297,7 +296,7 @@ func (th *Thread) detachOpenUpvals() {
 // coroutine resumes (or before closing TBC vars), syncing any mutations written to
 // uv.closed while suspended.
 func (th *Thread) attachOpenUpvals() {
-	for uv := th.openUpvals; uv != nil; uv = uv.next {
+	for _, uv := range th.openUpvals {
 		if uv.owner == nil {
 			th.stack[uv.stackIdx] = uv.closed
 			uv.closed = NilValue()
@@ -309,7 +308,11 @@ func (th *Thread) attachOpenUpvals() {
 // localSlotValue reads th.stack[slot], transparently consulting detached open upvalues
 // on suspended or errored coroutines.
 func (th *Thread) localSlotValue(slot int) Value {
-	for uv := th.openUpvals; uv != nil && uv.stackIdx >= slot; uv = uv.next {
+	for i := len(th.openUpvals) - 1; i >= 0; i-- {
+		uv := th.openUpvals[i]
+		if uv.stackIdx < slot {
+			break
+		}
 		if uv.stackIdx == slot {
 			if uv.owner == nil {
 				return uv.closed
@@ -323,7 +326,11 @@ func (th *Thread) localSlotValue(slot int) Value {
 // setLocalSlotValue writes val to th.stack[slot], updating detached open upvalues on
 // suspended or errored coroutines so live escaped closures observe debug.setlocal writes.
 func (th *Thread) setLocalSlotValue(slot int, val Value) {
-	for uv := th.openUpvals; uv != nil && uv.stackIdx >= slot; uv = uv.next {
+	for i := len(th.openUpvals) - 1; i >= 0; i-- {
+		uv := th.openUpvals[i]
+		if uv.stackIdx < slot {
+			break
+		}
 		if uv.stackIdx == slot {
 			if uv.owner == nil {
 				uv.closed = val
@@ -545,6 +552,7 @@ func (th *Thread) clearDeadRefs() {
 	clear(th.frames)
 	th.nframe = 0
 	th.top = 0
+	clear(th.openUpvals)
 	th.openUpvals = nil
 	th.tbc = nil
 	th.yieldVals = nil
@@ -577,10 +585,8 @@ func (th *Thread) clearUnusedRefs() {
 			liveTop = idx + 1
 		}
 	}
-	for uv := th.openUpvals; uv != nil; uv = uv.next {
-		if uv.stackIdx+1 > liveTop {
-			liveTop = uv.stackIdx + 1
-		}
+	if n := len(th.openUpvals); n > 0 && th.openUpvals[n-1].stackIdx+1 > liveTop {
+		liveTop = th.openUpvals[n-1].stackIdx + 1
 	}
 	if liveTop < len(th.stack) {
 		fillNil(th.stack[liveTop:])

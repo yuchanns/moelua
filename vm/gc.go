@@ -767,7 +767,7 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 		fillNil(th.stack[lim:])
 	}
 	maxOpenUpvalIdx := -1
-	for uv := th.openUpvals; uv != nil; uv = uv.next {
+	for _, uv := range th.openUpvals {
 		if tr.cancelFn != nil && tr.tickCancel() {
 			return
 		}
@@ -783,7 +783,7 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 	// Shrink oversized stacks on non-running coroutines (including coroutines with open upvalues,
 	// since Upvalue tracks stackIdx rather than raw slice pointers) & release finished dead stacks.
 	if th != tr.s.cur && th != tr.s.mainThread {
-		if th.status == ThreadDead && th.nframe == 0 && th.top == 0 && th.openUpvals == nil && len(th.tbc) == 0 {
+		if th.status == ThreadDead && th.nframe == 0 && th.top == 0 && len(th.openUpvals) == 0 && len(th.tbc) == 0 {
 			if len(th.stack) > 8 {
 				th.stack = []Value{NilValue()}
 				th.stackGen++
@@ -1467,7 +1467,6 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 			if uv.owner != nil && uv.owner.gcMark != tr.epoch {
 				uv.closed = uv.owner.stack[uv.stackIdx]
 				uv.owner = nil
-				uv.next = nil
 			}
 		}
 		s.sweepCoallocTables(tr.epoch)
@@ -1644,7 +1643,6 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		if uv.owner != nil && uv.owner.gcMark != tr.epoch {
 			uv.closed = uv.owner.stack[uv.stackIdx]
 			uv.owner = nil
-			uv.next = nil
 		}
 	}
 

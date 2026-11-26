@@ -91,7 +91,6 @@ func (nf *NativeFunc) callMulti(s *State, args []Value) ([]Value, error) {
 // An upvalue is open iff owner != nil; closed upvalues store their value in closed with owner == nil.
 type Upvalue struct {
 	owner    *Thread
-	next     *Upvalue // linked list of open upvalues sorted descending by stackIdx
 	closed   Value
 	stackIdx int
 	id       uint64 // lazily assigned non-owning debug.upvalueid token
@@ -832,7 +831,7 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 	entryDepth := th.nframe
 	clearTop := func() {
 		th.nframe = entryDepth
-		if entryDepth == 0 && th.openUpvals == nil {
+		if entryDepth == 0 && len(th.openUpvals) == 0 {
 			if base < len(th.stack) {
 				fillNil(th.stack[base:])
 			}
@@ -1114,7 +1113,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	}
 	clearTopStack := func() {
 		th.top = funcIdx
-		if entryDepth == 0 && th.openUpvals == nil {
+		if entryDepth == 0 && len(th.openUpvals) == 0 {
 			if funcIdx < len(th.stack) {
 				fillNil(th.stack[funcIdx:])
 			}

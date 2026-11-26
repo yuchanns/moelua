@@ -907,6 +907,60 @@ func TestUnreachableSuspendedCoroutineReclaimedInTier0(t *testing.T) {
 		}
 	})
 
+	t.Run("escaped_higher_upval_does_not_retain_sibling_upval", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+
+		var wp weak.Pointer[vm.Table]
+		func() {
+			cl, err := s.LoadChunk([]byte(`
+				local big = { payload = string.rep("x", 1024 * 1024) }
+				local co = coroutine.create(function(b)
+					local holdBig = function() return b end
+					local small = 7
+					coroutine.yield(function()
+						small = small + 1
+						return small
+					end)
+					return holdBig()
+				end)
+				local ok, fn = coroutine.resume(co, big)
+				assert(ok and type(fn) == "function")
+				FN = fn
+				return big
+			`), "=sibling_upval")
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := s.Call(cl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wp = weak.Make(res[0].AsTable())
+			res[0] = vm.NilValue()
+		}()
+
+		reclaimed := false
+		for range 12 {
+			runtime.GC()
+			if wp.Value() == nil {
+				reclaimed = true
+				break
+			}
+		}
+		if !reclaimed {
+			t.Fatalf("escaped higher-index upvalue retained lower-index sibling upvalue payload")
+		}
+
+		check, err := s.LoadChunk([]byte(`assert(FN() == 8 and FN() == 9)`), "=check_sibling")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(check); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("suspended_upval_mutations_debug_and_tbc_close", func(t *testing.T) {
 		src := `
 local co = coroutine.create(function()
@@ -1455,4 +1509,27 @@ func TestInlineCacheDoesNotPinObjectsInTier0(t *testing.T) {
 			return env1.BIG
 		`)
 	})
+}
+
+// TestMathRandomFullRangeAppliesLowerBound verifies that math.random(math.mininteger, math.maxinteger)
+// applies the +low wraparound offset matching Lua 5.5.1 lmathlib.c:math_random.
+func TestMathRandomFullRangeAppliesLowerBound(t *testing.T) {
+	src := `
+math.randomseed(123, 456)
+local a1, a2, a3 = math.random(0), math.random(0), math.random(0)
+math.randomseed(123, 456)
+local b1 = math.random(math.mininteger, math.maxinteger)
+local b2 = math.random(math.mininteger, math.maxinteger)
+local b3 = math.random(math.mininteger, math.maxinteger)
+assert(b1 == a1 + math.mininteger, string.format("%d ~= %d", b1, a1 + math.mininteger))
+assert(b2 == a2 + math.mininteger, string.format("%d ~= %d", b2, a2 + math.mininteger))
+assert(b3 == a3 + math.mininteger, string.format("%d ~= %d", b3, a3 + math.mininteger))
+print(b1, b2, b3)
+`
+	got := runMoeLua(t, src)
+	if hasCLua55(t) {
+		if want := runCLua55(t, src); got != want {
+			t.Fatalf("mismatch vs C Lua 5.5.1:\nwant: %q\ngot:  %q", want, got)
+		}
+	}
 }
