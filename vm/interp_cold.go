@@ -3699,11 +3699,16 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 	}
 	allSimple := true
 	totalLen := 0
+	var numStrs []string
 	for i := 0; i < n; i++ {
 		v := th.stack[start+i]
 		if v.IsString() {
 			totalLen += len(v.AsString().S)
-		} else if !v.IsNumber() {
+		} else if v.IsNumber() {
+			ns := FormatValue(v)
+			totalLen += len(ns)
+			numStrs = append(numStrs, ns)
+		} else {
 			allSimple = false
 			break
 		}
@@ -3716,12 +3721,14 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 		}
 		var sb strings.Builder
 		sb.Grow(totalLen)
+		ni := 0
 		for i := 0; i < n; i++ {
 			v := th.stack[start+i]
 			if v.IsString() {
 				sb.WriteString(v.AsString().S)
 			} else {
-				sb.WriteString(FormatValue(v))
+				sb.WriteString(numStrs[ni])
+				ni++
 			}
 		}
 		out := sb.String()

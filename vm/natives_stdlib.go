@@ -610,7 +610,14 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 			fargs[i] = fa
 		default:
 			// Defer __tostring / __name evaluation until a %s conversion actually consumes this argument.
-			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgPointer, Ptr: uintptr(a.ptr), ToString: lazyToStr}
+			// Use logical pointer identity for encoded light userdata (debug.upvalueid tokens / NULL lightud).
+			ptrVal := uintptr(a.ptr)
+			if a.ptr == tagTokenLightUD {
+				ptrVal = uintptr(a.bits)
+			} else if a.ptr == tagNullLightUD {
+				ptrVal = 0
+			}
+			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgPointer, Ptr: ptrVal, ToString: lazyToStr}
 		}
 	}
 	var checkSize func(int64) error

@@ -945,6 +945,13 @@ func (s *State) tryNewFileUD(lf *luaFile) (Value, error) {
 					_ = lf.f.Close()
 				}
 				if lf.cmd != nil {
+					if lf.cmd.Process != nil {
+						if lf.cmd.Cancel != nil {
+							_ = lf.cmd.Cancel()
+						} else {
+							_ = lf.cmd.Process.Kill()
+						}
+					}
 					_ = lf.cmd.Wait()
 				}
 				lf.w = nil
@@ -1308,6 +1315,12 @@ func nativeIOPopen(s *State, args []Value) ([]Value, error) {
 			return nil, cerr
 		}
 	}
+	if s.memLimit > 0 {
+		// Pre-check file userdata budget before spawning a child OS process.
+		if err := s.checkMem(128); err != nil {
+			return nil, err
+		}
+	}
 	// Flush buffered output streams before spawning the child process
 	// (matches Lua 5.5 liolib.c:l_popen calling fflush(NULL) before popen).
 	s.flushOpenFiles()
@@ -1343,15 +1356,7 @@ func nativeIOPopen(s *State, args []Value) ([]Value, error) {
 	}
 	ud, err := s.tryNewFileUD(&luaFile{f: f, cmd: cmd})
 	if err != nil {
-		_ = f.Close()
-		if cmd.Process != nil {
-			if cmd.Cancel != nil {
-				_ = cmd.Cancel()
-			} else {
-				_ = cmd.Process.Kill()
-			}
-			_ = cmd.Wait()
-		}
+		// tryNewFileUD already closed f and terminated+reaped cmd on allocation error.
 		return nil, err
 	}
 	return []Value{ud}, nil
