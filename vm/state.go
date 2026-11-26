@@ -850,15 +850,24 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 		}
 		th.top = savedTop
 	}
+	abortCleanup := func(uerr error) {
+		s.abortErr = uerr
+		th.discardTBCAtOrAbove(base)
+		th.closeUpvals(base)
+		clearTop()
+	}
 	pushed, err := s.pushProtectedCallMode(th, base, nargs, -1, isXP, entryDepth, topProtected)
 	if err != nil {
 		if errors.Is(err, errCoroCloseSelf) {
 			return nil, NilValue(), false, err
 		}
-		clearTop()
 		if isUncatchableErr(err) {
+			abortCleanup(err)
 			return nil, NilValue(), false, err
 		}
+		th.discardTBCAtOrAbove(base)
+		th.closeUpvals(base)
+		clearTop()
 		return nil, errorToLuaValue(s, err), false, nil
 	}
 	if pushed {
@@ -874,10 +883,13 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 			if errors.Is(runErr, errCoroCloseSelf) {
 				return nil, NilValue(), false, runErr
 			}
-			clearTop()
 			if isUncatchableErr(runErr) {
+				abortCleanup(runErr)
 				return nil, NilValue(), false, runErr
 			}
+			th.discardTBCAtOrAbove(base)
+			th.closeUpvals(base)
+			clearTop()
 			return nil, errorToLuaValue(s, runErr), false, nil
 		}
 	}
@@ -885,7 +897,7 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 		s.gcCheckDebt(th.top)
 		if s.abortErr != nil {
 			uerr := s.abortErr
-			clearTop()
+			abortCleanup(uerr)
 			return nil, NilValue(), false, uerr
 		}
 	}

@@ -231,12 +231,18 @@ func nativeWarn(s *State, args []Value) ([]Value, error) {
 	}
 	// Stream arguments directly to s.errOut without allocating a concatenated buffer
 	// (matches Lua 5.5 lbaselib.c:luaB_warn).
+	cancelFn := s.nativeCancelFunc()
+	work := 0
 	_, _ = io.WriteString(s.errOut, "Lua warning: ")
 	for _, a := range args {
+		var str string
 		if a.IsString() {
-			_, _ = io.WriteString(s.errOut, a.AsString().S)
+			str = a.AsString().S
 		} else {
-			_, _ = io.WriteString(s.errOut, FormatValue(a))
+			str = FormatValue(a)
+		}
+		if err := writeIOStringWithCancel(s.errOut, str, cancelFn, &work); err != nil {
+			return nil, err
 		}
 	}
 	_, _ = io.WriteString(s.errOut, "\n")
@@ -3258,7 +3264,10 @@ func (s *State) checkedReplaceSize(src, oldStr, newStr string) (int64, error) {
 	if oldStr == "" {
 		return baseLen, nil
 	}
-	cnt := int64(strings.Count(src, oldStr))
+	cnt, err := countStringWithCancel(src, oldStr, s.nativeCancelFunc())
+	if err != nil {
+		return 0, err
+	}
 	if cnt == 0 {
 		return baseLen, nil
 	}
@@ -3291,7 +3300,10 @@ func (s *State) forEachSearchCandidate(path, name string, cancelFn func() error,
 			if _, err := s.checkedReplaceSize(tmpl, "?", name); err != nil {
 				return err
 			}
-			cand := strings.ReplaceAll(tmpl, "?", name)
+			cand, err := replaceAllWithCancel(tmpl, "?", name, cancelFn)
+			if err != nil {
+				return err
+			}
 			stop, err := fn(cand)
 			if err != nil || stop {
 				return err
@@ -3301,6 +3313,7 @@ func (s *State) forEachSearchCandidate(path, name string, cancelFn func() error,
 	}
 	var cur strings.Builder
 	var stopped bool
+	copyWork := 0
 	emitPiece := func(piece string) error {
 		for len(piece) > 0 {
 			semi := strings.IndexByte(piece, ';')
@@ -3310,8 +3323,7 @@ func (s *State) forEachSearchCandidate(path, name string, cancelFn func() error,
 						return err
 					}
 				}
-				cur.WriteString(piece)
-				return nil
+				return writeStringWithCancel(&cur, piece, cancelFn, &copyWork)
 			}
 			if semi > 0 {
 				if s.memLimit > 0 {
@@ -3319,7 +3331,9 @@ func (s *State) forEachSearchCandidate(path, name string, cancelFn func() error,
 						return err
 					}
 				}
-				cur.WriteString(piece[:semi])
+				if err := writeStringWithCancel(&cur, piece[:semi], cancelFn, &copyWork); err != nil {
+					return err
+				}
 			}
 			steps++
 			if cancelFn != nil && (steps&1023) == 0 {
@@ -3369,15 +3383,20 @@ func (s *State) forEachSearchCandidate(path, name string, cancelFn func() error,
 }
 
 func (s *State) searchPath(name, path, sep, rep string) (string, string, error) {
+	cancelFn := s.nativeCancelFunc()
 	if sep != "" {
 		if _, err := s.checkedReplaceSize(name, sep, rep); err != nil {
 			return "", "", err
 		}
-		name = strings.ReplaceAll(name, sep, rep)
+		var err error
+		name, err = replaceAllWithCancel(name, sep, rep, cancelFn)
+		if err != nil {
+			return "", "", err
+		}
 	}
 	var errBuf strings.Builder
 	var found string
-	cancelFn := s.nativeCancelFunc()
+	errWork := 0
 	idx := 0
 	err := s.forEachSearchCandidate(path, name, cancelFn, func(cand string) (bool, error) {
 		if cand != "" {
@@ -3402,7 +3421,9 @@ func (s *State) searchPath(name, path, sep, rep string) (string, string, error) 
 		} else {
 			errBuf.WriteString("'\n\tno file '")
 		}
-		errBuf.WriteString(cand)
+		if cerr := writeStringWithCancel(&errBuf, cand, cancelFn, &errWork); cerr != nil {
+			return false, cerr
+		}
 		idx++
 		return false, nil
 	})

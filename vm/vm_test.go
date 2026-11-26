@@ -1533,3 +1533,139 @@ print(b1, b2, b3)
 		}
 	}
 }
+
+// TestLargeStringCopyCancelAndBudget verifies that copying large strings in table.concat,
+// OP_CONCAT, print, warn, and package.searchpath cooperatively polls execution controls
+// (both instruction limits and expired contexts) even on single-element/few-element inputs.
+func TestLargeStringCopyCancelAndBudget(t *testing.T) {
+	bigStr := strings.Repeat("z", 8*1024*1024)
+
+	t.Run("direct_state_call_table_concat", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		tblConcat := s.GetGlobal("table").AsTable().RawGetStr(s.Intern("concat"))
+		arr := s.NewTable(1, 0)
+		arr.RawSetInt(s, 1, vm.StringValue(s.Intern(bigStr)))
+
+		s.SetInstructionLimit(100)
+		if _, err := s.Call(tblConcat, vm.TableValue(arr)); err == nil {
+			t.Fatalf("direct State.Call(table.concat, {bigStr}) bypassed instruction limit 100")
+		}
+		if s.InstructionsExecuted() == 0 {
+			t.Fatalf("direct State.Call(table.concat) charged 0 instructions")
+		}
+
+		s2 := vm.NewState()
+		defer s2.Close()
+		tblConcat2 := s2.GetGlobal("table").AsTable().RawGetStr(s2.Intern("concat"))
+		arr2 := s2.NewTable(1, 0)
+		arr2.RawSetInt(s2, 1, vm.StringValue(s2.Intern(bigStr)))
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		s2.SetContext(ctx)
+		start := time.Now()
+		if _, err := s2.Call(tblConcat2, vm.TableValue(arr2)); err == nil {
+			t.Fatalf("direct State.Call(table.concat) bypassed expired context deadline")
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("direct State.Call(table.concat) took %v despite expired context", elapsed)
+		}
+	})
+
+	t.Run("lua_op_concat_print_warn_searchpath", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			src  string
+		}{
+			{"table_concat_sep", `return table.concat({"a", "b"}, BIG)`},
+			{"op_concat", `return BIG .. "x"`},
+			{"print", `print(BIG)`},
+			{"warn", `warn("@on"); warn(BIG)`},
+			{"searchpath", `return package.searchpath(BIG, "?.lua")`},
+		} {
+			s := vm.NewState()
+			defer s.Close()
+			var discard bytes.Buffer
+			s.SetOutput(&discard)
+			s.SetErrOutput(&discard)
+			s.SetGlobal("BIG", vm.StringValue(s.Intern(bigStr)))
+			cl, err := s.LoadChunk([]byte(tc.src), "="+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetInstructionLimit(100)
+			if _, err := s.Call(cl); err == nil {
+				t.Fatalf("%s bypassed instruction limit 100", tc.name)
+			}
+			if s.InstructionsExecuted() == 0 {
+				t.Fatalf("%s charged 0 instructions", tc.name)
+			}
+		}
+	})
+}
+
+// TestMathModfNormalizesIntegralZero verifies that math.modf returns +0.0 as the
+// fractional part for all integral inputs (including -1.0, -0.0, and large negative floats),
+// matching Lua 5.5.1 lmathlib.c:math_modf.
+func TestMathModfNormalizesIntegralZero(t *testing.T) {
+	src := `
+for _, x in ipairs({-1.0, -0.0, 0.0, 1.0, -1.5, 1.5, -1e20, -math.huge, math.huge}) do
+	local i, f = math.modf(x)
+	print(tostring(i), tostring(f), tostring(1 / f))
+end
+`
+	got := runMoeLua(t, src)
+	if hasCLua55(t) {
+		if want := runCLua55(t, src); got != want {
+			t.Fatalf("mismatch vs C Lua 5.5.1:\nwant:\n%s\ngot:\n%s", want, got)
+		}
+	}
+}
+
+// TestCallProtectedAbortClosesCapturedUpvalues verifies that aborting State.CallProtected
+// (or Go State.Call(xpcall/pcall, ...)) via instruction limit or context cancellation closes
+// open upvalues and discards pending TBC entries before clearing the stack, so escaped
+// closures retain their captured values when the State is reused.
+func TestCallProtectedAbortClosesCapturedUpvalues(t *testing.T) {
+	for _, mode := range []string{"CallProtected", "StateCallXPCall"} {
+		t.Run(mode, func(t *testing.T) {
+			s := vm.NewState()
+			defer s.Close()
+
+			cl, err := s.LoadChunk([]byte(`
+				local x = 42
+				local guard <close> = setmetatable({}, { __close = function() CLOSED_ON_ABORT = true end })
+				SAVED = function() return x end
+				while true do end
+			`), "=abort_upval")
+			if err != nil {
+				t.Fatal(err)
+			}
+			msgh := s.GetGlobal("tostring")
+			s.SetInstructionLimit(100)
+			if mode == "CallProtected" {
+				_, _, ok, abortErr := s.CallProtected(cl, msgh)
+				if ok || abortErr == nil {
+					t.Fatalf("expected instruction-limit abort, got ok=%v abortErr=%v", ok, abortErr)
+				}
+			} else {
+				_, callErr := s.Call(s.GetGlobal("xpcall"), cl, msgh)
+				if callErr == nil {
+					t.Fatalf("expected instruction-limit abort from State.Call(xpcall)")
+				}
+			}
+
+			s.SetInstructionLimit(0)
+			res, err := s.Call(s.GetGlobal("SAVED"))
+			if err != nil {
+				t.Fatalf("calling escaped closure after abort failed: %v", err)
+			}
+			if len(res) != 1 || !res[0].IsInt() || res[0].Int() != 42 {
+				t.Fatalf("escaped closure lost captured upvalue after %s abort: got %v, want 42", mode, res)
+			}
+			if !s.GetGlobal("CLOSED_ON_ABORT").IsNil() {
+				t.Fatalf("pending <close> handler should be discarded on uncatchable abort")
+			}
+		})
+	}
+}

@@ -199,6 +199,8 @@ func (s *State) initStringArithMetamethods(mt *Table) {
 }
 
 func nativePrint(s *State, args []Value) ([]Value, error) {
+	cancelFn := s.nativeCancelFunc()
+	work := 0
 	for i, a := range args {
 		if i > 0 {
 			_, _ = s.out.Write([]byte{'\t'})
@@ -207,7 +209,9 @@ func nativePrint(s *State, args []Value) ([]Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		_, _ = s.out.Write([]byte(str))
+		if err := writeIOStringWithCancel(s.out, str, cancelFn, &work); err != nil {
+			return nil, err
+		}
 	}
 	_, _ = s.out.Write([]byte{'\n'})
 	return nil, nil
@@ -882,6 +886,9 @@ func nativeMathModf(s *State, args []Value) ([]Value, error) {
 		return []Value{FloatValue(f), FloatValue(0)}, nil
 	}
 	ip, fp := math.Modf(f)
+	if f == ip {
+		fp = 0
+	}
 	if i, ok := FloatToIntExact(ip); ok {
 		return []Value{IntValue(i), FloatValue(fp)}, nil
 	}
@@ -1581,6 +1588,7 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 	}
 	cancelFn := s.nativeCancelFunc()
 	var iterCount int64
+	copyWork := 0
 	for k := i; k <= j; k++ {
 		if cancelFn != nil && (iterCount&1023) == 0 {
 			if err := cancelFn(); err != nil {
@@ -1594,7 +1602,9 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 					return nil, err
 				}
 			}
-			sb.WriteString(sep)
+			if err := writeStringWithCancel(&sb, sep, cancelFn, &copyWork); err != nil {
+				return nil, err
+			}
 		}
 		var v Value
 		if rawFast {
@@ -1615,7 +1625,9 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 				return nil, err
 			}
 		}
-		sb.WriteString(piece)
+		if err := writeStringWithCancel(&sb, piece, cancelFn, &copyWork); err != nil {
+			return nil, err
+		}
 		if k == math.MaxInt64 {
 			break
 		}

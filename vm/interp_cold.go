@@ -3978,16 +3978,31 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 				return false, err
 			}
 		}
+		cancelFn := s.nativeCancelFunc()
 		var sb strings.Builder
-		sb.Grow(totalLen)
+		if cancelFn == nil {
+			sb.Grow(totalLen)
+		} else {
+			if totalLen > strCloneCancelChunk {
+				if err := cancelFn(); err != nil {
+					return false, err
+				}
+			}
+			sb.Grow(min(totalLen, strCloneCancelChunk))
+		}
+		copyWork := 0
 		ni := 0
 		for i := 0; i < n; i++ {
 			v := th.stack[start+i]
+			var part string
 			if v.IsString() {
-				sb.WriteString(v.AsString().S)
+				part = v.AsString().S
 			} else {
-				sb.WriteString(numStrs[ni])
+				part = numStrs[ni]
 				ni++
+			}
+			if err := writeStringWithCancel(&sb, part, cancelFn, &copyWork); err != nil {
+				return false, err
 			}
 		}
 		out := sb.String()
@@ -4003,11 +4018,32 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 }
 
 func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, error) {
+	cancelFn := s.nativeCancelFunc()
 	for cur > start {
 		lhs := th.stack[cur-1]
 		rhs := th.stack[cur]
 		if (lhs.IsString() || lhs.IsNumber()) && (rhs.IsString() || rhs.IsNumber()) {
-			joined := FormatValue(lhs) + FormatValue(rhs)
+			ls, rs := FormatValue(lhs), FormatValue(rhs)
+			totalLen := len(ls) + len(rs)
+			if s.memLimit > 0 {
+				if err := s.checkMem(int64(totalLen) + 48); err != nil {
+					return false, err
+				}
+			}
+			var joined string
+			if cancelFn != nil && totalLen > strCloneCancelChunk {
+				var sb strings.Builder
+				work := 0
+				if err := writeStringWithCancel(&sb, ls, cancelFn, &work); err != nil {
+					return false, err
+				}
+				if err := writeStringWithCancel(&sb, rs, cancelFn, &work); err != nil {
+					return false, err
+				}
+				joined = sb.String()
+			} else {
+				joined = ls + rs
+			}
 			if s.memLimit > 0 || s.gc.tier1 {
 				if err := s.checkMemAndAccount(int64(len(joined)) + 48); err != nil {
 					return false, err

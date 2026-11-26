@@ -2,6 +2,7 @@ package vm
 
 import (
 	"hash/maphash"
+	"io"
 	"strings"
 	"sync/atomic"
 	"weak"
@@ -101,6 +102,148 @@ var tmNames = [tmCount]string{
 const strHashCancelChunk = 4096
 const strCmpCancelChunk = 65536
 const strCloneCancelChunk = 65536
+
+// writeStringWithCancel appends src to sb in bounded 64 KiB chunks while polling cancelFn
+// (zero overhead when cancelFn == nil, and zero extra charge on short strings below 64 KiB).
+func writeStringWithCancel(sb *strings.Builder, src string, cancelFn func() error, work *int) error {
+	if cancelFn == nil || len(src) == 0 {
+		sb.WriteString(src)
+		return nil
+	}
+	for off := 0; off < len(src); {
+		rem := strCloneCancelChunk - *work
+		if rem <= 0 {
+			if err := cancelFn(); err != nil {
+				return err
+			}
+			*work = 0
+			rem = strCloneCancelChunk
+		}
+		end := min(off+rem, len(src))
+		sb.WriteString(src[off:end])
+		*work += end - off
+		off = end
+		if *work >= strCloneCancelChunk {
+			if err := cancelFn(); err != nil {
+				return err
+			}
+			*work = 0
+		}
+	}
+	return nil
+}
+
+// writeIOStringWithCancel writes src to w in bounded 64 KiB chunks while polling cancelFn.
+func writeIOStringWithCancel(w io.Writer, src string, cancelFn func() error, work *int) error {
+	if cancelFn == nil || len(src) == 0 {
+		_, _ = io.WriteString(w, src)
+		return nil
+	}
+	for off := 0; off < len(src); {
+		rem := strCloneCancelChunk - *work
+		if rem <= 0 {
+			if err := cancelFn(); err != nil {
+				return err
+			}
+			*work = 0
+			rem = strCloneCancelChunk
+		}
+		end := min(off+rem, len(src))
+		if _, err := io.WriteString(w, src[off:end]); err != nil {
+			return nil
+		}
+		*work += end - off
+		off = end
+		if *work >= strCloneCancelChunk {
+			if err := cancelFn(); err != nil {
+				return err
+			}
+			*work = 0
+		}
+	}
+	return nil
+}
+
+// countStringWithCancel counts non-overlapping occurrences of sep in src, polling cancelFn
+// every 64 KiB when scanning large strings.
+func countStringWithCancel(src, sep string, cancelFn func() error) (int64, error) {
+	if cancelFn == nil || sep == "" || len(src) <= strCloneCancelChunk || len(sep) > len(src) {
+		return int64(strings.Count(src, sep)), nil
+	}
+	var cnt int64
+	rem := src
+	scanned := 0
+	for len(rem) >= len(sep) {
+		win := min(len(rem), strCloneCancelChunk+len(sep)-1)
+		idx := strings.Index(rem[:win], sep)
+		if idx < 0 {
+			if win == len(rem) {
+				break
+			}
+			rem = rem[strCloneCancelChunk:]
+			if err := cancelFn(); err != nil {
+				return 0, err
+			}
+			scanned = 0
+			continue
+		}
+		cnt++
+		adv := idx + len(sep)
+		rem = rem[adv:]
+		scanned += adv
+		if scanned >= strCloneCancelChunk {
+			if err := cancelFn(); err != nil {
+				return 0, err
+			}
+			scanned = 0
+		}
+	}
+	return cnt, nil
+}
+
+// replaceAllWithCancel behaves like strings.ReplaceAll while polling cancelFn every 64 KiB.
+func replaceAllWithCancel(src, oldStr, newStr string, cancelFn func() error) (string, error) {
+	if cancelFn == nil || oldStr == "" || len(oldStr) > len(src) ||
+		(len(src) <= strCloneCancelChunk && len(newStr) <= strCloneCancelChunk) {
+		return strings.ReplaceAll(src, oldStr, newStr), nil
+	}
+	var sb strings.Builder
+	work := 0
+	rem := src
+	for len(rem) > 0 {
+		if len(rem) < len(oldStr) {
+			if err := writeStringWithCancel(&sb, rem, cancelFn, &work); err != nil {
+				return "", err
+			}
+			break
+		}
+		win := min(len(rem), strCloneCancelChunk+len(oldStr)-1)
+		idx := strings.Index(rem[:win], oldStr)
+		if idx < 0 {
+			if win == len(rem) {
+				if err := writeStringWithCancel(&sb, rem, cancelFn, &work); err != nil {
+					return "", err
+				}
+				break
+			}
+			if err := writeStringWithCancel(&sb, rem[:strCloneCancelChunk], cancelFn, &work); err != nil {
+				return "", err
+			}
+			rem = rem[strCloneCancelChunk:]
+			continue
+		}
+		if idx > 0 {
+			if err := writeStringWithCancel(&sb, rem[:idx], cancelFn, &work); err != nil {
+				return "", err
+			}
+		}
+		if err := writeStringWithCancel(&sb, newStr, cancelFn, &work); err != nil {
+			return "", err
+		}
+		rem = rem[idx+len(oldStr):]
+	}
+	return sb.String(), nil
+}
 
 // cloneStringWithCancel clones src while polling execution controls every 64 KiB
 // when a context deadline or instruction budget is active.
