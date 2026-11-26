@@ -381,6 +381,9 @@ func (th *Thread) ensureFrameCap(s *State, need, limit int) error {
 		if err := s.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
 			return err
 		}
+		if need <= th.framesCap {
+			return nil
+		}
 	}
 	oldRef := th.framesRef
 	oldCap := th.framesCap
@@ -425,6 +428,9 @@ func (th *Thread) ensureStack(s *State, need int) error {
 		if err := s.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
 			return err
 		}
+		if need+stackSlack <= th.stackLen {
+			return nil
+		}
 	}
 	oldRef := th.stackRef
 	oldLen := th.stackLen
@@ -446,7 +452,7 @@ func (th *Thread) ensureStack(s *State, need int) error {
 		if th.nativeArgsDepth == 0 {
 			s.arena.Free(oldRef)
 		} else {
-			s.deferredStackFrees = append(s.deferredStackFrees, deferredStackFree{ref: oldRef, len: oldLen})
+			s.deferredStackFrees = append(s.deferredStackFrees, deferredStackFree{owner: th.self, ref: oldRef, len: oldLen})
 		}
 	}
 	return nil
@@ -454,13 +460,15 @@ func (th *Thread) ensureStack(s *State, need int) error {
 
 // finishNativeArgs decrements nativeArgsDepth after a borrowed-stack native call.
 // If the call grew th.stackRef while args were borrowed and the native returned a slice
-// aliasing a deferred old stack buffer, res is copied before freeing the deferred buffers.
+// aliasing a deferred old stack buffer owned by th, res is copied before freeing th's
+// deferred buffers. Deferred buffers belonging to other threads are preserved until
+// those threads finish their own borrowed native calls.
 func (th *Thread) finishNativeArgs(s *State, res []Value) []Value {
 	th.nativeArgsDepth--
 	if th.nativeArgsDepth == 0 && len(s.deferredStackFrees) > 0 {
 		if len(res) > 0 {
 			for _, df := range s.deferredStackFrees {
-				if slicesOverlapValues(res, arena.SliceFast[Value](s.arena, df.ref, 0, df.len)) {
+				if df.owner == th.self && slicesOverlapValues(res, arena.SliceFast[Value](s.arena, df.ref, 0, df.len)) {
 					cp := make([]Value, len(res))
 					copy(cp, res)
 					res = cp
@@ -468,10 +476,15 @@ func (th *Thread) finishNativeArgs(s *State, res []Value) []Value {
 				}
 			}
 		}
+		keep := s.deferredStackFrees[:0]
 		for _, df := range s.deferredStackFrees {
-			s.arena.Free(df.ref)
+			if df.owner == th.self {
+				s.arena.Free(df.ref)
+			} else {
+				keep = append(keep, df)
+			}
 		}
-		s.deferredStackFrees = s.deferredStackFrees[:0]
+		s.deferredStackFrees = keep
 	}
 	return res
 }
@@ -516,8 +529,9 @@ func (th *Thread) findOrCreateUpval(s *State, stackIdx int) *Upvalue {
 		newCap := max(int(th.openUpvalsCap)*2, 4)
 		newRef, aerr := a.Alloc(newCap * int(unsafe.Sizeof(arena.ObjRef(0))))
 		if aerr != nil {
+			uv.ownerRef = arena.NullRef
 			s.memExceeded = true
-			return uv
+			return nil
 		}
 		s.collector.AddDebt(int64(a.SlotSize(newRef)))
 		dst := arena.SliceFast[arena.ObjRef](a, newRef, 0, newCap)

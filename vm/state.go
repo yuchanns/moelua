@@ -255,8 +255,9 @@ type tableStub struct {
 }
 
 type deferredStackFree struct {
-	ref arena.ObjRef
-	len int
+	owner arena.ObjRef
+	ref   arena.ObjRef
+	len   int
 }
 
 // State is a single-goroutine Lua 5.5.1 execution state (multiple States share immutable Protos

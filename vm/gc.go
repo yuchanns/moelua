@@ -1047,6 +1047,17 @@ func (s *State) gcFreeObject(a *arena.Arena, ref arena.ObjRef) {
 		if th.uncaughtErrRef != arena.NullGoHandle && s.goRefs != nil {
 			s.goRefs.Free(th.uncaughtErrRef)
 		}
+		if len(s.deferredStackFrees) > 0 {
+			keep := s.deferredStackFrees[:0]
+			for _, df := range s.deferredStackFrees {
+				if df.owner == ref {
+					a.Free(df.ref)
+				} else {
+					keep = append(keep, df)
+				}
+			}
+			s.deferredStackFrees = keep
+		}
 		a.Free(ref)
 	case gcKindProto:
 		ap := arena.AsSmall[ArenaProto](a, ref)
