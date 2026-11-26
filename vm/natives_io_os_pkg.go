@@ -1503,6 +1503,15 @@ func nativeFileFlush(s *State, args []Value) ([]Value, error) {
 	if err := lf.flushWriter(); err != nil {
 		return ioFail(s, err), nil
 	}
+	if lf.r != nil {
+		// Synchronize the underlying fd offset with the logical reader position
+		// and invalidate buffered read-ahead bytes on seekable streams (matching
+		// POSIX fflush on seekable input streams). Non-seekable streams (pipes/stdin)
+		// return ESPIPE/EINVAL and keep their unread buffered data intact.
+		if _, err := lf.f.Seek(-int64(lf.r.Buffered()), io.SeekCurrent); err == nil {
+			lf.r.Reset(lf.f)
+		}
+	}
 	_ = lf.f.Sync()
 	return []Value{TrueValue()}, nil
 }
@@ -1648,8 +1657,11 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return ioFail(s, err), nil
 	}
-	// Only discard buffered input after the underlying seek succeeds.
-	lf.r = nil
+	// Only discard buffered input after the underlying seek succeeds; reuse the
+	// existing bufio.Reader buffer so repeated seek/read cycles do not re-charge memLimit.
+	if lf.r != nil {
+		lf.r.Reset(lf.f)
+	}
 	return []Value{IntValue(pos)}, nil
 }
 

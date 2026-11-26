@@ -228,11 +228,24 @@ func ValidCodesInit(s string) error {
 // Returns (nextPos, codepoint, true, nil) while characters remain, or
 // (0, 0, false, nil) when iteration ends.
 func Next(s string, pos int64, lax bool) (nextPos int64, cp int64, ok bool, err error) {
+	return NextWithCancel(s, pos, lax, nil)
+}
+
+// NextWithCancel implements the iteration step of Lua 5.5.1 utf8.codes(s [, lax])
+// while polling cancelFn every 1024 skipped continuation bytes when cancelFn != nil.
+func NextWithCancel(s string, pos int64, lax bool, cancelFn func() error) (nextPos int64, cp int64, ok bool, err error) {
 	n := uint64(pos)
 	slen := uint64(len(s))
 	if n < slen {
+		var steps uint64
 		for n < slen && isUTF8Cont(s[n]) {
 			n++
+			steps++
+			if cancelFn != nil && (steps&1023) == 0 {
+				if cerr := cancelFn(); cerr != nil {
+					return 0, 0, false, cerr
+				}
+			}
 		}
 	}
 	if n >= slen {
@@ -254,7 +267,7 @@ func Offset(s string, n int64, i int64) (start int64, end int64, ok bool, err er
 }
 
 // OffsetWithCancel implements Lua 5.5.1 utf8.offset while polling cancelFn every 1024
-// steps when cancelFn != nil.
+// scanned bytes when cancelFn != nil.
 func OffsetWithCancel(s string, n int64, i int64, cancelFn func() error) (start int64, end int64, ok bool, err error) {
 	length := int64(len(s))
 	posi := uPosrelat(i, len(s))
@@ -280,14 +293,14 @@ func OffsetWithCancel(s string, n int64, i int64, cancelFn func() error) (start 
 		}
 		if n < 0 {
 			for n < 0 && posi > 0 {
-				steps++
-				if cancelFn != nil && (steps&1023) == 0 {
-					if cerr := cancelFn(); cerr != nil {
-						return 0, 0, false, cerr
-					}
-				}
 				for {
 					posi--
+					steps++
+					if cancelFn != nil && (steps&1023) == 0 {
+						if cerr := cancelFn(); cerr != nil {
+							return 0, 0, false, cerr
+						}
+					}
 					if posi <= 0 || !isUTF8Cont(s[posi]) {
 						break
 					}
@@ -297,14 +310,14 @@ func OffsetWithCancel(s string, n int64, i int64, cancelFn func() error) (start 
 		} else {
 			n-- // do not move for 1st character
 			for n > 0 && posi < length {
-				steps++
-				if cancelFn != nil && (steps&1023) == 0 {
-					if cerr := cancelFn(); cerr != nil {
-						return 0, 0, false, cerr
-					}
-				}
 				for {
 					posi++
+					steps++
+					if cancelFn != nil && (steps&1023) == 0 {
+						if cerr := cancelFn(); cerr != nil {
+							return 0, 0, false, cerr
+						}
+					}
 					if posi >= length || !isUTF8Cont(s[posi]) {
 						break
 					}
@@ -325,6 +338,12 @@ func OffsetWithCancel(s string, n int64, i int64, cancelFn func() error) (start 
 		}
 		for posi+1 < length && isUTF8Cont(s[posi+1]) {
 			posi++
+			steps++
+			if cancelFn != nil && (steps&1023) == 0 {
+				if cerr := cancelFn(); cerr != nil {
+					return 0, 0, false, cerr
+				}
+			}
 		}
 	}
 	end = posi + 1

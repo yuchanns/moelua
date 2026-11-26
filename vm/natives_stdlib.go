@@ -861,24 +861,7 @@ func makeUTF8CodesIterFn(lax bool) func(*State, []Value) ([]Value, error) {
 				return nil, fmt.Errorf("bad argument #2 to 'codes' (number expected)")
 			}
 		}
-		if pos > 0 && uint64(pos) < uint64(len(sv)) && (sv[pos]&0xC0) == 0x80 {
-			if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
-				n := uint64(pos)
-				slen := uint64(len(sv))
-				var skipped uint64
-				for n < slen && (sv[n]&0xC0) == 0x80 {
-					n++
-					skipped++
-					if (skipped & 4095) == 0 {
-						if cerr := cancelFn(); cerr != nil {
-							return nil, cerr
-						}
-					}
-				}
-				pos = int64(n)
-			}
-		}
-		nextPos, cp, ok, err := luastdlib.Next(sv, pos, lax)
+		nextPos, cp, ok, err := luastdlib.NextWithCancel(sv, pos, lax, s.nativeCancelFunc())
 		if err != nil {
 			return nil, err
 		}

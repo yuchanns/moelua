@@ -3,6 +3,7 @@ package vm_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2270,4 +2271,119 @@ print("dofile_ok")
 	if !ok || got != 7 {
 		t.Fatalf("direct State.Call(dofile) expected 7, got %v", res[0])
 	}
+}
+
+func TestFileFlushSynchronizesBufferedInput(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "flush_sync.txt")
+	if err := os.WriteFile(path, []byte("abcdef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	script := `
+local p = ...
+local r = assert(io.open(p, "rb"))
+assert(r:read(1) == "a")
+assert(r:flush())
+local w = assert(io.open(p, "r+b"))
+assert(w:seek("set", 1))
+assert(w:write("X"))
+assert(w:close())
+assert(r:read(1) == "X", "flush must discard stale read-ahead bytes")
+assert(r:close())
+
+-- Verify read -> flush -> write on r+b writes at logical position
+local rw = assert(io.open(p, "r+b"))
+assert(rw:read(1) == "a")
+assert(rw:flush())
+assert(rw:write("Z"))
+assert(rw:flush())
+assert(rw:seek("set", 0))
+assert(rw:read("a") == "aZcdef")
+assert(rw:close())
+`
+	s := vm.NewState()
+	defer s.Close()
+	cl, err := s.LoadChunk([]byte(script), "=flush_sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(cl, vm.StringValue(s.Intern(path))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-seekable pipe flush must succeed and preserve unread buffered input.
+	if runtime.GOOS != "windows" {
+		pipeScript := `
+local p = assert(io.popen("printf hello", "r"))
+assert(p:read(2) == "he")
+assert(p:flush())
+assert(p:read("a") == "llo")
+assert(p:close())
+`
+		cl2, err := s.LoadChunk([]byte(pipeScript), "=flush_pipe")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(cl2); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUTF8ContinuationScanCancelAndBudget(t *testing.T) {
+	contRun := strings.Repeat("\x80", 4*1024*1024)
+	cases := []struct {
+		name string
+		str  string
+		n    int64
+	}{
+		{name: "forward", str: "a" + contRun, n: 2},
+		{name: "backward", str: "a" + contRun, n: -1},
+		{name: "endpos", str: "\xC2" + contRun, n: 1},
+	}
+
+	for _, tc := range cases {
+		t.Run("limit_"+tc.name, func(t *testing.T) {
+			s := vm.NewState()
+			defer s.Close()
+			s.SetInstructionLimit(100)
+			utf8Tbl := s.GetGlobal("utf8").AsTable()
+			offsetFn := utf8Tbl.RawGetStr(s.Intern("offset"))
+			_, err := s.Call(offsetFn, vm.StringValue(s.Intern(tc.str)), vm.IntValue(tc.n))
+			if !errors.Is(err, vm.ErrInstructionLimit) {
+				t.Fatalf("utf8.offset(%s) expected ErrInstructionLimit, got %v", tc.name, err)
+			}
+		})
+		t.Run("cancel_"+tc.name, func(t *testing.T) {
+			s := vm.NewState()
+			defer s.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			s.SetContext(ctx)
+			utf8Tbl := s.GetGlobal("utf8").AsTable()
+			offsetFn := utf8Tbl.RawGetStr(s.Intern("offset"))
+			_, err := s.Call(offsetFn, vm.StringValue(s.Intern(tc.str)), vm.IntValue(tc.n))
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("utf8.offset(%s) expected context.Canceled, got %v", tc.name, err)
+			}
+		})
+	}
+
+	t.Run("codes_iter_pos0_limit", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		utf8Tbl := s.GetGlobal("utf8").AsTable()
+		codesFn := utf8Tbl.RawGetStr(s.Intern("codes"))
+		res, err := s.Call(codesFn, vm.StringValue(s.Intern("a")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		iterFn := res[0]
+		s.SetInstructionLimit(100)
+		_, err = s.Call(iterFn, vm.StringValue(s.Intern(contRun)), vm.IntValue(0))
+		if !errors.Is(err, vm.ErrInstructionLimit) {
+			t.Fatalf("utf8.codes iter(pos=0) expected ErrInstructionLimit, got %v", err)
+		}
+	})
 }
