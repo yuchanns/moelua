@@ -88,7 +88,6 @@ func cloneFromStdTemplate(noEnv bool) *State {
 		shapes:           newShapeRegistry(),
 		protos:           []*boundProto{nil},
 		tables:           []*Table{nil},
-		threads:          []*Thread{nil},
 		nextRefID:        1,
 		out:              os.Stdout,
 		errOut:           os.Stderr,
@@ -99,7 +98,10 @@ func cloneFromStdTemplate(noEnv bool) *State {
 	s.initCollector()
 	s.seedRNG(makeRandomSeed(s), 0)
 
-	th := newThread(s, initFastStackCap)
+	th, err := s.newThread(initFastStackCap, initFastFrameCap)
+	if err != nil {
+		panic(err)
+	}
 	th.nny = 1 // main thread is never yieldable (L->nny = 1)
 	s.mainThreadRef = th.self
 	s.curRef = th.self

@@ -117,14 +117,14 @@ func (u *Upvalue) tokenID() uint64 {
 
 func (u *Upvalue) Get(s *State) Value {
 	if u.ownerRef != arena.NullRef {
-		return s.threadByRef(u.ownerRef).stack[u.stackIdx]
+		return arena.AsSmall[Thread](s.arena, u.ownerRef).stackSlice(s.arena)[u.stackIdx]
 	}
 	return u.closed
 }
 
 func (u *Upvalue) Set(s *State, v Value) {
 	if u.ownerRef != arena.NullRef {
-		s.threadByRef(u.ownerRef).stack[u.stackIdx] = v
+		arena.AsSmall[Thread](s.arena, u.ownerRef).stackSlice(s.arena)[u.stackIdx] = v
 		return
 	}
 	u.closed = v
@@ -246,18 +246,17 @@ const (
 	ridxMainThread = 3 // LUA_RIDX_MAINTHREAD
 )
 
-// tableStub and threadStub are 16-byte noscan Arena GC headers bridging Go-heap
-// Table and Thread structs into State.collector until Step 5d migrates them into Arena.
+// tableStub is a 16-byte noscan Arena GC header bridging Go-heap Table structs
+// into State.collector until Step 5e migrates Table and Shape into Arena.
 type tableStub struct {
 	hdr  arena.GCHeader // 8B: Kind=gcKindTable
 	self arena.ObjRef   // 4B
 	idx  uint32         // 4B: 1-based index into State.tables
 }
 
-type threadStub struct {
-	hdr  arena.GCHeader // 8B: Kind=gcKindThread
-	self arena.ObjRef   // 4B
-	idx  uint32         // 4B: 1-based index into State.threads
+type deferredStackFree struct {
+	ref arena.ObjRef
+	len int
 }
 
 // State is a single-goroutine Lua 5.5.1 execution state (multiple States share immutable Protos
@@ -280,15 +279,14 @@ type State struct {
 	protos       []*boundProto
 	freeProtoIDs []uint32
 
-	// Live Go-heap Table & Thread tables indexed by tableStub.idx / threadStub.idx (cleared on sweep).
-	tables        []*Table
-	freeTableIDs  []uint32
-	threads       []*Thread
-	freeThreadIDs []uint32
+	// Live Go-heap Table slice indexed by tableStub.idx (cleared on sweep).
+	tables       []*Table
+	freeTableIDs []uint32
 
 	// Weak/auxiliary GC tracking lists (noscan []ObjRef; maintained in PreSweep).
 	hashedTables       []arena.ObjRef
 	twups              []arena.ObjRef
+	deferredStackFrees []deferredStackFree
 	hasDeadHashKeys    bool
 	preserveFramesInGC bool
 
@@ -375,17 +373,6 @@ func (s *State) tableByRef(ref arena.ObjRef) *Table {
 	return nil
 }
 
-func (s *State) threadByRef(ref arena.ObjRef) *Thread {
-	if ref == arena.NullRef {
-		return nil
-	}
-	idx := arena.AsSmall[threadStub](s.arena, ref).idx
-	if int(idx) < len(s.threads) {
-		return s.threads[idx]
-	}
-	return nil
-}
-
 func (s *State) allocTableStub(t *Table) {
 	ref, err := s.collector.Alloc(int(unsafe.Sizeof(tableStub{})), gcKindTable)
 	if err != nil {
@@ -407,29 +394,6 @@ func (s *State) allocTableStub(t *Table) {
 	stub.self = ref
 	stub.idx = idx
 	t.self = ref
-}
-
-func (s *State) allocThreadStub(th *Thread) {
-	ref, err := s.collector.Alloc(int(unsafe.Sizeof(threadStub{})), gcKindThread)
-	if err != nil {
-		panic(err)
-	}
-	var idx uint32
-	if n := len(s.freeThreadIDs); n > 0 {
-		idx = s.freeThreadIDs[n-1]
-		s.freeThreadIDs = s.freeThreadIDs[:n-1]
-		s.threads[idx] = th
-	} else {
-		if len(s.threads) == 0 {
-			s.threads = []*Thread{nil}
-		}
-		idx = uint32(len(s.threads))
-		s.threads = append(s.threads, th)
-	}
-	stub := arena.AsSmall[threadStub](s.arena, ref)
-	stub.self = ref
-	stub.idx = idx
-	th.self = ref
 }
 
 func (s *State) addTableMem(t *Table, delta int64) {
@@ -456,46 +420,6 @@ func (s *State) subTableMem(t *Table, delta int64) {
 	s.subExtraMem(delta)
 }
 
-func (s *State) addThreadMem(th *Thread, delta int64) {
-	if delta <= 0 {
-		return
-	}
-	th.memBytes += delta
-	s.extraMemBytes += delta
-	if s.collector != nil {
-		s.collector.AddDebt(delta)
-	}
-}
-
-func (s *State) subThreadMem(th *Thread, delta int64) {
-	if delta <= 0 {
-		return
-	}
-	if th.memBytes > delta {
-		th.memBytes -= delta
-	} else {
-		delta = th.memBytes
-		th.memBytes = 0
-	}
-	s.subExtraMem(delta)
-}
-
-func (s *State) newThread(stackCap, _ int) (*Thread, error) {
-	return newThread(s, stackCap), nil
-}
-
-func (s *State) allocOpenUpval(th *Thread, stackIdx int) (*Upvalue, error) {
-	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Upvalue{})), gcKindUpvalue)
-	if err != nil {
-		return nil, err
-	}
-	uv := arena.AsSmall[Upvalue](s.arena, ref)
-	uv.self = ref
-	uv.ownerRef = th.self
-	uv.stackIdx = int32(stackIdx)
-	return uv, nil
-}
-
 func (s *State) asTable(v Value) *Table {
 	return s.tableByRef(v.Ref())
 }
@@ -505,7 +429,7 @@ func (s *State) asClosure(v Value) *Closure {
 }
 
 func (s *State) asThread(v Value) *Thread {
-	return s.threadByRef(v.Ref())
+	return arena.AsSmall[Thread](s.arena, v.Ref())
 }
 
 func (s *State) asUserdata(v Value) *Userdata {
@@ -545,11 +469,17 @@ func (s *State) boundProtoOf(cl *Closure) *boundProto {
 }
 
 func (s *State) mainThread() *Thread {
-	return s.threadByRef(s.mainThreadRef)
+	if s.mainThreadRef == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Thread](s.arena, s.mainThreadRef)
 }
 
 func (s *State) cur() *Thread {
-	return s.threadByRef(s.curRef)
+	if s.curRef == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Thread](s.arena, s.curRef)
 }
 
 func (s *State) registry() *Table {
@@ -672,7 +602,6 @@ func newBootstrapState() *State {
 		shapes:           newShapeRegistry(),
 		protos:           []*boundProto{nil},
 		tables:           []*Table{nil},
-		threads:          []*Thread{nil},
 		nextRefID:        1,
 		out:              os.Stdout,
 		errOut:           os.Stderr,
@@ -819,7 +748,7 @@ func isGCRootable(v Value) bool {
 // ensureStackWithRoots grows th.stack to hold need slots while rooting extra and args
 // across any emergency GC triggered when s.memLimit > 0. Zero overhead when stack fits.
 func (s *State) ensureStackWithRoots(th *Thread, need int, extra Value, args []Value) error {
-	if need+stackSlack <= len(th.stack) {
+	if need+stackSlack <= th.stackLen {
 		return nil
 	}
 	if s.memLimit > 0 {
@@ -844,7 +773,7 @@ func (s *State) ensureStackWithRoots(th *Thread, need int, extra Value, args []V
 // ensureFrameCapWithRoots grows th.frames to hold need entries while rooting extra and args
 // across any emergency GC triggered when s.memLimit > 0. Zero overhead when frames fit.
 func (s *State) ensureFrameCapWithRoots(th *Thread, need, limit int, extra Value, args []Value) error {
-	if need <= len(th.frames) {
+	if need <= th.framesCap {
 		return nil
 	}
 	if s.memLimit > 0 {
@@ -1540,8 +1469,9 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 	frames := th.framesSlice(s.arena)
 	for fi := range th.nframe {
 		cf := &frames[fi]
-		if cf.kind == frameLua && cf.cl != nil {
-			if end := cf.base + int(s.boundProtoOf(cf.cl).maxStack); end > base {
+		if cf.kind == frameLua && cf.clRef != arena.NullRef {
+			cl := arena.AsSmall[Closure](s.arena, cf.clRef)
+			if end := cf.base + int(s.boundProtoOf(cl).maxStack); end > base {
 				base = end
 			}
 		}
@@ -1760,8 +1690,9 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		frames := th.framesSlice(s.arena)
 		for fi := range th.nframe {
 			cf := &frames[fi]
-			if cf.kind == frameLua && cf.cl != nil {
-				if end := cf.base + int(s.boundProtoOf(cf.cl).maxStack); end > base {
+			if cf.kind == frameLua && cf.clRef != arena.NullRef {
+				cl := arena.AsSmall[Closure](s.arena, cf.clRef)
+				if end := cf.base + int(s.boundProtoOf(cl).maxStack); end > base {
 					base = end
 				}
 			}
@@ -1878,8 +1809,9 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	base := th.top
 	if th.nframe > 0 {
 		prev := &th.framesSlice(s.arena)[th.nframe-1]
-		if prev.kind == frameLua && prev.cl != nil {
-			if prevEnd := prev.base + int(s.boundProtoOf(prev.cl).maxStack); prevEnd > base {
+		if prev.kind == frameLua && prev.clRef != arena.NullRef {
+			prevCL := arena.AsSmall[Closure](s.arena, prev.clRef)
+			if prevEnd := prev.base + int(s.boundProtoOf(prevCL).maxStack); prevEnd > base {
 				base = prevEnd
 			}
 		}
@@ -2004,8 +1936,9 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 			base := th.top
 			if th.nframe > 0 {
 				prev := &th.framesSlice(s.arena)[th.nframe-1]
-				if prev.kind == frameLua && prev.cl != nil {
-					if prevEnd := prev.base + int(s.boundProtoOf(prev.cl).maxStack); prevEnd > base {
+				if prev.kind == frameLua && prev.clRef != arena.NullRef {
+					prevCL := arena.AsSmall[Closure](s.arena, prev.clRef)
+					if prevEnd := prev.base + int(s.boundProtoOf(prevCL).maxStack); prevEnd > base {
 						base = prevEnd
 					}
 				}
@@ -2014,7 +1947,7 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 			argBase := funcIdx + 1
 			maxStack := int(bp.maxStack)
 			need := argBase + max(len(args), maxStack) + 8
-			if need+stackSlack <= len(th.stack) && th.nframe < len(th.frames) {
+			if need+stackSlack <= th.stackLen && th.nframe < th.framesCap {
 				stack := th.stackSlice(s.arena)
 				stack[funcIdx] = fn
 				copy(stack[argBase:argBase+len(args)], args)
@@ -2035,7 +1968,7 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 				if nf.dirty {
 					*nf = callFrame{}
 				}
-				nf.cl = cl
+				nf.clRef = cl.self
 				nf.base = argBase
 				nf.funcIdx = funcIdx
 				nf.pc = 0

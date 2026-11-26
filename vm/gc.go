@@ -107,11 +107,27 @@ func (s *State) gcAuxBytes(a *arena.Arena, ref arena.ObjRef) int64 {
 		}
 		return total
 	case gcKindThread:
-		th := s.threadByRef(ref)
-		if th == nil {
-			return 0
+		th := arena.AsSmall[Thread](a, ref)
+		var total int64
+		if th.stackRef != arena.NullRef {
+			total += int64(a.SlotSize(th.stackRef))
 		}
-		return th.memBytes
+		if th.framesRef != arena.NullRef {
+			total += int64(a.SlotSize(th.framesRef))
+		}
+		if th.openUpvalsRef != arena.NullRef {
+			total += int64(a.SlotSize(th.openUpvalsRef))
+		}
+		if th.tbcRef != arena.NullRef {
+			total += int64(a.SlotSize(th.tbcRef))
+		}
+		if th.yieldValsRef != arena.NullRef {
+			total += int64(a.SlotSize(th.yieldValsRef))
+		}
+		if th.syncCloseRef != arena.NullRef {
+			total += int64(a.SlotSize(th.syncCloseRef))
+		}
+		return total
 	case gcKindProto:
 		ap := arena.AsSmall[ArenaProto](a, ref)
 		var total int64
@@ -278,11 +294,7 @@ func (s *State) gcTraverse(c *arena.Collector, ref arena.ObjRef) int64 {
 		}
 		return int64(1 + len(uvals) + len(grefs))
 	case gcKindThread:
-		th := s.threadByRef(ref)
-		if th == nil {
-			return 1
-		}
-		return s.gcTraverseThread(c, th)
+		return s.gcTraverseThread(c, arena.AsSmall[Thread](a, ref))
 	case gcKindProto:
 		ap := arena.AsSmall[ArenaProto](a, ref)
 		if ap.constsRef != arena.NullRef {
@@ -588,41 +600,43 @@ func (s *State) gcClearByKeys(c *arena.Collector, ref arena.ObjRef) {
 }
 
 func (s *State) gcTraverseThread(c *arena.Collector, th *Thread) int64 {
+	a := s.arena
 	// Threads always stay on grayAgain so stack writes need zero write barriers (lgc.c:traversethread).
 	c.MarkGrayAgain(th.self)
 
-	if th.caller != nil && th.caller.self != arena.NullRef {
-		c.MarkObject(th.caller.self)
+	if th.callerRef != arena.NullRef {
+		c.MarkObject(th.callerRef)
 	}
-	frames := th.frames
+	frames := th.framesSlice(a)
 	maxFrameEnd := th.top
 	for i := range th.nframe {
 		cf := &frames[i]
-		if cf.cl != nil && cf.cl.self != arena.NullRef {
-			c.MarkObject(cf.cl.self)
-			if end := cf.base + int(s.boundProtoOf(cf.cl).maxStack); end > maxFrameEnd {
+		if cf.clRef != arena.NullRef {
+			c.MarkObject(cf.clRef)
+			cl := arena.AsSmall[Closure](a, cf.clRef)
+			if end := cf.base + int(s.boundProtoOf(cl).maxStack); end > maxFrameEnd {
 				maxFrameEnd = end
 			}
 		}
 		s.markValue(c, cf.errFunc)
 		s.markValue(c, cf.closeErr)
 		s.markValue(c, cf.nativeFn)
-		if cf.varargTab != nil && cf.varargTab.self != arena.NullRef {
-			c.MarkObject(cf.varargTab.self)
+		if cf.varargTabRef != arena.NullRef {
+			c.MarkObject(cf.varargTabRef)
 		}
 	}
 	s.markValue(c, th.errObj)
 	s.markValue(c, th.lastErrNative)
 	s.markValue(c, th.yieldNativeFn)
 	s.markValue(c, th.hook)
-	for _, yv := range th.yieldVals {
+	for _, yv := range th.yieldValsSlice(a) {
 		s.markValue(c, yv)
 	}
-	for _, ce := range th.syncCloseErrs {
+	for _, ce := range th.syncCloseSlice(a) {
 		s.markValue(c, ce)
 	}
 
-	stack := th.stack
+	stack := th.stackSlice(a)
 	lim := th.top
 	inAtomic := c.State() == arena.GCSAtomic
 	if !inAtomic || s.preserveFramesInGC {
@@ -637,7 +651,8 @@ func (s *State) gcTraverseThread(c *arena.Collector, th *Thread) int64 {
 		s.markValue(c, stack[i])
 	}
 	maxOpenUpvalIdx := -1
-	for _, uv := range th.openUpvals {
+	for _, uvRef := range th.openUpvalsSlice(a) {
+		uv := arena.AsSmall[Upvalue](a, uvRef)
 		idx := int(uv.stackIdx)
 		if idx < len(stack) {
 			s.markValue(c, stack[idx])
@@ -656,36 +671,41 @@ func (s *State) gcTraverseThread(c *arena.Collector, th *Thread) int64 {
 		}
 		// Shrink oversized stacks on non-running coroutines (matching lgc.c:traversethread).
 		if th.self != s.curRef && th.self != s.mainThreadRef && !c.IsEmergency() {
-			if th.status == ThreadDead && th.nframe == 0 && th.top == 0 && len(th.openUpvals) == 0 && len(th.tbc) == 0 {
-				if len(th.stack) > 8 {
-					freed := int64(len(th.stack)-1) * 16
-					th.stack = []Value{NilValue()}
-					th.stackGen++
-					s.subThreadMem(th, freed)
+			if th.status == ThreadDead && th.nframe == 0 && th.top == 0 && th.openUpvalsLen == 0 && th.tbcLen == 0 {
+				if th.stackLen > 8 && th.stackRef != arena.NullRef {
+					if sref, err := a.Alloc(16); err == nil {
+						arena.SliceFast[Value](a, sref, 0, 1)[0] = NilValue()
+						a.Free(th.stackRef)
+						th.stackRef = sref
+						th.stackLen = 1
+						th.stackGen++
+					}
 				}
-				if len(th.frames) > 0 {
-					freed := int64(len(th.frames)) * int64(unsafe.Sizeof(callFrame{}))
-					th.frames = nil
-					s.subThreadMem(th, freed)
+				if th.framesRef != arena.NullRef {
+					a.Free(th.framesRef)
+					th.framesRef = arena.NullRef
+					th.framesCap = 0
 				}
 			} else if th.status == ThreadSuspended {
 				keepEnd := max(lim, maxFrameEnd)
 				if maxOpenUpvalIdx+1 > keepEnd {
 					keepEnd = maxOpenUpvalIdx + 1
 				}
-				if len(th.tbc) > 0 && th.tbc[len(th.tbc)-1]+1 > keepEnd {
-					keepEnd = th.tbc[len(th.tbc)-1] + 1
+				if tbc := th.tbcSlice(a); len(tbc) > 0 && int(tbc[len(tbc)-1])+1 > keepEnd {
+					keepEnd = int(tbc[len(tbc)-1]) + 1
 				}
 				needed := max(keepEnd+stackSlack, 128)
-				if len(th.stack) > needed*4 && len(th.stack) > 2048 {
-					freed := int64(len(th.stack)-needed) * 16
-					shrunk := make([]Value, needed)
-					copyLen := min(keepEnd, len(stack))
-					copy(shrunk, stack[:copyLen])
-					fillNil(shrunk[copyLen:])
-					th.stack = shrunk
-					th.stackGen++
-					s.subThreadMem(th, freed)
+				if th.stackLen > needed*4 && th.stackLen > 2048 {
+					if sref, err := a.Alloc(needed * int(unsafe.Sizeof(Value{}))); err == nil {
+						shrunk := arena.SliceFast[Value](a, sref, 0, needed)
+						copyLen := min(keepEnd, len(stack))
+						copy(shrunk, stack[:copyLen])
+						fillNil(shrunk[copyLen:])
+						a.Free(th.stackRef)
+						th.stackRef = sref
+						th.stackLen = needed
+						th.stackGen++
+					}
 				}
 			}
 		}
@@ -694,14 +714,13 @@ func (s *State) gcTraverseThread(c *arena.Collector, th *Thread) int64 {
 }
 
 func (s *State) gcRemarkUpvals(c *arena.Collector) {
+	a := s.arena
 	for _, thRef := range s.twups {
-		th := s.threadByRef(thRef)
-		if th == nil {
-			continue
-		}
-		stack := th.stack
-		for _, uv := range th.openUpvals {
-			if !c.IsWhite(uv.self) {
+		th := arena.AsSmall[Thread](a, thRef)
+		stack := th.stackSlice(a)
+		for _, uvRef := range th.openUpvalsSlice(a) {
+			if !c.IsWhite(uvRef) {
+				uv := arena.AsSmall[Upvalue](a, uvRef)
 				if uv.ownerRef == thRef && int(uv.stackIdx) < len(stack) {
 					s.markValue(c, stack[uv.stackIdx])
 				}
@@ -711,17 +730,17 @@ func (s *State) gcRemarkUpvals(c *arena.Collector) {
 }
 
 func (s *State) gcPreSweep(c *arena.Collector) {
+	a := s.arena
+
 	// 1. Close surviving open upvalues on dead threads; prune dead open upvalues on live threads.
 	keptTwups := 0
 	for _, thRef := range s.twups {
-		th := s.threadByRef(thRef)
-		if th == nil {
-			continue
-		}
+		th := arena.AsSmall[Thread](a, thRef)
 		if c.IsWhite(thRef) {
-			stack := th.stack
-			for _, uv := range th.openUpvals {
-				if !c.IsWhite(uv.self) {
+			stack := th.stackSlice(a)
+			for _, uvRef := range th.openUpvalsSlice(a) {
+				if !c.IsWhite(uvRef) {
+					uv := arena.AsSmall[Upvalue](a, uvRef)
 					if uv.ownerRef == thRef {
 						val := NilValue()
 						if int(uv.stackIdx) < len(stack) {
@@ -731,22 +750,21 @@ func (s *State) gcPreSweep(c *arena.Collector) {
 					}
 				}
 			}
-			clear(th.openUpvals)
-			th.openUpvals = nil
-			th.inTwups = false
+			th.openUpvalsLen = 0
+			th.hdr.Flags &^= thFlagInTwups
 			continue
 		}
+		ups := th.openUpvalsSlice(a)
 		k := 0
-		for _, uv := range th.openUpvals {
-			if !c.IsWhite(uv.self) {
-				th.openUpvals[k] = uv
+		for _, uvRef := range ups {
+			if !c.IsWhite(uvRef) {
+				ups[k] = uvRef
 				k++
 			}
 		}
-		clear(th.openUpvals[k:])
-		th.openUpvals = th.openUpvals[:k]
+		th.openUpvalsLen = int32(k)
 		if k == 0 {
-			th.inTwups = false
+			th.hdr.Flags &^= thFlagInTwups
 			continue
 		}
 		s.twups[keptTwups] = thRef
@@ -1007,16 +1025,27 @@ func (s *State) gcFreeObject(a *arena.Arena, ref arena.ObjRef) {
 		}
 		a.Free(ref)
 	case gcKindThread:
-		stub := arena.AsSmall[threadStub](a, ref)
-		if int(stub.idx) > 0 && int(stub.idx) < len(s.threads) {
-			if th := s.threads[stub.idx]; th != nil {
-				s.subExtraMem(th.memBytes)
-				th.memBytes = 0
-				th.self = arena.NullRef
-				th.clearDeadRefs(s)
-				s.threads[stub.idx] = nil
-				s.freeThreadIDs = append(s.freeThreadIDs, stub.idx)
-			}
+		th := arena.AsSmall[Thread](a, ref)
+		if th.stackRef != arena.NullRef {
+			a.Free(th.stackRef)
+		}
+		if th.framesRef != arena.NullRef {
+			a.Free(th.framesRef)
+		}
+		if th.openUpvalsRef != arena.NullRef {
+			a.Free(th.openUpvalsRef)
+		}
+		if th.tbcRef != arena.NullRef {
+			a.Free(th.tbcRef)
+		}
+		if th.yieldValsRef != arena.NullRef {
+			a.Free(th.yieldValsRef)
+		}
+		if th.syncCloseRef != arena.NullRef {
+			a.Free(th.syncCloseRef)
+		}
+		if th.uncaughtErrRef != arena.NullGoHandle && s.goRefs != nil {
+			s.goRefs.Free(th.uncaughtErrRef)
 		}
 		a.Free(ref)
 	case gcKindProto:
@@ -1240,12 +1269,11 @@ func (s *State) Close() {
 		s.pinnedRefs = nil
 		s.hashedTables = nil
 		s.twups = nil
+		s.deferredStackFrees = nil
 		s.protos = nil
 		s.freeProtoIDs = nil
 		s.tables = nil
 		s.freeTableIDs = nil
-		s.threads = nil
-		s.freeThreadIDs = nil
 		if s.goRefs != nil {
 			s.goRefs.ClearAll()
 		}
