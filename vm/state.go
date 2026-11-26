@@ -1241,6 +1241,7 @@ func (s *State) TryNewUserdata(data any, nUValues int) (Value, error) {
 	u := &Userdata{Data: data}
 	if nUValues > 0 {
 		u.UValues = make([]Value, nUValues)
+		fillNil(u.UValues)
 	}
 	return UserdataValue(u), nil
 }

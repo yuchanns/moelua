@@ -2181,33 +2181,73 @@ func nativeFileWrite(s *State, args []Value) ([]Value, error) {
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
-	var totalBytes int64
-	for i, a := range args[1:] {
-		if !a.IsString() && !a.IsNumber() {
-			return nil, fmt.Errorf("bad argument #%d to 'write' (string expected, got %s)", s.methodArgNum(i+2), s.objTypeName(a))
+	const writeCancelChunk = 64 * 1024
+	cancelFn := s.nativeCancelFunc()
+	if cancelFn != nil {
+		if err := s.checkPreCancel(); err != nil {
+			return nil, err
 		}
-		str := FormatValue(a)
+	}
+	var totalBytes int64
+	var bytesSincePoll int
+	writeChunk := func(chunk string) ([]Value, error) {
 		if lf.w != nil {
-			n, err := lf.w.WriteString(str)
+			n, err := lf.w.WriteString(chunk)
 			totalBytes += int64(n)
 			if err != nil {
 				written := max(int64(0), totalBytes-int64(lf.w.Buffered()))
 				lf.w.Reset(lf.f)
 				return append(ioFail(s, err), IntValue(written)), nil
 			}
-			if lf.bufMode == bufModeLine && strings.ContainsRune(str, '\n') {
+			if lf.bufMode == bufModeLine && strings.ContainsRune(chunk, '\n') {
 				if err := lf.w.Flush(); err != nil {
 					written := max(int64(0), totalBytes-int64(lf.w.Buffered()))
 					lf.w.Reset(lf.f)
 					return append(ioFail(s, err), IntValue(written)), nil
 				}
 			}
-		} else {
-			n, err := lf.f.WriteString(str)
-			totalBytes += int64(n)
-			if err != nil {
-				return append(ioFail(s, err), IntValue(totalBytes)), nil
+			return nil, nil
+		}
+		n, err := lf.f.WriteString(chunk)
+		totalBytes += int64(n)
+		if err != nil {
+			return append(ioFail(s, err), IntValue(totalBytes)), nil
+		}
+		return nil, nil
+	}
+	for i, a := range args[1:] {
+		if !a.IsString() && !a.IsNumber() {
+			return nil, fmt.Errorf("bad argument #%d to 'write' (string expected, got %s)", s.methodArgNum(i+2), s.objTypeName(a))
+		}
+		if cancelFn != nil && i > 0 && (i&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
 			}
+		}
+		str := FormatValue(a)
+		if cancelFn == nil || (len(str) < writeCancelChunk && bytesSincePoll+len(str) < writeCancelChunk) {
+			if cancelFn != nil {
+				bytesSincePoll += len(str)
+			}
+			if fail, err := writeChunk(str); fail != nil || err != nil {
+				return fail, err
+			}
+			continue
+		}
+		for off := 0; off < len(str); {
+			end := min(off+writeCancelChunk, len(str))
+			chunk := str[off:end]
+			bytesSincePoll += len(chunk)
+			if bytesSincePoll >= writeCancelChunk {
+				bytesSincePoll = 0
+				if err := cancelFn(); err != nil {
+					return nil, err
+				}
+			}
+			if fail, err := writeChunk(chunk); fail != nil || err != nil {
+				return fail, err
+			}
+			off = end
 		}
 	}
 	return []Value{args[0]}, nil
