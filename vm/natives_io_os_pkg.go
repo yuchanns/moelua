@@ -195,10 +195,26 @@ func (s *State) initBaseExtra() {
 }
 
 func (s *State) emitWarning(msg string) {
-	if !s.warnOn {
+	if !s.warnOn || s.errOut == nil {
 		return
 	}
 	_, _ = fmt.Fprintf(s.errOut, "Lua warning: %s\n", msg)
+}
+
+func (s *State) emitWarningParts(parts ...string) error {
+	if !s.warnOn || s.errOut == nil {
+		return nil
+	}
+	cancelFn := s.nativeCancelFunc()
+	work := 0
+	_, _ = io.WriteString(s.errOut, "Lua warning: ")
+	for _, p := range parts {
+		if err := writeIOStringWithCancel(s.errOut, p, cancelFn, &work); err != nil {
+			return err
+		}
+	}
+	_, _ = io.WriteString(s.errOut, "\n")
+	return nil
 }
 
 func nativeWarn(s *State, args []Value) ([]Value, error) {
@@ -3124,8 +3140,21 @@ func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'searcher_preload' (string expected)")
 	}
-	name := FormatValue(args[0])
-	key := s.intern.Intern(name)
+	var (
+		name string
+		key  *LuaString
+		err  error
+	)
+	if args[0].IsString() {
+		key = args[0].AsString()
+		name = key.S
+	} else {
+		name = FormatValue(args[0])
+		key, err = s.TryIntern(name)
+		if err != nil {
+			return nil, err
+		}
+	}
 	preloadVal, err := s.registryField("_PRELOAD")
 	if err != nil {
 		return nil, err
@@ -3135,12 +3164,11 @@ func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
 		return nil, err
 	}
 	if v.IsNil() {
-		if s.memLimit > 0 {
-			if err := s.checkMem(int64(len(name)) + 80); err != nil {
-				return nil, err
-			}
+		msg, jerr := s.joinStringsWithCancel("no field package.preload['", name, "']")
+		if jerr != nil {
+			return nil, jerr
 		}
-		ls, err := s.TryIntern(fmt.Sprintf("no field package.preload['%s']", name))
+		ls, err := s.TryIntern(msg)
 		if err != nil {
 			return nil, err
 		}
@@ -3181,7 +3209,11 @@ func nativeSearcherLua(s *State, args []Value) ([]Value, error) {
 		return nil, err
 	}
 	if res[0].IsNil() {
-		return nil, fmt.Errorf("error loading module '%s' from file '%s':\n\t%s", name, fname, FormatValue(res[1]))
+		msg, jerr := s.joinStringsWithCancel("error loading module '", name, "' from file '", fname, "':\n\t", FormatValue(res[1]))
+		if jerr != nil {
+			return nil, jerr
+		}
+		return nil, errors.New(msg)
 	}
 	return []Value{res[0], StringValue(fnameLS)}, nil
 }
@@ -3213,8 +3245,21 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'require' (string expected)")
 	}
-	name := FormatValue(args[0])
-	key := s.intern.Intern(name)
+	var (
+		name string
+		key  *LuaString
+		err  error
+	)
+	if args[0].IsString() {
+		key = args[0].AsString()
+		name = key.S
+	} else {
+		name = FormatValue(args[0])
+		key, err = s.TryIntern(name)
+		if err != nil {
+			return nil, err
+		}
+	}
 	loadedVal, err := s.registryField("_LOADED")
 	if err != nil {
 		return nil, err
@@ -3261,12 +3306,40 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	}
 	st := sv.AsTable()
 	th.stack[baseTop+1] = sv
+	cancelFn := s.nativeCancelFunc()
 	var errs strings.Builder
+	errWork := 0
+	hasErrPrefix := false
+	ensureErrPrefix := func() error {
+		if hasErrPrefix {
+			return nil
+		}
+		if s.memLimit > 0 {
+			if merr := s.checkMem(int64(len(name)) + 64); merr != nil {
+				return merr
+			}
+		}
+		errs.WriteString("module '")
+		if cerr := writeStringWithCancel(&errs, name, cancelFn, &errWork); cerr != nil {
+			return cerr
+		}
+		errs.WriteString("' not found:")
+		hasErrPrefix = true
+		return nil
+	}
 	var loader, extra Value
 	for i := int64(1); ; i++ {
+		if cancelFn != nil && i > 1 && (i&63) == 0 {
+			if cerr := cancelFn(); cerr != nil {
+				return nil, cerr
+			}
+		}
 		searcher := st.RawGetInt(i)
 		if searcher.IsNil() {
-			return nil, fmt.Errorf("module '%s' not found:%s", name, errs.String())
+			if cerr := ensureErrPrefix(); cerr != nil {
+				return nil, cerr
+			}
+			return nil, errors.New(errs.String())
 		}
 		res, err := s.Call(searcher, StringValue(key))
 		if err != nil {
@@ -3282,6 +3355,9 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 			break
 		}
 		if len(res) > 0 && (res[0].IsString() || res[0].IsNumber()) {
+			if cerr := ensureErrPrefix(); cerr != nil {
+				return nil, cerr
+			}
 			smsg := FormatValue(res[0])
 			if s.memLimit > 0 {
 				if merr := s.checkMem(int64(errs.Len()) + int64(len(smsg)) + 64); merr != nil {
@@ -3289,7 +3365,9 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 				}
 			}
 			errs.WriteString("\n\t")
-			errs.WriteString(smsg)
+			if cerr := writeStringWithCancel(&errs, smsg, cancelFn, &errWork); cerr != nil {
+				return nil, cerr
+			}
 		}
 	}
 	th.stack[baseTop+1] = loader
@@ -3633,14 +3711,19 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 	if pv := s.pkgTbl.RawGetStr(s.intern.Intern("path")); pv.IsString() {
 		pathStr = pv.AsString().S
 	}
+	cancelFn := s.nativeCancelFunc()
 	if _, err := s.checkedReplaceSize(name, ".", "/"); err != nil {
 		return nil, err
 	}
-	rel := strings.ReplaceAll(name, ".", "/")
+	rel, err := replaceAllWithCancel(name, ".", "/", cancelFn)
+	if err != nil {
+		return nil, err
+	}
 	var tried strings.Builder
 	var triedCount int
-	appendTried := func(msg string) error {
-		add := int64(len(msg))
+	triedWork := 0
+	appendTried := func(prefix, cand, suffix string) error {
+		add := int64(len(prefix)) + int64(len(cand)) + int64(len(suffix))
 		if triedCount > 0 {
 			add += 2
 		}
@@ -3652,22 +3735,28 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 		if triedCount > 0 {
 			tried.WriteString("\n\t")
 		}
-		tried.WriteString(msg)
+		tried.WriteString(prefix)
+		if cerr := writeStringWithCancel(&tried, cand, cancelFn, &triedWork); cerr != nil {
+			return cerr
+		}
+		tried.WriteString(suffix)
 		triedCount++
 		return nil
 	}
-	cancelFn := s.nativeCancelFunc()
 	var loadedRes []Value
-	err := s.forEachSearchCandidate(pathStr, rel, cancelFn, func(rawCand string) (bool, error) {
+	err = s.forEachSearchCandidate(pathStr, rel, cancelFn, func(rawCand string) (bool, error) {
 		if rawCand == "" {
 			return false, nil
 		}
-		cand := strings.ReplaceAll(rawCand, "\\", "/")
+		cand, cerr := replaceAllWithCancel(rawCand, "\\", "/", cancelFn)
+		if cerr != nil {
+			return false, cerr
+		}
 		for strings.HasPrefix(cand, "./") {
 			cand = cand[2:]
 		}
 		if !fs.ValidPath(cand) {
-			if err := appendTried(fmt.Sprintf("no file '%s' (invalid fs path)", cand)); err != nil {
+			if err := appendTried("no file '", cand, "' (invalid fs path)"); err != nil {
 				return false, err
 			}
 			return false, nil
@@ -3675,16 +3764,24 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 		f, err := fsys.Open(cand)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				if err := appendTried(fmt.Sprintf("no file '%s' (in fs.FS)", cand)); err != nil {
+				if err := appendTried("no file '", cand, "' (in fs.FS)"); err != nil {
 					return false, err
 				}
 				return false, nil
 			}
-			return false, fmt.Errorf("error reading module '%s' from file '%s': %w", name, cand, err)
+			msg, jerr := s.joinStringsWithCancel("error reading module '", name, "' from file '", cand, "': ", err.Error())
+			if jerr != nil {
+				return false, jerr
+			}
+			return false, errors.New(msg)
 		}
 		if fi, serr := f.Stat(); serr == nil && fi.IsDir() {
 			_ = f.Close()
-			return false, fmt.Errorf("error reading module '%s' from file '%s': is a directory", name, cand)
+			msg, jerr := s.joinStringsWithCancel("error reading module '", name, "' from file '", cand, "': is a directory")
+			if jerr != nil {
+				return false, jerr
+			}
+			return false, errors.New(msg)
 		}
 		fn, err := s.LoadChunkReader(fileErrReader{r: f}, "@"+cand)
 		_ = f.Close()
@@ -3694,12 +3791,20 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 			}
 			var fre loadFileReadErr
 			if errors.As(err, &fre) {
-				return false, fmt.Errorf("error reading module '%s' from file '%s': %w", name, cand, fre.err)
+				msg, jerr := s.joinStringsWithCancel("error reading module '", name, "' from file '", cand, "': ", fre.err.Error())
+				if jerr != nil {
+					return false, jerr
+				}
+				return false, errors.New(msg)
 			}
 			if strings.Contains(err.Error(), "not enough memory") {
 				return false, err
 			}
-			return false, fmt.Errorf("error loading module '%s' from file '%s':\n\t%s", name, cand, err.Error())
+			msg, jerr := s.joinStringsWithCancel("error loading module '", name, "' from file '", cand, "':\n\t", err.Error())
+			if jerr != nil {
+				return false, jerr
+			}
+			return false, errors.New(msg)
 		}
 		candStr, ierr := s.TryIntern(cand)
 		if ierr != nil {

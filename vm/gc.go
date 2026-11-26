@@ -1742,12 +1742,18 @@ func (s *State) runFinalizerObj(th *Thread, obj Value) bool {
 		var le *LuaError
 		if errors.As(err, &le) {
 			if le.Val.IsString() {
-				s.emitWarning(fmt.Sprintf("error in __gc (%s)", le.Val.AsString().S))
+				if werr := s.emitWarningParts("error in __gc (", le.Val.AsString().S, ")"); werr != nil {
+					s.abortErr = werr
+					return false
+				}
 			} else {
 				s.emitWarning("error in __gc (error object is not a string)")
 			}
 		} else {
-			s.emitWarning(fmt.Sprintf("error in __gc (%s)", err.Error()))
+			if werr := s.emitWarningParts("error in __gc (", err.Error(), ")"); werr != nil {
+				s.abortErr = werr
+				return false
+			}
 		}
 	}
 	return true

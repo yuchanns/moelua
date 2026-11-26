@@ -236,9 +236,9 @@ func (s *State) toStringValue(v Value) (string, error) {
 	if mt := s.getMetatableOf(v); mt != nil {
 		if nm := mt.RawGetStr(s.intern.Intern("__name")); nm.IsString() {
 			if v.IsLightUD() {
-				return fmt.Sprintf("%s: %s", nm.AsString().S, v.formatLightUDAddr()), nil
+				return s.joinStringsWithCancel(nm.AsString().S, ": ", v.formatLightUDAddr())
 			}
-			return fmt.Sprintf("%s: %p", nm.AsString().S, v.ptr), nil
+			return s.joinStringsWithCancel(nm.AsString().S, ": ", fmt.Sprintf("%p", v.ptr))
 		}
 	}
 	return FormatValue(v), nil
@@ -308,12 +308,11 @@ func nativeError(s *State, args []Value) ([]Value, error) {
 	if level > 0 && args[0].IsString() {
 		if where := s.errorWhere(level); where != "" {
 			msg := args[0].AsString().S
-			if s.memLimit > 0 {
-				if err := s.checkMem(int64(len(where)) + int64(len(msg)) + 48); err != nil {
-					return nil, err
-				}
+			joined, err := s.joinStringsWithCancel(where, msg)
+			if err != nil {
+				return nil, err
 			}
-			ls, err := s.TryIntern(where + msg)
+			ls, err := s.TryIntern(joined)
 			if err != nil {
 				return nil, err
 			}
@@ -2848,84 +2847,6 @@ func nativeStringUpper(s *State, args []Value) ([]Value, error) {
 		}
 	}
 	return []Value{StringValue(s.intern.Intern(string(b)))}, nil
-}
-
-func nativeStringFormat(s *State, args []Value) ([]Value, error) {
-	if len(args) == 0 || !args[0].IsString() {
-		return nil, fmt.Errorf("bad argument #1 to 'string.format'")
-	}
-	format := args[0].AsString().S
-	var sb strings.Builder
-	argIdx := 1
-	for i := 0; i < len(format); i++ {
-		if format[i] != '%' {
-			sb.WriteByte(format[i])
-			continue
-		}
-		i++
-		if i >= len(format) {
-			return nil, fmt.Errorf("invalid format (ends with '%%')")
-		}
-		if format[i] == '%' {
-			sb.WriteByte('%')
-			continue
-		}
-		start := i - 1
-		for i < len(format) && strings.ContainsRune("-+ #0123456789.", rune(format[i])) {
-			i++
-		}
-		if i >= len(format) {
-			return nil, fmt.Errorf("invalid format")
-		}
-		spec := format[i]
-		verb := format[start : i+1]
-		if argIdx >= len(args) {
-			return nil, fmt.Errorf("bad argument #%d to 'format' (no value)", argIdx+1)
-		}
-		a := args[argIdx]
-		argIdx++
-		switch spec {
-		case 'd', 'i':
-			iv, _, err := s.coerceInt(a)
-			if err != nil {
-				return nil, err
-			}
-			sb.WriteString(fmt.Sprintf(strings.ReplaceAll(verb, "i", "d"), iv))
-		case 'u':
-			iv, _, err := s.coerceInt(a)
-			if err != nil {
-				return nil, err
-			}
-			sb.WriteString(fmt.Sprintf(strings.ReplaceAll(verb, "u", "d"), uint64(iv)))
-		case 'x', 'X', 'o':
-			iv, _, err := s.coerceInt(a)
-			if err != nil {
-				return nil, err
-			}
-			sb.WriteString(fmt.Sprintf(verb, uint64(iv)))
-		case 'f', 'e', 'E', 'g', 'G':
-			fv, _, err := s.coerceFloat(a)
-			if err != nil {
-				return nil, err
-			}
-			sb.WriteString(fmt.Sprintf(verb, fv))
-		case 's':
-			str, err := s.toStringValue(a)
-			if err != nil {
-				return nil, err
-			}
-			sb.WriteString(fmt.Sprintf(verb, str))
-		case 'c':
-			iv, _, err := s.coerceInt(a)
-			if err != nil {
-				return nil, err
-			}
-			sb.WriteByte(byte(iv))
-		default:
-			return nil, fmt.Errorf("invalid conversion '%s' to 'format'", verb)
-		}
-	}
-	return []Value{StringValue(s.intern.Intern(sb.String()))}, nil
 }
 
 func nativeOSClock(s *State, _ []Value) ([]Value, error) {

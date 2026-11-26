@@ -2664,3 +2664,159 @@ func TestXPCallBypassesMessageHandlerOnAllocationError(t *testing.T) {
 		t.Fatalf("xpcall LUA_ERRMEM contract test failed: %v", err)
 	}
 }
+
+func TestRequireDiagnosticsAndStringFormatErrorsCancelAndBudget(t *testing.T) {
+	bigDiag := strings.Repeat("d", 8*1024*1024)
+	t.Run("require_searcher_diag_instruction_limit", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		bigVal := vm.StringValue(s.Intern(bigDiag))
+		pkgTbl := s.GetGlobal("package").AsTable()
+		searchers := s.NewTable(1, 0)
+		searchers.RawSetInt(s, 1, vm.NativeValue(&vm.NativeFunc{
+			Name: "big_diag_searcher",
+			Fn: func(*vm.State, []vm.Value) ([]vm.Value, error) {
+				return []vm.Value{bigVal}, nil
+			},
+		}))
+		pkgTbl.RawSetStr(s, s.Intern("searchers"), vm.TableValue(searchers))
+
+		reqFn := s.GetGlobal("require")
+		s.SetInstructionLimit(100)
+		_, err := s.Call(reqFn, vm.StringValue(s.Intern("missing_mod")))
+		if !errors.Is(err, vm.ErrInstructionLimit) {
+			t.Fatalf("require(64-chunk diag) expected ErrInstructionLimit, got %v", err)
+		}
+		if s.InstructionsExecuted() <= 0 {
+			t.Fatalf("expected non-zero instructions charged during require diagnostics copy")
+		}
+	})
+
+	t.Run("require_searcher_diag_context_cancel", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		bigVal := vm.StringValue(s.Intern(bigDiag))
+		pkgTbl := s.GetGlobal("package").AsTable()
+		searchers := s.NewTable(1, 0)
+		searchers.RawSetInt(s, 1, vm.NativeValue(&vm.NativeFunc{
+			Name: "big_diag_searcher",
+			Fn: func(*vm.State, []vm.Value) ([]vm.Value, error) {
+				return []vm.Value{bigVal}, nil
+			},
+		}))
+		pkgTbl.RawSetStr(s, s.Intern("searchers"), vm.TableValue(searchers))
+
+		reqFn := s.GetGlobal("require")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		s.SetContext(ctx)
+		_, err := s.Call(reqFn, vm.StringValue(s.Intern("missing_mod")))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("require(64-chunk diag) expected context.Canceled, got %v", err)
+		}
+	})
+
+	t.Run("require_normal_not_found_format", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		pkgTbl := s.GetGlobal("package").AsTable()
+		searchers := s.NewTable(2, 0)
+		searchers.RawSetInt(s, 1, vm.NativeValue(&vm.NativeFunc{
+			Name: "s1",
+			Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
+				return []vm.Value{vm.StringValue(st.Intern("no foo"))}, nil
+			},
+		}))
+		searchers.RawSetInt(s, 2, vm.NativeValue(&vm.NativeFunc{
+			Name: "s2",
+			Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
+				return []vm.Value{vm.StringValue(st.Intern("no bar"))}, nil
+			},
+		}))
+		pkgTbl.RawSetStr(s, s.Intern("searchers"), vm.TableValue(searchers))
+
+		reqFn := s.GetGlobal("require")
+		_, err := s.Call(reqFn, vm.StringValue(s.Intern("demo")))
+		want := "module 'demo' not found:\n\tno foo\n\tno bar"
+		if err == nil || err.Error() != want {
+			t.Fatalf("require not-found message = %v, want %q", err, want)
+		}
+	})
+
+	t.Run("searcher_preload_big_name_limit", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		bigVal := vm.StringValue(s.Intern(bigDiag))
+		pkgTbl := s.GetGlobal("package").AsTable()
+		searchers := pkgTbl.RawGetStr(s.Intern("searchers")).AsTable()
+		preloadFn := searchers.RawGetInt(1)
+		s.SetInstructionLimit(100)
+		_, err := s.Call(preloadFn, bigVal)
+		if !errors.Is(err, vm.ErrInstructionLimit) {
+			t.Fatalf("searcher_preload(big name) expected ErrInstructionLimit, got %v", err)
+		}
+	})
+
+	t.Run("tostring_big_name_limit", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		tbl := s.NewTable(0, 0)
+		mt := s.NewTable(0, 1)
+		mt.RawSetStr(s, s.Intern("__name"), vm.StringValue(s.Intern(bigDiag)))
+		s.SetMetatable(tbl, mt)
+		s.SetInstructionLimit(100)
+		_, err := s.Call(s.GetGlobal("tostring"), vm.TableValue(tbl))
+		if !errors.Is(err, vm.ErrInstructionLimit) {
+			t.Fatalf("tostring(big __name) expected ErrInstructionLimit, got %v", err)
+		}
+	})
+
+	t.Run("error_big_msg_limit", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		s.SetGlobal("BIG_ERR", vm.StringValue(s.Intern(bigDiag)))
+		cl, err := s.LoadChunk([]byte(`error(BIG_ERR)`), "=big_err")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetInstructionLimit(100)
+		_, err = s.Call(cl)
+		if !errors.Is(err, vm.ErrInstructionLimit) {
+			t.Fatalf("error(big msg) expected ErrInstructionLimit, got %v", err)
+		}
+	})
+}
+
+func TestNumericForNaNStepAndBoundsParity(t *testing.T) {
+	s := vm.NewState()
+	defer s.Close()
+	cl, err := s.LoadChunk([]byte(`
+		local function run(code)
+			return assert(load(code))()
+		end
+		-- Float loops with NaN step (Lua 5.5.1 lvm.c:forprep takes descending branch when !(0 < step))
+		assert(run("local c=0; for i=1.0,10.0,0/0 do c=c+1 end; return c") == 0)
+		assert(run("local c=0; for i=1,10,0/0 do c=c+1 end; return c") == 0)
+		assert(run("local c=0; for i=10.0,1.0,0/0 do c=c+1 end; return c") == 1)
+		assert(run("local c=0; for i=1.0,1.0,0/0 do c=c+1 end; return c") == 1)
+		-- Float loops with NaN init or NaN limit
+		assert(run("local c=0; for i=0/0,10.0,1.0 do c=c+1 end; return c") == 1)
+		assert(run("local c=0; for i=0/0,10.0,-1.0 do c=c+1 end; return c") == 1)
+		assert(run("local c=0; for i=1.0,0/0,1.0 do c=c+1 end; return c") == 1)
+		assert(run("local c=0; for i=1.0,0/0,-1.0 do c=c+1 end; return c") == 1)
+		-- Integer loops with NaN limit (Lua 5.5.1 lvm.c:forlimit)
+		assert(run("local c=0; for i=1,0/0,1 do c=c+1 end; return c") == 0)
+		assert(run("local c=0; for i=1,0/0,-1 do c=c+1; if c>5 then break end end; return c") == 6)
+		assert(run("local c=0; for i=math.mininteger,0/0,-1 do c=c+1; if c>5 then break end end; return c") == 1)
+		-- Infinity edge cases
+		assert(run("local c=0; for i=math.huge,-math.huge,-math.huge do c=c+1; if c>5 then break end end; return c") == 1)
+		assert(run("local c=0; for i=math.huge,math.huge,math.huge do c=c+1; if c>5 then break end end; return c") == 6)
+		assert(run("local c=0; for i=-math.huge,math.huge,math.huge do c=c+1; if c>5 then break end end; return c") == 1)
+	`), "=for_nan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(cl); err != nil {
+		t.Fatalf("numeric for NaN/Inf parity failed: %v", err)
+	}
+}

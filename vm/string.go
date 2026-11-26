@@ -156,6 +156,36 @@ func writeStringWithCancel(sb *strings.Builder, src string, cancelFn func() erro
 	return nil
 }
 
+// joinStringsWithCancel concatenates parts while checking memLimit (when enabled)
+// and polling execution controls every 64 KiB.
+func (s *State) joinStringsWithCancel(parts ...string) (string, error) {
+	var total int64
+	for _, p := range parts {
+		total += int64(len(p))
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMem(total + 48); err != nil {
+			return "", err
+		}
+	}
+	cancelFn := s.nativeCancelFunc()
+	var sb strings.Builder
+	if cancelFn == nil {
+		sb.Grow(int(total))
+		for _, p := range parts {
+			sb.WriteString(p)
+		}
+		return sb.String(), nil
+	}
+	work := 0
+	for _, p := range parts {
+		if err := writeStringWithCancel(&sb, p, cancelFn, &work); err != nil {
+			return "", err
+		}
+	}
+	return sb.String(), nil
+}
+
 // writeIOStringWithCancel writes src to w in bounded 64 KiB chunks while polling cancelFn.
 func writeIOStringWithCancel(w io.Writer, src string, cancelFn func() error, work *int) error {
 	if cancelFn == nil || len(src) == 0 {

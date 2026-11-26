@@ -256,16 +256,25 @@ func (s *State) rawRuntimeErrorToValue(th *Thread, err error) Value {
 					pc--
 				}
 				line := getFuncLine(p, pc)
+				var prefix string
 				if line > 0 {
-					msg = fmt.Sprintf("%s:%d: %s", shortSrc(p.Source), line, msg)
+					prefix = fmt.Sprintf("%s:%d: ", shortSrc(p.Source), line)
 				} else {
 					// Stripped function with no debug line info (errors.lua:309: "?:?: ...")
 					src := "?"
 					if !p.NoSource && p.Source != "" {
 						src = shortSrc(p.Source)
 					}
-					msg = fmt.Sprintf("%s:?: %s", src, msg)
+					prefix = fmt.Sprintf("%s:?: ", src)
 				}
+				joined, jerr := s.joinStringsWithCancel(prefix, msg)
+				if jerr != nil {
+					if isUncatchableErr(jerr) || s.abortErr != nil {
+						return NilValue()
+					}
+					return StringValue(s.intern.Intern("not enough memory"))
+				}
+				msg = joined
 			}
 		}
 	}
@@ -293,6 +302,9 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 		}
 	}
 	rawErrVal := s.rawRuntimeErrorToValue(th, err)
+	if s.abortErr != nil {
+		return false
+	}
 	// Locate nearest enclosing pcall/xpcall frame before unwinding anything.
 	catchIdx := -1
 	for j := th.nframe - 1; j >= entryDepth; j-- {
@@ -2456,7 +2468,15 @@ func (s *State) forPrepSlow(regs *[256]Value, a uint8) (bool, error) {
 	if step == 0 {
 		return false, fmt.Errorf("'for' step is zero")
 	}
-	if (step > 0 && lim < initV) || (step < 0 && initV < lim) {
+	// Match Lua 5.5.1 lvm.c:forprep: luai_numlt(0, step) ? luai_numlt(limit, init) : luai_numlt(init, limit)
+	// When step is NaN, step > 0 is false so the descending check (initV < lim) applies.
+	var skip bool
+	if step > 0 {
+		skip = lim < initV
+	} else {
+		skip = initV < lim
+	}
+	if skip {
 		return true, nil
 	}
 	regs[a].SetFloat(lim)
