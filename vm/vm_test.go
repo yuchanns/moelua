@@ -2387,3 +2387,156 @@ func TestUTF8ContinuationScanCancelAndBudget(t *testing.T) {
 		}
 	})
 }
+
+func TestColdOpcodeCallbackSwitchesToHookedDispatch(t *testing.T) {
+	t.Run("native_index_enables_instruction_limit", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		s.SetGlobal("arm_limit", vm.NativeValue(&vm.NativeFunc{
+			Name: "arm_limit",
+			Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
+				st.SetInstructionLimit(10)
+				return []vm.Value{vm.IntValue(1)}, nil
+			},
+		}))
+		cl, err := s.LoadChunk([]byte(`
+			local t = setmetatable({}, { __index = arm_limit })
+			local v = t.trigger
+			local sum = v
+			for i = 1, 10000 do
+				sum = sum + i
+			end
+			return sum
+		`), "=cold_limit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.Call(cl)
+		if !errors.Is(err, vm.ErrInstructionLimit) {
+			t.Fatalf("expected ErrInstructionLimit after __index callback armed limit, got %v", err)
+		}
+	})
+
+	t.Run("native_add_cold_opcode_enables_instruction_limit", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		s.SetGlobal("arm_limit", vm.NativeValue(&vm.NativeFunc{
+			Name: "arm_limit",
+			Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
+				st.SetInstructionLimit(10)
+				return []vm.Value{vm.IntValue(1)}, nil
+			},
+		}))
+		cl, err := s.LoadChunk([]byte(`
+			local t = setmetatable({}, { __add = arm_limit })
+			local v = t + 1
+			local sum = v
+			for i = 1, 10000 do
+				sum = sum + i
+			end
+			return sum
+		`), "=cold_add_limit")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.Call(cl)
+		if !errors.Is(err, vm.ErrInstructionLimit) {
+			t.Fatalf("expected ErrInstructionLimit after __add cold callback armed limit, got %v", err)
+		}
+	})
+
+	t.Run("pure_lua_cold_metamethod_installs_count_hook", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`
+			local hits = 0
+			local arr = setmetatable({3, 1, 2}, {
+				__index = function(self, k)
+					if k == "sort_and_hook" then
+						table.sort(self, function(a, b)
+							debug.sethook(function() hits = hits + 1 end, "", 5)
+							return a < b
+						end)
+						return true
+					end
+				end
+			})
+			assert(arr.sort_and_hook)
+			local sum = 0
+			for i = 1, 200 do
+				sum = sum + i
+			end
+			debug.sethook()
+			return hits, sum
+		`), "=cold_hook")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hits, ok := res[0].ToInt()
+		if !ok || hits < 50 {
+			t.Fatalf("expected caller loop to be traced by hook installed in __index callback, got hits=%v", res[0])
+		}
+	})
+}
+
+func TestSetMemoryLimitRecountsExistingAllocations(t *testing.T) {
+	t.Run("fresh_state_baseline_enforced_immediately", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		const limit = int64(65536)
+		s.SetMemoryLimit(limit)
+		initial := s.MemoryUsage()
+		if initial <= 4096 {
+			t.Fatalf("expected SetMemoryLimit to recount stdlib baseline (>4096), got %d", initial)
+		}
+		strTbl := s.GetGlobal("string").AsTable()
+		repFn := strTbl.RawGetStr(s.Intern("rep"))
+		res, err := s.Call(repFn, vm.StringValue(s.Intern("x")), vm.IntValue(49152))
+		if err == nil {
+			s.SetGlobal("PIN", res[0])
+			s.CollectFull()
+			if used := s.MemoryUsage(); used > limit {
+				t.Fatalf("string.rep('x', 49152) succeeded under limit=%d but pinned live usage is %d", limit, used)
+			}
+		} else if !strings.Contains(err.Error(), "not enough memory") {
+			t.Fatalf("expected 'not enough memory', got %v", err)
+		}
+	})
+
+	t.Run("tier0_preloaded_data_accounted_on_enable", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		setup, err := s.LoadChunk([]byte(`
+			PRELOAD = {}
+			for i = 1, 64 do
+				PRELOAD[i] = string.rep("p", 4096) .. tostring(i)
+			end
+		`), "=tier0_preload")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(setup); err != nil {
+			t.Fatal(err)
+		}
+		// Transition from unlimited (0) to limited (> 0): must recount PRELOAD immediately.
+		s.SetMemoryLimit(64 << 20)
+		baseline := s.MemoryUsage()
+		if baseline < 256*1024 {
+			t.Fatalf("expected recounted baseline >= 256 KiB for preloaded Tier-0 data, got %d", baseline)
+		}
+		s.SetMemoryLimit(0)
+		// Enable a tight limit directly from unlimited state without calling CollectFull first.
+		tight := baseline + 16*1024
+		s.SetMemoryLimit(tight)
+		strTbl := s.GetGlobal("string").AsTable()
+		repFn := strTbl.RawGetStr(s.Intern("rep"))
+		_, err = s.Call(repFn, vm.StringValue(s.Intern("z")), vm.IntValue(64*1024))
+		if err == nil || !strings.Contains(err.Error(), "not enough memory") {
+			t.Fatalf("expected 'not enough memory' for 64 KiB alloc with 16 KiB headroom above Tier-0 preload, got %v", err)
+		}
+	})
+}

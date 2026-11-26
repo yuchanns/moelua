@@ -87,11 +87,13 @@ func generateHooked(src string, withRegcheck bool) string {
 	}
 	fn := src[idx:end]
 	fn = strings.Replace(fn, "func (s *State) run(", "func (s *State) runHooked(", 1)
-	// Remove self-switch inside OP_CALL (already in runHooked).
-	fn = strings.ReplaceAll(fn,
-		"\t\t\tif (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {\n\t\t\t\treturn s.runHooked(th, entryDepth)\n\t\t\t}\n",
-		"",
-	)
+	// Remove self-switches into runHooked (already executing in runHooked).
+	for _, block := range []string{
+		"\t\tif (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {\n\t\t\tth.frames[ev.ci].pc = pc\n\t\t\treturn s.runHooked(th, entryDepth)\n\t\t}\n",
+		"\t\tif (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {\n\t\t\treturn s.runHooked(th, entryDepth)\n\t\t}\n",
+	} {
+		fn = strings.ReplaceAll(fn, block, "")
+	}
 	// Inject instruction hook / interrupt check at top of dispatch loop!
 	fn = strings.Replace(fn,
 		"\tfor {\n\t\tregs = nonNilWindow(regs)\n",

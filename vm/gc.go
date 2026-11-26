@@ -1334,6 +1334,50 @@ func (s *State) collectEmergency() {
 	s.collectFullImpl(true, true)
 }
 
+// recountLiveBytes recomputes s.gc.allocBytes from the State's existing live object graph
+// without running __gc finalizers, clearing weak entries, or mutating caches. Used when
+// SetMemoryLimit transitions from unlimited (0) to limited (> 0) so pre-existing stdlib
+// and Tier-0 allocations are accounted immediately before the next allocation check.
+func (s *State) recountLiveBytes() {
+	s.gc.epoch++
+	if s.gc.epoch == 0 {
+		s.gc.epoch = 1
+	}
+	tr := &gcTracer{
+		s:              s,
+		epoch:          s.gc.epoch,
+		preserveFrames: true,
+		countStrings:   true,
+	}
+	tr.markRoots()
+	tr.propagateAll()
+	tr.convergeEphemerons()
+	for _, fe := range s.gc.finalizable {
+		if fe.obj.IsTable() && fe.obj.AsTable().flags&tblFlagGCFnzed != 0 {
+			continue
+		}
+		if fe.obj.IsUserdata() && fe.obj.AsUserdata().gcFnzed {
+			continue
+		}
+		if !tr.isMarked(fe.obj) {
+			tr.mark(fe.obj)
+		}
+	}
+	for _, wf := range s.gc.weakFiles {
+		if u := wf.userdata(); u != nil && !u.gcFnzed {
+			obj := UserdataValue(u)
+			if !tr.isMarked(obj) {
+				tr.mark(obj)
+			}
+		}
+	}
+	tr.propagateAll()
+	tr.convergeEphemerons()
+	tr.accountWeakStrings()
+	s.gc.allocBytes = tr.liveBytes
+	s.gc.lastLiveBytes = tr.liveBytes
+}
+
 func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	if s.gc.inGCTM && !emergency {
 		return // non-reentrant inside __gc (gc.lua:698-705), except emergency GC under memLimit

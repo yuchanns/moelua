@@ -2180,6 +2180,9 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 		if tm.IsNil() {
 			return false, fmt.Errorf("attempt to call a nil value (metamethod 'close')")
 		}
+		// Match PUC-Rio Lua 5.5.1 lfunc.c:callclosemethod (and testes/locals.lua:314,325-330):
+		// normal scope exit passes 1 argument (obj) so select('#', ...) == 1;
+		// error unwinding passes 2 arguments (obj, err) so select('#', ...) == 2.
 		var cargs []Value
 		if cf.closeHasErr {
 			cargs = []Value{obj, cf.closeErr}

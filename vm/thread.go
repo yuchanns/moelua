@@ -486,6 +486,9 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 			raised = true
 			continue
 		}
+		// Match PUC-Rio Lua 5.5.1 lfunc.c:callclosemethod (and testes/locals.lua:314,325-330):
+		// normal closing passes 1 argument (obj) so select('#', ...) == 1;
+		// error closing passes 2 arguments (obj, errVal) so select('#', ...) == 2.
 		var args []Value
 		if hasErr {
 			args = []Value{obj, errVal}

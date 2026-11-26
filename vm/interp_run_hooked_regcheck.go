@@ -144,11 +144,9 @@ reloadFrame:
 				return err
 			}
 			if pushed {
-				goto reloadFrame
+				goto slowReload
 			}
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-			continue
+			goto slowContinue
 
 		case bytecode.OP_GETFIELD:
 			rb := regs[uint8(w>>bytecode.PosB)]
@@ -172,11 +170,9 @@ reloadFrame:
 				return err
 			}
 			if pushed {
-				goto reloadFrame
+				goto slowReload
 			}
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-			continue
+			goto slowContinue
 
 		case bytecode.OP_SETFIELD:
 			ra := regs[a]
@@ -200,11 +196,9 @@ reloadFrame:
 				return err
 			}
 			if pushed {
-				goto reloadFrame
+				goto slowReload
 			}
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-			continue
+			goto slowContinue
 
 		case bytecode.OP_NEWTABLE:
 			if OptimizeEnabled && !s.gc.tier1 && s.memLimit == 0 && !w.K() && w.VC() == 0 && w.VB() <= 2 {
@@ -239,11 +233,9 @@ reloadFrame:
 				return err
 			}
 			if pushed {
-				goto reloadFrame
+				goto slowReload
 			}
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-			continue
+			goto slowContinue
 
 		case bytecode.OP_GETI:
 			rb := regs[uint8(w>>bytecode.PosB)]
@@ -276,11 +268,9 @@ reloadFrame:
 				return err
 			}
 			if pushed {
-				goto reloadFrame
+				goto slowReload
 			}
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-			continue
+			goto slowContinue
 
 		case bytecode.OP_GETTABLE:
 			rb := regs[uint8(w>>bytecode.PosB)]
@@ -318,11 +308,9 @@ reloadFrame:
 				return err
 			}
 			if pushed {
-				goto reloadFrame
+				goto slowReload
 			}
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-			continue
+			goto slowContinue
 
 		case bytecode.OP_SETI:
 			ra := regs[a]
@@ -361,11 +349,9 @@ reloadFrame:
 				return err
 			}
 			if pushed {
-				goto reloadFrame
+				goto slowReload
 			}
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-			continue
+			goto slowContinue
 
 		case bytecode.OP_SETTABLE:
 			ra := regs[a]
@@ -433,11 +419,9 @@ reloadFrame:
 				return err
 			}
 			if pushed {
-				goto reloadFrame
+				goto slowReload
 			}
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-			continue
+			goto slowContinue
 
 		case bytecode.OP_ADDI:
 			rb := regs[uint8(w>>bytecode.PosB)]
@@ -885,11 +869,9 @@ reloadFrame:
 				return err
 			}
 			if pushed {
-				goto reloadFrame
+				goto slowReload
 			}
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-			continue
+			goto slowContinue
 
 		case bytecode.OP_FORLOOP:
 			if regs[a+1].IsInt() {
@@ -919,7 +901,7 @@ reloadFrame:
 			skip, err := s.forPrepSlow(regs, a)
 			if err != nil {
 				if s.handleError(th, entryDepth, err) {
-					goto reloadFrame
+					goto slowReload
 				}
 				return err
 			}
@@ -961,11 +943,9 @@ reloadFrame:
 				return err
 			}
 			if pushed {
-				goto reloadFrame
+				goto slowReload
 			}
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-			continue
+			goto slowContinue
 
 		case bytecode.OP_TFORLOOP:
 			if !regs[a+3].IsNil() {
@@ -978,22 +958,31 @@ reloadFrame:
 		}
 
 	cold:
-		th.frames[ev.ci].pc = pc
-		action, newPC, err := s.coldOp(th, &ev, pc-1, w, regs, entryDepth)
-		if err != nil {
-			return err
-		}
-		switch action {
-		case coldContinue:
-			pc = newPC
-			winGen = th.stackGen
-	regs = th.window(ev.base)
-		case coldReload:
-			goto reloadFrame
-		case coldReturn:
-			return nil
+		{
+			th.frames[ev.ci].pc = pc
+			action, newPC, err := s.coldOp(th, &ev, pc-1, w, regs, entryDepth)
+			if err != nil {
+				return err
+			}
+			switch action {
+			case coldContinue:
+				pc = newPC
+				goto slowContinue
+			case coldReload:
+				goto slowReload
+			case coldReturn:
+				return nil
+			}
 		}
 		continue
+
+	slowContinue:
+		winGen = th.stackGen
+	regs = th.window(ev.base)
+		continue
+
+	slowReload:
+		goto reloadFrame
 	}
 }
 

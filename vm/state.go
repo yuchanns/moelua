@@ -262,8 +262,12 @@ func (s *State) SetMemoryLimit(limit int64) {
 	if limit < 0 {
 		limit = 0
 	}
+	wasUnlimited := s.memLimit == 0
 	s.memLimit = limit
 	s.memExceeded = false
+	if limit > 0 && wasUnlimited {
+		s.recountLiveBytes()
+	}
 }
 
 // MemoryUsage returns the current VM-accounted memory usage in bytes.
