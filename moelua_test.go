@@ -1448,4 +1448,29 @@ func TestRootOperandsAcrossAllocationPreservesMemoryLimit(t *testing.T) {
 			t.Fatalf("TryNewMetatable err=%v but recounted MemoryUsage()=%d exceeded %d", err, usage, l)
 		}
 	})
+
+	t.Run("NewThread", func(t *testing.T) {
+		s := moelua.New()
+		defer s.Close()
+		s.SetMemoryLimit(1 << 30)
+		rets, err := s.DoString(`local big = string.rep("c", 35000) return function() return #big end`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fn := rets[0]
+		// Too little headroom for the thread, so its allocation runs an emergency GC; that GC
+		// must still count fn's 35,000-byte upvalue.
+		l := s.MemoryUsage() + 5000
+		s.SetMemoryLimit(l)
+		th, err := s.NewThread(fn)
+		if err != nil {
+			return
+		}
+		h := s.Pin(th.Value())
+		defer h.Release()
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > l {
+			t.Fatalf("NewThread succeeded but recounted MemoryUsage()=%d exceeded %d", usage, l)
+		}
+	})
 }

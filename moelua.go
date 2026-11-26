@@ -1081,6 +1081,7 @@ func (s *State) NewThread(fn Value) (*Thread, error) {
 	if !s.ready() {
 		return nil, ErrStateClosed
 	}
+	defer s.pinTemps(fn)()
 	raw, err := s.vm.NewThread(fn)
 	if err != nil {
 		return nil, err
