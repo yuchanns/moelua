@@ -421,7 +421,12 @@ func nativeStringPack(s *State, args []Value) ([]Value, error) {
 	checkSize := func(n int64) error {
 		return s.checkMem(n + 48)
 	}
-	res, err := luastdlib.PackWithControls(fmtStr, checkSize, s.nativeCancelFunc(), pargs...)
+	var res string
+	if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
+		res, err = s.packWithCancel(fmtStr, checkSize, cancelFn, pargs)
+	} else {
+		res, err = luastdlib.PackWithControls(fmtStr, checkSize, nil, pargs...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -454,9 +459,15 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 	// Pass 1: validate format/data and count decoded outputs with zero slice allocations,
 	// enforcing memLimit and cancellation controls before allocating any result storage.
 	cancelFn := s.nativeCancelFunc()
+	runUnpack := func(emit func(luastdlib.PackValue) error) (int64, error) {
+		if cancelFn != nil {
+			return unpackEachWithCancel(fmtStr, data, initPos, cancelFn, emit)
+		}
+		return luastdlib.UnpackEachWithCancel(fmtStr, data, initPos, nil, emit)
+	}
 	var count int64
 	var strBytes int64
-	nextPos, err := luastdlib.UnpackEachWithCancel(fmtStr, data, initPos, cancelFn, func(pv luastdlib.PackValue) error {
+	nextPos, err := runUnpack(func(pv luastdlib.PackValue) error {
 		count++
 		if count > 1_000_000 {
 			return fmt.Errorf("too many results to unpack")
@@ -510,7 +521,7 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 			}
 			th.top = savedTop
 		}()
-		_, err = luastdlib.UnpackEachWithCancel(fmtStr, data, initPos, cancelFn, func(pv luastdlib.PackValue) error {
+		_, err = runUnpack(func(pv luastdlib.PackValue) error {
 			var v Value
 			switch pv.Kind {
 			case luastdlib.PackInt:
@@ -549,7 +560,7 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 	}
 	out := make([]Value, nOut)
 	idx := 0
-	_, err = luastdlib.UnpackEachWithCancel(fmtStr, data, initPos, cancelFn, func(pv luastdlib.PackValue) error {
+	_, err = runUnpack(func(pv luastdlib.PackValue) error {
 		switch pv.Kind {
 		case luastdlib.PackInt:
 			out[idx] = IntValue(pv.Int)

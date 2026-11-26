@@ -1152,10 +1152,11 @@ func nativeIOInput(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || args[0].IsNil() {
 		return []Value{s.defaultInput}, nil
 	}
-	if args[0].IsString() {
-		lf, err := openFileWithMode(args[0].AsString().S, "r")
+	if args[0].IsString() || args[0].IsNumber() {
+		fname := FormatValue(args[0])
+		lf, err := openFileWithMode(fname, "r")
 		if err != nil {
-			return nil, fmt.Errorf("cannot open file '%s' (%v)", args[0].AsString().S, err)
+			return nil, fmt.Errorf("cannot open file '%s' (%v)", fname, err)
 		}
 		ud, err := s.tryNewFileUD(lf)
 		if err != nil {
@@ -1164,8 +1165,12 @@ func nativeIOInput(s *State, args []Value) ([]Value, error) {
 		s.defaultInput = ud
 		return []Value{s.defaultInput}, nil
 	}
-	if _, ok := asLuaFile(args[0]); !ok {
-		return nil, fmt.Errorf("bad argument #1 to 'io.input' (FILE* expected, got %s)", s.objTypeName(args[0]))
+	lf, ok := asLuaFile(args[0])
+	if !ok {
+		return nil, fmt.Errorf("bad argument #1 to 'input' (FILE* expected, got %s)", s.objTypeName(args[0]))
+	}
+	if lf.closed {
+		return nil, fmt.Errorf("attempt to use a closed file")
 	}
 	s.defaultInput = args[0]
 	return []Value{s.defaultInput}, nil
@@ -1175,10 +1180,11 @@ func nativeIOOutput(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || args[0].IsNil() {
 		return []Value{s.defaultOutput}, nil
 	}
-	if args[0].IsString() {
-		lf, err := openFileWithMode(args[0].AsString().S, "w")
+	if args[0].IsString() || args[0].IsNumber() {
+		fname := FormatValue(args[0])
+		lf, err := openFileWithMode(fname, "w")
 		if err != nil {
-			return nil, fmt.Errorf("cannot open file '%s' (%v)", args[0].AsString().S, err)
+			return nil, fmt.Errorf("cannot open file '%s' (%v)", fname, err)
 		}
 		ud, err := s.tryNewFileUD(lf)
 		if err != nil {
@@ -1187,8 +1193,12 @@ func nativeIOOutput(s *State, args []Value) ([]Value, error) {
 		s.defaultOutput = ud
 		return []Value{s.defaultOutput}, nil
 	}
-	if _, ok := asLuaFile(args[0]); !ok {
-		return nil, fmt.Errorf("bad argument #1 to 'io.output' (FILE* expected)")
+	lf, ok := asLuaFile(args[0])
+	if !ok {
+		return nil, fmt.Errorf("bad argument #1 to 'output' (FILE* expected, got %s)", s.objTypeName(args[0]))
+	}
+	if lf.closed {
+		return nil, fmt.Errorf("attempt to use a closed file")
 	}
 	s.defaultOutput = args[0]
 	return []Value{s.defaultOutput}, nil

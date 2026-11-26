@@ -202,6 +202,7 @@ func (th *Thread) ensureFrameCap(need, limit int) error {
 	}
 	nf := make([]callFrame, newCap)
 	copy(nf, th.frames)
+	clear(th.frames)
 	th.frames = nf
 	return nil
 }
@@ -235,6 +236,7 @@ func (th *Thread) ensureStack(need int) error {
 	ns := make([]Value, newSize)
 	copy(ns, th.stack)
 	fillNil(ns[len(th.stack):])
+	clear(th.stack)
 	th.stack = ns
 	th.stackGen++
 	return nil

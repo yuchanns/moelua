@@ -1669,3 +1669,170 @@ func TestCallProtectedAbortClosesCapturedUpvalues(t *testing.T) {
 		})
 	}
 }
+
+// TestStringPackAndUnpackCancelAndBudget verifies that string.pack (s/c/z fields and padding)
+// and string.unpack ('z' NUL scanning) cooperatively poll execution controls (both instruction
+// budgets and expired contexts), including direct State.Call with zero Lua opcodes.
+func TestStringPackAndUnpackCancelAndBudget(t *testing.T) {
+	bigStr := strings.Repeat("p", 8*1024*1024)
+
+	t.Run("direct_state_call_pack_s8", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		strPack := s.GetGlobal("string").AsTable().RawGetStr(s.Intern("pack"))
+		fmtVal := vm.StringValue(s.Intern("s8"))
+		bigVal := vm.StringValue(s.Intern(bigStr))
+
+		s.SetInstructionLimit(100)
+		if _, err := s.Call(strPack, fmtVal, bigVal); err == nil {
+			t.Fatalf("direct State.Call(string.pack, 's8', bigStr) bypassed instruction limit 100")
+		}
+		if s.InstructionsExecuted() == 0 {
+			t.Fatalf("direct State.Call(string.pack) charged 0 instructions")
+		}
+
+		s2 := vm.NewState()
+		defer s2.Close()
+		strPack2 := s2.GetGlobal("string").AsTable().RawGetStr(s2.Intern("pack"))
+		fmtVal2 := vm.StringValue(s2.Intern("s8"))
+		bigVal2 := vm.StringValue(s2.Intern(bigStr))
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		s2.SetContext(ctx)
+		start := time.Now()
+		if _, err := s2.Call(strPack2, fmtVal2, bigVal2); err == nil {
+			t.Fatalf("direct State.Call(string.pack) bypassed expired context deadline")
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("direct State.Call(string.pack) took %v despite expired context", elapsed)
+		}
+	})
+
+	t.Run("pack_c_padding_z_and_unpack_z", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			src  string
+		}{
+			{"pack_s8", `return string.pack("s8", BIG)`},
+			{"pack_c_pad", `return string.pack("c8388608", "a")`},
+			{"pack_z", `return string.pack("z", BIG)`},
+			{"unpack_z", `return string.unpack("z", BIG)`},
+		} {
+			s := vm.NewState()
+			defer s.Close()
+			s.SetGlobal("BIG", vm.StringValue(s.Intern(bigStr)))
+			cl, err := s.LoadChunk([]byte(tc.src), "="+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetInstructionLimit(100)
+			if _, err := s.Call(cl); err == nil {
+				t.Fatalf("%s bypassed instruction limit 100", tc.name)
+			}
+			if s.InstructionsExecuted() == 0 {
+				t.Fatalf("%s charged 0 instructions", tc.name)
+			}
+		}
+	})
+}
+
+// TestStdlibSlabAndInitStackGrowthDoNotPinObjects verifies that reallocating a stdlib
+// table's slots/hash/array off the shared stdlib slab (or growing mainThread's stack off
+// stateAlloc.initStack) clears abandoned entries so discarded objects are reclaimed by Go GC.
+func TestStdlibSlabAndInitStackGrowthDoNotPinObjects(t *testing.T) {
+	runReclaim := func(t *testing.T, src string) {
+		t.Helper()
+		s := vm.NewState()
+		defer s.Close()
+		var wp weak.Pointer[vm.Table]
+		func() {
+			cl, err := s.LoadChunk([]byte(src), "=slab_reclaim")
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := s.Call(cl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wp = weak.Make(res[0].AsTable())
+			res[0] = vm.NilValue()
+		}()
+		reclaimed := false
+		for range 12 {
+			runtime.GC()
+			if wp.Value() == nil {
+				reclaimed = true
+				break
+			}
+		}
+		if !reclaimed {
+			t.Fatalf("abandoned shared slab or initStack retained unreachable table")
+		}
+	}
+
+	t.Run("stdlib_math_slots_and_hash_growth", func(t *testing.T) {
+		runReclaim(t, `
+			local payload = { data = string.rep("m", 1024 * 1024) }
+			math.pi = payload
+			for i = 1, 80 do
+				math["extra_" .. i] = i
+			end
+			math.pi = nil
+			return payload
+		`)
+	})
+
+	t.Run("stdlib_searchers_array_growth", func(t *testing.T) {
+		runReclaim(t, `
+			local payload = { data = string.rep("s", 1024 * 1024) }
+			package.searchers[1] = payload
+			for i = 4, 20 do
+				package.searchers[i] = i
+			end
+			package.searchers[1] = nil
+			return payload
+		`)
+	})
+
+	t.Run("main_thread_init_stack_growth", func(t *testing.T) {
+		runReclaim(t, `
+			local payload = { data = string.rep("k", 1024 * 1024) }
+			local function grow(n, x)
+				if n == 0 then return x end
+				return grow(n - 1, x)
+			end
+			local keep = grow(120, payload)
+			return keep
+		`)
+	})
+}
+
+// TestIOInputOutputRejectClosedHandles verifies that io.input(closedFile) and
+// io.output(closedFile) raise "attempt to use a closed file" and preserve the
+// previously installed default streams (matching Lua 5.5.1 liolib.c:g_iofile).
+func TestIOInputOutputRejectClosedHandles(t *testing.T) {
+	src := `
+local prevIn = io.input()
+local prevOut = io.output()
+local f = assert(io.tmpfile())
+assert(f:close())
+
+local okIn, errIn = pcall(io.input, f)
+assert(not okIn and string.find(errIn, "closed file", 1, true), tostring(errIn))
+assert(io.input() == prevIn, "io.input replaced default stream on closed handle")
+
+local okOut, errOut = pcall(io.output, f)
+assert(not okOut and string.find(errOut, "closed file", 1, true), tostring(errOut))
+assert(io.output() == prevOut, "io.output replaced default stream on closed handle")
+print("io_closed_ok")
+`
+	got := runMoeLua(t, src)
+	if got != "io_closed_ok\n" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+	if hasCLua55(t) {
+		if want := runCLua55(t, src); got != want {
+			t.Fatalf("mismatch vs C Lua 5.5.1:\nwant:\n%s\ngot:\n%s", want, got)
+		}
+	}
+}
