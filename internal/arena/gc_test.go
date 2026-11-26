@@ -338,7 +338,10 @@ func TestGCWeakTablesEphemeronsLIFOFinalizersAndResurrection(t *testing.T) {
 			// 3. Object with __gc in BOTH weak-v (value) and ephemeron (key):
 			//    Lua 5.5 rule: weak-v MUST be cleared BEFORE __gc runs,
 			//    while weak-k MUST still contain the object DURING __gc!
-			type goRes struct{ tag int }
+			type goRes struct {
+				tag int
+				pad [64]byte // >16B so Go's tiny allocator never batches it with unrelated live objects
+			}
 			gObj := &goRes{tag: 77}
 			wpGo := weak.Make(gObj)
 			ud1, id1 := vm.newUD(gObj)
@@ -529,6 +532,76 @@ func TestGCGenerationalMinorToMajorAndBackToMinor(t *testing.T) {
 	}
 	if vm.a.LiveObjects() != 1 {
 		t.Fatalf("expected only root live after major->minor return, got %d", vm.a.LiveObjects())
+	}
+}
+
+func TestGCGenerationalEmptyBaselineTriggersMajorAndReclaimsOld(t *testing.T) {
+	vm := newToyVM()
+	defer vm.a.Close()
+
+	// Enter generational mode while the arena is completely empty (gcMajorMinor == 0).
+	vm.gc.SetMode(arena.ModeGenMinor)
+	if vm.gc.Mode() != arena.ModeGenMinor {
+		t.Fatalf("expected ModeGenMinor, got %v", vm.gc.Mode())
+	}
+	if vm.gc.NeedsStep() {
+		t.Fatalf("expected non-zero minor debt threshold on empty arena")
+	}
+
+	// Allocate and promote a rooted table through minor collections; with default
+	// non-zero ParamMinorMajor, promotion must trigger ModeGenMajor rather than getting stuck.
+	tbl, tblID := vm.newTable(arena.WeakNone)
+	vm.roots = append(vm.roots, tbl)
+	vm.gc.StepBytes(0) // AgeNew -> AgeSurvival
+	vm.gc.StepBytes(0) // AgeSurvival -> AgeOld1 -> shifts to ModeGenMajor
+	if vm.gc.Mode() != arena.ModeGenMajor {
+		t.Fatalf("expected ModeGenMajor after promotion from empty baseline, got %v", vm.gc.Mode())
+	}
+
+	// Drop the root and step until major collection reclaims the old table.
+	vm.roots = nil
+	for range 200 {
+		vm.gc.StepBytes(512)
+		if vm.freed[tblID] {
+			break
+		}
+	}
+	if !vm.freed[tblID] || vm.a.LiveObjects() != 0 {
+		t.Fatalf("old object allocated after empty gen baseline was not reclaimed: freed=%v live=%d",
+			vm.freed[tblID], vm.a.LiveObjects())
+	}
+}
+
+func TestGCFinalizerReentryGuardsNormalFullAndSetMode(t *testing.T) {
+	vm := newToyVM()
+	defer vm.a.Close()
+
+	u1, id1 := vm.newUD(nil)
+	u2, id2 := vm.newUD(nil)
+	vm.gc.RegisterFinalizer(u1)
+	vm.gc.RegisterFinalizer(u2)
+
+	reentered := false
+	vm.onFin = func(id uint32, ref arena.ObjRef) {
+		if id == id2 {
+			// Attempting Full(false) or SetMode inside __gc must be ignored (Lua 5.5 GCSTPGC).
+			vm.gc.Full(false)
+			vm.gc.SetMode(arena.ModeGenMinor)
+			if vm.freed[id] {
+				reentered = true
+			}
+		}
+	}
+
+	vm.gc.Full(false)
+	if reentered {
+		t.Fatalf("Full(false) inside RunFinalizer prematurely swept the executing object")
+	}
+	if vm.gc.Mode() != arena.ModeIncremental {
+		t.Fatalf("SetMode inside RunFinalizer unexpectedly changed mode to %v", vm.gc.Mode())
+	}
+	if !slices.Equal(vm.finLog, []uint32{id2, id1}) {
+		t.Fatalf("finalizer order corrupted by reentrant Full(false): got %v, want [%d %d]", vm.finLog, id2, id1)
 	}
 }
 

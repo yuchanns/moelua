@@ -1081,9 +1081,12 @@ func (c *Collector) minor2Inc(kind GCMode) {
 }
 
 func (c *Collector) checkMinorMajor() bool {
+	if c.params[ParamMinorMajor] == 0 {
+		return false // special case: minormajor == 0 disables automatic major collections
+	}
 	limit := ApplyGCParam(c.params[ParamMinorMajor], c.gcMajorMinor)
 	if limit == 0 {
-		return false
+		return c.gcMarked > 0
 	}
 	return c.gcMarked >= limit
 }
@@ -1105,7 +1108,11 @@ func (c *Collector) checkMajorMinor() bool {
 }
 
 func (c *Collector) setMinorDebt() {
-	c.setDebtTarget(ApplyGCParam(c.params[ParamMinorMul], c.gcMajorMinor))
+	target := ApplyGCParam(c.params[ParamMinorMul], c.gcMajorMinor)
+	if target == 0 && c.params[ParamMinorMul] != 0 {
+		target = ApplyGCParam(c.params[ParamStepSize], 100)
+	}
+	c.setDebtTarget(target)
 }
 
 func (c *Collector) setPause() {
@@ -1284,7 +1291,7 @@ func (c *Collector) enterGen() {
 
 // SetMode switches between ModeIncremental and ModeGenMinor (matching luaC_changemode).
 func (c *Collector) SetMode(newMode GCMode) {
-	if c.inGC {
+	if c.inGC || c.inFinalizer || c.closing {
 		return
 	}
 	c.inGC = true
@@ -1354,10 +1361,11 @@ func (c *Collector) StepBytes(stepBytes int64) bool {
 }
 
 // Full executes a complete garbage collection cycle (matching luaC_fullgc).
-// When emergency is true, finalizers and cache shrinking are suppressed so allocation
-// recovery never re-enters Lua code.
+// Non-emergency collections are ignored while a __gc finalizer is executing
+// (matching Lua 5.5 GCSTPGC). When emergency is true, finalizers and cache
+// shrinking are suppressed so allocation recovery never re-enters Lua code.
 func (c *Collector) Full(emergency bool) {
-	if c.inGC {
+	if c.inGC || c.closing || (c.inFinalizer && !emergency) {
 		return
 	}
 	c.inGC = true
