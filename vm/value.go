@@ -3,30 +3,41 @@ package vm
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 
+	"github.com/yuchanns/moelua/internal/arena"
 	"github.com/yuchanns/moelua/internal/luastdlib"
 )
 
-// Value is a 16-byte Go-GC-safe tagged Lua 5.5 value (zero-boxing layout).
-// Exact size is statically asserted below.
+// Value is a 16-byte zero-pointer (noscan, ptrdata == 0) tagged Lua 5.5 value.
+// Because Value contains zero Go pointers, Go's GC never scans Lua stacks, tables,
+// closures, upvalues, or inline caches, and writing Values emits zero Go write barriers.
 //
-// In default build (!moeluafloatnil):
-//   ptr == nil            => full 64-bit int64 in bits (zero GC scan, zero write barrier on int->int)
-//   ptr == &scalarTags[0] => nil (bits == 0)
-//   ptr == &scalarTags[1] => false (bits == 0)
-//   ptr == &scalarTags[2] => true (bits == 0)
-//   ptr == &scalarTags[3] => full 64-bit float64 in bits (exact IEEE-754, zero NaN canonicalization)
-//   ptr == heap pointer   => heap object discriminated by quiet-NaN-spaced kind tag in bits
-//
-// In -tags moeluafloatnil build:
-//   ptr == nil            => full 64-bit float64 in bits
-//   ptr == &scalarTags[3] => full 64-bit int64 in bits
+// Tag encoding:
+//   0, 1: Int / Float (polarity selected by !moeluafloatnil vs moeluafloatnil) -> IsNumber: tag <= 1
+//   2:    Nil         (bits == 0)
+//   3:    False       (bits == 0) -> IsFalsy: tag-2 <= 1
+//   4:    True        (bits == 0) -> IsBool:  tag-3 <= 1
+//   5:    LightUD     (bits == opaque pointer address, 0 for nil light userdata)
+//   6:    TokenLightUD(bits == non-owning debug.upvalueid token)
+//   7:    StaticNative(bits == 1-based index into process-wide immutable staticNatives table)
+//   8:    FrozenString(bits == arena.ObjRef in process-wide read-only stdTemplate.strArena)
+//   --- Per-State Arena GC-managed ObjRefs (tag >= tagFirstGC && tag <= tagLastGC) ---
+//   9:    String      (bits == arena.ObjRef in State.arena, gcKindShortStr / gcKindLongStr)
+//   10:   Closure     (bits == arena.ObjRef in State.arena, gcKindClosure)
+//   11:   Native      (bits == arena.ObjRef in State.arena, gcKindNative)
+//   12:   Table       (bits == arena.ObjRef in State.arena, gcKindTable)
+//   13:   Userdata    (bits == arena.ObjRef in State.arena, gcKindUserdata)
+//   14:   Thread      (bits == arena.ObjRef in State.arena, gcKindThread)
+//   15:   DeadKey     (internal swept hash-tombstone marker; never escapes to Lua)
 type Value struct {
-	ptr  unsafe.Pointer
 	bits uint64
+	tag  uint64
 }
 
 // Compile-time assertion: sizeof(Value) == 16 bytes.
@@ -35,47 +46,171 @@ const (
 	_ = uint(unsafe.Sizeof(Value{}) - 16)
 )
 
-// Non-zero-size static sentinel array in .noptrbss (never aliases runtime.zerobase).
-// Layout: [0]=nil, [1]=false, [2]=true, [3]=altScalar (float in intnil, int in floatnil),
-// [4]=nullLightUD (distinct nonnumeric sentinel so LightUDValue(nil) stays LUA_TLIGHTUSERDATA),
-// [5]=tokenLightUD (non-owning identity token for debug.upvalueid; bits stores unique uint64 ID).
-// Keeping [0]=nil and [1]=false adjacent makes IsFalsy a single SUB+CMP:
-//   uintptr(v.ptr) - tagBase < 16
-var scalarTags [6]uint64
-
-var (
-	tagNil          = unsafe.Pointer(&scalarTags[0])
-	tagFalse        = unsafe.Pointer(&scalarTags[1])
-	tagTrue         = unsafe.Pointer(&scalarTags[2])
-	tagAlt          = unsafe.Pointer(&scalarTags[3])
-	tagNullLightUD  = unsafe.Pointer(&scalarTags[4])
-	tagTokenLightUD = unsafe.Pointer(&scalarTags[5])
-	tagBase         = uintptr(unsafe.Pointer(&scalarTags[0]))
-)
-
-// Quiet-NaN-spaced heap object kind tags stored in Value.bits when ptr is a Go heap pointer.
-// Every Is<HeapKind> check verifies BOTH bits == kind AND ptr != nil && ptr != tagAlt,
-// making type confusion impossible even against adversarial int64 or float64 bit patterns.
 const (
-	kindString   uint64 = 0xFFF9_0000_0000_0001
-	kindTable    uint64 = 0xFFF9_0000_0000_0002
-	kindClosure  uint64 = 0xFFF9_0000_0000_0003
-	kindNative   uint64 = 0xFFF9_0000_0000_0004
-	kindThread   uint64 = 0xFFF9_0000_0000_0005
-	kindUserdata uint64 = 0xFFF9_0000_0000_0006
-	kindLightUD  uint64 = 0xFFF9_0000_0000_0007
+	tagNil          uint64 = 2
+	tagFalse        uint64 = 3
+	tagTrue         uint64 = 4
+	tagLightUD      uint64 = 5
+	tagTokenLightUD uint64 = 6
+	tagStaticNative uint64 = 7
+	tagFrozenString uint64 = 8
+	tagString       uint64 = 9
+	tagClosure      uint64 = 10
+	tagNative       uint64 = 11
+	tagTable        uint64 = 12
+	tagUserdata     uint64 = 13
+	tagThread       uint64 = 14
+	tagDeadKey      uint64 = 15
+
+	tagFirstGC     = tagString
+	tagFirstWeakGC = tagClosure
+	tagLastGC      = tagThread
 )
 
-// Userdata represents a full Lua userdata with metatable and user values (Lua 5.4/5.5 nuvalue).
+// GC object kind tags stored in arena.GCHeader.Kind for every Arena-managed VM object.
+const (
+	gcKindShortStr uint8 = 1
+	gcKindLongStr  uint8 = 2
+	gcKindTable    uint8 = 3
+	gcKindShape    uint8 = 4
+	gcKindClosure  uint8 = 5
+	gcKindUpvalue  uint8 = 6
+	gcKindNative   uint8 = 7
+	gcKindUserdata uint8 = 8
+	gcKindThread   uint8 = 9
+	gcKindProto    uint8 = 10
+)
+
+type staticNativeKey struct {
+	name      string
+	fnPC      uintptr
+	fastFnPC  uintptr
+	intrinsic uint8
+	numUpvals uint8
+}
+
+func makeStaticNativeKey(nf *NativeFunc) (staticNativeKey, bool) {
+	if nf == nil || nf.Collectable || len(nf.upvals) != 0 {
+		return staticNativeKey{}, false
+	}
+	var fnPC, fastPC uintptr
+	if nf.Fn != nil {
+		fnPC = reflect.ValueOf(nf.Fn).Pointer()
+	}
+	if nf.FastFn != nil {
+		fastPC = reflect.ValueOf(nf.FastFn).Pointer()
+	}
+	return staticNativeKey{
+		name:      nf.Name,
+		fnPC:      fnPC,
+		fastFnPC:  fastPC,
+		intrinsic: nf.Intrinsic,
+		numUpvals: nf.NumUpvals,
+	}, true
+}
+
+// Process-wide immutable registry of non-collectable stdlib builtins (1-based index).
+// Backed by an atomic copy-on-write slice snapshot so concurrent lookupStaticNative calls
+// are lock-free and race-free while deduplicating identical stdlib builtin descriptors.
+var (
+	staticNativeMu    sync.Mutex
+	staticNatives     atomic.Pointer[[]*NativeFunc]
+	staticNativeBy    = map[*NativeFunc]uint32{}
+	staticNativeByKey = map[staticNativeKey]uint32{}
+)
+
+func init() {
+	initSlice := []*NativeFunc{nil} // index 0 is unused sentinel
+	staticNatives.Store(&initSlice)
+}
+
+func registerStaticNative(nf *NativeFunc) uint32 {
+	if nf == nil {
+		return 0
+	}
+	staticNativeMu.Lock()
+	defer staticNativeMu.Unlock()
+	if idx, ok := staticNativeBy[nf]; ok {
+		return idx
+	}
+	key, hasKey := makeStaticNativeKey(nf)
+	if hasKey {
+		if idx, ok := staticNativeByKey[key]; ok {
+			return idx
+		}
+	}
+	cur := *staticNatives.Load()
+	idx := uint32(len(cur))
+	next := make([]*NativeFunc, len(cur)+1)
+	copy(next, cur)
+	next[idx] = nf
+	staticNatives.Store(&next)
+	staticNativeBy[nf] = idx
+	if hasKey {
+		staticNativeByKey[key] = idx
+	}
+	return idx
+}
+
+func staticNativeValue(idx uint32) Value {
+	return Value{bits: uint64(idx), tag: tagStaticNative}
+}
+
+func lookupStaticNative(idx uint32) *NativeFunc {
+	if p := staticNatives.Load(); p != nil {
+		list := *p
+		if int(idx) < len(list) {
+			return list[idx]
+		}
+	}
+	return nil
+}
+
+// Userdata is a 48-byte noscan Lua full userdata stored inside State.arena.
+// Its Go host payload is bridged via dataRef in State.goRefs and released automatically
+// when Lua's Arena GC sweeps the userdata.
 type Userdata struct {
-	Data      any
-	Meta      *Table
-	UValues   []Value
-	gcRefs    []Value // internal GC-traced references (invisible to debug.getuservalue/setuservalue)
-	gcMark    uint64
-	gcFnzed   bool
-	gcInFnz   bool
-	gcPending bool
+	hdr       arena.GCHeader // 8B: Kind=gcKindUserdata
+	dataRef   arena.GoHandle // 8B: GoRefs handle for Go `any` payload (NullGoHandle if nil)
+	self      arena.ObjRef   // 4B: own ObjRef inside State.arena
+	metaRef   arena.ObjRef   // 4B: metatable Table ObjRef (NullRef if nil)
+	uvalsRef  arena.ObjRef   // 4B: raw Arena []Value for Lua user values (NullRef if nUValues==0)
+	gcRefsRef arena.ObjRef   // 4B: raw Arena []Value for internal GC-traced refs (NullRef if nGCRefs==0)
+	nUValues  uint32         // 4B
+	nGCRefs   uint32         // 4B
+	_         uint64         // 8B pad -> 48B exact
+}
+
+const (
+	_ = uint(48 - unsafe.Sizeof(Userdata{}))
+	_ = uint(unsafe.Sizeof(Userdata{}) - 48)
+)
+
+const (
+	natFlagCollectable uint8 = 1 << 0
+)
+
+// ArenaNative is a 32-byte noscan Lua C-closure / dynamic native function stored in State.arena.
+// The Go *NativeFunc callback descriptor is bridged via goRef in State.goRefs and released
+// when Lua's Arena GC sweeps this ArenaNative.
+type ArenaNative struct {
+	hdr         arena.GCHeader // 8B: Kind=gcKindNative, Flags=natFlag*
+	goRef       arena.GoHandle // 8B: GoRefs handle for *NativeFunc
+	self        arena.ObjRef   // 4B: own ObjRef inside State.arena
+	upvalsRef   arena.ObjRef   // 4B: raw Arena []Value of captured C upvalues
+	upvalIDsRef arena.ObjRef   // 4B: raw Arena []uint64 of lazy debug.upvalueid tokens
+	nUpvals     uint16         // 2B: actual captured upvals length
+	numUpvals   uint8          // 1B: logical C closure upvalue count
+	intrinsic   uint8          // 1B: cached Intrinsic ID
+}
+
+const (
+	_ = uint(32 - unsafe.Sizeof(ArenaNative{}))
+	_ = uint(unsafe.Sizeof(ArenaNative{}) - 32)
+)
+
+func (an *ArenaNative) isCollectable() bool {
+	return an != nil && an.hdr.Flags&natFlagCollectable != 0
 }
 
 // LuaError wraps any Lua Value raised via error(v) so pcall/xpcall preserve non-string errors verbatim.
@@ -94,89 +229,181 @@ func (e *LuaError) Error() string {
 	return FormatValue(e.Val)
 }
 
-func NilValue() Value   { return Value{ptr: tagNil} }
-func FalseValue() Value { return Value{ptr: tagFalse} }
-func TrueValue() Value  { return Value{ptr: tagTrue} }
+func NilValue() Value   { return Value{tag: tagNil} }
+func FalseValue() Value { return Value{tag: tagFalse} }
+func TrueValue() Value  { return Value{tag: tagTrue} }
 func BoolValue(b bool) Value {
 	if b {
-		return Value{ptr: tagTrue}
+		return Value{tag: tagTrue}
 	}
-	return Value{ptr: tagFalse}
+	return Value{tag: tagFalse}
 }
 
-func StringValue(s *LuaString) Value   { return Value{ptr: unsafe.Pointer(s), bits: kindString} }
-func TableValue(t *Table) Value        { return Value{ptr: unsafe.Pointer(t), bits: kindTable} }
-func ClosureValue(c *Closure) Value    { return Value{ptr: unsafe.Pointer(c), bits: kindClosure} }
-func ThreadValue(th *Thread) Value     { return Value{ptr: unsafe.Pointer(th), bits: kindThread} }
-func UserdataValue(u *Userdata) Value  { return Value{ptr: unsafe.Pointer(u), bits: kindUserdata} }
-func LightUDValue(p unsafe.Pointer) Value {
-	if p == nil {
-		return Value{ptr: tagNullLightUD, bits: kindLightUD}
+func deadKeyValue() Value { return Value{tag: tagDeadKey} }
+
+func StringValue(ls *LuaString) Value {
+	if ls == nil {
+		return NilValue()
 	}
-	return Value{ptr: p, bits: kindLightUD}
+	if ls.IsFixed() {
+		return Value{bits: uint64(ls.self), tag: tagFrozenString}
+	}
+	return Value{bits: uint64(ls.self), tag: tagString}
+}
+
+func TableValue(t *Table) Value {
+	if t == nil {
+		return NilValue()
+	}
+	return Value{bits: uint64(t.self), tag: tagTable}
+}
+
+func ClosureValue(c *Closure) Value {
+	if c == nil {
+		return NilValue()
+	}
+	return Value{bits: uint64(c.self), tag: tagClosure}
+}
+
+func ArenaNativeValue(an *ArenaNative) Value {
+	if an == nil {
+		return NilValue()
+	}
+	return Value{bits: uint64(an.self), tag: tagNative}
+}
+
+func ThreadValue(th *Thread) Value {
+	if th == nil {
+		return NilValue()
+	}
+	return Value{bits: uint64(th.self), tag: tagThread}
+}
+
+func UserdataValue(u *Userdata) Value {
+	if u == nil {
+		return NilValue()
+	}
+	return Value{bits: uint64(u.self), tag: tagUserdata}
+}
+
+func tableRefValue(ref arena.ObjRef) Value {
+	if ref == arena.NullRef {
+		return NilValue()
+	}
+	return Value{bits: uint64(ref), tag: tagTable}
+}
+
+func closureRefValue(ref arena.ObjRef) Value {
+	if ref == arena.NullRef {
+		return NilValue()
+	}
+	return Value{bits: uint64(ref), tag: tagClosure}
+}
+
+func threadRefValue(ref arena.ObjRef) Value {
+	if ref == arena.NullRef {
+		return NilValue()
+	}
+	return Value{bits: uint64(ref), tag: tagThread}
+}
+
+func userdataRefValue(ref arena.ObjRef) Value {
+	if ref == arena.NullRef {
+		return NilValue()
+	}
+	return Value{bits: uint64(ref), tag: tagUserdata}
+}
+
+func stringRefValue(ref arena.ObjRef, frozen bool) Value {
+	if ref == arena.NullRef {
+		return NilValue()
+	}
+	if frozen {
+		return Value{bits: uint64(ref), tag: tagFrozenString}
+	}
+	return Value{bits: uint64(ref), tag: tagString}
+}
+
+func LightUDValue(p unsafe.Pointer) Value {
+	return Value{bits: uint64(uintptr(p)), tag: tagLightUD}
 }
 
 // LightUDTokenValue constructs a non-owning light userdata identified by an opaque uint64 token
 // without pinning any Go heap pointer (used by debug.upvalueid).
 func LightUDTokenValue(id uint64) Value {
-	return Value{ptr: tagTokenLightUD, bits: id}
+	return Value{bits: id, tag: tagTokenLightUD}
 }
 
-func (v Value) IsNil() bool   { return v.ptr == tagNil }
-func (v Value) IsFalse() bool { return v.ptr == tagFalse }
-func (v Value) IsTrue() bool  { return v.ptr == tagTrue }
-func (v Value) IsBool() bool  { return v.ptr == tagFalse || v.ptr == tagTrue }
+func (v Value) IsNil() bool   { return v.tag == tagNil }
+func (v Value) IsFalse() bool { return v.tag == tagFalse }
+func (v Value) IsTrue() bool  { return v.tag == tagTrue }
+func (v Value) IsBool() bool  { return v.tag-tagFalse <= 1 }
 
 // IsFalsy reports whether v is nil or false in 1 SUB + 1 CMP.
 func (v Value) IsFalsy() bool {
-	return uintptr(v.ptr)-tagBase < 16
+	return v.tag-tagNil <= 1
 }
 
+// IsNumber reports whether v is an int64 or float64 in 1 CMP.
 func (v Value) IsNumber() bool {
-	return v.ptr == nil || v.ptr == tagAlt
+	return v.tag <= 1
 }
 
-func (v Value) IsString() bool   { return v.bits == kindString && v.ptr != nil && v.ptr != tagAlt }
-func (v Value) IsTable() bool    { return v.bits == kindTable && v.ptr != nil && v.ptr != tagAlt }
-func (v Value) IsClosure() bool  { return v.bits == kindClosure && v.ptr != nil && v.ptr != tagAlt }
-func (v Value) IsNative() bool   { return v.bits == kindNative && v.ptr != nil && v.ptr != tagAlt }
-func (v Value) IsThread() bool   { return v.bits == kindThread && v.ptr != nil && v.ptr != tagAlt }
-func (v Value) IsUserdata() bool { return v.bits == kindUserdata && v.ptr != nil && v.ptr != tagAlt }
-func (v Value) IsLightUD() bool {
-	return v.ptr == tagTokenLightUD || (v.bits == kindLightUD && v.ptr != nil && v.ptr != tagAlt)
-}
-func (v Value) IsFunction() bool { return v.IsClosure() || v.IsNative() }
+func (v Value) IsString() bool       { return v.tag-tagFrozenString <= 1 }
+func (v Value) IsFrozenString() bool { return v.tag == tagFrozenString }
+func (v Value) IsTable() bool        { return v.tag == tagTable }
+func (v Value) IsClosure() bool      { return v.tag == tagClosure }
+func (v Value) IsStaticNative() bool { return v.tag == tagStaticNative }
+func (v Value) IsDynNative() bool    { return v.tag == tagNative }
+func (v Value) IsNative() bool       { return v.tag == tagStaticNative || v.tag == tagNative }
+func (v Value) IsThread() bool       { return v.tag == tagThread }
+func (v Value) IsUserdata() bool     { return v.tag == tagUserdata }
+func (v Value) IsLightUD() bool      { return v.tag-tagLightUD <= 1 }
+func (v Value) IsFunction() bool     { return v.tag == tagClosure || v.tag == tagStaticNative || v.tag == tagNative }
+func (v Value) IsDeadKey() bool      { return v.tag == tagDeadKey }
 
+// IsGCObject reports whether v holds a per-State Arena ObjRef managed by State.collector
+// (dynamic String, Closure, DynNative, Table, Userdata, or Thread).
+func (v Value) IsGCObject() bool {
+	return v.tag >= tagFirstGC && v.tag <= tagLastGC
+}
+
+// Ref returns the underlying arena.ObjRef stored in v (only meaningful for Arena-backed tags).
+func (v Value) Ref() arena.ObjRef {
+	return arena.ObjRef(v.bits)
+}
+
+func (v Value) staticNativeIdx() uint32 {
+	return uint32(v.bits)
+}
+
+// AsLightUD returns nil for null/token light userdata.
+// Non-nil light userdata identity addresses are exposed via LightUDAddr.
 func (v Value) AsLightUD() unsafe.Pointer {
-	if v.ptr == tagNullLightUD || v.ptr == tagTokenLightUD {
-		return nil
-	}
-	return v.ptr
+	return nil
+}
+
+// LightUDAddr returns the opaque pointer address or token ID of a light userdata Value.
+func (v Value) LightUDAddr() uintptr {
+	return uintptr(v.bits)
 }
 
 func (v Value) formatLightUDAddr() string {
-	if v.ptr == tagTokenLightUD {
-		return fmt.Sprintf("0x%x", v.bits)
-	}
-	return fmt.Sprintf("%p", v.AsLightUD())
+	return fmt.Sprintf("0x%x", v.bits)
 }
 
 func (v *Value) SetNil() {
-	if v.ptr != tagNil {
-		v.ptr = tagNil
-	}
 	v.bits = 0
+	v.tag = tagNil
 }
 
 func (v *Value) SetBool(b bool) {
-	want := tagFalse
-	if b {
-		want = tagTrue
-	}
-	if v.ptr != want {
-		v.ptr = want
-	}
 	v.bits = 0
+	if b {
+		v.tag = tagTrue
+	} else {
+		v.tag = tagFalse
+	}
 }
 
 // ToFloat converts an int or float Value to float64.
@@ -210,7 +437,7 @@ func (v Value) ToInt() (int64, bool) {
 }
 
 // CoerceFloat converts an int, float, or numeric string Value to float64 (matching lua_tonumberx).
-func (v Value) CoerceFloat() (float64, bool) {
+func (s *State) CoerceFloat(v Value) (float64, bool) {
 	if v.IsFloat() {
 		return v.Float(), true
 	}
@@ -218,7 +445,7 @@ func (v Value) CoerceFloat() (float64, bool) {
 		return float64(v.Int()), true
 	}
 	if v.IsString() {
-		if i, f, isInt, ok := luastdlib.StrToNum((*LuaString)(v.ptr).Str()); ok {
+		if i, f, isInt, ok := luastdlib.StrToNum(s.asString(v).Str()); ok {
 			if isInt {
 				return float64(i), true
 			}
@@ -229,7 +456,7 @@ func (v Value) CoerceFloat() (float64, bool) {
 }
 
 // CoerceInt converts an int, exact-integer float, or numeric string Value to int64 (matching lua_tointegerx).
-func (v Value) CoerceInt() (int64, bool) {
+func (s *State) CoerceInt(v Value) (int64, bool) {
 	if v.IsInt() {
 		return v.Int(), true
 	}
@@ -237,7 +464,7 @@ func (v Value) CoerceInt() (int64, bool) {
 		return FloatToIntExact(v.Float())
 	}
 	if v.IsString() {
-		if i, f, isInt, ok := luastdlib.StrToNum((*LuaString)(v.ptr).Str()); ok {
+		if i, f, isInt, ok := luastdlib.StrToNum(s.asString(v).Str()); ok {
 			if isInt {
 				return i, true
 			}
@@ -247,83 +474,102 @@ func (v Value) CoerceInt() (int64, bool) {
 	return 0, false
 }
 
+var valTypeTags = [16]int{
+	0:               3, // LUA_TNUMBER (Int/Float)
+	1:               3, // LUA_TNUMBER (Float/Int)
+	tagNil:          0, // LUA_TNIL
+	tagFalse:        1, // LUA_TBOOLEAN
+	tagTrue:         1, // LUA_TBOOLEAN
+	tagLightUD:      2, // LUA_TLIGHTUSERDATA
+	tagTokenLightUD: 2, // LUA_TLIGHTUSERDATA
+	tagStaticNative: 6, // LUA_TFUNCTION
+	tagFrozenString: 4, // LUA_TSTRING
+	tagString:       4, // LUA_TSTRING
+	tagClosure:      6, // LUA_TFUNCTION
+	tagNative:       6, // LUA_TFUNCTION
+	tagTable:        5, // LUA_TTABLE
+	tagUserdata:     7, // LUA_TUSERDATA
+	tagThread:       8, // LUA_TTHREAD
+	tagDeadKey:      0,
+}
+
 // TypeTag returns the Lua 5.5 numeric type tag (0..8 matching lua.h LUA_T*).
 func (v Value) TypeTag() int {
-	switch {
-	case v.IsNil():
-		return 0 // LUA_TNIL
-	case v.IsBool():
-		return 1 // LUA_TBOOLEAN
-	case v.IsLightUD():
-		return 2 // LUA_TLIGHTUSERDATA
-	case v.IsNumber():
-		return 3 // LUA_TNUMBER
-	case v.IsString():
-		return 4 // LUA_TSTRING
-	case v.IsTable():
-		return 5 // LUA_TTABLE
-	case v.IsClosure(), v.IsNative():
-		return 6 // LUA_TFUNCTION
-	case v.IsUserdata():
-		return 7 // LUA_TUSERDATA
-	case v.IsThread():
-		return 8 // LUA_TTHREAD
-	default:
-		return 7
+	if v.tag < uint64(len(valTypeTags)) {
+		return valTypeTags[v.tag]
 	}
+	return 7
+}
+
+var valTypeNames = [16]string{
+	0:               "number",
+	1:               "number",
+	tagNil:          "nil",
+	tagFalse:        "boolean",
+	tagTrue:         "boolean",
+	tagLightUD:      "userdata",
+	tagTokenLightUD: "userdata",
+	tagStaticNative: "function",
+	tagFrozenString: "string",
+	tagString:       "string",
+	tagClosure:      "function",
+	tagNative:       "function",
+	tagTable:        "table",
+	tagUserdata:     "userdata",
+	tagThread:       "thread",
+	tagDeadKey:      "nil",
 }
 
 // TypeName returns the Lua 5.5 type(v) string.
 func (v Value) TypeName() string {
-	switch {
-	case v.IsNil():
-		return "nil"
-	case v.IsBool():
-		return "boolean"
-	case v.IsNumber():
-		return "number"
-	case v.IsString():
-		return "string"
-	case v.IsTable():
-		return "table"
-	case v.IsClosure(), v.IsNative():
-		return "function"
-	case v.IsThread():
-		return "thread"
-	default:
-		return "userdata"
+	if v.tag < uint64(len(valTypeNames)) {
+		return valTypeNames[v.tag]
 	}
+	return "userdata"
 }
 
-// RawEqual implements Lua 5.5 rawequal(a, b) (exact int/float cross-equality, NaN != NaN).
+// RawEqualScalar compares two Values without dereferencing Arena long strings.
+// For dynamic long strings, use (*State).RawEqual.
 func RawEqual(a, b Value) bool {
-	if a.ptr == b.ptr {
-		if a.IsNil() || a.IsBool() {
-			return true
-		}
-		if a.IsInt() {
-			return a.bits == b.bits
-		}
+	if a.tag == b.tag {
 		if a.IsFloat() {
 			return a.Float() == b.Float()
 		}
-		// Heap and light-userdata objects with identical pointer and kind tag are equal.
 		return a.bits == b.bits
 	}
-	// Cross int/float comparison
 	if a.IsInt() && b.IsFloat() {
 		return eqIntFloat(a.Int(), b.Float())
 	}
 	if a.IsFloat() && b.IsInt() {
 		return eqIntFloat(b.Int(), a.Float())
 	}
-	// Two long strings with different pointers may still have equal contents.
-	if a.IsString() && b.IsString() {
-		sa, sb := (*LuaString)(a.ptr), (*LuaString)(b.ptr)
-		if sa.IsShort() && sb.IsShort() {
-			return false // short strings are interned per State
+	return false
+}
+
+// RawEqual implements Lua 5.5 rawequal(a, b) for Values owned by this State
+// (exact int/float cross-equality, NaN != NaN, and content equality for long strings).
+func (s *State) RawEqual(a, b Value) bool {
+	if a.tag == b.tag {
+		if a.IsFloat() {
+			return a.Float() == b.Float()
 		}
-		return sa.Len == sb.Len && sa.Str() == sb.Str()
+		if a.bits == b.bits {
+			return true
+		}
+		if a.tag == tagString {
+			sa, sb := s.asString(a), s.asString(b)
+			if sa.IsShort() || sb.IsShort() {
+				return false
+			}
+			return sa.Len == sb.Len && sa.Str() == sb.Str()
+		}
+		return false
+	}
+	if a.IsInt() && b.IsFloat() {
+		return eqIntFloat(a.Int(), b.Float())
+	}
+	if a.IsFloat() && b.IsInt() {
+		return eqIntFloat(b.Int(), a.Float())
 	}
 	return false
 }
@@ -380,7 +626,6 @@ func LTIntFloat(i int64, f float64) bool {
 	if f < minIntAsFloat {
 		return false
 	}
-	// f is in [-2^63, 2^63): floor(f) fits in int64.
 	fl := math.Floor(f)
 	fi := int64(fl)
 	if i < fi {
@@ -389,7 +634,7 @@ func LTIntFloat(i int64, f float64) bool {
 	if i > fi {
 		return false
 	}
-	return f > fl // i == floor(f) < f iff f had a fractional part
+	return f > fl
 }
 
 // LEIntFloat implements exact Lua 5.5 LEintfloat (lvm.c).
@@ -450,7 +695,7 @@ func IntDiv(m, n int64) (int64, error) {
 		return 0, fmt.Errorf("attempt to divide by zero")
 	}
 	if n == -1 {
-		return -m, nil // handles MinInt64 // -1 == MinInt64 wraparound
+		return -m, nil
 	}
 	q := m / n
 	if (m^n) < 0 && m%n != 0 {
@@ -516,7 +761,8 @@ func FormatFloat(f float64) string {
 	return luastdlib.FormatFloat(f)
 }
 
-// FormatValue formats a Lua Value for tostring() / print().
+// FormatValue formats a scalar or non-string Lua Value without a State context.
+// For string Values (stored in per-State Arena storage), use (*State).FormatValue(v).
 func FormatValue(v Value) string {
 	switch {
 	case v.IsNil():
@@ -529,19 +775,73 @@ func FormatValue(v Value) string {
 		return strconv.FormatInt(v.Int(), 10)
 	case v.IsFloat():
 		return FormatFloat(v.Float())
+	case v.IsFrozenString():
+		if tmpl := stdTmpl; tmpl != nil && tmpl.strArena != nil {
+			return strings.Clone(arena.AsFast[LuaString](tmpl.strArena, v.Ref()).Str())
+		}
+		return fmt.Sprintf("string: 0x%x", v.bits)
 	case v.IsString():
-		return strings.Clone((*LuaString)(v.ptr).Str())
+		return fmt.Sprintf("string: 0x%x", v.bits)
 	case v.IsTable():
-		return fmt.Sprintf("table: %p", v.ptr)
-	case v.IsClosure():
-		return fmt.Sprintf("function: %p", v.ptr)
-	case v.IsNative():
-		return fmt.Sprintf("function: %p", v.ptr)
+		return fmt.Sprintf("table: 0x%x", v.bits)
+	case v.IsClosure(), v.IsNative():
+		return fmt.Sprintf("function: 0x%x", v.bits)
 	case v.IsThread():
-		return fmt.Sprintf("thread: %p", v.ptr)
+		return fmt.Sprintf("thread: 0x%x", v.bits)
 	case v.IsLightUD():
 		return "userdata: " + v.formatLightUDAddr()
 	default:
-		return fmt.Sprintf("userdata: %p", v.ptr)
+		return fmt.Sprintf("userdata: 0x%x", v.bits)
+	}
+}
+
+// valueAddr returns a deterministic unique pointer-like uintptr for %p / tostring() formatting.
+func (s *State) valueAddr(v Value) uintptr {
+	switch v.tag {
+	case tagLightUD, tagTokenLightUD:
+		return uintptr(v.bits)
+	case tagStaticNative:
+		return uintptr(unsafe.Pointer(lookupStaticNative(v.staticNativeIdx())))
+	case tagFrozenString:
+		if s.intern.frozenArena != nil {
+			return uintptr(s.intern.frozenArena.PtrFast(v.Ref()))
+		}
+		return uintptr(v.bits)
+	case tagString, tagClosure, tagNative, tagTable, tagUserdata, tagThread:
+		if s.arena != nil {
+			return uintptr(s.arena.PtrFast(v.Ref()))
+		}
+		return uintptr(v.bits)
+	default:
+		return 0
+	}
+}
+
+// FormatValue formats a Lua Value owned by this State for tostring() / print() / host diagnostics.
+// Returned strings are safely cloned copies independent of Arena lifetime.
+func (s *State) FormatValue(v Value) string {
+	switch {
+	case v.IsNil():
+		return "nil"
+	case v.IsFalse():
+		return "false"
+	case v.IsTrue():
+		return "true"
+	case v.IsInt():
+		return strconv.FormatInt(v.Int(), 10)
+	case v.IsFloat():
+		return FormatFloat(v.Float())
+	case v.IsString():
+		return strings.Clone(s.asString(v).Str())
+	case v.IsTable():
+		return fmt.Sprintf("table: 0x%x", s.valueAddr(v))
+	case v.IsClosure(), v.IsNative():
+		return fmt.Sprintf("function: 0x%x", s.valueAddr(v))
+	case v.IsThread():
+		return fmt.Sprintf("thread: 0x%x", s.valueAddr(v))
+	case v.IsLightUD():
+		return "userdata: " + v.formatLightUDAddr()
+	default:
+		return fmt.Sprintf("userdata: 0x%x", s.valueAddr(v))
 	}
 }

@@ -19,6 +19,7 @@ import (
 
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/compiler"
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
 func TestArrBoolLifecycleAndPromotion(t *testing.T) {
@@ -234,21 +235,21 @@ func TestCoroutineStackShrinkWithOpenUpvalues(t *testing.T) {
 	getter := res[1]
 	setter := res[2]
 
-	if co.openUpvals == nil {
+	if co.openUpvalsCount() == 0 {
 		t.Fatalf("expected coroutine to have open upvalues before GC shrink")
 	}
-	beforeLen := len(co.stack)
+	beforeLen := co.stackSize()
 	if beforeLen <= 2048 {
 		t.Fatalf("expected grown stack > 2048 before GC, got %d", beforeLen)
 	}
 
-	// Anchor co/getter/setter as globals so Tier 1 GC keeps them alive while shrinking co.stack!
+	// Anchor co/getter/setter as globals so GC keeps them alive while shrinking co's stack!
 	s.SetGlobal("_co", res[0])
 	s.SetGlobal("_getter", getter)
 	s.SetGlobal("_setter", setter)
 	s.CollectFull()
 
-	afterLen := len(co.stack)
+	afterLen := co.stackSize()
 	if afterLen >= beforeLen/2 {
 		t.Fatalf("expected coroutine stack with open upvalues to shrink significantly: before=%d after=%d", beforeLen, afterLen)
 	}
@@ -743,31 +744,26 @@ func TestCodexReviewRound3VMRegressions(t *testing.T) {
 	t.Run("weak_metatable_shapes_reclaimed", func(t *testing.T) {
 		s := NewState()
 		defer s.Close()
-		var w1, w2 weak.Pointer[Table]
-		func() {
-			mt1 := s.NewTable(0, 1)
-			mt1.RawSetStr(s, s.intern.Intern("payload"), StringValue(s.intern.Intern("empty_tbl_mt")))
-			w1 = weak.Make(mt1)
-			t1 := s.NewTable(0, 0)
-			s.SetMetatable(t1, mt1)
+		mt1 := s.NewTable(0, 1)
+		mt1.RawSetStr(s, s.intern.Intern("payload"), StringValue(s.intern.Intern("empty_tbl_mt")))
+		mt1Ref := mt1.self
+		t1 := s.NewTable(0, 0)
+		s.SetMetatable(t1, mt1)
 
-			mt2 := s.NewTable(0, 1)
-			mt2.RawSetStr(s, s.intern.Intern("payload"), StringValue(s.intern.Intern("shaped_tbl_mt")))
-			w2 = weak.Make(mt2)
-			t2 := s.NewTable(0, 2)
-			t2.RawSetStr(s, s.intern.Intern("x"), IntValue(1))
-			s.SetMetatable(t2, mt2)
-			_ = t1
-			_ = t2
-		}()
-		for range 5 {
-			runtime.GC()
-		}
-		s.shapes.Prune()
-		if w1.Value() != nil {
+		mt2 := s.NewTable(0, 1)
+		mt2.RawSetStr(s, s.intern.Intern("payload"), StringValue(s.intern.Intern("shaped_tbl_mt")))
+		mt2Ref := mt2.self
+		t2 := s.NewTable(0, 2)
+		t2.RawSetStr(s, s.intern.Intern("x"), IntValue(1))
+		s.SetMetatable(t2, mt2)
+		_ = t1
+		_ = t2
+
+		s.CollectFull()
+		if s.arena.IsLive(mt1Ref) {
 			t.Fatalf("metatable retained by metaRoots after dropping table")
 		}
-		if w2.Value() != nil {
+		if s.arena.IsLive(mt2Ref) {
 			t.Fatalf("metatable retained by metaTrans after dropping shaped table")
 		}
 	})
@@ -928,7 +924,7 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 		}
 	})
 
-	// 3. Weak-key table tombstones clear nd.key so Go GC immediately reclaims collected keys.
+	// 3. Weak-key table tombstones clear nd.key so Arena GC immediately reclaims collected keys.
 	t.Run("weak_key_tombstone_reclaimed", func(t *testing.T) {
 		s := NewState()
 		defer s.Close()
@@ -938,58 +934,52 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 		s.SetMetatable(wt, mt)
 		s.SetGlobal("wt", TableValue(wt))
 
-		var wk weak.Pointer[Table]
-		func() {
-			k := s.NewTable(0, 1)
-			k.RawSetStr(s, s.intern.Intern("tag"), StringValue(s.intern.Intern("ephemeral")))
-			wk = weak.Make(k)
-			_ = wt.RawSet(s, TableValue(k), IntValue(42))
-		}()
+		k := s.NewTable(0, 1)
+		k.RawSetStr(s, s.intern.Intern("tag"), StringValue(s.intern.Intern("ephemeral")))
+		kRef := k.self
+		_ = wt.RawSet(s, TableValue(k), IntValue(42))
 
 		s.CollectFull()
-		for range 5 {
-			runtime.GC()
-		}
-		if wk.Value() != nil {
-			t.Fatalf("weak-key table tombstone retained collected key after CollectGarbage + runtime.GC")
+		if s.arena.IsLive(kRef) {
+			t.Fatalf("weak-key table tombstone retained collected key after CollectFull")
 		}
 	})
 
-	// 4. Ordinary shape transitions use weak pointers so transient shapes are Go-GC reclaimable.
+	// 4. Ordinary shape transitions do not strongly root transient shapes.
 	t.Run("weak_shape_transitions_reclaimed", func(t *testing.T) {
 		s := NewState()
 		defer s.Close()
-		var wRootChild, wNestedChild weak.Pointer[Shape]
 		parent := s.NewTable(0, 2)
 		parent.RawSetStr(s, s.intern.Intern("base"), IntValue(1))
+		s.SetGlobal("parent_keep", TableValue(parent))
+		var rootChild, nestedChild weak.Pointer[Shape]
 		func() {
 			for i := range 20 {
 				tmp := s.NewTable(0, 2)
 				k := s.intern.Intern(fmt.Sprintf("transient_root_%d", i))
 				tmp.RawSetStr(s, k, IntValue(int64(i)))
 				if i == 0 {
-					wRootChild = weak.Make(tmp.shape)
+					rootChild = weak.Make(tmp.shape)
 				}
 				tmp2 := s.NewTable(0, 2)
 				tmp2.RawSetStr(s, s.intern.Intern("base"), IntValue(1))
 				k2 := s.intern.Intern(fmt.Sprintf("transient_nested_%d", i))
 				tmp2.RawSetStr(s, k2, IntValue(int64(i)))
 				if i == 0 {
-					wNestedChild = weak.Make(tmp2.shape)
+					nestedChild = weak.Make(tmp2.shape)
 				}
 			}
 		}()
-		for range 5 {
+		s.CollectFull()
+		for range 10 {
 			runtime.GC()
 		}
-		s.shapes.Prune()
-		if wRootChild.Value() != nil {
+		if rootChild.Value() != nil {
 			t.Fatalf("root shape retained transient child shape")
 		}
-		if wNestedChild.Value() != nil {
+		if nestedChild.Value() != nil {
 			t.Fatalf("non-root shape retained transient child shape")
 		}
-		_ = parent
 	})
 
 	// 5. next(t, k) matches PUC-Rio ltable.c:findindex/equalkey raw tag semantics:
@@ -1275,8 +1265,8 @@ func TestCodexReviewRound5VMRegressions(t *testing.T) {
 		if peakMem < 16384 {
 			t.Fatalf("expected peak MemoryUsage during load(reader) to include compiler memory, got %d", peakMem)
 		}
-		if s.gc.tempBytes != 0 {
-			t.Fatalf("expected tempBytes == 0 after load(reader) returns, got %d", s.gc.tempBytes)
+		if s.tempBytes != 0 {
+			t.Fatalf("expected tempBytes == 0 after load(reader) returns, got %d", s.tempBytes)
 		}
 	})
 
@@ -1485,7 +1475,7 @@ func TestCodexReviewRound6VMRegressions(t *testing.T) {
 		}
 	})
 
-	// 4. Discarded file handles are reclaimed automatically by Go GC + runtime.AddCleanup in Tier 0.
+	// 4. Discarded file handles are reclaimed and closed deterministically by Arena GC.
 	t.Run("discarded_file_handles_reclaimed_in_tier0", func(t *testing.T) {
 		s := NewState()
 		defer s.Close()
@@ -1501,24 +1491,10 @@ func TestCodexReviewRound6VMRegressions(t *testing.T) {
 		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
-		if s.gc.tier1 {
-			t.Fatalf("opening standard files must not activate Tier 1 GC")
-		}
-		deadline := time.Now().Add(2 * time.Second)
-		for {
-			runtime.GC()
-			s.compactOpenFiles()
-			if len(s.openFiles) == 0 {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("expected discarded tmpfiles to be closed automatically by Go GC, still open: %d", len(s.openFiles))
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		s.compactWeakFiles()
-		if len(s.gc.weakFiles) != 0 {
-			t.Fatalf("expected weakFiles compacted to 0, got %d", len(s.gc.weakFiles))
+		s.CollectFull()
+		s.compactOpenFiles()
+		if len(s.openFiles) != 0 {
+			t.Fatalf("expected discarded tmpfiles to be closed by Arena GC, still open: %d", len(s.openFiles))
 		}
 	})
 }
@@ -1541,7 +1517,9 @@ func TestCodexReviewRound7VMRegressions(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				s := NewState()
 				defer s.Close()
-				s.SetMemoryLimit(65536)
+				// Provide 48 KiB headroom above baseline so specialized arrInt/arrFloat (32 KiB)
+				// fits cleanly while promoting to arrGeneric (64 KiB) hits the memory limit.
+				s.SetMemoryLimit(s.MemoryUsage() + 48*1024)
 				cl, err := s.LoadChunk([]byte(fmt.Sprintf(`
 					local t = {}
 					for i = 1, %d do t[i] = %s end
@@ -3289,7 +3267,7 @@ func TestCodexReviewRound15VMRegressions(t *testing.T) {
 			Name: "gc_consumer",
 			Fn: func(st *State, args []Value) ([]Value, error) {
 				st.CollectFull()
-				v := s.AsTable(args[0]).RawGetStr(s, st.Intern("live"))
+				v := st.AsTable(args[0]).RawGetStr(st, st.Intern("live"))
 				liveDuringCall = v.IsTrue()
 				return []Value{BoolValue(liveDuringCall)}, nil
 			},
@@ -4146,7 +4124,7 @@ func TestCodexReviewRound17VMRegressions(t *testing.T) {
 		runtime.ReadMemStats(&before)
 		res, err := s2.Call(clBig)
 		runtime.ReadMemStats(&after)
-		if err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
+		if err != nil || len(res) != 1 || s2.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("warn big failed: res=%v err=%v", res, err)
 		}
 		if delta := after.TotalAlloc - before.TotalAlloc; delta > 2*1024*1024 {
@@ -4196,8 +4174,8 @@ func TestCodexReviewRound18VMRegressions(t *testing.T) {
 				t.Fatalf("entry %d not a table", i)
 			}
 			tbl := s.AsTable(tv)
-			if (!tbl.inlineSlots[0].IsNil() && tbl.inlineSlots[0].ptr != nil) || (!tbl.inlineSlots[1].IsNil() && tbl.inlineSlots[1].ptr != nil) {
-				t.Fatalf("table %d retained stale inlineSlots pointer after growth/demotion: %v", i, tbl.inlineSlots)
+			if !tbl.inlineSlots[0].IsNil() || !tbl.inlineSlots[1].IsNil() {
+				t.Fatalf("table %d retained stale inlineSlots after growth/demotion: %v", i, tbl.inlineSlots)
 			}
 		}
 	})
@@ -5072,7 +5050,7 @@ func TestCodexReviewRound22VMRegressions(t *testing.T) {
 		s.SetMemoryLimit(0)
 
 		if OptimizeEnabled {
-			if len(res) < 2 || res[0].IsTrue() || !strings.Contains(FormatValue(res[1]), "not enough memory") {
+			if len(res) < 2 || res[0].IsTrue() || !strings.Contains(s.FormatValue(res[1]), "not enough memory") {
 				t.Fatalf("expected setmetatable OOM in optimized mode, got %v", res)
 			}
 			clCheckConsistent, err := s.LoadChunk([]byte(`
@@ -5116,7 +5094,7 @@ func TestCodexReviewRound22VMRegressions(t *testing.T) {
 		}
 		s.SetMemoryLimit(0)
 		if OptimizeEnabled {
-			if len(res2) < 2 || res2[0].IsTrue() || !strings.Contains(FormatValue(res2[1]), "not enough memory") {
+			if len(res2) < 2 || res2[0].IsTrue() || !strings.Contains(s.FormatValue(res2[1]), "not enough memory") {
 				t.Fatalf("expected debug.setmetatable OOM in optimized mode, got %v", res2)
 			}
 		}
@@ -5144,8 +5122,8 @@ func TestCodexReviewRound22VMRegressions(t *testing.T) {
 		}
 		s.CollectFull()
 
-		// Separately finalize 8 tables containing fresh 32 KiB strings and keep only weak pointers.
-		var weakTables []weak.Pointer[Table]
+		// Separately finalize 8 tables containing fresh 32 KiB strings and verify Arena GC reclaims all of them.
+		var tableRefs []arena.ObjRef
 		for i := range 8 {
 			tbl := s.NewTable(0, 1)
 			payload := strings.Repeat(string(byte('A'+i)), 32768)
@@ -5161,27 +5139,20 @@ func TestCodexReviewRound22VMRegressions(t *testing.T) {
 			if err := s.ConsumeMemErr(); err != nil {
 				t.Fatalf("SetMetatable #%d failed: %v", i, err)
 			}
-			weakTables = append(weakTables, weak.Make(tbl))
+			tableRefs = append(tableRefs, tbl.self)
 			tbl = nil
 			s.CollectFull()
 			s.CollectFull()
 		}
 
-		if len(s.gc.toBeFnz) != 0 || cap(s.gc.toBeFnz) != 0 {
-			t.Fatalf("expected toBeFnz to be cleared after drain, got len=%d cap=%d", len(s.gc.toBeFnz), cap(s.gc.toBeFnz))
-		}
-		// Trigger Go GC so cleared finalized tables are reclaimed.
-		for range 3 {
-			runtime.GC()
-		}
 		alive := 0
-		for _, wp := range weakTables {
-			if wp.Value() != nil {
+		for _, ref := range tableRefs {
+			if s.arena.IsLive(ref) {
 				alive++
 			}
 		}
 		if alive != 0 {
-			t.Fatalf("expected all 8 finalized tables to be reclaimed by Go GC, %d still pinned", alive)
+			t.Fatalf("expected all 8 finalized tables to be reclaimed by Arena GC, %d still live", alive)
 		}
 	})
 }
@@ -5220,7 +5191,7 @@ func TestCodexReviewRound23VMRegressions(t *testing.T) {
 		// Also verify execution controls on many ';' templates.
 		s2 := NewState()
 		defer s2.Close()
-		searchPathFn := s2.AsTable(s2.GetGlobal("package")).RawGetStr(s, s2.Intern("searchpath"))
+		searchPathFn := s2.AsTable(s2.GetGlobal("package")).RawGetStr(s2, s2.Intern("searchpath"))
 		manySep := StringValue(s2.Intern(strings.Repeat(";", 200_000)))
 		s2.SetInstructionLimit(100)
 		_, err = s2.Call(searchPathFn, StringValue(s2.Intern("m")), manySep)
@@ -5609,27 +5580,17 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil || len(res) != 2 {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
-		wco := weak.Make(s.AsThread(res[0]))
+		coRef := res[0].Ref()
 		fn := res[1]
 		res = nil
 		s.SetGlobal("kept_fn", fn)
-		// Stay in Tier 0 and trigger emergency GC via memory pressure.
-		if s.gc.tier1 {
-			t.Fatal("expected Tier 0 before emergency GC")
-		}
 		s.collectEmergency()
 		// Verify open upvalue was closed and captured value survived.
 		got, err := s.Call(fn)
 		if err != nil || len(got) != 1 || s.AsString(got[0]).Str() != "captured-value" {
 			t.Fatalf("captured value corrupted: got=%v err=%v", got, err)
 		}
-		for range 10 {
-			runtime.GC()
-			if wco.Value() == nil {
-				break
-			}
-		}
-		if wco.Value() != nil {
+		if s.arena.IsLive(coRef) {
 			t.Fatal("dead coroutine was still pinned by open upvalue after emergency GC")
 		}
 	})
@@ -5658,7 +5619,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		s2.SetContext(ctx)
-		_, err = s2.Call(s2.AsTable(s2.GetGlobal("string")).RawGetStr(s, s2.Intern("dump")), fn2)
+		_, err = s2.Call(s2.AsTable(s2.GetGlobal("string")).RawGetStr(s2, s2.Intern("dump")), fn2)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected context.Canceled from string.dump, got %v", err)
 		}
@@ -6079,8 +6040,8 @@ return "ok"
 		var closeOrder []string
 		s.SetGlobal("record_close", s.NativeValue(&NativeFunc{
 			Name: "record_close",
-			Fn: func(_ *State, args []Value) ([]Value, error) {
-				closeOrder = append(closeOrder, FormatValue(args[0]))
+			Fn: func(st *State, args []Value) ([]Value, error) {
+				closeOrder = append(closeOrder, st.FormatValue(args[0]))
 				return nil, nil
 			},
 		}))
@@ -6119,8 +6080,11 @@ return "ok"
 		closeOrder = nil
 		s.Close()
 		got := strings.Join(closeOrder, ",")
-		if got != "t4,file2,t3" {
-			t.Fatalf("State.Close finalizer order = %q, want %q", got, "t4,file2,t3")
+		// PUC-Rio Lua 5.5.1 (liolib.c:createstdfile) registers stdin/stdout/stderr with LUA_FILEHANDLE
+		// so lua_close invokes fileMeta.__gc on them in LIFO order after user objects.
+		const wantOrder = "t4,file2,t3,file2,file2,file2"
+		if got != wantOrder {
+			t.Fatalf("State.Close finalizer order = %q, want %q", got, wantOrder)
 		}
 	})
 
@@ -6201,12 +6165,12 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		defer s.Close()
 		s.SetMemoryLimit(131072)
 
-		var watched []weak.Pointer[LuaString]
+		var watched []arena.ObjRef
 		s.SetGlobal("watch_str", s.NativeValue(&NativeFunc{
 			Name: "watch_str",
 			Fn: func(_ *State, args []Value) ([]Value, error) {
 				if len(args) > 0 && args[0].IsString() {
-					watched = append(watched, weak.Make(s.AsString(args[0])))
+					watched = append(watched, args[0].Ref())
 				}
 				return args, nil
 			},
@@ -6244,17 +6208,14 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		if len(watched) != 7 {
 			t.Fatalf("expected 7 watched payloads, got %d", len(watched))
 		}
-		for range 5 {
-			runtime.GC()
-		}
 		alive := 0
-		for _, wp := range watched {
-			if wp.Value() != nil {
+		for _, ref := range watched {
+			if s.arena.IsLive(ref) {
 				alive++
 			}
 		}
 		if alive != 0 {
-			t.Fatalf("expected Go GC to reclaim all 7 removed stdlib payloads, %d still alive", alive)
+			t.Fatalf("expected Arena GC to reclaim all 7 removed stdlib payloads, %d still live", alive)
 		}
 	})
 
@@ -6374,12 +6335,12 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		defer s.Close()
 		s.SetMemoryLimit(131072)
 
-		var watched []weak.Pointer[LuaString]
+		var watched []arena.ObjRef
 		s.SetGlobal("watch_str", s.NativeValue(&NativeFunc{
 			Name: "watch_str",
 			Fn: func(_ *State, args []Value) ([]Value, error) {
 				if len(args) > 0 && args[0].IsString() {
-					watched = append(watched, weak.Make(s.AsString(args[0])))
+					watched = append(watched, args[0].Ref())
 				}
 				return args, nil
 			},
@@ -6428,17 +6389,14 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].Int() != 51 {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
-		for range 5 {
-			runtime.GC()
-		}
 		alive := 0
-		for _, wp := range watched {
-			if wp.Value() != nil {
+		for _, ref := range watched {
+			if s.arena.IsLive(ref) {
 				alive++
 			}
 		}
 		if alive != 0 {
-			t.Fatalf("expected Go GC to reclaim all %d strings captured by discarded closures despite retaining upvalueids, %d still alive", len(watched), alive)
+			t.Fatalf("expected Arena GC to reclaim all %d strings captured by discarded closures despite retaining upvalueids, %d still live", len(watched), alive)
 		}
 	})
 }
@@ -6726,8 +6684,8 @@ func TestCodexReviewRound32VMRegressions(t *testing.T) {
 		}()
 		s.Close()
 		s.Unref(id) // safe no-op after Close
-		if len(s.gc.pinnedRefs) != 0 {
-			t.Fatalf("expected pinnedRefs cleared on Close, got %d entries", len(s.gc.pinnedRefs))
+		if len(s.pinnedRefs) != 0 {
+			t.Fatalf("expected pinnedRefs cleared on Close, got %d entries", len(s.pinnedRefs))
 		}
 		for range 10 {
 			runtime.GC()

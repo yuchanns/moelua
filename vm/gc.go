@@ -3,353 +3,199 @@ package vm
 import (
 	"errors"
 	"fmt"
-	"math"
-	"math/bits"
 	"unsafe"
 	"weak"
+
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
-// Two-Tier GC Semantics Engine ("Go frees, VM decides reachability"):
+// Per-State PUC-Rio Lua 5.5.1 Incremental & Generational GC Bridge:
 //
-//   - Tier 0 (default): State has never seen "__gc" or "__mode".
-//     100% pure Go GC, ZERO extra GC overhead.
-//   - Tier 1 (lazily activated on first rawset of "__gc" or "__mode" into any table):
-//     Deterministic VM-side mark-only tracer (per-object gcMark uint64 + explicit gray stack,
-//     NO second write barrier!) running at collectgarbage() / safepoints in exact PUC-Rio lgc.c
-//     atomic() 6-step order:
-//       1. convergeEphemerons
-//       2. clearByValues (weak-v / all-weak) -> BEFORE __gc!
-//       3. separateToBeFnz (strict LIFO order)
-//       4. markBeingFnz + propagate (resurrection -> keeps weak keys alive DURING __gc!)
-//       5. convergeEphemerons + clearByKeys (ephemeron / all-weak)
-//       6. clearByValues again (from orig weak/all-weak)
-//     Then synchronously drains __gc finalizers on the VM thread.
+// Wires State's noscan Arena objects (LuaString, Table, Shape, Closure, Upvalue,
+// ArenaNative, Userdata, Thread, ArenaProto) directly into internal/arena.Collector.
+// Go's GC never scans Lua heaps (O(pages) mark per VM), while Lua's Collector runs
+// exact PUC-Rio lgc.c incremental tri-color + generational minor/major cycles,
+// weak/ephemeron clearing, LIFO __gc finalizers, and automatic GoRefs reclamation.
 
-type gcFinalEntry struct {
-	obj Value // *Table or *Userdata
-	seq uint64
+func (s *State) initCollector() {
+	s.collector = arena.NewCollector(s.arena, arena.Callbacks{
+		MarkRoots:         s.gcMarkRoots,
+		MarkAtomicRoots:   s.gcMarkRoots,
+		AfterGrayAgain:    s.gcRemarkUpvals,
+		PreSweep:          s.gcPreSweep,
+		AuxBytes:          s.gcAuxBytes,
+		Traverse:          s.gcTraverse,
+		TraverseEphemeron: s.gcTraverseEphemeron,
+		ClearByKeys:       s.gcClearByKeys,
+		ClearByValues:     s.gcClearByValues,
+		IsThread:          s.gcIsThread,
+		IsOpenUpval:       s.gcIsOpenUpval,
+		MarkLeaf:          s.gcMarkLeaf,
+		FreeObject:        s.gcFreeObject,
+		RunFinalizer:      s.gcRunFinalizer,
+		CheckSizes:        s.gcCheckSizes,
+		CancelCheck:       s.gcCancelCheck,
+	})
+	s.intern.arena = s.arena
+	s.intern.collector = s.collector
 }
 
-type gcWeakFileEntry struct {
-	u      weak.Pointer[Userdata]
-	strong *Userdata // non-nil when fileMeta.__gc was customized so Go GC cannot drop the userdata before VM __gc runs
-	fi     *fileInner
-	seq    uint64
-}
-
-func (wf gcWeakFileEntry) userdata() *Userdata {
-	if wf.strong != nil {
-		return wf.strong
-	}
-	return wf.u.Value()
-}
-
-type gcMode uint8
-
-const (
-	gcModeIncremental gcMode = iota
-	gcModeGenerational
-)
-
-type gcState struct {
-	tier1           bool // true once __gc or __mode has been observed in this State
-	hasDeadHashKeys bool // true once a string or collectable hash key has been deleted since last full trace
-	epoch           uint64
-	running       bool
-	inGCTM        bool // true while draining __gc finalizers (prevents re-entrant collectgarbage)
-	closing       bool // true once State.Close() has begun (new __gc objects registered during close are ignored)
-	mode          gcMode
-	allocBytes    int64 // logical VM-accounted bytes for collectgarbage("count")
-	tempBytes     int64 // transient Go-side buffer bytes (e.g. load(reader)) held across calls
-	lastLiveBytes int64 // live bytes measured at end of last full trace (proportional Tier 1 pacing)
-	debt          int64
-	params        [6]byte // encoded via luaGCParamCode: minormul, majorminor, minormajor, pause, stepmul, stepsize
-
-	// Shared monotonic sequence for strict LIFO finalizer order across tables, userdata, and files.
-	finalSeq uint64
-	// True once Lua has written fileMeta.__gc; retains open file userdata strongly until VM __gc runs.
-	customFileGC bool
-	// Objects marked for finalization at setmetatable time (ascending seq; merged in reverse LIFO).
-	finalizable []gcFinalEntry
-	// Weakly-tracked standard file userdata so Go GC + runtime.AddCleanup reclaims discarded
-	// handles automatically in Tier 0, while explicit collectgarbage()/Close() closes live ones.
-	weakFiles []gcWeakFileEntry
-	// Queue of unreachable objects pending __gc invocation in LIFO order.
-	toBeFnz []Value
-	// Host-pinned references (analog of luaL_ref) so Tier 1 marker keeps host-held Lua values alive.
-	pinnedRefs map[int]Value
-	nextRefID  int
-	// Transient shape pinned while table slot growth checks memory limits (may trigger emergency GC).
-	pinnedShape *Shape
-}
-
-const (
-	gcParamMinorMul = iota
-	gcParamMajorMinor
-	gcParamMinorMajor
-	gcParamPause
-	gcParamStepMul
-	gcParamStepSize
-)
-
-// luaGCParamCode implements Lua 5.5.1 lobject.c:luaO_codeparam (4-bit exponent + 4-bit mantissa).
-func luaGCParamCode(p uint64) byte {
-	const maxParam = (uint64(0x1F) << (0xF - 7 - 1)) * 100
-	if p >= maxParam {
-		return 0xFF
-	}
-	q := (p*128 + 99) / 100
-	if q < 0x10 {
-		return byte(q)
-	}
-	log := uint(bits.Len64(q) - 5)
-	return byte(((q >> log) - 0x10) | (uint64(log+1) << 4))
-}
-
-// luaGCParamApply implements Lua 5.5.1 lobject.c:luaO_applyparam.
-func luaGCParamApply(p byte, x int64) int64 {
-	m := int64(p & 0xF)
-	e := int(p >> 4)
-	if e > 0 {
-		e--
-		m += 0x10
-	}
-	e -= 7
-	if e >= 0 {
-		if x < (math.MaxInt64/0x1F)>>uint(e) {
-			return (x * m) << uint(e)
-		}
-		return math.MaxInt64
-	}
-	sh := uint(-e)
-	if x < math.MaxInt64/0x1F {
-		return (x * m) >> sh
-	}
-	if (x >> sh) < math.MaxInt64/0x1F {
-		return (x >> sh) * m
-	}
-	return math.MaxInt64
-}
-
-func newGCState() gcState {
-	return gcState{
-		running:       true,
-		mode:          gcModeIncremental,
-		allocBytes:    4096,
-		lastLiveBytes: 4096,
-		params: [6]byte{
-			luaGCParamCode(20),   // minormul
-			luaGCParamCode(50),   // majorminor
-			luaGCParamCode(70),   // minormajor
-			luaGCParamCode(250),  // pause
-			luaGCParamCode(200),  // stepmul
-			luaGCParamCode(9600), // stepsize (200 * sizeof(Table) on 64-bit)
-		},
-		nextRefID: 1,
+func (s *State) markValue(c *arena.Collector, v Value) {
+	if v.IsGCObject() {
+		c.MarkObject(v.Ref())
 	}
 }
 
-// gcAddDebt adds bytes to the Tier 1 automatic GC pacing debt counter without
-// triggering a collection mid-operation (call gcCheckDebt at a safe point once
-// newly allocated objects are rooted on the thread stack).
-func (s *State) gcAddDebt(bytes int64) {
-	if !s.gc.tier1 || bytes <= 0 || !s.gc.running || s.gc.inGCTM {
-		return
+func (s *State) gcCancelCheck() error {
+	if s.abortErr != nil {
+		return s.abortErr
 	}
-	s.gc.debt += bytes
+	if s.ctx != nil || s.insnLimit > 0 {
+		return s.checkNativeCancelStep()
+	}
+	return nil
 }
 
-func (s *State) gcDebtThreshold() int64 {
-	pause := luaGCParamApply(s.gc.params[gcParamPause], 100)
-	threshold := int64(65536)
-	if pause > 100 {
-		if prop := s.gc.lastLiveBytes * (pause - 100) / 100; prop > threshold {
-			threshold = prop
-		}
-	}
-	return threshold
+func (s *State) gcIsThread(ref arena.ObjRef) bool {
+	return s.arena.Header(ref).Kind == gcKindThread
 }
 
-// gcNeedsCheck reports whether gcCheckDebt would trigger a Tier-1 collection,
-// drain finalizers, or sweep accumulated per-State Arena allocations.
-func (s *State) gcNeedsCheck() bool {
-	if !s.gc.running || s.gc.inGCTM {
+func (s *State) gcIsOpenUpval(ref arena.ObjRef) bool {
+	if s.arena.Header(ref).Kind != gcKindUpvalue {
 		return false
 	}
-	if s.gc.tier1 && (s.gc.debt >= s.gcDebtThreshold() || len(s.gc.toBeFnz) > 0) {
+	return arena.AsSmall[Upvalue](s.arena, ref).ownerRef != arena.NullRef
+}
+
+func (s *State) gcMarkLeaf(c *arena.Collector, ref arena.ObjRef) bool {
+	kind := s.arena.Header(ref).Kind
+	return kind == gcKindShortStr || kind == gcKindLongStr
+}
+
+func (s *State) gcAuxBytes(a *arena.Arena, ref arena.ObjRef) int64 {
+	switch a.Header(ref).Kind {
+	case gcKindTable:
+		t := s.tableByRef(ref)
+		if t == nil {
+			return 0
+		}
+		return t.memBytes
+	case gcKindClosure:
+		cl := arena.AsSmall[Closure](a, ref)
+		if cl.upvalsRef != arena.NullRef {
+			return int64(a.SlotSize(cl.upvalsRef))
+		}
+		return 0
+	case gcKindNative:
+		an := arena.AsSmall[ArenaNative](a, ref)
+		var total int64
+		if an.upvalsRef != arena.NullRef {
+			total += int64(a.SlotSize(an.upvalsRef))
+		}
+		if an.upvalIDsRef != arena.NullRef {
+			total += int64(a.SlotSize(an.upvalIDsRef))
+		}
+		return total
+	case gcKindUserdata:
+		u := arena.AsSmall[Userdata](a, ref)
+		var total int64
+		if u.uvalsRef != arena.NullRef {
+			total += int64(a.SlotSize(u.uvalsRef))
+		}
+		if u.gcRefsRef != arena.NullRef {
+			total += int64(a.SlotSize(u.gcRefsRef))
+		}
+		return total
+	case gcKindThread:
+		th := s.threadByRef(ref)
+		if th == nil {
+			return 0
+		}
+		return th.memBytes
+	case gcKindProto:
+		ap := arena.AsSmall[ArenaProto](a, ref)
+		var total int64
+		if ap.constsRef != arena.NullRef {
+			total += int64(a.SlotSize(ap.constsRef))
+		}
+		if ap.subRef != arena.NullRef {
+			total += int64(a.SlotSize(ap.subRef))
+		}
+		return total
+	default:
+		return 0
+	}
+}
+
+func (s *State) markShape(c *arena.Collector, sh *Shape) {
+	for cur := sh; cur != nil; cur = cur.parent {
+		if cur.meta != nil && cur.meta.self != arena.NullRef {
+			c.MarkObject(cur.meta.self)
+		}
+		if cur.key != nil && cur.key.hdr.Flags&strFlagFixed == 0 && cur.key.self != arena.NullRef {
+			c.MarkObject(cur.key.self)
+		}
+	}
+}
+
+func (s *State) gcMarkRoots(c *arena.Collector) {
+	if s.registryRef != arena.NullRef {
+		c.MarkObject(s.registryRef)
+	}
+	if s.pkgRef != arena.NullRef {
+		c.MarkObject(s.pkgRef)
+	}
+	if s.fileMetaRef != arena.NullRef {
+		c.MarkObject(s.fileMetaRef)
+	}
+	if s.stringMetaRef != arena.NullRef {
+		c.MarkObject(s.stringMetaRef)
+	}
+	for _, ref := range s.typeMetaRefs {
+		if ref != arena.NullRef {
+			c.MarkObject(ref)
+		}
+	}
+	if s.pinnedShape != nil {
+		s.markShape(c, s.pinnedShape)
+	}
+	s.markValue(c, s.stdinInput)
+	s.markValue(c, s.defaultInput)
+	s.markValue(c, s.defaultOutput)
+	if s.mainThreadRef != arena.NullRef {
+		c.MarkObject(s.mainThreadRef)
+	}
+	if s.curRef != arena.NullRef && s.curRef != s.mainThreadRef {
+		c.MarkObject(s.curRef)
+	}
+	for _, v := range s.pinnedRefs {
+		s.markValue(c, v)
+	}
+}
+
+// isWeakCollectable reports whether v can be cleared from a weak table.
+// Per Lua 5.5 spec (lgc.c:iscleared): strings, numbers, bools, nil, lightud, and
+// non-collectable C functions are NEVER weak!
+func (s *State) isWeakCollectable(v Value) bool {
+	switch v.tag {
+	case tagTable, tagClosure, tagUserdata, tagThread:
 		return true
-	}
-	return s.arenaNeedsSweep()
-}
-
-func (s *State) arenaNeedsSweep() bool {
-	a := s.intern.arena
-	if a == nil || s.arenaSweepThresh <= 0 {
+	case tagNative:
+		return arena.AsSmall[ArenaNative](s.arena, v.Ref()).isCollectable()
+	default:
 		return false
 	}
-	return a.AllocBytes() >= s.arenaSweepThresh
 }
 
-// gcCheckDebt triggers an automatic GC cycle (or drains pending finalizers / sweeps
-// accumulated Arena allocations) when accumulated debt reaches the threshold.
-// liveTop matches PUC-Rio lvm.c's checkGC(L, ra+1): only stack[0..liveTop) is live
-// so dead temporaries above R[a] are collected.
-func (s *State) gcCheckDebt(liveTop int) {
-	if !s.gc.running || s.gc.inGCTM {
-		return
-	}
-	if (s.gc.tier1 && s.gc.debt >= s.gcDebtThreshold()) || s.arenaNeedsSweep() {
-		s.gc.debt = 0
-		if s.curThread != nil && liveTop > 0 {
-			savedTop := s.curThread.top
-			s.curThread.top = liveTop
-			s.CollectFull()
-			if savedTop > s.curThread.top {
-				s.curThread.top = savedTop
-			}
-			return
+func (s *State) isClearedWeak(c *arena.Collector, v Value) bool {
+	if !s.isWeakCollectable(v) {
+		// Strings and non-collectable natives survive weak tables; ensure they are marked!
+		if v.IsGCObject() {
+			c.MarkObject(v.Ref())
 		}
-		s.CollectFull()
-		return
+		return false
 	}
-	if s.gc.tier1 && len(s.gc.toBeFnz) > 0 {
-		s.drainFinalizers()
-	}
-}
-
-// gcRecordAlloc accounts allocations in Tier 1 mode and triggers automatic GC cycles
-// so loops allocating tables/strings/closures fire weak clearing and __gc finalizers
-// (required by closure.lua:39, gc.lua:88-100, db.lua:926). Zero cost in Tier 0!
-func (s *State) gcRecordAlloc(bytes int64, liveTop int) {
-	if !s.gc.tier1 {
-		return
-	}
-	s.gc.allocBytes += bytes
-	s.gcAddDebt(bytes)
-	s.gcCheckDebt(liveTop)
-}
-
-// activateTier1 flips this State into deterministic Tier 1 GC semantics.
-func (s *State) activateTier1() {
-	s.gc.tier1 = true
-}
-
-// promoteFileFinalizers switches open file userdata tracking from weak-only to strong retention
-// once Lua customizes fileMeta.__gc, ensuring Go GC cannot discard userdata before VM __gc runs.
-func (s *State) promoteFileFinalizers() {
-	s.activateTier1()
-	if s.gc.customFileGC {
-		return
-	}
-	s.gc.customFileGC = true
-	for i := range s.gc.weakFiles {
-		wf := &s.gc.weakFiles[i]
-		if wf.strong == nil {
-			if u := wf.u.Value(); u != nil && !u.gcInFnz && !u.gcFnzed {
-				wf.strong = u
-			}
-		}
-	}
-}
-
-// sweepCoallocTables clears outgoing Go references from unreachable stdlib tables/hashes
-// embedded in stateAlloc so Go GC can reclaim values stored in removed stdlib tables
-// (including values written in-place into shared template slabs).
-func (s *State) sweepCoallocTables(epoch uint64) {
-	for i := range s.coallocTables {
-		t := &s.coallocTables[i]
-		if t.gcMark == epoch {
-			continue
-		}
-		if len(t.slots) > 0 {
-			clear(t.slots)
-		}
-		if t.arrPtr != nil && t.arrKind == arrGeneric && t.arrCap > 0 {
-			clear(unsafe.Slice((*Value)(t.arrPtr), t.arrCap))
-		}
-		if t.hash != nil {
-			if len(t.hash.nodes) > 0 {
-				clear(t.hash.nodes)
-			}
-			*t.hash = tableHash{}
-		}
-		*t = Table{}
-		if i < len(s.coallocHashes) {
-			h := &s.coallocHashes[i]
-			if len(h.nodes) > 0 {
-				clear(h.nodes)
-			}
-			*h = tableHash{}
-		}
-	}
-}
-
-// registerFinalizable records obj (Table or Userdata) for __gc finalization in LIFO order
-// when setmetatable attaches a metatable containing "__gc" (matching lgc.c:luaC_checkfinalizer).
-func (s *State) registerFinalizable(obj Value, mt *Table) {
-	if mt == nil || s.gc.closing {
-		return
-	}
-	if mt.RawGetStr(s, s.intern.tms[TMGC]).IsNil() {
-		return
-	}
-	s.activateTier1()
-	switch {
-	case obj.IsTable():
-		t := s.asTable(obj)
-		if t.flags&tblFlagGCPending != 0 {
-			return // already separated into toBeFnz; matches lgc.c:luaC_checkfinalizer FINALIZEDBIT
-		}
-		if t.flags&tblFlagGCFnzed != 0 {
-			// Re-arming inside __gc (tracegc.lua / gc.lua)!
-			t.flags &^= tblFlagGCFnzed
-		}
-		if t.flags&tblFlagGCInFnz == 0 {
-			t.flags |= tblFlagGCInFnz
-			s.gc.finalSeq++
-			s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: obj, seq: s.gc.finalSeq})
-		}
-	case obj.IsUserdata():
-		u := s.asUserdata(obj)
-		if u.gcPending {
-			return
-		}
-		if u.gcFnzed {
-			u.gcFnzed = false
-		}
-		if !u.gcInFnz {
-			u.gcInFnz = true
-			s.gc.finalSeq++
-			s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: obj, seq: s.gc.finalSeq})
-		}
-	}
-}
-
-// registerWeakCandidate activates Tier 1 GC if mt has a __mode field.
-func (s *State) registerWeakCandidate(t, mt *Table) {
-	if mt == nil {
-		return
-	}
-	if !mt.RawGetStr(s, s.intern.tms[TMMode]).IsNil() {
-		s.activateTier1()
-		t.flags |= tblFlagGCWeakCand
-	}
-}
-
-// Ref pins a Lua Value so Tier 1 GC keeps it reachable from the Go host (like luaL_ref).
-func (s *State) Ref(v Value) int {
-	if s.gc.pinnedRefs == nil {
-		s.gc.pinnedRefs = make(map[int]Value)
-	}
-	id := s.gc.nextRefID
-	s.gc.nextRefID++
-	s.gc.pinnedRefs[id] = v
-	return id
-}
-
-// Unref releases a host-pinned reference.
-func (s *State) Unref(id int) {
-	delete(s.gc.pinnedRefs, id)
+	return c.IsWhite(v.Ref())
 }
 
 func (s *State) weakModeOf(t *Table) (weakK, weakV bool) {
@@ -378,898 +224,682 @@ func (s *State) weakModeOf(t *Table) (weakK, weakV bool) {
 	return wk, wv
 }
 
-// isCollectableWeak reports whether v can be cleared from a weak table.
-// Per Lua 5.5 spec (lgc.c:223-230, lobject.h, gc.lua:246): strings, numbers, bools, nil,
-// lightud, and light C functions (immutable stdlib builtins) are NEVER weak!
-// Lua closures and dynamic C closures (coroutine.wrap, gmatch, io.lines, utf8.codes) ARE collectable.
-func isCollectableWeak(v Value) bool {
-	if v.IsNative() {
-		return (*NativeFunc)(v.ptr).Collectable
-	}
-	return v.IsTable() || v.IsClosure() || v.IsUserdata() || v.IsThread()
-}
-
-func gcObjPtr(v Value) (unsafe.Pointer, bool) {
-	switch {
-	case v.IsTable():
-		return v.ptr, true
-	case v.IsClosure():
-		return v.ptr, true
-	case v.IsNative():
-		nf := (*NativeFunc)(v.ptr)
-		if nf.Collectable {
-			return unsafe.Pointer(nf), true
+func (s *State) gcTraverse(c *arena.Collector, ref arena.ObjRef) int64 {
+	a := s.arena
+	switch a.Header(ref).Kind {
+	case gcKindTable:
+		t := s.tableByRef(ref)
+		if t == nil {
+			return 1
 		}
-	case v.IsUserdata():
-		return v.ptr, true
-	case v.IsThread():
-		return v.ptr, true
-	}
-	return nil, false
-}
-
-type gcTracer struct {
-	s              *State
-	epoch          uint64
-	preserveFrames bool // true when triggered mid-opcode (e.g. checkMem) where s.cur.top may be stale
-	countStrings   bool // true when s.memLimit > 0 so live strings are counted accurately in liveBytes
-	cancelFn       func() error
-	cancelSteps    int64
-	aborted        bool
-	seenProtos     map[*boundProto]struct{}
-	seenShapes     map[*Shape]struct{}
-	seenShapeIDs   map[uint64]struct{}
-	gray           []Value
-	hashedTables   []*Table // all marked tables with t.hash != nil (for dead hash-key clearing)
-	weakVals       []*Table // __mode="v"
-	ephemerons     []*Table // __mode="k"
-	allWeaks       []*Table // __mode="kv"
-	ephemDeps      map[unsafe.Pointer][]Value
-	ephemReady     []Value
-	ephemScanned   int
-	liveOpenUpvals []*Upvalue
-	liveBytes      int64
-}
-
-func (tr *gcTracer) tickCancel() bool {
-	if tr.aborted {
-		return true
-	}
-	if tr.cancelFn == nil {
-		return false
-	}
-	tr.cancelSteps++
-	if (tr.cancelSteps & 4095) == 0 {
-		if err := tr.cancelFn(); err != nil {
-			tr.aborted = true
-			return true
+		return s.gcTraverseTable(c, t)
+	case gcKindClosure:
+		cl := arena.AsSmall[Closure](a, ref)
+		if cl.protoRef != arena.NullRef {
+			c.MarkObject(cl.protoRef)
 		}
-	}
-	return false
-}
-
-func (tr *gcTracer) unlockEphemDeps(ptr unsafe.Pointer) {
-	if len(tr.ephemDeps) == 0 {
-		return
-	}
-	if deps, ok := tr.ephemDeps[ptr]; ok {
-		tr.ephemReady = append(tr.ephemReady, deps...)
-		delete(tr.ephemDeps, ptr)
-	}
-}
-
-func (tr *gcTracer) markShape(sh *Shape) {
-	root := tr.s.shapes.root
-	for cur := sh; cur != nil && !cur.frozen; cur = cur.parent {
-		if _, ok := tr.seenShapes[cur]; ok {
-			return
-		}
-		if tr.seenShapes == nil {
-			tr.seenShapes = make(map[*Shape]struct{}, 32)
-			tr.seenShapeIDs = make(map[uint64]struct{}, 32)
-		}
-		tr.seenShapes[cur] = struct{}{}
-		tr.seenShapeIDs[cur.id] = struct{}{}
-		if cur == root {
-			if cur.transMap != nil {
-				tr.liveBytes += 48 + int64(len(cur.transMap))*32
+		ups := cl.upvalsSlice(a)
+		for _, uvRef := range ups {
+			if uvRef != arena.NullRef {
+				c.MarkObject(uvRef)
 			}
-			continue
 		}
-		tr.liveBytes += shapeNodeBytes(cur)
-		if cur.key != nil {
-			tr.mark(StringValue(cur.key))
+		return int64(1 + len(ups))
+	case gcKindUpvalue:
+		uv := arena.AsSmall[Upvalue](a, ref)
+		if uv.ownerRef == arena.NullRef {
+			s.markValue(c, uv.closed)
 		}
-	}
-}
-
-func (tr *gcTracer) markBoundProto(bp *boundProto) {
-	if bp == nil {
-		return
-	}
-	if _, ok := tr.seenProtos[bp]; ok {
-		return
-	}
-	if tr.seenProtos == nil {
-		tr.seenProtos = make(map[*boundProto]struct{}, 32)
-	}
-	tr.seenProtos[bp] = struct{}{}
-	tr.liveBytes += protoOwnBytes(bp.proto, len(bp.ic) > 0)
-	for _, ls := range bp.strConsts {
-		if ls != nil {
-			tr.mark(StringValue(ls))
+		return 1
+	case gcKindNative:
+		an := arena.AsSmall[ArenaNative](a, ref)
+		ups := an.upvalsSlice(a)
+		for _, v := range ups {
+			s.markValue(c, v)
 		}
-	}
-	for _, sub := range bp.sub {
-		tr.markBoundProto(sub)
-	}
-}
-
-func (tr *gcTracer) markRoots() {
-	s := tr.s
-	if s.registryTbl != nil {
-		tr.mark(TableValue(s.registryTbl))
-	}
-	if s.pkgTbl != nil {
-		tr.mark(TableValue(s.pkgTbl))
-	}
-	for _, mt := range s.typeMetas {
-		if mt != nil {
-			tr.mark(TableValue(mt))
+		return int64(1 + len(ups))
+	case gcKindUserdata:
+		u := arena.AsSmall[Userdata](a, ref)
+		if u.metaRef != arena.NullRef {
+			c.MarkObject(u.metaRef)
 		}
-	}
-	if s.fileMetaTbl != nil {
-		tr.mark(TableValue(s.fileMetaTbl))
-	}
-	if !s.stdinInput.IsNil() {
-		tr.mark(s.stdinInput)
-	}
-	if !s.defaultInput.IsNil() {
-		tr.mark(s.defaultInput)
-	}
-	if !s.defaultOutput.IsNil() {
-		tr.mark(s.defaultOutput)
-	}
-	tr.mark(ThreadValue(s.mainThreadPtr))
-	if s.curThread != nil && s.curThread != s.mainThreadPtr {
-		tr.mark(ThreadValue(s.curThread))
-	}
-	for _, v := range s.gc.pinnedRefs {
-		if tr.cancelFn != nil && tr.tickCancel() {
-			return
+		uvals := u.uvalsSlice(a)
+		for _, v := range uvals {
+			s.markValue(c, v)
 		}
-		tr.mark(v)
-	}
-	for _, v := range s.gc.toBeFnz {
-		if tr.cancelFn != nil && tr.tickCancel() {
-			return
+		grefs := u.gcRefsSlice(a)
+		for _, v := range grefs {
+			s.markValue(c, v)
 		}
-		tr.mark(v)
-	}
-	if s.gc.pinnedShape != nil {
-		tr.markShape(s.gc.pinnedShape)
-	}
-}
-
-func (tr *gcTracer) isMarked(v Value) bool {
-	if !isCollectableWeak(v) {
-		return true // primitives & strings are always "marked" (never cleared from weak tables)
-	}
-	s := tr.s
-	switch {
-	case v.IsTable():
-		return s.asTable(v).gcMark == tr.epoch
-	case v.IsClosure():
-		return s.asClosure(v).gcMark == tr.epoch
-	case v.IsNative():
-		return s.asNative(v).gcMark == tr.epoch
-	case v.IsUserdata():
-		return s.asUserdata(v).gcMark == tr.epoch
-	case v.IsThread():
-		return s.asThread(v).gcMark == tr.epoch
+		return int64(1 + len(uvals) + len(grefs))
+	case gcKindThread:
+		th := s.threadByRef(ref)
+		if th == nil {
+			return 1
+		}
+		return s.gcTraverseThread(c, th)
+	case gcKindProto:
+		ap := arena.AsSmall[ArenaProto](a, ref)
+		if ap.constsRef != arena.NullRef {
+			consts := arena.SliceFast[Value](a, ap.constsRef, 0, int(ap.nConsts))
+			for _, v := range consts {
+				s.markValue(c, v)
+			}
+		}
+		if ap.subRef != arena.NullRef {
+			subs := arena.SliceFast[arena.ObjRef](a, ap.subRef, 0, int(ap.nSub))
+			for _, subRef := range subs {
+				if subRef != arena.NullRef {
+					c.MarkObject(subRef)
+				}
+			}
+		}
+		return int64(1 + ap.nConsts + ap.nSub)
 	default:
-		return true
+		return 1
 	}
 }
 
-func (tr *gcTracer) mark(v Value) {
-	s := tr.s
-	if v.IsString() {
-		ls := s.asString(v)
-		if !ls.IsFixed() && !ls.hdr.IsBlack() {
-			ls.hdr.SetBlack()
-			if tr.countStrings {
-				tr.liveBytes += 48 + int64(ls.Len)
+func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
+	if t.shape != nil {
+		s.markShape(c, t.shape)
+	}
+	if t.meta != nil && t.meta.self != arena.NullRef {
+		c.MarkObject(t.meta.self)
+	}
+	var work int64 = 1
+	weakK, weakV := s.weakModeOf(t)
+	checkCancel := s.hasInterruptControl()
+	if !weakK && !weakV {
+		if t.arrKind == arrGeneric && t.arrLen > 0 {
+			arr := t.arrValSlice(nil)
+			for i, v := range arr {
+				if checkCancel && (i&4095) == 4095 {
+					if err := s.gcCancelCheck(); err != nil {
+						c.SetCancelErr(err)
+						return work + int64(i)
+					}
+				}
+				s.markValue(c, v)
 			}
+			work += int64(len(arr))
 		}
-		return
-	}
-	if !isCollectableWeak(v) {
-		return
-	}
-	switch {
-	case v.IsTable():
-		t := s.asTable(v)
-		if t.gcMark == tr.epoch {
-			return
-		}
-		t.gcMark = tr.epoch
-		tr.unlockEphemDeps(unsafe.Pointer(t))
-		var arrBytes, nodeBytes, slotBytes int64
-		switch t.arrKind {
-		case arrInt, arrFloat:
-			arrBytes = int64(t.arrCap) * 8
-		case arrBool:
-			arrBytes = int64(t.arrCap)
-		case arrGeneric:
-			arrBytes = int64(t.arrCap) * 16
+		if len(t.slots) > 0 {
+			for _, v := range t.slots {
+				s.markValue(c, v)
+			}
+			work += int64(len(t.slots))
 		}
 		if t.hash != nil {
-			nodeBytes = int64(len(t.hash.nodes)) * 40
-		}
-		if c := cap(t.slots); c > len(t.inlineSlots) {
-			slotBytes = int64(c) * 16
-		}
-		if t.shape != nil {
-			tr.markShape(t.shape)
-		}
-		tr.liveBytes += 96 + slotBytes + nodeBytes + arrBytes
-		tr.gray = append(tr.gray, v)
-	case v.IsClosure():
-		c := s.asClosure(v)
-		if c.gcMark == tr.epoch {
-			return
-		}
-		c.gcMark = tr.epoch
-		tr.unlockEphemDeps(unsafe.Pointer(c))
-		tr.liveBytes += 64 + int64(len(c.upvals)*24)
-		tr.markBoundProto(c.bp)
-		tr.gray = append(tr.gray, v)
-	case v.IsNative():
-		nf := s.asNative(v)
-		if nf.gcMark == tr.epoch {
-			return
-		}
-		nf.gcMark = tr.epoch
-		tr.unlockEphemDeps(unsafe.Pointer(nf))
-		tr.liveBytes += 48 + int64(len(nf.upvals))*16
-		if len(nf.upvals) > 0 {
-			tr.gray = append(tr.gray, v)
-		}
-	case v.IsUserdata():
-		u := s.asUserdata(v)
-		if u.gcMark == tr.epoch {
-			return
-		}
-		u.gcMark = tr.epoch
-		tr.unlockEphemDeps(unsafe.Pointer(u))
-		tr.liveBytes += 64 + int64((len(u.UValues)+len(u.gcRefs))*16)
-		if lf, ok := tr.s.UserdataData(u).(*luaFile); ok {
-			tr.liveBytes += lf.memBytes()
-		}
-		tr.gray = append(tr.gray, v)
-	case v.IsThread():
-		th := s.asThread(v)
-		if th.gcMark == tr.epoch {
-			return
-		}
-		th.gcMark = tr.epoch
-		tr.unlockEphemDeps(unsafe.Pointer(th))
-		tr.liveBytes += 512 + int64(cap(th.stack))*16 + int64(cap(th.frames))*int64(unsafe.Sizeof(callFrame{}))
-		tr.gray = append(tr.gray, v)
-	}
-}
-
-func (tr *gcTracer) propagateAll() {
-	s := tr.s
-	for len(tr.gray) > 0 {
-		if tr.tickCancel() {
-			return
-		}
-		v := tr.gray[len(tr.gray)-1]
-		tr.gray = tr.gray[:len(tr.gray)-1]
-		switch {
-		case v.IsTable():
-			tr.traverseTable(s.asTable(v))
-			if tr.aborted {
-				return
-			}
-		case v.IsClosure():
-			c := s.asClosure(v)
-			for _, uv := range c.upvals {
-				if uv == nil {
-					continue
+			nodes := t.hash.nodes
+			for i := range nodes {
+				if checkCancel && (i&4095) == 4095 {
+					if err := s.gcCancelCheck(); err != nil {
+						c.SetCancelErr(err)
+						return work + int64(i)
+					}
 				}
-				if uv.owner == nil {
-					tr.mark(uv.closed)
-				} else {
-					// Per lgc.c:remarkupvals, mark open upvalue's slot value WITHOUT marking
-					// uv.owner so an unreachable coroutine can still be collected while live closures
-					// keep their captured values intact (closed after Step 4 if owner remains unmarked).
-					tr.mark(uv.Get(s))
-					tr.liveOpenUpvals = append(tr.liveOpenUpvals, uv)
+				nd := &nodes[i]
+				if nd.used && !nd.dead && !nd.val.IsNil() {
+					s.markValue(c, nd.key)
+					s.markValue(c, nd.val)
 				}
 			}
-		case v.IsNative():
-			nf := s.asNative(v)
-			for _, uv := range nf.upvals {
-				tr.mark(uv)
-			}
-		case v.IsUserdata():
-			u := s.asUserdata(v)
-			if u.Meta != nil {
-				tr.mark(TableValue(u.Meta))
-			}
-			for _, uv := range u.UValues {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return
-				}
-				tr.mark(uv)
-			}
-			for _, rv := range u.gcRefs {
-				tr.mark(rv)
-			}
-		case v.IsThread():
-			tr.traverseThread(s.asThread(v))
-			if tr.aborted {
-				return
-			}
+			work += int64(len(nodes))
 		}
+		return work
 	}
-}
-
-func (tr *gcTracer) traverseThread(th *Thread) {
-	// Mirror lgc.c:traversethread literally: mark only stack[0..th.top) and nil-fill stack[th.top:)!
-	for i := range th.nframe {
-		if tr.cancelFn != nil && tr.tickCancel() {
-			return
-		}
-		cf := &th.frames[i]
-		if cf.cl != nil {
-			tr.mark(ClosureValue(cf.cl))
-		}
-		tr.mark(cf.errFunc)
-		tr.mark(cf.closeErr)
-		tr.mark(cf.nativeFn)
-		if cf.varargTab != nil {
-			tr.mark(TableValue(cf.varargTab))
-		}
-	}
-	tr.mark(th.errObj)
-	tr.mark(th.lastErrNative)
-	tr.mark(th.yieldNativeFn)
-	tr.mark(th.hook)
-	if th.caller != nil {
-		tr.mark(ThreadValue(th.caller))
-	}
-	for _, yv := range th.yieldVals {
-		tr.mark(yv)
-	}
-	for _, ce := range th.syncCloseErrs {
-		tr.mark(ce)
-	}
-	// Clear stale frame slots above nframe so dead closures/errFuncs/tables are never pinned.
-	if th.nframe < len(th.frames) {
-		clear(th.frames[th.nframe:])
-	}
-	lim := th.top
-	maxFrameEnd := lim
-	for i := range th.nframe {
-		cf := &th.frames[i]
-		if cf.cl != nil {
-			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > maxFrameEnd {
-				maxFrameEnd = end
-			}
-		}
-	}
-	if tr.preserveFrames && maxFrameEnd > lim {
-		lim = maxFrameEnd
-	}
-	if lim > len(th.stack) {
-		lim = len(th.stack)
-	}
-	for i := 0; i < lim; i++ {
-		if tr.cancelFn != nil && tr.tickCancel() {
-			return
-		}
-		tr.mark(th.stack[i])
-	}
-	if lim < len(th.stack) {
-		fillNil(th.stack[lim:])
-	}
-	maxOpenUpvalIdx := -1
-	for _, uv := range th.openUpvals {
-		if tr.cancelFn != nil && tr.tickCancel() {
-			return
-		}
-		if uv.owner == nil {
-			tr.mark(uv.closed)
-		} else if uv.stackIdx < len(th.stack) {
-			tr.mark(th.stack[uv.stackIdx])
-		}
-		if uv.stackIdx > maxOpenUpvalIdx {
-			maxOpenUpvalIdx = uv.stackIdx
-		}
-	}
-	// Shrink oversized stacks on non-running coroutines (including coroutines with open upvalues,
-	// since Upvalue tracks stackIdx rather than raw slice pointers) & release finished dead stacks.
-	if th != tr.s.curThread && th != tr.s.mainThreadPtr {
-		if th.status == ThreadDead && th.nframe == 0 && th.top == 0 && len(th.openUpvals) == 0 && len(th.tbc) == 0 {
-			if len(th.stack) > 8 {
-				th.stack = []Value{NilValue()}
-				th.stackGen++
-			}
-			if len(th.frames) > 0 {
-				th.frames = nil
-			}
-		} else if th.status == ThreadSuspended {
-			keepEnd := max(lim, maxFrameEnd)
-			if maxOpenUpvalIdx+1 > keepEnd {
-				keepEnd = maxOpenUpvalIdx + 1
-			}
-			if len(th.tbc) > 0 && th.tbc[len(th.tbc)-1]+1 > keepEnd {
-				keepEnd = th.tbc[len(th.tbc)-1] + 1
-			}
-			needed := keepEnd + stackSlack
-			if needed < 128 {
-				needed = 128
-			}
-			if len(th.stack) > needed*4 && len(th.stack) > 2048 {
-				shrunk := make([]Value, needed)
-				copyLen := min(keepEnd, len(th.stack))
-				copy(shrunk, th.stack[:copyLen])
-				fillNil(shrunk[copyLen:])
-				th.stack = shrunk
-				th.stackGen++
-			}
-		}
-	}
-}
-
-func (tr *gcTracer) traverseTable(t *Table) {
-	if t.meta != nil {
-		tr.mark(TableValue(t.meta))
-	}
-	if t.hash != nil {
-		tr.hashedTables = append(tr.hashedTables, t)
-	}
-	weakK, weakV := tr.s.weakModeOf(t)
-	if !weakK && !weakV {
-		// Strong table: mark all keys and values.
+	if weakK && weakV {
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
-			for _, v := range t.arrValSlice(nil) {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return
+			for i, v := range t.arrValSlice(nil) {
+				if checkCancel && (i&4095) == 4095 {
+					if err := s.gcCancelCheck(); err != nil {
+						c.SetCancelErr(err)
+						return work + int64(i)
+					}
 				}
-				tr.mark(v)
+				if !v.IsNil() && !s.isWeakCollectable(v) {
+					s.markValue(c, v)
+				}
 			}
 		}
 		for _, v := range t.slots {
-			if tr.cancelFn != nil && tr.tickCancel() {
-				return
+			if !v.IsNil() && !s.isWeakCollectable(v) {
+				s.markValue(c, v)
 			}
-			tr.mark(v)
 		}
 		if t.hash != nil {
 			nodes := t.hash.nodes
 			for i := range nodes {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return
+				if checkCancel && (i&4095) == 4095 {
+					if err := s.gcCancelCheck(); err != nil {
+						c.SetCancelErr(err)
+						return work + int64(i)
+					}
 				}
 				nd := &nodes[i]
 				if nd.used && !nd.dead && !nd.val.IsNil() {
-					tr.mark(nd.key)
-					tr.mark(nd.val)
+					if !s.isWeakCollectable(nd.key) {
+						s.markValue(c, nd.key)
+					}
+					if !s.isWeakCollectable(nd.val) {
+						s.markValue(c, nd.val)
+					}
 				}
 			}
+			work += int64(len(nodes))
 		}
-		return
-	}
-	if weakK && weakV {
-		tr.allWeaks = append(tr.allWeaks, t)
-		return
+		c.MarkAllWeak(t.self)
+		return work
 	}
 	if weakV {
-		// Weak values, strong keys: mark all keys now; defer value clearing.
-		tr.weakVals = append(tr.weakVals, t)
+		hasClears := false
+		if t.arrKind == arrGeneric && t.arrLen > 0 {
+			arr := t.arrValSlice(nil)
+			for i, v := range arr {
+				if checkCancel && (i&4095) == 4095 {
+					if err := s.gcCancelCheck(); err != nil {
+						c.SetCancelErr(err)
+						return work + int64(i)
+					}
+				}
+				if !v.IsNil() {
+					if !s.isWeakCollectable(v) {
+						s.markValue(c, v)
+					} else if c.IsWhite(v.Ref()) {
+						hasClears = true
+					}
+				}
+			}
+			work += int64(len(arr))
+		}
+		if len(t.slots) > 0 {
+			for _, v := range t.slots {
+				if !v.IsNil() {
+					if !s.isWeakCollectable(v) {
+						s.markValue(c, v)
+					} else if c.IsWhite(v.Ref()) {
+						hasClears = true
+					}
+				}
+			}
+			work += int64(len(t.slots))
+		}
 		if t.hash != nil {
 			nodes := t.hash.nodes
 			for i := range nodes {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return
+				if checkCancel && (i&4095) == 4095 {
+					if err := s.gcCancelCheck(); err != nil {
+						c.SetCancelErr(err)
+						return work + int64(i)
+					}
 				}
 				nd := &nodes[i]
 				if nd.used && !nd.dead && !nd.val.IsNil() {
-					tr.mark(nd.key)
+					s.markValue(c, nd.key)
+					if !s.isWeakCollectable(nd.val) {
+						s.markValue(c, nd.val)
+					} else if c.IsWhite(nd.val.Ref()) {
+						hasClears = true
+					}
 				}
 			}
+			work += int64(len(nodes))
 		}
-		return
+		c.MarkWeakValues(t.self, hasClears)
+		return work
 	}
-	// Ephemeron table (__mode = "k"): mark values whose keys are non-collectable or already marked!
-	tr.ephemerons = append(tr.ephemerons, t)
-	// Dense array & shape slots have non-collectable keys (int / string) -> always strong!
+	// Ephemeron table (__mode = "k"): array & shape slots have non-weak int/string keys -> strong values!
 	if t.arrKind == arrGeneric && t.arrLen > 0 {
-		for _, v := range t.arrValSlice(nil) {
-			if tr.cancelFn != nil && tr.tickCancel() {
-				return
+		arr := t.arrValSlice(nil)
+		for i, v := range arr {
+			if checkCancel && (i&4095) == 4095 {
+				if err := s.gcCancelCheck(); err != nil {
+					c.SetCancelErr(err)
+					return work + int64(i)
+				}
 			}
-			tr.mark(v)
+			s.markValue(c, v)
 		}
+		work += int64(len(arr))
 	}
-	for _, v := range t.slots {
-		if tr.cancelFn != nil && tr.tickCancel() {
-			return
+	if len(t.slots) > 0 {
+		for _, v := range t.slots {
+			s.markValue(c, v)
 		}
-		tr.mark(v)
+		work += int64(len(t.slots))
 	}
+	s.gcTraverseEphemeron(c, t.self, 0)
+	if t.hash != nil {
+		work += int64(len(t.hash.nodes))
+	}
+	return work
+}
+
+func (s *State) gcTraverseEphemeron(c *arena.Collector, ref arena.ObjRef, dir int) bool {
+	t := s.tableByRef(ref)
+	if t == nil {
+		return false
+	}
+	hasWW := false
+	hasClears := false
+	marked := false
 	if t.hash != nil {
 		nodes := t.hash.nodes
-		for i := range nodes {
-			if tr.cancelFn != nil && tr.tickCancel() {
-				return
+		n := len(nodes)
+		for step := range n {
+			i := step
+			if dir&1 != 0 {
+				i = n - 1 - step
 			}
 			nd := &nodes[i]
-			if nd.used && !nd.dead && !nd.val.IsNil() {
-				if tr.isMarked(nd.key) {
-					tr.mark(nd.val)
-				}
-			}
-		}
-	}
-}
-
-func (tr *gcTracer) convergeEphemerons() {
-	for !tr.aborted {
-		// Scan any newly discovered ephemeron tables once into the key -> dependent-values worklist.
-		for tr.ephemScanned < len(tr.ephemerons) {
-			t := tr.ephemerons[tr.ephemScanned]
-			tr.ephemScanned++
-			if t.hash == nil {
+			if !nd.used || nd.dead || nd.val.IsNil() {
 				continue
 			}
-			nodes := t.hash.nodes
-			for i := range nodes {
-				if tr.tickCancel() {
-					return
+			if s.isClearedWeak(c, nd.key) {
+				hasClears = true
+				if !s.isWeakCollectable(nd.val) {
+					s.markValue(c, nd.val)
+				} else if c.IsWhite(nd.val.Ref()) {
+					hasWW = true
 				}
-				nd := &nodes[i]
-				if !nd.used || nd.dead || nd.val.IsNil() {
-					continue
-				}
-				if tr.isMarked(nd.key) {
-					if !tr.isMarked(nd.val) {
-						tr.mark(nd.val)
-					}
-				} else if isCollectableWeak(nd.val) && !tr.isMarked(nd.val) {
-					if kptr, ok := gcObjPtr(nd.key); ok {
-						if tr.ephemDeps == nil {
-							tr.ephemDeps = make(map[unsafe.Pointer][]Value, 16)
-						}
-						tr.ephemDeps[kptr] = append(tr.ephemDeps[kptr], nd.val)
-					}
+			} else {
+				if nd.val.IsGCObject() && c.IsWhite(nd.val.Ref()) {
+					c.MarkObject(nd.val.Ref())
+					marked = true
 				}
 			}
 		}
-		for len(tr.ephemReady) > 0 && !tr.aborted {
-			if tr.tickCancel() {
-				return
-			}
-			v := tr.ephemReady[len(tr.ephemReady)-1]
-			tr.ephemReady = tr.ephemReady[:len(tr.ephemReady)-1]
-			if !tr.isMarked(v) {
-				tr.mark(v)
-			}
-		}
-		if len(tr.gray) == 0 {
-			break
-		}
-		tr.propagateAll()
 	}
+	c.MarkEphemeron(ref, hasWW, hasClears)
+	return marked
 }
 
-func (tr *gcTracer) clearByValues(tables []*Table) {
+func (s *State) gcClearByValues(c *arena.Collector, ref arena.ObjRef) {
+	t := s.tableByRef(ref)
+	if t == nil {
+		return
+	}
 	cleared := false
-	defer func() {
-		if cleared {
-			tr.s.protoEpoch++
-		}
-	}()
-	for _, t := range tables {
-		if t.arrKind == arrGeneric && t.arrLen > 0 {
-			arr := t.arrValSlice(nil)
-			for i := range arr {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return
-				}
-				if !arr[i].IsNil() && !tr.isMarked(arr[i]) {
-					arr[i] = NilValue()
-					cleared = true
-				}
+	if t.arrKind == arrGeneric && t.arrLen > 0 {
+		arr := t.arrValSlice(nil)
+		for i := range arr {
+			if !arr[i].IsNil() && s.isClearedWeak(c, arr[i]) {
+				arr[i] = NilValue()
+				cleared = true
 			}
 		}
+	}
+	if len(t.slots) > 0 {
 		for i := range t.slots {
-			if tr.cancelFn != nil && tr.tickCancel() {
-				return
-			}
-			if !t.slots[i].IsNil() && !tr.isMarked(t.slots[i]) {
+			if !t.slots[i].IsNil() && s.isClearedWeak(c, t.slots[i]) {
 				t.slots[i] = NilValue()
 				cleared = true
 			}
 		}
-		if h := t.hash; h != nil {
-			nodes := h.nodes
-			for i := range nodes {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return
-				}
-				nd := &nodes[i]
-				if nd.used && !nd.dead && !nd.val.IsNil() && !tr.isMarked(nd.val) {
-					h.markDead(i)
-					cleared = true
-				}
-			}
-		}
 	}
-}
-
-func (tr *gcTracer) clearByKeys(tables []*Table) {
-	cleared := false
-	defer func() {
-		if cleared {
-			tr.s.protoEpoch++
-		}
-	}()
-	for _, t := range tables {
-		if h := t.hash; h != nil {
-			nodes := h.nodes
-			for i := range nodes {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return
-				}
-				nd := &nodes[i]
-				if nd.used && !nd.dead && !nd.val.IsNil() && !tr.isMarked(nd.key) {
-					// Key is provably unreachable; clear both key and val so Go's GC reclaims the key immediately.
-					nd.key = NilValue()
-					nd.val = NilValue()
-					nd.dead = true
-					h.live--
-					h.dictGen++
-					cleared = true
-				}
-			}
-		}
-	}
-}
-
-func (tr *gcTracer) accountWeakStrings() {
-	markTableStrings := func(tables []*Table) {
-		for _, t := range tables {
-			if t.arrKind == arrGeneric && t.arrLen > 0 {
-				for _, v := range t.arrValSlice(nil) {
-					if tr.cancelFn != nil && tr.tickCancel() {
-						return
-					}
-					if v.IsString() {
-						tr.mark(v)
-					}
-				}
-			}
-			for _, v := range t.slots {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return
-				}
-				if v.IsString() {
-					tr.mark(v)
-				}
-			}
-			if t.hash != nil {
-				nodes := t.hash.nodes
-				for i := range nodes {
-					if tr.cancelFn != nil && tr.tickCancel() {
-						return
-					}
-					nd := &nodes[i]
-					if nd.used && !nd.dead && !nd.val.IsNil() {
-						if nd.key.IsString() {
-							tr.mark(nd.key)
-						}
-						if nd.val.IsString() {
-							tr.mark(nd.val)
-						}
-					}
-				}
-			}
-		}
-	}
-	markTableStrings(tr.weakVals)
-	if tr.aborted {
-		return
-	}
-	markTableStrings(tr.ephemerons)
-	if tr.aborted {
-		return
-	}
-	markTableStrings(tr.allWeaks)
-}
-
-// clearDeadHashKeys releases strong Go references held by dead/tombstoned hash keys
-// that are no longer reachable from anywhere in the VM (matching lgc.c:clearkey),
-// while preserving live tombstoned keys (e.g. active pairs() traversal) and hash probe chains.
-func (tr *gcTracer) clearDeadHashKeys() bool {
-	anyDead := false
-	for _, t := range tr.hashedTables {
-		nodes := t.hash.nodes
+	if t.hash != nil {
+		h := t.hash
+		nodes := h.nodes
 		for i := range nodes {
-			if tr.cancelFn != nil && tr.tickCancel() {
-				return true
-			}
 			nd := &nodes[i]
-			if !nd.used || !nd.dead || nd.key.IsNil() {
-				continue
-			}
-			if nd.key.IsString() {
-				ls := tr.s.asString(nd.key)
-				if !ls.IsFixed() && !ls.hdr.IsBlack() {
-					nd.key = NilValue()
-					continue
+			if nd.used && !nd.dead && !nd.val.IsNil() && s.isClearedWeak(c, nd.val) {
+				h.markDead(i)
+				if nd.key.IsGCObject() {
+					t.flags |= tblFlagHasDeadKeys
+					s.hasDeadHashKeys = true
 				}
-				anyDead = true
-			} else if isCollectableWeak(nd.key) {
-				if !tr.isMarked(nd.key) {
-					nd.key = NilValue()
-					continue
-				}
-				anyDead = true
+				cleared = true
 			}
 		}
-		if len(t.hash.deadKeys) > 0 {
-			for slot, ref := range t.hash.deadKeys {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return true
+	}
+	if cleared {
+		s.protoEpoch++
+	}
+}
+
+func (s *State) gcClearByKeys(c *arena.Collector, ref arena.ObjRef) {
+	t := s.tableByRef(ref)
+	if t == nil || t.hash == nil {
+		return
+	}
+	h := t.hash
+	nodes := h.nodes
+	cleared := false
+	for i := range nodes {
+		nd := &nodes[i]
+		if nd.used && !nd.dead && !nd.val.IsNil() && s.isClearedWeak(c, nd.key) {
+			nd.key = deadKeyValue()
+			nd.val = NilValue()
+			nd.dead = true
+			h.live--
+			h.dictGen++
+			cleared = true
+		}
+	}
+	if cleared {
+		s.protoEpoch++
+	}
+}
+
+func (s *State) gcTraverseThread(c *arena.Collector, th *Thread) int64 {
+	// Threads always stay on grayAgain so stack writes need zero write barriers (lgc.c:traversethread).
+	c.MarkGrayAgain(th.self)
+
+	if th.caller != nil && th.caller.self != arena.NullRef {
+		c.MarkObject(th.caller.self)
+	}
+	frames := th.frames
+	maxFrameEnd := th.top
+	for i := range th.nframe {
+		cf := &frames[i]
+		if cf.cl != nil && cf.cl.self != arena.NullRef {
+			c.MarkObject(cf.cl.self)
+			if end := cf.base + int(s.boundProtoOf(cf.cl).maxStack); end > maxFrameEnd {
+				maxFrameEnd = end
+			}
+		}
+		s.markValue(c, cf.errFunc)
+		s.markValue(c, cf.closeErr)
+		s.markValue(c, cf.nativeFn)
+		if cf.varargTab != nil && cf.varargTab.self != arena.NullRef {
+			c.MarkObject(cf.varargTab.self)
+		}
+	}
+	s.markValue(c, th.errObj)
+	s.markValue(c, th.lastErrNative)
+	s.markValue(c, th.yieldNativeFn)
+	s.markValue(c, th.hook)
+	for _, yv := range th.yieldVals {
+		s.markValue(c, yv)
+	}
+	for _, ce := range th.syncCloseErrs {
+		s.markValue(c, ce)
+	}
+
+	stack := th.stack
+	lim := th.top
+	inAtomic := c.State() == arena.GCSAtomic
+	if !inAtomic || s.preserveFramesInGC {
+		if maxFrameEnd > lim {
+			lim = maxFrameEnd
+		}
+	}
+	if lim > len(stack) {
+		lim = len(stack)
+	}
+	for i := range lim {
+		s.markValue(c, stack[i])
+	}
+	maxOpenUpvalIdx := -1
+	for _, uv := range th.openUpvals {
+		idx := int(uv.stackIdx)
+		if idx < len(stack) {
+			s.markValue(c, stack[idx])
+		}
+		if idx > maxOpenUpvalIdx {
+			maxOpenUpvalIdx = idx
+		}
+	}
+
+	if inAtomic {
+		if th.nframe < len(frames) {
+			clear(frames[th.nframe:])
+		}
+		if lim < len(stack) {
+			fillNil(stack[lim:])
+		}
+		// Shrink oversized stacks on non-running coroutines (matching lgc.c:traversethread).
+		if th.self != s.curRef && th.self != s.mainThreadRef && !c.IsEmergency() {
+			if th.status == ThreadDead && th.nframe == 0 && th.top == 0 && len(th.openUpvals) == 0 && len(th.tbc) == 0 {
+				if len(th.stack) > 8 {
+					freed := int64(len(th.stack)-1) * 16
+					th.stack = []Value{NilValue()}
+					th.stackGen++
+					s.subThreadMem(th, freed)
 				}
-				v, alive := deadKeyValue(ref)
-				if !alive {
-					delete(t.hash.deadKeys, slot)
-					continue
+				if len(th.frames) > 0 {
+					freed := int64(len(th.frames)) * int64(unsafe.Sizeof(callFrame{}))
+					th.frames = nil
+					s.subThreadMem(th, freed)
 				}
-				if isCollectableWeak(v) {
-					if !tr.isMarked(v) {
-						delete(t.hash.deadKeys, slot)
-						continue
+			} else if th.status == ThreadSuspended {
+				keepEnd := max(lim, maxFrameEnd)
+				if maxOpenUpvalIdx+1 > keepEnd {
+					keepEnd = maxOpenUpvalIdx + 1
+				}
+				if len(th.tbc) > 0 && th.tbc[len(th.tbc)-1]+1 > keepEnd {
+					keepEnd = th.tbc[len(th.tbc)-1] + 1
+				}
+				needed := max(keepEnd+stackSlack, 128)
+				if len(th.stack) > needed*4 && len(th.stack) > 2048 {
+					freed := int64(len(th.stack)-needed) * 16
+					shrunk := make([]Value, needed)
+					copyLen := min(keepEnd, len(stack))
+					copy(shrunk, stack[:copyLen])
+					fillNil(shrunk[copyLen:])
+					th.stack = shrunk
+					th.stackGen++
+					s.subThreadMem(th, freed)
+				}
+			}
+		}
+	}
+	return int64(1 + th.nframe + lim)
+}
+
+func (s *State) gcRemarkUpvals(c *arena.Collector) {
+	for _, thRef := range s.twups {
+		th := s.threadByRef(thRef)
+		if th == nil {
+			continue
+		}
+		stack := th.stack
+		for _, uv := range th.openUpvals {
+			if !c.IsWhite(uv.self) {
+				if uv.ownerRef == thRef && int(uv.stackIdx) < len(stack) {
+					s.markValue(c, stack[uv.stackIdx])
+				}
+			}
+		}
+	}
+}
+
+func (s *State) gcPreSweep(c *arena.Collector) {
+	// 1. Close surviving open upvalues on dead threads; prune dead open upvalues on live threads.
+	keptTwups := 0
+	for _, thRef := range s.twups {
+		th := s.threadByRef(thRef)
+		if th == nil {
+			continue
+		}
+		if c.IsWhite(thRef) {
+			stack := th.stack
+			for _, uv := range th.openUpvals {
+				if !c.IsWhite(uv.self) {
+					if uv.ownerRef == thRef {
+						val := NilValue()
+						if int(uv.stackIdx) < len(stack) {
+							val = stack[uv.stackIdx]
+						}
+						closeUpvalObj(s, uv, val)
 					}
-					anyDead = true
 				}
 			}
-			if len(t.hash.deadKeys) == 0 {
-				t.hash.deadKeys = nil
+			clear(th.openUpvals)
+			th.openUpvals = nil
+			th.inTwups = false
+			continue
+		}
+		k := 0
+		for _, uv := range th.openUpvals {
+			if !c.IsWhite(uv.self) {
+				th.openUpvals[k] = uv
+				k++
 			}
 		}
-	}
-	return anyDead
-}
-
-func (tr *gcTracer) icValAlive(v Value) bool {
-	if v.IsString() {
-		ls := tr.s.asString(v)
-		return ls.IsFixed() || ls.hdr.IsBlack()
-	}
-	if isCollectableWeak(v) {
-		return tr.isMarked(v)
-	}
-	return true
-}
-
-func (tr *gcTracer) icShapeAlive(sh *Shape) bool {
-	if sh == nil {
-		return true
-	}
-	if sh.meta != nil && sh.meta.gcMark != tr.epoch {
-		return false
-	}
-	if !sh.frozen {
-		if _, live := tr.seenShapes[sh]; !live {
-			return false
+		clear(th.openUpvals[k:])
+		th.openUpvals = th.openUpvals[:k]
+		if k == 0 {
+			th.inTwups = false
+			continue
 		}
+		s.twups[keptTwups] = thRef
+		keptTwups++
+	}
+	s.twups = s.twups[:keptTwups]
+
+	// 2. Prune dead weak shape caches and recount live Go-heap Shape memory.
+	s.shapes.Prune()
+	if s.shapeMemBytes > 0 {
+		var seenShapes map[*Shape]struct{}
+		var liveShapeBytes int64
+		countShape := func(sh *Shape) {
+			for cur := sh; cur != nil && cur != s.shapes.root && cur.id > s.shapes.frozenMaxID; cur = cur.parent {
+				if seenShapes == nil {
+					seenShapes = make(map[*Shape]struct{}, 32)
+				}
+				if _, ok := seenShapes[cur]; ok {
+					break
+				}
+				seenShapes[cur] = struct{}{}
+				liveShapeBytes += shapeNodeBytes(cur)
+			}
+		}
+		for i := 1; i < len(s.tables); i++ {
+			t := s.tables[i]
+			if t != nil && t.shape != nil && t.self != arena.NullRef && !c.IsWhite(t.self) {
+				countShape(t.shape)
+			}
+		}
+		if s.pinnedShape != nil {
+			countShape(s.pinnedShape)
+		}
+		s.shapeMemBytes = liveShapeBytes
+	}
+
+	// 3. Sweep inline caches on all surviving ArenaProtos so no IC entry outlives a White value/table.
+	s.gcSweepInlineCaches(c)
+
+	// 4. Sweep dead collectable tombstoned hash keys (replacing dead keys with deadKeyValue)
+	// and compact dead tables out of s.hashedTables.
+	anyDead := false
+	keptHashed := 0
+	for _, tRef := range s.hashedTables {
+		if c.IsWhite(tRef) {
+			continue
+		}
+		t := s.tableByRef(tRef)
+		if t == nil || t.hash == nil {
+			if t != nil {
+				t.flags &^= tblFlagTrackedHash | tblFlagHasDeadKeys
+			}
+			continue
+		}
+		if s.hasDeadHashKeys && t.flags&tblFlagHasDeadKeys != 0 {
+			tableHasDead := false
+			nodes := t.hash.nodes
+			for i := range nodes {
+				nd := &nodes[i]
+				if nd.used && nd.dead && nd.key.IsGCObject() {
+					if c.IsWhite(nd.key.Ref()) {
+						nd.key = deadKeyValue()
+					} else {
+						tableHasDead = true
+					}
+				}
+			}
+			if !tableHasDead {
+				t.flags &^= tblFlagHasDeadKeys
+			} else {
+				anyDead = true
+			}
+		}
+		s.hashedTables[keptHashed] = tRef
+		keptHashed++
+	}
+	s.hashedTables = s.hashedTables[:keptHashed]
+	s.hasDeadHashKeys = anyDead
+}
+
+func (s *State) icValAlive(c *arena.Collector, v Value) bool {
+	if v.IsGCObject() {
+		return !c.IsWhite(v.Ref())
 	}
 	return true
 }
 
-func (tr *gcTracer) icShapeIDAlive(id uint64) bool {
-	if id == 0 {
-		return false
-	}
-	if id <= tr.s.shapes.frozenMaxID {
-		return true
-	}
-	_, live := tr.seenShapeIDs[id]
-	return live
-}
-
-func (tr *gcTracer) icPrimaryAlive(ic *ICEntry) bool {
+func (s *State) icPrimaryAlive(c *arena.Collector, ic *ICEntry) bool {
 	switch ic.kind {
 	case icEmpty:
 		return false
 	case icEnvSlot:
 		h := ic.holder.Value()
-		if h == nil || h.gcMark != tr.epoch || h.hash == nil || h.hash.dictGen != ic.epoch {
+		if h == nil || h.self == arena.NullRef || c.IsWhite(h.self) || h.hash == nil || h.hash.dictGen != ic.epoch {
 			return false
 		}
 		return true
 	case icProtoVal:
-		if !ic.noMeta && ic.epoch != tr.s.protoEpoch {
+		if !ic.noMeta && ic.epoch != s.protoEpoch {
 			return false
 		}
-		if !tr.icShapeIDAlive(ic.shapeID) {
-			return false
-		}
-		v, ok := ic.protoValue()
-		return ok && tr.icValAlive(v)
+		return s.icValAlive(c, ic.val)
 	case icAddSlot:
-		if !ic.noMeta && ic.epoch != tr.s.protoEpoch {
+		if !ic.noMeta && ic.epoch != s.protoEpoch {
 			return false
 		}
-		ts := ic.targetShape.Value()
-		return tr.icShapeIDAlive(ic.shapeID) && ts != nil && tr.icShapeAlive(ts)
+		return ic.targetShape.Value() != nil
 	case icOwnSlot:
-		if !ic.noMeta && ic.epoch != tr.s.protoEpoch {
+		if !ic.noMeta && ic.epoch != s.protoEpoch {
 			return false
 		}
-		return tr.icShapeIDAlive(ic.shapeID)
+		return true
 	default:
 		return false
 	}
 }
 
-func (tr *gcTracer) icPolyAlive(pe *polyEntry) bool {
+func (s *State) icPolyAlive(c *arena.Collector, pe *polyEntry) bool {
 	switch pe.kind {
 	case icEmpty:
 		return false
 	case icProtoVal:
-		if !pe.noMeta && pe.epoch != tr.s.protoEpoch {
+		if !pe.noMeta && pe.epoch != s.protoEpoch {
 			return false
 		}
-		if !tr.icShapeIDAlive(pe.shapeID) {
-			return false
-		}
-		v, ok := pe.protoValue()
-		return ok && tr.icValAlive(v)
+		return s.icValAlive(c, pe.val)
 	case icAddSlot:
-		if !pe.noMeta && pe.epoch != tr.s.protoEpoch {
+		if !pe.noMeta && pe.epoch != s.protoEpoch {
 			return false
 		}
-		ts := pe.targetShape.Value()
-		return tr.icShapeIDAlive(pe.shapeID) && ts != nil && tr.icShapeAlive(ts)
+		return pe.targetShape.Value() != nil
 	case icOwnSlot:
-		if !pe.noMeta && pe.epoch != tr.s.protoEpoch {
+		if !pe.noMeta && pe.epoch != s.protoEpoch {
 			return false
 		}
-		return tr.icShapeIDAlive(pe.shapeID)
+		return true
 	default:
 		return false
 	}
 }
 
-// sweepInlineCaches clears invalidated or unreachable references from monomorphic and
-// polymorphic inline caches on all reachable boundProtos so IC entries act as weak caches
-// and never pin dead strings, tables, shapes, or closures across GC cycles.
-func (tr *gcTracer) sweepInlineCaches() {
-	for bp := range tr.seenProtos {
+func (s *State) gcSweepInlineCaches(c *arena.Collector) {
+	for idx := 1; idx < len(s.protos); idx++ {
+		bp := s.protos[idx]
+		if bp == nil || c.IsWhite(bp.arenaRef) {
+			continue
+		}
 		ics := bp.ic
 		for i := range ics {
-			if tr.cancelFn != nil && tr.tickCancel() {
-				return
-			}
 			ic := &ics[i]
 			if ic.kind == icEmpty && ic.poly == nil {
 				continue
 			}
-			// Filter polymorphic entries first.
 			if ic.poly != nil {
 				kept := 0
 				for j := range int(ic.polyCount) {
 					pe := &ic.poly[j]
-					if tr.icPolyAlive(pe) {
+					if s.icPolyAlive(c, pe) {
 						if kept != j {
 							ic.poly[kept] = *pe
 						}
@@ -1284,9 +914,8 @@ func (tr *gcTracer) sweepInlineCaches() {
 					ic.poly = nil
 				}
 			}
-			if !tr.icPrimaryAlive(ic) {
+			if !s.icPrimaryAlive(c, ic) {
 				if ic.poly != nil && ic.polyCount > 0 {
-					// Promote first surviving poly entry to primary slot.
 					pe := ic.poly[0]
 					for j := 1; j < int(ic.polyCount); j++ {
 						ic.poly[j-1] = ic.poly[j]
@@ -1298,11 +927,8 @@ func (tr *gcTracer) sweepInlineCaches() {
 					}
 					ic.shapeID = pe.shapeID
 					ic.targetShape = pe.targetShape
-					ic.holder = ICEntry{}.holder
+					ic.holder = weak.Pointer[Table]{}
 					ic.val = pe.val
-					ic.weakCl = pe.weakCl
-					ic.weakVal = pe.weakVal
-					ic.weakKind = pe.weakKind
 					ic.epoch = pe.epoch
 					ic.slot = pe.slot
 					ic.kind = pe.kind
@@ -1316,439 +942,158 @@ func (tr *gcTracer) sweepInlineCaches() {
 	}
 }
 
-// CollectFull executes a full deterministic Tier 1 GC cycle (exact lgc.c atomic() 6-step order)
-// and drains all newly separated __gc finalizers synchronously on the VM thread.
-func (s *State) CollectFull() {
-	s.collectFullImpl(false, false)
-}
-
-// collectEmergency runs a mark-and-recount emergency GC pass during memory-limit pressure:
-// conservatively preserves all active frame register windows and NEVER invokes __gc finalizers
-// or mutates weak tables mid-allocation (matching PUC-Rio lgc.c emergency collector semantics).
-func (s *State) collectEmergency() {
-	s.collectFullImpl(true, true)
-}
-
-// recountLiveBytes recomputes s.gc.allocBytes from the State's existing live object graph
-// without running __gc finalizers, clearing weak entries, or mutating caches. Used when
-// SetMemoryLimit transitions from unlimited (0) to limited (> 0) so pre-existing stdlib
-// and Tier-0 allocations are accounted immediately before the next allocation check.
-func (s *State) recountLiveBytes() {
-	s.gc.epoch++
-	if s.gc.epoch == 0 {
-		s.gc.epoch = 1
-	}
-	tr := &gcTracer{
-		s:              s,
-		epoch:          s.gc.epoch,
-		preserveFrames: true,
-		countStrings:   true,
-	}
-	tr.markRoots()
-	tr.propagateAll()
-	tr.convergeEphemerons()
-	for _, fe := range s.gc.finalizable {
-		if fe.obj.IsTable() && s.asTable(fe.obj).flags&tblFlagGCFnzed != 0 {
-			continue
-		}
-		if fe.obj.IsUserdata() && s.asUserdata(fe.obj).gcFnzed {
-			continue
-		}
-		if !tr.isMarked(fe.obj) {
-			tr.mark(fe.obj)
-		}
-	}
-	for _, wf := range s.gc.weakFiles {
-		if u := wf.userdata(); u != nil && !u.gcFnzed {
-			obj := UserdataValue(u)
-			if !tr.isMarked(obj) {
-				tr.mark(obj)
+func (s *State) gcFreeObject(a *arena.Arena, ref arena.ObjRef) {
+	switch a.Header(ref).Kind {
+	case gcKindShortStr:
+		ls := arena.AsSmall[LuaString](a, ref)
+		s.intern.unlinkBucket(ref, ls.Hash)
+		a.Free(ref)
+	case gcKindLongStr:
+		a.Free(ref)
+	case gcKindTable:
+		stub := arena.AsSmall[tableStub](a, ref)
+		if int(stub.idx) > 0 && int(stub.idx) < len(s.tables) {
+			if t := s.tables[stub.idx]; t != nil {
+				s.subExtraMem(t.memBytes)
+				t.memBytes = 0
+				t.self = arena.NullRef
+				s.tables[stub.idx] = nil
+				s.freeTableIDs = append(s.freeTableIDs, stub.idx)
 			}
 		}
-	}
-	tr.propagateAll()
-	tr.convergeEphemerons()
-	tr.accountWeakStrings()
-	s.intern.ClearMarks()
-	s.gc.allocBytes = tr.liveBytes
-	s.gc.lastLiveBytes = tr.liveBytes
-}
-
-func (s *State) updateArenaSweepThresh() {
-	if a := s.intern.arena; a != nil {
-		s.arenaSweepThresh = max(defaultArenaSweepThresh, a.AllocBytes()*2)
-	}
-}
-
-func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
-	if s.gc.inGCTM && !emergency {
-		return // non-reentrant inside __gc (gc.lua:698-705), except emergency GC under memLimit
-	}
-	countStr := s.memLimit > 0
-	cancelFn := s.nativeCancelFunc()
-	sweptStrings := false
-	defer func() {
-		if !sweptStrings {
-			s.intern.ClearMarks()
+		a.Free(ref)
+	case gcKindClosure:
+		cl := arena.AsSmall[Closure](a, ref)
+		if cl.upvalsRef != arena.NullRef {
+			a.Free(cl.upvalsRef)
 		}
-	}()
-	if emergency || (!s.gc.tier1 && len(s.gc.finalizable) == 0 && len(s.gc.weakFiles) == 0) {
-		// Tier 0 (with no open finalizable handles) or emergency allocation-time recount:
-		// nil-fill dead stack/frame slack and recompute exact live VM bytes without running
-		// __gc finalizers mid-operation!
-		if s.curThread != nil {
-			if s.curThread.nframe < len(s.curThread.frames) {
-				clear(s.curThread.frames[s.curThread.nframe:])
-			}
-			if s.curThread.top < len(s.curThread.stack) {
-				lim := s.curThread.top
-				for i := range s.curThread.nframe {
-					cf := &s.curThread.frames[i]
-					if cf.cl != nil {
-						if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > lim {
-							lim = end
-						}
-					}
-				}
-				if lim < len(s.curThread.stack) {
-					fillNil(s.curThread.stack[lim:])
-				}
-			}
+		a.Free(ref)
+	case gcKindUpvalue:
+		a.Free(ref)
+	case gcKindNative:
+		an := arena.AsSmall[ArenaNative](a, ref)
+		if an.upvalsRef != arena.NullRef {
+			a.Free(an.upvalsRef)
 		}
-		s.gc.epoch++
-		if s.gc.epoch == 0 {
-			s.gc.epoch = 1
+		if an.upvalIDsRef != arena.NullRef {
+			a.Free(an.upvalIDsRef)
 		}
-		tr := &gcTracer{
-			s:              s,
-			epoch:          s.gc.epoch,
-			preserveFrames: preserveFrames,
-			countStrings:   countStr,
-			cancelFn:       cancelFn,
+		if an.goRef != arena.NullGoHandle && s.goRefs != nil {
+			s.goRefs.Free(an.goRef)
 		}
-		tr.markRoots()
-		if tr.aborted {
-			return
+		a.Free(ref)
+	case gcKindUserdata:
+		u := arena.AsSmall[Userdata](a, ref)
+		if u.uvalsRef != arena.NullRef {
+			a.Free(u.uvalsRef)
 		}
-		tr.propagateAll()
-		if tr.aborted {
-			return
+		if u.gcRefsRef != arena.NullRef {
+			a.Free(u.gcRefsRef)
 		}
-		if emergency && (len(tr.ephemerons) > 0 || len(tr.weakVals) > 0 || len(tr.allWeaks) > 0 || len(s.gc.finalizable) > 0 || len(s.gc.weakFiles) > 0) {
-			// Match PUC-Rio lgc.c:luaC_fullgc(L, isemergency=1): clear unreachable weak entries
-			// so weak caches cannot pin gigabytes when collectgarbage("stop") is active, while
-			// deferring __gc execution and keeping pending-finalizer objects accounted in liveBytes.
-			tr.convergeEphemerons()
-			if tr.aborted {
-				return
-			}
-			tr.clearByValues(tr.weakVals)
-			if tr.aborted {
-				return
-			}
-			tr.clearByValues(tr.allWeaks)
-			if tr.aborted {
-				return
-			}
-			for _, fe := range s.gc.finalizable {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return
-				}
-				if fe.obj.IsTable() && s.asTable(fe.obj).flags&tblFlagGCFnzed != 0 {
-					continue
-				}
-				if fe.obj.IsUserdata() && s.asUserdata(fe.obj).gcFnzed {
-					continue
-				}
-				if !tr.isMarked(fe.obj) {
-					tr.mark(fe.obj)
-				}
-			}
-			for _, wf := range s.gc.weakFiles {
-				if tr.cancelFn != nil && tr.tickCancel() {
-					return
-				}
-				if u := wf.userdata(); u != nil && !u.gcFnzed {
-					obj := UserdataValue(u)
-					if !tr.isMarked(obj) {
-						tr.mark(obj)
+		if u.dataRef != arena.NullGoHandle && s.goRefs != nil {
+			if raw, ok := s.goRefs.Get(u.dataRef); ok {
+				if lf, ok := raw.(*luaFile); ok && !lf.closed && !lf.isStd {
+					if freed := lf.memBytes(); freed > 0 {
+						s.subExtraMem(freed)
 					}
 				}
 			}
-			tr.propagateAll()
-			if tr.aborted {
-				return
-			}
-			tr.convergeEphemerons()
-			if tr.aborted {
-				return
-			}
-			tr.clearByKeys(tr.ephemerons)
-			if tr.aborted {
-				return
-			}
-			tr.clearByKeys(tr.allWeaks)
-			if tr.aborted {
-				return
-			}
-			tr.clearByValues(tr.weakVals)
-			if tr.aborted {
-				return
-			}
-			tr.clearByValues(tr.allWeaks)
-			if tr.aborted {
-				return
+			s.goRefs.Free(u.dataRef)
+		}
+		a.Free(ref)
+	case gcKindThread:
+		stub := arena.AsSmall[threadStub](a, ref)
+		if int(stub.idx) > 0 && int(stub.idx) < len(s.threads) {
+			if th := s.threads[stub.idx]; th != nil {
+				s.subExtraMem(th.memBytes)
+				th.memBytes = 0
+				th.self = arena.NullRef
+				th.clearDeadRefs(s)
+				s.threads[stub.idx] = nil
+				s.freeThreadIDs = append(s.freeThreadIDs, stub.idx)
 			}
 		}
-		tr.accountWeakStrings()
-		if tr.aborted {
-			return
+		a.Free(ref)
+	case gcKindProto:
+		ap := arena.AsSmall[ArenaProto](a, ref)
+		if ap.constsRef != arena.NullRef {
+			a.Free(ap.constsRef)
 		}
-		s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
-		if tr.aborted {
-			return
+		if ap.subRef != arena.NullRef {
+			a.Free(ap.subRef)
 		}
-		tr.sweepInlineCaches()
-		if tr.aborted {
-			return
-		}
-		// Close open upvalues belonging to threads that remain unreachable, so dead
-		// coroutines are unpinned for Go's GC even in Tier 0 / emergency GC paths.
-		for _, uv := range tr.liveOpenUpvals {
-			if uv.owner != nil && uv.owner.gcMark != tr.epoch {
-				uv.closed = uv.owner.stack[uv.stackIdx]
-				uv.owner = nil
+		if int(ap.protoIdx) > 0 && int(ap.protoIdx) < len(s.protos) {
+			if bp := s.protos[ap.protoIdx]; bp != nil {
+				s.subExtraMem(bp.goBytes)
+				s.protos[ap.protoIdx] = nil
+				s.freeProtoIDs = append(s.freeProtoIDs, ap.protoIdx)
 			}
 		}
-		s.sweepCoallocTables(tr.epoch)
-		s.intern.Sweep(emergency)
-		sweptStrings = true
-		s.updateArenaSweepThresh()
-		s.shapes.Prune()
-		s.gc.allocBytes = tr.liveBytes
-		s.gc.lastLiveBytes = tr.liveBytes
-		return
+		a.Free(ref)
+	default:
+		a.Free(ref)
 	}
+}
 
-	s.gc.epoch++
-	if s.gc.epoch == 0 {
-		s.gc.epoch = 1
-	}
-	tr := &gcTracer{
-		s:              s,
-		epoch:          s.gc.epoch,
-		preserveFrames: preserveFrames,
-		countStrings:   countStr,
-		cancelFn:       cancelFn,
-	}
-
-	// Mark all VM roots.
-	tr.markRoots()
-	if tr.aborted {
-		return
-	}
-	tr.propagateAll()
-	if tr.aborted {
-		return
-	}
-
-	// Step 1: Converge ephemerons before clearing weak values.
-	tr.convergeEphemerons()
-	if tr.aborted {
-		return
-	}
-
-	// Step 2: clearByValues BEFORE __gc separation (weak values are nil inside __gc!).
-	tr.clearByValues(tr.weakVals)
-	if tr.aborted {
-		return
-	}
-	tr.clearByValues(tr.allWeaks)
-	if tr.aborted {
-		return
-	}
-
-	// Step 3: separateToBeFnz in STRICT REVERSE (LIFO) registration order across tables,
-	// userdata, and file handles using the shared monotonic registration sequence!
-	var kept []gcFinalEntry
-	var keptFiles []gcWeakFileEntry
-	var newlySep []Value
-	fi := len(s.gc.finalizable) - 1
-	wi := len(s.gc.weakFiles) - 1
-	for fi >= 0 || wi >= 0 {
-		if tr.cancelFn != nil && tr.tickCancel() {
-			return
-		}
-		if wi >= 0 && (fi < 0 || s.gc.weakFiles[wi].seq > s.gc.finalizable[fi].seq) {
-			wf := s.gc.weakFiles[wi]
-			wi--
-			u := wf.userdata()
-			if u == nil {
-				// Go GC already collected the userdata; ensure flush+close completes synchronously now.
-				if wf.fi != nil {
-					_ = wf.fi.flushAndClose()
-				}
-				continue
-			}
-			if u.gcInFnz || u.gcFnzed {
-				continue
-			}
-			obj := UserdataValue(u)
-			if !tr.isMarked(obj) {
-				newlySep = append(newlySep, obj)
-			} else {
-				keptFiles = append(keptFiles, wf)
-			}
-			continue
-		}
-		entry := s.gc.finalizable[fi]
-		fi--
-		obj := entry.obj
-		if !tr.isMarked(obj) {
-			newlySep = append(newlySep, obj)
-		} else {
-			kept = append(kept, entry)
-		}
-	}
-	// Commit finalization flags only after separation completes without cancellation
-	// so an aborted collection never drops pending table/userdata/file finalizers.
-	for _, obj := range newlySep {
-		switch {
-		case obj.IsTable():
-			t := s.asTable(obj)
-			t.flags = (t.flags | tblFlagGCFnzed | tblFlagGCPending) &^ tblFlagGCInFnz
-		case obj.IsUserdata():
-			u := s.asUserdata(obj)
-			u.gcFnzed = true
-			u.gcPending = true
-			u.gcInFnz = false
-		}
-	}
-	// Restore ascending registration order in kept and keptFiles (since we merged backwards).
-	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
-		kept[i], kept[j] = kept[j], kept[i]
-	}
-	for i, j := 0, len(keptFiles)-1; i < j; i, j = i+1, j-1 {
-		keptFiles[i], keptFiles[j] = keptFiles[j], keptFiles[i]
-	}
-	s.gc.finalizable = kept
-	s.gc.weakFiles = keptFiles
-	s.gc.toBeFnz = append(s.gc.toBeFnz, newlySep...)
-
-	// Step 4: markBeingFnz + propagate (resurrection: keeps dying object & its refs alive during __gc!).
-	for _, obj := range s.gc.toBeFnz {
-		if tr.cancelFn != nil && tr.tickCancel() {
-			return
-		}
-		tr.mark(obj)
-	}
-	tr.propagateAll()
-	if tr.aborted {
-		return
-	}
-
-	// Step 5: convergeEphemerons + clearByKeys (weak keys of finalizing objects stay alive during __gc!).
-	tr.convergeEphemerons()
-	if tr.aborted {
-		return
-	}
-	tr.clearByKeys(tr.ephemerons)
-	if tr.aborted {
-		return
-	}
-	tr.clearByKeys(tr.allWeaks)
-	if tr.aborted {
-		return
-	}
-
-	// Step 6: clearByValues again on ALL weak-value/all-weak tables (including any resurrected in Step 4, gc.lua:444!).
-	tr.clearByValues(tr.weakVals)
-	if tr.aborted {
-		return
-	}
-	tr.clearByValues(tr.allWeaks)
-	if tr.aborted {
-		return
-	}
-
-	// Strings are value-like in Lua 5.5 and survive weak clearing; account for surviving strings
-	// in weak table positions before sweeping dead hash keys and updating allocBytes.
-	tr.accountWeakStrings()
-	if tr.aborted {
-		return
-	}
-
-	// Release strong Go pointers from unreachable dead/tombstoned hash keys (matching lgc.c:clearkey)
-	// and sweep invalidated/unreachable inline cache entries.
-	s.gc.hasDeadHashKeys = tr.clearDeadHashKeys()
-	if tr.aborted {
-		return
-	}
-	tr.sweepInlineCaches()
-	if tr.aborted {
-		return
-	}
-
-	// Close open upvalues belonging to threads that remain unreachable after Step 4 resurrection,
-	// so live closures keep their captured values and dead threads are unpinned for Go's GC.
-	for _, uv := range tr.liveOpenUpvals {
-		if uv.owner != nil && uv.owner.gcMark != tr.epoch {
-			uv.closed = uv.owner.stack[uv.stackIdx]
-			uv.owner = nil
-		}
-	}
-
-	s.sweepCoallocTables(tr.epoch)
-	s.intern.Sweep(emergency)
-	sweptStrings = true
-	s.updateArenaSweepThresh()
-	s.shapes.Prune()
-	s.gc.allocBytes = tr.liveBytes
-	s.gc.lastLiveBytes = tr.liveBytes
-	s.gc.debt = 0
-
-	// Drain all queued __gc finalizers synchronously on the VM thread.
-	s.drainFinalizers()
+func (s *State) gcCheckSizes(_ *arena.Collector) {
+	s.intern.checkSizes()
 	s.compactOpenFiles()
 }
 
-func (s *State) runFinalizerObj(th *Thread, obj Value) bool {
-	var mt *Table
-	switch {
-	case obj.IsTable():
-		t := s.asTable(obj)
-		t.flags &^= tblFlagGCPending
-		mt = t.meta
-	case obj.IsUserdata():
-		u := s.asUserdata(obj)
-		u.gcPending = false
-		mt = u.Meta
+func (s *State) gcRunFinalizer(_ *arena.Collector, ref arena.ObjRef) {
+	var (
+		obj Value
+		mt  *Table
+	)
+	switch s.arena.Header(ref).Kind {
+	case gcKindTable:
+		t := s.tableByRef(ref)
+		if t == nil {
+			return
+		}
+		obj = TableValue(t)
+		mt = t.Metatable(s)
+	case gcKindUserdata:
+		u := arena.AsSmall[Userdata](s.arena, ref)
+		obj = UserdataValue(u)
+		mt = s.UserdataMeta(u)
+	default:
+		return
 	}
 	if mt == nil {
-		return true
+		return
 	}
 	tm := mt.RawGetStr(s, s.intern.tms[TMGC])
 	if tm.IsNil() {
-		return true
+		return
 	}
 	if !tm.IsClosure() && !tm.IsNative() && s.getTMByObj(tm, TMCall).IsNil() {
 		s.emitWarning(fmt.Sprintf("error in __gc (attempt to call a %s value (metamethod '__gc'))", s.objTypeName(tm)))
-		return true
+		return
 	}
+	th := s.cur()
+	if th == nil {
+		return
+	}
+	savedSuppress := th.suppressHook
+	th.suppressHook = true
+	th.nny++
 	th.nextFrameFinalizer = true
 	_, err := s.callOnThread(th, tm, []Value{obj})
 	th.nextFrameFinalizer = false
+	th.nny--
+	th.suppressHook = savedSuppress
 	if err != nil {
 		if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 			s.abortErr = err
-			return false
+			return
 		}
 		var le *LuaError
 		if errors.As(err, &le) {
 			if le.Val.IsString() {
 				if werr := s.emitWarningParts("error in __gc (", s.asString(le.Val).Str(), ")"); werr != nil {
 					s.abortErr = werr
-					return false
+					return
 				}
 			} else {
 				s.emitWarning("error in __gc (error object is not a string)")
@@ -1756,139 +1101,164 @@ func (s *State) runFinalizerObj(th *Thread, obj Value) bool {
 		} else {
 			if werr := s.emitWarningParts("error in __gc (", err.Error(), ")"); werr != nil {
 				s.abortErr = werr
-				return false
+				return
 			}
 		}
 	}
-	return true
 }
 
-func (s *State) drainFinalizers() {
-	if s.gc.inGCTM || len(s.gc.toBeFnz) == 0 {
+func (s *State) subExtraMem(delta int64) {
+	if delta <= 0 {
 		return
 	}
-	s.gc.inGCTM = true
-	// Suppress debug hooks (without clearing hookMask so debug.gethook/sethook still work)
-	// and forbid coroutine.yield while running __gc (lgc.c:GCTM: L->allowhook = 0).
-	th := s.curThread
-	savedSuppress := false
-	if th != nil {
-		savedSuppress = th.suppressHook
-		th.suppressHook = true
-		th.nny++
+	if s.extraMemBytes > delta {
+		s.extraMemBytes -= delta
+	} else {
+		s.extraMemBytes = 0
 	}
-	defer func() {
-		if th != nil {
-			th.nny--
-			th.suppressHook = savedSuppress
-		}
-		s.gc.inGCTM = false
-	}()
+}
 
-	for len(s.gc.toBeFnz) > 0 {
-		obj := s.gc.toBeFnz[0]
-		s.gc.toBeFnz[0] = Value{}
-		s.gc.toBeFnz = s.gc.toBeFnz[1:]
-		if !s.runFinalizerObj(th, obj) {
-			return
-		}
+// gcNeedsCheck reports whether an automatic GC step is due at the next safepoint.
+func (s *State) gcNeedsCheck() bool {
+	return s.collector != nil && s.collector.NeedsStep()
+}
+
+// gcCheckStep runs one automatic incremental or generational GC step if pacing debt is due.
+// liveTop matches PUC-Rio lvm.c checkGC(L, c): only stack[0..liveTop) is live in s.cur.
+func (s *State) gcCheckStep(liveTop int) {
+	if s.collector == nil || !s.collector.NeedsStep() {
+		return
 	}
-	s.gc.toBeFnz = nil
+	th := s.cur()
+	if th != nil && liveTop > 0 {
+		savedTop := th.top
+		th.top = liveTop
+		s.collector.Step()
+		if savedTop > th.top {
+			th.top = savedTop
+		}
+	} else {
+		s.collector.Step()
+	}
+	if err := s.collector.CancelErr(); err != nil && s.abortErr == nil {
+		s.abortErr = err
+	}
+}
+
+// registerFinalizable marks ref (Table or Userdata) for __gc finalization in strict LIFO order
+// when setmetatable attaches a metatable containing "__gc" (matching lgc.c:luaC_checkfinalizer).
+func (s *State) registerFinalizable(ref arena.ObjRef, mt *Table) {
+	if ref == arena.NullRef || mt == nil || s.collector == nil || s.collector.IsClosing() {
+		return
+	}
+	if mt.RawGetStr(s, s.intern.tms[TMGC]).IsNil() {
+		return
+	}
+	s.collector.RegisterFinalizer(ref)
+}
+
+func (s *State) registerWeakCandidate(t, mt *Table) {
+	if mt == nil {
+		return
+	}
+	if !mt.RawGetStr(s, s.intern.tms[TMMode]).IsNil() {
+		t.flags |= tblFlagGCWeakCand
+	}
+}
+
+// Ref pins a Lua Value so Lua's Arena GC keeps it reachable from the Go host (like luaL_ref).
+func (s *State) Ref(v Value) int {
+	if s.pinnedRefs == nil {
+		s.pinnedRefs = make(map[int]Value)
+	}
+	if s.nextRefID <= 0 {
+		s.nextRefID = 1
+	}
+	id := s.nextRefID
+	s.nextRefID++
+	s.pinnedRefs[id] = v
+	return id
+}
+
+// Unref releases a host-pinned reference.
+func (s *State) Unref(id int) {
+	delete(s.pinnedRefs, id)
+}
+
+// CollectFull executes a complete PUC-Rio Lua 5.5.1 GC cycle (exact lgc.c atomic() 6-step order)
+// and drains all newly separated __gc finalizers synchronously on the VM thread.
+func (s *State) CollectFull() {
+	if s.collector == nil {
+		return
+	}
+	s.collector.Full(false)
+	if err := s.collector.CancelErr(); err != nil && s.abortErr == nil {
+		s.abortErr = err
+	}
+	s.compactOpenFiles()
+}
+
+// collectEmergency runs an emergency GC pass under memory-limit pressure without invoking __gc finalizers.
+func (s *State) collectEmergency() {
+	if s.collector == nil {
+		return
+	}
+	prev := s.preserveFramesInGC
+	s.preserveFramesInGC = true
+	s.collector.Full(true)
+	s.preserveFramesInGC = prev
+	if err := s.collector.CancelErr(); err != nil && s.abortErr == nil {
+		s.abortErr = err
+	}
 }
 
 // Close closes the State: closes remaining mainThread <close> variables, runs ALL remaining
-// __gc finalizers in strict LIFO order regardless of reachability (matching lua_close /
-// gc.lua:653-668 / main.lua:333-360,491-501), flushes/closes all open files, and clears
-// host-pinned references once top-level finalization finishes.
+// __gc finalizers in strict LIFO order regardless of reachability (matching lua_close),
+// flushes/closes all open files, clears GoRefs, and releases all Arena pages back to Go.
 func (s *State) Close() {
-	if !s.gc.closing {
-		// Close any active <close> TBC variables on mainThread first (e.g. os.exit(true, true)).
-		if s.mainThreadPtr != nil {
-			s.mainThreadPtr.nframe = 0
-			s.mainThreadPtr.nny++
-			_, _, _ = s.mainThreadPtr.closeAllSync(s, 0, NilValue(), false)
-			s.mainThreadPtr.nny--
-		}
-		s.gc.closing = true
-		// Merge all remaining finalizable objects and file handles into toBeFnz in strict LIFO order.
-		fi := len(s.gc.finalizable) - 1
-		wi := len(s.gc.weakFiles) - 1
-		for fi >= 0 || wi >= 0 {
-			if wi >= 0 && (fi < 0 || s.gc.weakFiles[wi].seq > s.gc.finalizable[fi].seq) {
-				wf := s.gc.weakFiles[wi]
-				wi--
-				u := wf.userdata()
-				if u == nil {
-					if wf.fi != nil {
-						_ = wf.fi.flushAndClose()
-					}
-					continue
-				}
-				if u.gcInFnz || u.gcFnzed {
-					continue
-				}
-				u.gcFnzed = true
-				u.gcPending = true
-				s.gc.toBeFnz = append(s.gc.toBeFnz, UserdataValue(u))
-				continue
-			}
-			obj := s.gc.finalizable[fi].obj
-			fi--
-			switch {
-			case obj.IsTable():
-				t := s.asTable(obj)
-				t.flags = (t.flags | tblFlagGCFnzed | tblFlagGCPending) &^ tblFlagGCInFnz
-			case obj.IsUserdata():
-				u := s.asUserdata(obj)
-				u.gcFnzed = true
-				u.gcPending = true
-				u.gcInFnz = false
-			}
-			s.gc.toBeFnz = append(s.gc.toBeFnz, obj)
-		}
-		s.gc.finalizable = nil
-		s.gc.weakFiles = nil
+	if s.collector == nil {
+		s.closeOpenFiles()
+		return
 	}
-	if s.gc.inGCTM {
-		// Re-entrant Close (e.g. os.exit(0, true) inside a __gc finalizer, main.lua:349):
-		// drain any remaining queued finalizers in LIFO order while keeping inGCTM active!
-		s.drainFinalizersQueued()
-	} else {
-		s.drainFinalizers()
+	wasInFin := s.collector.InFinalizer()
+	if !s.collector.IsClosing() {
+		if mt := s.mainThread(); mt != nil {
+			mt.nframe = 0
+			mt.nny++
+			_, _, _ = mt.closeAllSync(s, 0, NilValue(), false)
+			mt.nny--
+		}
 	}
+	s.collector.FreeAll()
 	s.closeOpenFiles()
-	if !s.gc.inGCTM {
-		s.gc.pinnedRefs = nil
+	if !wasInFin {
+		s.pinnedRefs = nil
+		s.hashedTables = nil
+		s.twups = nil
+		s.protos = nil
+		s.freeProtoIDs = nil
+		s.tables = nil
+		s.freeTableIDs = nil
+		s.threads = nil
+		s.freeThreadIDs = nil
 		if s.goRefs != nil {
 			s.goRefs.ClearAll()
 		}
-		if a := s.intern.arena; a != nil {
-			s.intern.Close()
-			a.Close()
+		s.intern.Close()
+		if s.arena != nil {
+			s.arena.Close()
 		}
+		s.collector = nil
 	}
-}
-
-func (s *State) drainFinalizersQueued() {
-	th := s.curThread
-	for len(s.gc.toBeFnz) > 0 {
-		obj := s.gc.toBeFnz[0]
-		s.gc.toBeFnz[0] = Value{}
-		s.gc.toBeFnz = s.gc.toBeFnz[1:]
-		if !s.runFinalizerObj(th, obj) {
-			return
-		}
-	}
-	s.gc.toBeFnz = nil
 }
 
 var gcParamNames = map[string]int{
-	"minormul":   gcParamMinorMul,
-	"majorminor": gcParamMajorMinor,
-	"minormajor": gcParamMinorMajor,
-	"pause":      gcParamPause,
-	"stepmul":    gcParamStepMul,
-	"stepsize":   gcParamStepSize,
+	"minormul":   arena.ParamMinorMul,
+	"majorminor": arena.ParamMajorMinor,
+	"minormajor": arena.ParamMinorMajor,
+	"pause":      arena.ParamPause,
+	"stepmul":    arena.ParamStepMul,
+	"stepsize":   arena.ParamStepSize,
 }
 
 func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
@@ -1899,9 +1269,10 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 		}
 		opt = s.asString(args[0]).Str()
 	}
+	inFin := s.collector.InFinalizer()
 	switch opt {
 	case "collect":
-		if s.gc.inGCTM {
+		if inFin {
 			return []Value{NilValue()}, nil
 		}
 		s.CollectFull()
@@ -1910,26 +1281,27 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{IntValue(0)}, nil
 	case "stop":
-		if s.gc.inGCTM {
+		if inFin {
 			return []Value{NilValue()}, nil
 		}
-		s.gc.running = false
+		s.collector.Stop()
 		return []Value{IntValue(0)}, nil
 	case "restart":
-		if s.gc.inGCTM {
+		if inFin {
 			return []Value{NilValue()}, nil
 		}
-		s.gc.running = true
+		s.collector.Restart()
 		return []Value{IntValue(0)}, nil
 	case "count":
-		if s.gc.inGCTM {
+		if inFin {
 			return []Value{NilValue()}, nil
 		}
-		kb := float64(s.gc.allocBytes) / 1024.0
+		kb := float64(s.MemoryUsage()) / 1024.0
 		return []Value{FloatValue(kb)}, nil
 	case "step":
+		var stepBytes int64
 		if len(args) >= 2 && !args[1].IsNil() {
-			_, ok, nonInt, err := s.coerceIntKind(args[1])
+			n, ok, nonInt, err := s.coerceIntKind(args[1])
 			if err != nil {
 				return nil, err
 			}
@@ -1939,41 +1311,46 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 				}
 				return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (number expected, got %s)", s.objTypeName(args[1]))
 			}
-		}
-		if s.gc.inGCTM {
-			return []Value{NilValue()}, nil
-		}
-		if s.gc.tier1 {
-			s.CollectFull()
-			if s.abortErr != nil {
-				return nil, s.abortErr
+			if n > 0 {
+				stepBytes = n
 			}
 		}
-		return []Value{TrueValue()}, nil
-	case "isrunning":
-		if s.gc.inGCTM {
+		if inFin {
 			return []Value{NilValue()}, nil
 		}
-		return []Value{BoolValue(s.gc.running)}, nil
+		finished := s.collector.StepBytes(stepBytes)
+		if err := s.collector.CancelErr(); err != nil {
+			s.abortErr = err
+			return nil, err
+		}
+		if s.abortErr != nil {
+			return nil, s.abortErr
+		}
+		return []Value{BoolValue(finished)}, nil
+	case "isrunning":
+		if inFin {
+			return []Value{NilValue()}, nil
+		}
+		return []Value{BoolValue(s.collector.IsRunning())}, nil
 	case "incremental":
-		if s.gc.inGCTM {
+		if inFin {
 			return []Value{NilValue()}, nil
 		}
 		prev := "incremental"
-		if s.gc.mode == gcModeGenerational {
+		if s.collector.Mode() != arena.ModeIncremental {
 			prev = "generational"
 		}
-		s.gc.mode = gcModeIncremental
+		s.collector.SetMode(arena.ModeIncremental)
 		return []Value{StringValue(s.intern.Intern(prev))}, nil
 	case "generational":
-		if s.gc.inGCTM {
+		if inFin {
 			return []Value{NilValue()}, nil
 		}
 		prev := "incremental"
-		if s.gc.mode == gcModeGenerational {
+		if s.collector.Mode() != arena.ModeIncremental {
 			prev = "generational"
 		}
-		s.gc.mode = gcModeGenerational
+		s.collector.SetMode(arena.ModeGenMinor)
 		return []Value{StringValue(s.intern.Intern(prev))}, nil
 	case "param":
 		if len(args) < 2 || !args[1].IsString() {
@@ -1983,9 +1360,10 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 			}
 			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (string expected, got %s)", got)
 		}
-		idx, ok := gcParamNames[s.asString(args[1]).Str()]
+		name := s.asString(args[1]).Str()
+		idx, ok := gcParamNames[name]
 		if !ok {
-			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (invalid option '%s')", s.asString(args[1]).Str())
+			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (invalid option '%s')", name)
 		}
 		nv := int64(-1)
 		if len(args) >= 3 && !args[2].IsNil() {
@@ -2002,14 +1380,16 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 				return nil, fmt.Errorf("bad argument #3 to 'collectgarbage' (number expected, got %s)", s.objTypeName(args[2]))
 			}
 		}
-		if s.gc.inGCTM {
+		if inFin {
 			return []Value{NilValue()}, nil
 		}
-		old := luaGCParamApply(s.gc.params[idx], 100)
+		var prev uint64
 		if nv >= 0 {
-			s.gc.params[idx] = luaGCParamCode(uint64(nv))
+			prev = s.collector.SetParam(idx, uint64(nv), true)
+		} else {
+			prev = s.collector.SetParam(idx, 0, false)
 		}
-		return []Value{IntValue(old)}, nil
+		return []Value{IntValue(int64(prev))}, nil
 	default:
 		return nil, fmt.Errorf("bad argument #1 to 'collectgarbage' (invalid option '%s')", opt)
 	}

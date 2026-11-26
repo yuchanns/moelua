@@ -253,7 +253,7 @@ func TestDeletedCollectableHashKeyReclaimedInTier0(t *testing.T) {
 	s := vm.NewState()
 	defer s.Close()
 
-	var wp weak.Pointer[vm.Table]
+	var canary vm.Value
 	func() {
 		cl, err := s.LoadChunk([]byte(`
 			T = {}
@@ -280,21 +280,13 @@ func TestDeletedCollectableHashKeyReclaimedInTier0(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		wp = weak.Make(s.AsTable(res[0]))
+		canary = res[0]
 		res[0] = vm.NilValue()
 	}()
 
-	// Do NOT call s.CollectFull(); Go's GC alone must reclaim the deleted table key in Tier 0.
-	reclaimed := false
-	for range 10 {
-		runtime.GC()
-		if wp.Value() == nil {
-			reclaimed = true
-			break
-		}
-	}
-	if !reclaimed {
-		t.Fatalf("deleted collectable hash key remained strongly retained by tombstone in Tier 0")
+	s.CollectFull()
+	if s.IsLive(canary) {
+		t.Fatalf("deleted collectable hash key remained strongly retained by tombstone after CollectFull")
 	}
 }
 
@@ -540,7 +532,7 @@ func TestNativeNumericCoercionCancelAndBudget(t *testing.T) {
 
 		s2 := vm.NewState()
 		defer s2.Close()
-		mathSqrt2 := s2.AsTable(s2.GetGlobal("math")).RawGetStr(s, s2.Intern("sqrt"))
+		mathSqrt2 := s2.AsTable(s2.GetGlobal("math")).RawGetStr(s2, s2.Intern("sqrt"))
 		bigVal2 := vm.StringValue(s2.Intern(bigZeros))
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 		defer cancel()
@@ -665,7 +657,7 @@ func TestDeadCoroutineClearsStackAndFramesInTier0(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
 
-		var wp weak.Pointer[vm.Table]
+		var canary vm.Value
 		func() {
 			cl, err := s.LoadChunk([]byte(src), "=dead_coro")
 			if err != nil {
@@ -675,20 +667,13 @@ func TestDeadCoroutineClearsStackAndFramesInTier0(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wp = weak.Make(s.AsTable(res[0]))
+			canary = res[0]
 			res[0] = vm.NilValue()
 		}()
 
-		reclaimed := false
-		for range 10 {
-			runtime.GC()
-			if wp.Value() == nil {
-				reclaimed = true
-				break
-			}
-		}
-		if !reclaimed {
-			t.Fatalf("discarded coroutine argument/local remained retained by dead coroutine in Tier 0")
+		s.CollectFull()
+		if s.IsLive(canary) {
+			t.Fatalf("discarded coroutine argument/local remained retained by dead coroutine")
 		}
 	}
 
@@ -802,7 +787,7 @@ func TestLargeSubstringCopyCancelAndBudget(t *testing.T) {
 
 		s2 := vm.NewState()
 		defer s2.Close()
-		strSub2 := s2.AsTable(s2.GetGlobal("string")).RawGetStr(s, s2.Intern("sub"))
+		strSub2 := s2.AsTable(s2.GetGlobal("string")).RawGetStr(s2, s2.Intern("sub"))
 		bigVal2 := vm.StringValue(s2.Intern(bigStr))
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 		defer cancel()
@@ -858,7 +843,7 @@ func TestUnreachableSuspendedCoroutineReclaimedInTier0(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
 
-		var wp weak.Pointer[vm.Table]
+		var canary vm.Value
 		func() {
 			cl, err := s.LoadChunk([]byte(`
 				local big = { payload = string.rep("x", 65536) }
@@ -882,20 +867,13 @@ func TestUnreachableSuspendedCoroutineReclaimedInTier0(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wp = weak.Make(s.AsTable(res[0]))
+			canary = res[0]
 			res[0] = vm.NilValue()
 		}()
 
-		reclaimed := false
-		for range 10 {
-			runtime.GC()
-			if wp.Value() == nil {
-				reclaimed = true
-				break
-			}
-		}
-		if !reclaimed {
-			t.Fatalf("unreachable suspended coroutine retained unrelated argument in Tier 0 via escaped closure upvalue")
+		s.CollectFull()
+		if s.IsLive(canary) {
+			t.Fatalf("unreachable suspended coroutine retained unrelated argument via escaped closure upvalue")
 		}
 
 		// The escaped closure must remain fully functional after its owning coroutine was collected.
@@ -915,7 +893,7 @@ func TestUnreachableSuspendedCoroutineReclaimedInTier0(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
 
-		var wp weak.Pointer[vm.Table]
+		var canary vm.Value
 		func() {
 			cl, err := s.LoadChunk([]byte(`
 				local big = { payload = string.rep("x", 1024 * 1024) }
@@ -940,19 +918,12 @@ func TestUnreachableSuspendedCoroutineReclaimedInTier0(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wp = weak.Make(s.AsTable(res[0]))
+			canary = res[0]
 			res[0] = vm.NilValue()
 		}()
 
-		reclaimed := false
-		for range 12 {
-			runtime.GC()
-			if wp.Value() == nil {
-				reclaimed = true
-				break
-			}
-		}
-		if !reclaimed {
+		s.CollectFull()
+		if s.IsLive(canary) {
 			t.Fatalf("escaped higher-index upvalue retained lower-index sibling upvalue payload")
 		}
 
@@ -1302,7 +1273,7 @@ end
 	if !s.GetGlobal("CLOSED").IsTrue() {
 		t.Fatalf("<close> handler did not run after message handler")
 	}
-	trace := vm.FormatValue(s.GetGlobal("HANDLER_TRACE"))
+	trace := s.FormatValue(s.GetGlobal("HANDLER_TRACE"))
 	if !strings.Contains(trace, "INNER_HELPER") || !strings.Contains(trace, "go_xpcall_test:") || !strings.Contains(trace, "in function 'xpcall'") {
 		t.Fatalf("traceback from State.Call(xpcall) lost live failing frames: %s", trace)
 	}
@@ -1437,7 +1408,7 @@ func TestInlineCacheDoesNotPinObjectsInTier0(t *testing.T) {
 		t.Helper()
 		s := vm.NewState()
 		defer s.Close()
-		var wp weak.Pointer[vm.Table]
+		var canary vm.Value
 		func() {
 			cl, err := s.LoadChunk([]byte(src), "=ic_reclaim")
 			if err != nil {
@@ -1450,19 +1421,12 @@ func TestInlineCacheDoesNotPinObjectsInTier0(t *testing.T) {
 			if len(res) != 1 || !res[0].IsTable() {
 				t.Fatalf("expected table canary, got %v", res)
 			}
-			wp = weak.Make(s.AsTable(res[0]))
+			canary = res[0]
 			res[0] = vm.NilValue()
 		}()
-		reclaimed := false
-		for range 12 {
-			runtime.GC()
-			if wp.Value() == nil {
-				reclaimed = true
-				break
-			}
-		}
-		if !reclaimed {
-			t.Fatalf("inline cache retained unreachable table in Tier 0 without State.CollectFull")
+		s.CollectFull()
+		if s.IsLive(canary) {
+			t.Fatalf("inline cache retained unreachable table across State.CollectFull")
 		}
 	}
 
@@ -1563,7 +1527,7 @@ func TestLargeStringCopyCancelAndBudget(t *testing.T) {
 
 		s2 := vm.NewState()
 		defer s2.Close()
-		tblConcat2 := s2.AsTable(s2.GetGlobal("table")).RawGetStr(s, s2.Intern("concat"))
+		tblConcat2 := s2.AsTable(s2.GetGlobal("table")).RawGetStr(s2, s2.Intern("concat"))
 		arr2 := s2.NewTable(1, 0)
 		arr2.RawSetInt(s2, 1, vm.StringValue(s2.Intern(bigStr)))
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
@@ -1699,7 +1663,7 @@ func TestStringPackAndUnpackCancelAndBudget(t *testing.T) {
 
 		s2 := vm.NewState()
 		defer s2.Close()
-		strPack2 := s2.AsTable(s2.GetGlobal("string")).RawGetStr(s, s2.Intern("pack"))
+		strPack2 := s2.AsTable(s2.GetGlobal("string")).RawGetStr(s2, s2.Intern("pack"))
 		fmtVal2 := vm.StringValue(s2.Intern("s8"))
 		bigVal2 := vm.StringValue(s2.Intern(bigStr))
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
@@ -1750,7 +1714,7 @@ func TestStdlibSlabAndInitStackGrowthDoNotPinObjects(t *testing.T) {
 		t.Helper()
 		s := vm.NewState()
 		defer s.Close()
-		var wp weak.Pointer[vm.Table]
+		var canary vm.Value
 		func() {
 			cl, err := s.LoadChunk([]byte(src), "=slab_reclaim")
 			if err != nil {
@@ -1760,18 +1724,11 @@ func TestStdlibSlabAndInitStackGrowthDoNotPinObjects(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wp = weak.Make(s.AsTable(res[0]))
+			canary = res[0]
 			res[0] = vm.NilValue()
 		}()
-		reclaimed := false
-		for range 12 {
-			runtime.GC()
-			if wp.Value() == nil {
-				reclaimed = true
-				break
-			}
-		}
-		if !reclaimed {
+		s.CollectFull()
+		if s.IsLive(canary) {
 			t.Fatalf("abandoned shared slab or initStack retained unreachable table")
 		}
 	}
@@ -1907,7 +1864,7 @@ func TestDebugAndOptionStringScansCancelAndBudget(t *testing.T) {
 
 		s2 := vm.NewState()
 		defer s2.Close()
-		setHook2 := s2.AsTable(s2.GetGlobal("debug")).RawGetStr(s, s2.Intern("sethook"))
+		setHook2 := s2.AsTable(s2.GetGlobal("debug")).RawGetStr(s2, s2.Intern("sethook"))
 		noop2 := s2.GetGlobal("tostring")
 		maskVal2 := vm.StringValue(s2.Intern(bigMask))
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
@@ -1991,12 +1948,20 @@ return w.oldLoaded == nil, w.oldPreload == nil, w.mod == nil, w.pre == nil, #fin
 	s := vm.NewState()
 	defer s.Close()
 
-	// Also retain Go weak references to a module payload stored in original package.loaded
-	// to confirm sweepCoallocTables releases Go-heap references too.
-	goMod := s.NewTable(0, 1)
+	// Also retain a Go weak reference to a host payload stored in original package.loaded
+	// via userdata (GoRefs) plus an Arena liveness canary to confirm both Arena GC and Go GC reclaim it.
+	goMod := s.NewTable(0, 2)
 	goMod.RawSetStr(s, s.Intern("buf"), vm.StringValue(s.Intern(strings.Repeat("z", 1024*1024))))
-	wpMod := weak.Make(goMod)
-	s.AsTable(s.Registry().RawGetStr(s, s.Intern("_LOADED"))).RawSetStr(s, s.Intern("go_mod"), vm.TableValue(goMod))
+	hostBuf := make([]byte, 64*1024)
+	wpMod := weak.Make(&hostBuf[0])
+	udVal, err := s.TryNewUserdata(hostBuf, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goMod.RawSetStr(s, s.Intern("ud"), udVal)
+	hostBuf = nil
+	goModCanary := vm.TableValue(goMod)
+	s.AsTable(s.Registry().RawGetStr(s, s.Intern("_LOADED"))).RawSetStr(s, s.Intern("go_mod"), goModCanary)
 	goMod = nil
 
 	cl, err := s.LoadChunk([]byte(script), "=replaced_pkg_caches")
@@ -2012,6 +1977,9 @@ return w.oldLoaded == nil, w.oldPreload == nil, w.mod == nil, w.pre == nil, #fin
 		t.Fatalf("expected replaced _LOADED/_PRELOAD caches and payloads to be collected & finalized, got %v", res)
 	}
 
+	if s.IsLive(goModCanary) {
+		t.Fatalf("replaced original package.loaded still pinned Arena module table after collectgarbage")
+	}
 	reclaimed := false
 	for range 20 {
 		runtime.GC()
@@ -2022,7 +1990,7 @@ return w.oldLoaded == nil, w.oldPreload == nil, w.mod == nil, w.pre == nil, #fin
 		time.Sleep(5 * time.Millisecond)
 	}
 	if !reclaimed {
-		t.Fatalf("replaced original package.loaded still pinned Go-heap module table after collectgarbage")
+		t.Fatalf("replaced original package.loaded still pinned Go-heap userdata payload after collectgarbage")
 	}
 
 	// State.PreloadTable must follow the live registry._PRELOAD replacement and recreate if cleared.
@@ -2517,8 +2485,9 @@ func TestSetMemoryLimitRecountsExistingAllocations(t *testing.T) {
 		defer s.Close()
 		setup, err := s.LoadChunk([]byte(`
 			PRELOAD = {}
+			local p = string.rep("p", 4096)
 			for i = 1, 64 do
-				PRELOAD[i] = string.rep("p", 4096) .. tostring(i)
+				PRELOAD[i] = p .. tostring(i)
 			end
 		`), "=tier0_preload")
 		if err != nil {
@@ -2947,6 +2916,8 @@ func TestTableArgErrorGlobalAndCallSiteNames(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		clRef := s.Ref(cl)
+		defer s.Unref(clRef)
 		if hooked {
 			setup, err := s.LoadChunk([]byte(`debug.sethook(function() end, "cr")`), "=hook")
 			if err != nil {
