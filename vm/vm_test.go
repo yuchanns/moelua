@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"weak"
 
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/compiler"
@@ -236,5 +238,58 @@ print(#f, f[1], f[3], f[4])
 				t.Fatalf("stdout mismatch vs C Lua 5.5.1:\n--- want (C) ---\n%s--- got (MoeLua) ---\n%s", want, got)
 			}
 		})
+	}
+}
+
+// TestDeletedCollectableHashKeyReclaimedInTier0 verifies that deleting a collectable hash key
+// drops the strong Go pointer immediately via a weak tombstone so Go GC reclaims the deleted
+// key graph in Tier 0 without waiting for rehash or State.CollectFull, while preserving
+// active pairs()/next() traversal while the key remains live.
+func TestDeletedCollectableHashKeyReclaimedInTier0(t *testing.T) {
+	s := vm.NewState()
+	defer s.Close()
+
+	var wp weak.Pointer[vm.Table]
+	func() {
+		cl, err := s.LoadChunk([]byte(`
+			T = {}
+			local k1 = { payload = string.rep("x", 65536) }
+			local k2 = { name = "keep" }
+			T[k1] = 1
+			T[k2] = 2
+			-- Deleting during pairs() traversal must keep next(T, k1) working while k1 is live.
+			local seen = 0
+			for k, _ in pairs(T) do
+				seen = seen + 1
+				if k == k1 then
+					T[k] = nil
+				end
+			end
+			assert(seen == 2, "expected to visit both entries while deleting k1, got " .. seen)
+			assert(T[k1] == nil and T[k2] == 2)
+			return k1
+		`), "=weak_tombstone")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wp = weak.Make(res[0].AsTable())
+		res[0] = vm.NilValue()
+	}()
+
+	// Do NOT call s.CollectFull(); Go's GC alone must reclaim the deleted table key in Tier 0.
+	reclaimed := false
+	for range 10 {
+		runtime.GC()
+		if wp.Value() == nil {
+			reclaimed = true
+			break
+		}
+	}
+	if !reclaimed {
+		t.Fatalf("deleted collectable hash key remained strongly retained by tombstone in Tier 0")
 	}
 }

@@ -989,10 +989,7 @@ func (tr *gcTracer) clearByValues(tables []*Table) {
 				}
 				nd := &nodes[i]
 				if nd.used && !nd.dead && !nd.val.IsNil() && !tr.isMarked(nd.val) {
-					nd.val = NilValue()
-					nd.dead = true
-					h.live--
-					h.dictGen++
+					h.markDead(i)
 					cleared = true
 				}
 			}
@@ -1112,6 +1109,36 @@ func (tr *gcTracer) clearDeadHashKeys() bool {
 					continue
 				}
 				anyDead = true
+			}
+		}
+		if len(t.hash.deadKeys) > 0 {
+			for slot, ref := range t.hash.deadKeys {
+				if tr.cancelFn != nil && tr.tickCancel() {
+					return true
+				}
+				v, alive := deadKeyValue(ref)
+				if !alive {
+					delete(t.hash.deadKeys, slot)
+					continue
+				}
+				if v.IsString() {
+					if tr.countStrings || tr.trackDeadStrings {
+						if _, live := tr.seenStrings[v.AsString()]; !live {
+							delete(t.hash.deadKeys, slot)
+							continue
+						}
+					}
+					anyDead = true
+				} else if isCollectableWeak(v) {
+					if !tr.isMarked(v) {
+						delete(t.hash.deadKeys, slot)
+						continue
+					}
+					anyDead = true
+				}
+			}
+			if len(t.hash.deadKeys) == 0 {
+				t.hash.deadKeys = nil
 			}
 		}
 	}

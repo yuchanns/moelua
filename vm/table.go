@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"unsafe"
+	"weak"
 )
 
 type arrKind uint8
@@ -35,11 +36,79 @@ type hashNode struct {
 // tableHash holds the lazily-allocated hash/dict part of a Lua Table.
 // Pure record tables (Shape/slots) and pure dense arrays never allocate a tableHash.
 type tableHash struct {
-	nodes   []hashNode
-	dictGen uint64 // bumped on rehash / structure change for _ENV IC (uint64 prevents 32-bit wraparound)
-	mask    uint32
-	count   int32 // active + dead slots (for load factor)
-	live    int32 // active non-nil entries
+	nodes    []hashNode
+	deadKeys map[int]any // lazy weak.Pointer[T] tombstones for deleted collectable keys (reclaimable in Tier 0)
+	dictGen  uint64      // bumped on rehash / structure change for _ENV IC (uint64 prevents 32-bit wraparound)
+	mask     uint32
+	count    int32 // active + dead slots (for load factor)
+	live     int32 // active non-nil entries
+}
+
+func makeDeadKeyRef(key Value) (any, bool) {
+	switch {
+	case key.IsTable():
+		return weak.Make(key.AsTable()), true
+	case key.IsClosure():
+		return weak.Make(key.AsClosure()), true
+	case key.IsNative() && key.AsNative().Collectable:
+		return weak.Make(key.AsNative()), true
+	case key.IsUserdata():
+		return weak.Make(key.AsUserdata()), true
+	case key.IsThread():
+		return weak.Make(key.AsThread()), true
+	case key.IsString() && !key.AsString().Short:
+		return weak.Make(key.AsString()), true
+	default:
+		return nil, false
+	}
+}
+
+func deadKeyValue(ref any) (Value, bool) {
+	switch wp := ref.(type) {
+	case weak.Pointer[Table]:
+		if p := wp.Value(); p != nil {
+			return TableValue(p), true
+		}
+	case weak.Pointer[Closure]:
+		if p := wp.Value(); p != nil {
+			return ClosureValue(p), true
+		}
+	case weak.Pointer[NativeFunc]:
+		if p := wp.Value(); p != nil {
+			return NativeValue(p), true
+		}
+	case weak.Pointer[Userdata]:
+		if p := wp.Value(); p != nil {
+			return UserdataValue(p), true
+		}
+	case weak.Pointer[Thread]:
+		if p := wp.Value(); p != nil {
+			return ThreadValue(p), true
+		}
+	case weak.Pointer[LuaString]:
+		if p := wp.Value(); p != nil {
+			return StringValue(p), true
+		}
+	}
+	return NilValue(), false
+}
+
+// markDead turns slot into a tombstone while dropping any strong Go pointer to a
+// collectable key (storing a weak.Pointer in h.deadKeys so pairs/next still works
+// while the key is live, and Go GC can reclaim deleted keys immediately in Tier 0).
+func (h *tableHash) markDead(slot int) {
+	nd := &h.nodes[slot]
+	nd.val = NilValue()
+	nd.dead = true
+	h.live--
+	h.dictGen++
+	if ref, ok := makeDeadKeyRef(nd.key); ok {
+		nd.key = NilValue()
+		if h.deadKeys == nil {
+			h.deadKeys = make(map[int]any)
+		}
+		h.deadKeys[slot] = ref
+	}
 }
 
 // Table is a Lua 5.5 table supporting both:
@@ -315,6 +384,7 @@ func (t *Table) growHash() {
 		newSz = len(old)
 	}
 	h.nodes = make([]hashNode, newSz)
+	h.deadKeys = nil
 	h.mask = uint32(newSz - 1)
 	h.count = 0
 	h.live = 0
@@ -419,6 +489,9 @@ func (t *Table) hashPutNoGrow(key, val Value) int {
 			target := int(idx)
 			if firstDead >= 0 {
 				target = firstDead
+				if h.deadKeys != nil {
+					delete(h.deadKeys, target)
+				}
 				h.dictGen++
 			} else {
 				h.count++
@@ -442,11 +515,7 @@ func (t *Table) hashPutNoGrow(key, val Value) int {
 func (t *Table) hashSet(key, val Value) int {
 	if val.IsNil() {
 		if slot, ok := t.hashFindSlot(key); ok {
-			h := t.hash
-			h.nodes[slot].val = NilValue()
-			h.nodes[slot].dead = true
-			h.live--
-			h.dictGen++
+			t.hash.markDead(slot)
 			return slot
 		}
 		return -1
@@ -468,11 +537,7 @@ func (t *Table) hashSet(key, val Value) int {
 func (t *Table) hashSetChecked(s *State, key, val Value) (int, error) {
 	if val.IsNil() {
 		if slot, ok := t.hashFindSlot(key); ok {
-			h := t.hash
-			h.nodes[slot].val = NilValue()
-			h.nodes[slot].dead = true
-			h.live--
-			h.dictGen++
+			t.hash.markDead(slot)
 			return slot, nil
 		}
 		return -1, nil
@@ -1225,8 +1290,20 @@ func (t *Table) hashFindSlotForNext(key Value) (int, bool) {
 		if !nd.used {
 			return -1, false
 		}
-		if RawEqual(nd.key, key) {
-			return int(idx), true
+		if !nd.dead || !nd.key.IsNil() {
+			if RawEqual(nd.key, key) {
+				return int(idx), true
+			}
+		} else if h.deadKeys != nil {
+			if ref, ok := h.deadKeys[int(idx)]; ok {
+				if dv, alive := deadKeyValue(ref); alive {
+					if RawEqual(dv, key) {
+						return int(idx), true
+					}
+				} else {
+					delete(h.deadKeys, int(idx))
+				}
+			}
 		}
 		idx = (idx + 1) & mask
 	}
