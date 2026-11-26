@@ -2031,3 +2031,108 @@ return w.oldLoaded == nil, w.oldPreload == nil, w.mod == nil, w.pre == nil, #fin
 		t.Fatalf("PreloadTable() did not recreate cleared registry._PRELOAD")
 	}
 }
+
+func TestNativeReturningArgsAfterStackGrowthPreservesResults(t *testing.T) {
+	makeState := func(t *testing.T) (*vm.State, vm.Value) {
+		t.Helper()
+		s := vm.NewState()
+		cl, err := s.LoadChunk([]byte(`
+			local function grow(n)
+				if n == 0 then return 0 end
+				return grow(n - 1) + 1
+			end
+			return grow
+		`), "=grow")
+		if err != nil {
+			t.Fatal(err)
+		}
+		growRes, err := s.Call(cl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		growFn := growRes[0]
+		echoGrow := vm.NativeValue(&vm.NativeFunc{
+			Name: "echo_grow",
+			Fn: func(st *vm.State, args []vm.Value) ([]vm.Value, error) {
+				if _, err := st.Call(growFn, vm.IntValue(400)); err != nil {
+					return nil, err
+				}
+				return args, nil
+			},
+		})
+		s.SetGlobal("echo_grow", echoGrow)
+		return s, echoGrow
+	}
+
+	t.Run("direct_state_call", func(t *testing.T) {
+		s, echoGrow := makeState(t)
+		defer s.Close()
+		res, err := s.Call(echoGrow, vm.IntValue(42), vm.StringValue(s.Intern("ok")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(res))
+		}
+		got, ok := res[0].ToInt()
+		if !ok || got != 42 || !res[1].IsString() || res[1].AsString().S != "ok" {
+			t.Fatalf("aliased native results corrupted: got (%v, %v)", res[0], res[1])
+		}
+	})
+
+	t.Run("direct_state_call_with_hooks", func(t *testing.T) {
+		s, echoGrow := makeState(t)
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(`debug.sethook(function() end, "cr")`), "=hook")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(cl); err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(echoGrow, vm.IntValue(42), vm.StringValue(s.Intern("ok")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok := res[0].ToInt()
+		if len(res) != 2 || !ok || got != 42 || !res[1].IsString() || res[1].AsString().S != "ok" {
+			t.Fatalf("hooked aliased native results corrupted: got %v", res)
+		}
+	})
+
+	t.Run("lua_call_and_nested_native", func(t *testing.T) {
+		s, echoGrow := makeState(t)
+		defer s.Close()
+		outer := vm.NativeValue(&vm.NativeFunc{
+			Name: "outer_echo",
+			Fn: func(st *vm.State, args []vm.Value) ([]vm.Value, error) {
+				innerRes, err := st.Call(echoGrow, args...)
+				if err != nil {
+					return nil, err
+				}
+				if got, ok := innerRes[0].ToInt(); !ok || got != 42 {
+					t.Fatalf("inner result corrupted: %v", innerRes[0])
+				}
+				return args, nil
+			},
+		})
+		s.SetGlobal("outer_echo", outer)
+		cl, err := s.LoadChunk([]byte(`
+			local a, b = echo_grow(42, "lua")
+			assert(a == 42 and b == "lua", "callSlow corrupted: " .. tostring(a) .. "," .. tostring(b))
+			local c, d = outer_echo(42, "nested")
+			assert(c == 42 and d == "nested", "nested native corrupted: " .. tostring(c) .. "," .. tostring(d))
+			return a, b, c, d
+		`), "=lua_call_echo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 4 {
+			t.Fatalf("expected 4 results, got %v", res)
+		}
+	})
+}

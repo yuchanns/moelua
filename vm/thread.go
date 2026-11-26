@@ -274,6 +274,25 @@ func (th *Thread) clearAbandonedInitStack() {
 	}
 }
 
+// finishNativeArgs decrements nativeArgsDepth after a borrowed-stack native call.
+// If the call grew th.stack off initStack and the native returned a slice aliasing
+// initStack (e.g. returning its args slice directly), res is copied before clearing
+// the abandoned initStack storage.
+func (th *Thread) finishNativeArgs(res []Value) []Value {
+	th.nativeArgsDepth--
+	if th.nativeArgsDepth == 0 && th.initStackAbandoned && th.initStack != nil {
+		if len(res) > 0 && slicesOverlapValues(res, th.initStack) {
+			cp := make([]Value, len(res))
+			copy(cp, res)
+			res = cp
+		}
+		clear(th.initStack)
+		th.initStack = nil
+		th.initStackAbandoned = false
+	}
+	return res
+}
+
 func (th *Thread) clearAbandonedInitStorage() {
 	th.clearAbandonedInitStack()
 	if th.initFramesAbandoned && th.initFrames != nil && th.nframe == 0 {

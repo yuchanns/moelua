@@ -1060,14 +1060,11 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		} else if th.hookMask == 0 || th.inHook || th.suppressHook {
 			th.nativeArgsDepth++
 			res, err = nf.callMulti(s, th.stack[base+1:base+1+len(args)])
-			th.nativeArgsDepth--
-			if th.nativeArgsDepth == 0 && th.initStackAbandoned {
-				th.clearAbandonedInitStack()
-			}
+			res = th.finishNativeArgs(res)
 		} else {
 			res, _, err = s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
 		}
-		if err == nil && len(res) > 0 && slicesOverlapValues(res, th.stack) {
+		if err == nil && len(res) > 0 && (slicesOverlapValues(res, th.stack) || slicesOverlapValues(res, th.initStack)) {
 			cp := make([]Value, len(res))
 			copy(cp, res)
 			res = cp

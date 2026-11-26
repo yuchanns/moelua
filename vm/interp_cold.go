@@ -1344,10 +1344,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		if nf.FastFn != nil && !pushedFrame {
 			th.nativeArgsDepth++
 			rv, err := nf.FastFn(s, args)
-			th.nativeArgsDepth--
-			if th.nativeArgsDepth == 0 && th.initStackAbandoned {
-				th.clearAbandonedInitStack()
-			}
+			th.finishNativeArgs(nil)
 			if err == nil && (th.hookMask == 0 || th.hookMask&HookMaskRet == 0 || th.inHook || th.suppressHook) {
 				liveTop := funcIdx + 1
 				switch nresults {
@@ -1469,10 +1466,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		}
 		th.nativeArgsDepth++
 		res, err := nf.callMulti(s, args)
-		th.nativeArgsDepth--
-		if th.nativeArgsDepth == 0 && th.initStackAbandoned {
-			th.clearAbandonedInitStack()
-		}
+		res = th.finishNativeArgs(res)
 		if err != nil {
 			if err == errYieldSentinel || errors.Is(err, errYieldSentinel) {
 				if pushedFrame {
@@ -1684,10 +1678,7 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 	args := th.stack[funcIdx+1 : funcIdx+1+nargs]
 	th.nativeArgsDepth++
 	res, err := nf.callMulti(s, args)
-	th.nativeArgsDepth--
-	if th.nativeArgsDepth == 0 && th.initStackAbandoned {
-		th.clearAbandonedInitStack()
-	}
+	res = th.finishNativeArgs(res)
 	if pushedFrame || (th.hookMask != 0 && err == nil && th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook) {
 		var hookErr error
 		if pushedFrame {
