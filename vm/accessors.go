@@ -86,7 +86,8 @@ func (s *State) accountTableCreateDebt(checkBytes int64) {
 }
 
 func (s *State) gmatchPreallocBytes() int64 {
-	return 48 + 3*16 + 64 + 2*16
+	// Userdata (64B) is accounted by TryNewUserdata; account NativeFunc + 3 upvals + 2 gcRefs once here.
+	return 48 + 3*16 + 2*16
 }
 
 func (s *State) coroWrapPreallocBytes() int64 {
@@ -176,7 +177,7 @@ func (s *State) setChunkEnv(cl *Closure, env Value) error {
 	return nil
 }
 
-func (s *State) newSubClosure(th *Thread, bp *boundProto, curCl *Closure, base, bx, liveTop int) (*Closure, error) {
+func (s *State) newSubClosure(th *Thread, bp *boundProto, curCl *Closure, base, bx int) (*Closure, int64, error) {
 	sub := bp.proto.Protos[bx]
 	sbp := bp.sub[bx]
 	estBytes := int64(64 + len(sub.Upvalues)*24)
@@ -185,7 +186,7 @@ func (s *State) newSubClosure(th *Thread, bp *boundProto, curCl *Closure, base, 
 	}
 	if s.memLimit > 0 {
 		if err := s.checkMem(estBytes); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	if sbp == nil {
@@ -200,12 +201,7 @@ func (s *State) newSubClosure(th *Thread, bp *boundProto, curCl *Closure, base, 
 			cl.upvals[i] = curCl.upvals[ud.Idx]
 		}
 	}
-	if s.gc.tier1 {
-		s.gcRecordAlloc(estBytes, liveTop)
-	} else if s.memLimit > 0 {
-		s.gc.allocBytes += estBytes
-	}
-	return cl, nil
+	return cl, estBytes, nil
 }
 
 // --- Dynamic NativeFunc & Userdata helpers ---

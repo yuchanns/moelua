@@ -2443,8 +2443,10 @@ func nativeStringChar(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{StringValue(ls)}, nil
 	}
-	if err := s.checkPreallocMem(int64(len(args)) + 48); err != nil {
-		return nil, err
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(len(args)) + 48); err != nil {
+			return nil, err
+		}
 	}
 	buf := make([]byte, len(args))
 	for i, a := range args {
@@ -2712,8 +2714,10 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 			}
 			return []Value{StringValue(interned)}, nil
 		}
-		if err := s.checkPreallocMem(totalBytes + 48); err != nil {
-			return nil, err
+		if s.memLimit > 0 {
+			if err := s.checkMem(totalBytes + 48); err != nil {
+				return nil, err
+			}
 		}
 	}
 	var out string
@@ -2763,8 +2767,10 @@ func nativeStringReverse(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{StringValue(ls)}, nil
 	}
-	if err := s.checkPreallocMem(int64(len(str)) + 48); err != nil {
-		return nil, err
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(len(str)) + 48); err != nil {
+			return nil, err
+		}
 	}
 	b := []byte(str)
 	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
@@ -2808,8 +2814,10 @@ func nativeStringLower(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{StringValue(ls)}, nil
 	}
-	if err := s.checkPreallocMem(int64(len(str)) + 48); err != nil {
-		return nil, err
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(len(str)) + 48); err != nil {
+			return nil, err
+		}
 	}
 	b := []byte(str)
 	for i, c := range b {
@@ -2854,8 +2862,10 @@ func nativeStringUpper(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{StringValue(ls)}, nil
 	}
-	if err := s.checkPreallocMem(int64(len(str)) + 48); err != nil {
-		return nil, err
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(len(str)) + 48); err != nil {
+			return nil, err
+		}
 	}
 	b := []byte(str)
 	for i, c := range b {

@@ -2626,6 +2626,9 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		}
 		regs[a] = TableValue(t)
 		s.recordNewTableAlloc(estBytes, ev.base+int(a)+1)
+		if s.abortErr != nil {
+			return coldContinue, pc, s.abortErr
+		}
 		if s.gcNeedsCheck() {
 			s.gcCheckStep(ev.base + int(a) + 1)
 			if s.abortErr != nil {
@@ -3730,11 +3733,15 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 
 	case bytecode.OP_CLOSURE:
 		bx := w.Bx()
-		cl, err := s.newSubClosure(th, ev.bp, ev.cl, ev.base, bx, ev.base+int(a)+1)
+		cl, estBytes, err := s.newSubClosure(th, ev.bp, ev.cl, ev.base, bx)
 		if err != nil {
 			return coldContinue, pc, err
 		}
 		regs[a] = ClosureValue(cl)
+		s.recordNewTableAlloc(estBytes, ev.base+int(a)+1)
+		if s.abortErr != nil {
+			return coldContinue, pc, s.abortErr
+		}
 		if s.gcNeedsCheck() {
 			s.gcCheckStep(ev.base + int(a) + 1)
 			if s.abortErr != nil {
@@ -4123,7 +4130,6 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 			return false, err
 		}
 		th.stackSlice(s.arena)[start] = StringValue(ls)
-		s.recordNewTableAlloc(int64(48+len(out)), start+1)
 		if s.gcNeedsCheck() {
 			s.gcCheckStep(start + 1)
 			if s.abortErr != nil {
@@ -4145,8 +4151,10 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 		if (lhs.IsString() || lhs.IsNumber()) && (rhs.IsString() || rhs.IsNumber()) {
 			ls, rs := s.FormatValue(lhs), s.FormatValue(rhs)
 			totalLen := len(ls) + len(rs)
-			if err := s.checkPreallocMem(int64(totalLen) + 48); err != nil {
-				return false, err
+			if s.memLimit > 0 {
+				if err := s.checkMem(int64(totalLen) + 48); err != nil {
+					return false, err
+				}
 			}
 			var joined string
 			if cancelFn != nil && totalLen > strCloneCancelChunk {
