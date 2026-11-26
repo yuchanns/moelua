@@ -593,7 +593,7 @@ func (s *State) FormatError(err error) string {
 	if errors.As(err, &le) {
 		v := le.Val
 		if v.IsString() {
-			return v.AsString().Str()
+			return strings.Clone(v.AsString().Str())
 		}
 		if v.IsNumber() {
 			return FormatValue(v)
@@ -601,7 +601,7 @@ func (s *State) FormatError(err error) string {
 		if tm := s.getTMByObj(v, TMToString); !tm.IsNil() {
 			res, terr := s.Call(tm, v)
 			if terr == nil && len(res) > 0 && res[0].IsString() {
-				return res[0].AsString().Str()
+				return strings.Clone(res[0].AsString().Str())
 			}
 		}
 		return fmt.Sprintf("error object is a %s value", v.TypeName())

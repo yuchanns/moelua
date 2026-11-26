@@ -212,3 +212,134 @@ func TestStateCall1FastPathAndHighWaterCleanup(t *testing.T) {
 		t.Fatalf("Call1 high-water cleanup retained temporary table argument on Thread stack")
 	}
 }
+
+func TestFormatErrorClonesArenaStrings(t *testing.T) {
+	s := vm.NewState()
+	defer s.Close()
+
+	// 1. Direct string error object (20-byte dynamic Arena short string).
+	errMsg := "alpha_err_msg_123456"
+	var savedDirect string
+	func() {
+		cl, err := s.LoadChunk([]byte(`error(string.sub("ZZalpha_err_msg_123456", 3), 0)`), "=fmt_err_direct")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, cerr := s.Call(cl)
+		if cerr == nil {
+			t.Fatal("expected Lua error")
+		}
+		savedDirect = s.FormatError(cerr)
+	}()
+	if savedDirect != errMsg {
+		t.Fatalf("FormatError direct = %q, want %q", savedDirect, errMsg)
+	}
+
+	// 2. Non-string error object formatted via __tostring returning a dynamic Arena string.
+	var savedMeta string
+	func() {
+		cl, err := s.LoadChunk([]byte(`
+			local mt = { __tostring = function() return string.sub("YYmeta_err_msg_9876543", 3) end }
+			error(setmetatable({}, mt))
+		`), "=fmt_err_meta")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, cerr := s.Call(cl)
+		if cerr == nil {
+			t.Fatal("expected Lua error")
+		}
+		savedMeta = s.FormatError(cerr)
+	}()
+	if savedMeta != "meta_err_msg_9876543" {
+		t.Fatalf("FormatError __tostring = %q, want %q", savedMeta, "meta_err_msg_9876543")
+	}
+
+	// Sweep the unreachable error strings and reuse their 64-byte Arena slots with fresh 20-byte strings.
+	s.CollectFull()
+	for i := range 64 {
+		_ = s.Intern(fmt.Sprintf("overwrite_slot_%05d", i))
+	}
+	if savedDirect != errMsg {
+		t.Fatalf("FormatError direct string was mutated after Arena slot reuse: got %q, want %q", savedDirect, errMsg)
+	}
+	if savedMeta != "meta_err_msg_9876543" {
+		t.Fatalf("FormatError __tostring string was mutated after Arena slot reuse: got %q, want %q", savedMeta, "meta_err_msg_9876543")
+	}
+}
+
+func TestArenaStringAutoPaceInNativeCallLoops(t *testing.T) {
+	s := vm.NewState()
+	defer s.Close()
+
+	var peakDirect, peakPCall, peakGMatch int64
+	s.SetGlobal("sample_arena", vm.NativeValue(&vm.NativeFunc{
+		Name: "sample_arena",
+		FastFn: func(st *vm.State, args []vm.Value) (vm.Value, error) {
+			cur := st.ArenaStats().AllocBytes
+			switch args[0].Int() {
+			case 1:
+				if cur > peakDirect {
+					peakDirect = cur
+				}
+			case 2:
+				if cur > peakPCall {
+					peakPCall = cur
+				}
+			case 3:
+				if cur > peakGMatch {
+					peakGMatch = cur
+				}
+			}
+			return vm.IntValue(cur), nil
+		},
+	}))
+
+	// 1. Tight Tier-0 loop allocating strings via string.rep (no OP_CONCAT).
+	cl, err := s.LoadChunk([]byte(`
+		local last
+		for i = 1, 100000 do
+			last = string.rep("x", 100)
+			if i % 1000 == 0 then
+				sample_arena(1)
+			end
+		end
+		-- 2. Same loop inside pcall (pcallSlow native return path).
+		for i = 1, 20000 do
+			local ok, v = pcall(string.rep, "y", 100)
+			assert(ok)
+			last = v
+			if i % 1000 == 0 then
+				sample_arena(2)
+			end
+		end
+		-- 3. Native iterator loop via string.gmatch (tforCallSlow native return path).
+		local big = string.rep(string.rep("z", 80) .. " ", 10000)
+		local n = 0
+		for w in string.gmatch(big, "%S+") do
+			last = w
+			n = n + 1
+			if n % 1000 == 0 then
+				sample_arena(3)
+			end
+		end
+		return #last, n
+	`), "=native_arena_pace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Call(cl)
+	if err != nil || len(res) != 2 || res[0].Int() != 80 || res[1].Int() != 10000 {
+		t.Fatalf("native loop failed: res=%v err=%v", res, err)
+	}
+	const maxAllowed = 4 * 1024 * 1024
+	if peakDirect > maxAllowed {
+		t.Fatalf("direct string.rep loop exceeded bounded Arena memory: peak=%d bytes", peakDirect)
+	}
+	if peakPCall > maxAllowed {
+		t.Fatalf("pcall(string.rep) loop exceeded bounded Arena memory: peak=%d bytes", peakPCall)
+	}
+	if peakGMatch > maxAllowed {
+		t.Fatalf("string.gmatch iterator loop exceeded bounded Arena memory: peak=%d bytes", peakGMatch)
+	}
+}
