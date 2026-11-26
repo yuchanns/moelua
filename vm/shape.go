@@ -3,6 +3,8 @@ package vm
 import (
 	"unsafe"
 	"weak"
+
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
 const maxShapeProps = 64
@@ -496,7 +498,7 @@ func (ic *ICEntry) protoValue() (Value, bool) {
 	return loadWeakICVal(ic.weakVal)
 }
 
-func (ic *ICEntry) getTabUpFast(t *Table) (Value, bool) {
+func (ic *ICEntry) getTabUpFast(_ *arena.Arena, t *Table) (Value, bool) {
 	if ic.kind == icEnvSlot && ic.holder.Value() == t && ic.epoch == t.hash.dictGen {
 		v := t.hash.nodes[ic.slot].val
 		if !v.IsNil() || ic.noMeta {
@@ -512,7 +514,7 @@ func (ic *ICEntry) getTabUpFast(t *Table) (Value, bool) {
 	return NilValue(), false
 }
 
-func (ic *ICEntry) getFieldFast(t *Table, protoEpoch uint64) (Value, bool) {
+func (ic *ICEntry) getFieldFast(_ *arena.Arena, t *Table, protoEpoch uint64) (Value, bool) {
 	if t.shape != nil && t.shape.id == ic.shapeID {
 		if ic.kind == icOwnSlot {
 			v := t.slots[ic.slot]
@@ -526,7 +528,7 @@ func (ic *ICEntry) getFieldFast(t *Table, protoEpoch uint64) (Value, bool) {
 	return NilValue(), false
 }
 
-func (ic *ICEntry) setFieldFast(t *Table, val Value, protoEpoch uint64) bool {
+func (ic *ICEntry) setFieldFast(_ *State, t *Table, val Value, protoEpoch uint64) bool {
 	if t.shape != nil && t.shape.id == ic.shapeID && t.flags&tblFlagIsProto == 0 {
 		if ic.kind == icOwnSlot {
 			if !t.slots[ic.slot].IsNil() || ic.noMeta || (ic.protoAbsent && protoEpoch == ic.epoch) {

@@ -9,10 +9,7 @@ func (s *State) initCoroLib() {
 	coro := s.NewTable(0, 10)
 	s.registerFunc(coro, "create", intrNone, nativeCoroCreate)
 	s.registerFunc(coro, "resume", intrNone, nativeCoroResume)
-	s.registerFunc(coro, "yield", intrNone, nativeCoroYield)
-	if v := coro.RawGetStr(s, s.intern.Intern("yield")); v.IsNative() {
-		s.builtinCoroYield = s.asNative(v)
-	}
+	s.builtinCoroYield = s.registerFunc(coro, "yield", intrNone, nativeCoroYield)
 	s.registerFunc(coro, "status", intrNone, nativeCoroStatus)
 	s.registerFunc(coro, "running", intrNone, nativeCoroRunning)
 	s.registerFunc(coro, "isyieldable", intrNone, nativeCoroIsYieldable)
@@ -26,13 +23,14 @@ func (s *State) NewThread(fn Value) (*Thread, error) {
 	if !fn.IsFunction() {
 		return nil, fmt.Errorf("bad argument #1 to 'NewThread' (function expected)")
 	}
-	if s.memLimit > 0 || s.gc.tier1 {
-		if err := s.checkMemAndAccountWithRoots(threadInitMemBytes(128, defaultFrameCap), fn, NilValue(), NilValue()); err != nil {
-			return nil, err
-		}
+	if err := s.checkPreallocMemWithRoots(threadInitMemBytes(128, defaultFrameCap), fn, NilValue(), NilValue()); err != nil {
+		return nil, err
 	}
-	co := newThread(s, 128)
-	co.stack[0] = fn
+	co, err := s.newThread(128, defaultFrameCap)
+	if err != nil {
+		return nil, s.memError()
+	}
+	co.stackSlice(s.arena)[0] = fn
 	co.top = 1
 	return co, nil
 }
@@ -45,7 +43,7 @@ func (s *State) Resume(co *Thread, args ...Value) ([]Value, bool, error) {
 	if co == nil {
 		return nil, false, fmt.Errorf("cannot resume nil thread")
 	}
-	if co.state != s {
+	if !s.ownsThread(co) {
 		return nil, false, fmt.Errorf("cannot resume thread belonging to another State")
 	}
 	if s.nCcalls == 0 {
@@ -76,14 +74,14 @@ func (s *State) CloseThread(co *Thread) error {
 	if co == nil {
 		return fmt.Errorf("cannot close nil thread")
 	}
-	if co.state != s {
+	if !s.ownsThread(co) {
 		return fmt.Errorf("cannot close thread belonging to another State")
 	}
 	switch co.StatusString(s) {
 	case "normal":
 		return fmt.Errorf("cannot close a normal coroutine")
 	case "running":
-		if co == s.mainThread {
+		if s.isMainThread(co) {
 			return fmt.Errorf("cannot close main thread")
 		}
 		return fmt.Errorf("cannot close a running coroutine from Go")
@@ -96,11 +94,11 @@ func (s *State) CloseThread(co *Thread) error {
 		co.nny++
 		hasInitErr := co.status == ThreadDead && !co.errObj.IsNil()
 		errVal := co.errObj
-		errVal, hasErr, _ := co.closeAllSync(0, errVal, hasInitErr)
+		errVal, hasErr, _ := co.closeAllSync(s, 0, errVal, hasInitErr)
 		co.nny--
 		co.closing = false
 		co.status = ThreadDead
-		co.clearDeadRefs()
+		co.clearDeadRefs(s)
 		co.errObj = NilValue()
 		if uerr := s.abortErr; uerr != nil {
 			if s.nCcalls == 0 {
@@ -125,19 +123,32 @@ func nativeCoroCreate(s *State, args []Value) ([]Value, error) {
 		}
 		return nil, fmt.Errorf("bad argument #1 to 'create' (function expected, got %s)", got)
 	}
-	if s.memLimit > 0 || s.gc.tier1 {
-		if err := s.checkMemAndAccountWithRoots(threadInitMemBytes(128, defaultFrameCap), args[0], NilValue(), NilValue()); err != nil {
-			return nil, err
-		}
+	if err := s.checkPreallocMemWithRoots(threadInitMemBytes(128, defaultFrameCap), args[0], NilValue(), NilValue()); err != nil {
+		return nil, err
 	}
-	co := newThread(s, 128)
-	co.stack[0] = args[0]
+	co, err := s.newThread(128, defaultFrameCap)
+	if err != nil {
+		return nil, s.memError()
+	}
+	co.stackSlice(s.arena)[0] = args[0]
 	co.top = 1
 	return []Value{ThreadValue(co)}, nil
 }
 
+func (s *State) takeYieldVals(co *Thread) []Value {
+	co.onSuspend()
+	yv := co.yieldValsSlice(s.arena)
+	if len(yv) == 0 {
+		return nil
+	}
+	out := make([]Value, len(yv))
+	copy(out, yv)
+	co.clearYieldVals()
+	return out
+}
+
 func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
-	if co == s.cur || co.closing {
+	if co == s.cur() || co.closing {
 		return false, []Value{StringValue(s.intern.Intern("cannot resume non-suspended coroutine"))}, nil
 	}
 	if co.status == ThreadDead {
@@ -155,26 +166,29 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 		}
 	}
 
-	parent := s.cur
+	parent := s.cur()
 	parentStatus := parent.status
 	parent.status = ThreadNormal
-	co.caller = parent
+	co.setCallerThread(s, parent)
 	co.lastErrNative = NilValue()
-	s.cur = co
+	s.setCur(co)
 	s.nCcalls++
 	defer func() {
 		s.nCcalls--
-		co.caller = nil
-		s.cur = parent
+		co.setCallerThread(s, nil)
+		s.setCur(parent)
 		parent.status = parentStatus
 	}()
 
 	if co.status == ThreadOK && co.nframe == 0 {
-		// First resume of a freshly created coroutine!
-		fn := co.stack[0]
+		stack := co.stackSlice(s.arena)
+		fn := NilValue()
+		if len(stack) > 0 {
+			fn = stack[0]
+		}
 		if fn.IsNil() {
 			co.status = ThreadDead
-			co.clearDeadRefs()
+			co.clearDeadRefs(s)
 			return false, []Value{StringValue(s.intern.Intern("cannot resume dead coroutine"))}, nil
 		}
 		if fn.IsNative() {
@@ -186,18 +200,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
-				co.stack[0] = fn
-				for i, a := range args {
-					co.stack[1+i] = a
-				}
+				st := co.stackSlice(s.arena)
+				st[0] = fn
+				copy(st[1:1+len(args)], args)
 				co.top = 1 + len(args)
 				if _, err := s.pushProtectedCall(co, 0, len(args), -1, false, 0); err != nil {
 					if errors.Is(err, errYieldSentinel) {
 						co.status = ThreadSuspended
-						co.detachOpenUpvals()
-						out := co.yieldVals
-						co.yieldVals = nil
-						return true, out, nil
+						return true, s.takeYieldVals(co), nil
 					}
 					if errors.Is(err, errCoroCloseSelf) || errors.Is(s.abortErr, errCoroCloseSelf) {
 						return s.finishCoroCloseSelf(co)
@@ -219,18 +229,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
-				co.stack[0] = fn
-				for i, a := range args {
-					co.stack[1+i] = a
-				}
+				st := co.stackSlice(s.arena)
+				st[0] = fn
+				copy(st[1:1+len(args)], args)
 				co.top = 1 + len(args)
 				if _, err := s.pushProtectedCall(co, 0, len(args), -1, true, 0); err != nil {
 					if errors.Is(err, errYieldSentinel) {
 						co.status = ThreadSuspended
-						co.detachOpenUpvals()
-						out := co.yieldVals
-						co.yieldVals = nil
-						return true, out, nil
+						return true, s.takeYieldVals(co), nil
 					}
 					if errors.Is(err, errCoroCloseSelf) || errors.Is(s.abortErr, errCoroCloseSelf) {
 						return s.finishCoroCloseSelf(co)
@@ -249,7 +255,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				loaded, lerr := nativeLoadFile(s, dofileArgs(args))
 				if lerr != nil || len(loaded) == 0 || loaded[0].IsNil() {
 					co.status = ThreadDead
-					co.stack[0] = NilValue()
+					co.stackSlice(s.arena)[0] = NilValue()
 					var ev Value
 					if lerr != nil {
 						ev = s.runtimeErrorToValue(co, lerr)
@@ -262,9 +268,9 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					return false, []Value{ev}, nil
 				}
 				cl := s.asClosure(loaded[0])
-				co.stack[0] = loaded[0]
+				co.stackSlice(s.arena)[0] = loaded[0]
 				co.top = 1
-				if err := co.pushLuaFrame(cl, 0, 0, -1); err != nil {
+				if err := co.pushLuaFrame(s, cl, 0, 0, -1); err != nil {
 					co.status = ThreadDead
 					ev := s.runtimeErrorToValue(co, err)
 					co.errObj = ev
@@ -276,9 +282,9 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				tm, cargs, tmExtra, hasTM, terr := s.resolvePairsTM(args[0])
 				if terr != nil {
 					co.status = ThreadDead
-					co.stack[0] = NilValue()
+					co.stackSlice(s.arena)[0] = NilValue()
 					ev := s.runtimeErrorToValue(co, terr)
-					co.clearUnusedRefs()
+					co.clearUnusedRefs(s)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -286,35 +292,36 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					if err := s.ensureStackWithRoots(co, 1+len(cargs)+8, tm, cargs); err != nil {
 						co.status = ThreadDead
 						ev := s.runtimeErrorToValue(co, err)
-						co.clearUnusedRefs()
+						co.clearUnusedRefs(s)
 						co.errObj = ev
 						return false, []Value{ev}, nil
 					}
-					co.stack[0] = tm
-					copy(co.stack[1:1+len(cargs)], cargs)
+					st := co.stackSlice(s.arena)
+					st[0] = tm
+					copy(st[1:1+len(cargs)], cargs)
 					co.top = 1 + len(cargs)
 					if tm.IsClosure() {
 						cl := s.asClosure(tm)
-						if err := co.pushLuaFrame(cl, 0, len(cargs), 4); err != nil {
+						if err := co.pushLuaFrame(s, cl, 0, len(cargs), 4); err != nil {
 							co.status = ThreadDead
 							ev := s.runtimeErrorToValue(co, err)
-							co.clearUnusedRefs()
+							co.clearUnusedRefs(s)
 							co.errObj = ev
 							return false, []Value{ev}, nil
 						}
-						co.frames[co.nframe-1].extraArgs = tmExtra
+						co.framesSlice(s.arena)[co.nframe-1].extraArgs = tmExtra
 						if herr := s.fireLuaCallHook(co, cl, len(cargs)); herr != nil {
 							if errors.Is(herr, errCoroCloseSelf) {
 								return s.finishCoroCloseSelf(co)
 							}
 							if isUncatchableErr(herr) {
 								co.status = ThreadDead
-								co.clearDeadRefs()
+								co.clearDeadRefs(s)
 								return false, nil, herr
 							}
 							co.status = ThreadDead
 							ev := s.runtimeErrorToValue(co, herr)
-							co.clearUnusedRefs()
+							co.clearUnusedRefs(s)
 							co.errObj = ev
 							return false, []Value{ev}, nil
 						}
@@ -323,14 +330,11 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					res, _, err := s.callNativeHooked(co, tm, 0, len(cargs), tmExtra, maxFrames+128)
 					if errors.Is(err, errYieldSentinel) {
 						co.status = ThreadSuspended
-						co.detachOpenUpvals()
 						co.yieldDst = 0
 						co.yieldNRes = 4
 						co.yieldedNative = true
 						co.yieldNativeFn = tm
-						out := co.yieldVals
-						co.yieldVals = nil
-						return true, out, nil
+						return true, s.takeYieldVals(co), nil
 					}
 					co.status = ThreadDead
 					if err != nil {
@@ -338,20 +342,20 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 							return s.finishCoroCloseSelf(co)
 						}
 						if isUncatchableErr(err) {
-							co.discardTBCAtOrAbove(0)
-							co.closeUpvals(0)
-							co.clearDeadRefs()
+							co.discardTBCAtOrAbove(s, 0)
+							co.closeUpvals(s, 0)
+							co.clearDeadRefs(s)
 							return false, nil, err
 						}
-						co.stack[0] = NilValue()
+						co.stackSlice(s.arena)[0] = NilValue()
 						ev := s.runtimeErrorToValue(co, err)
-						co.clearUnusedRefs()
+						co.clearUnusedRefs(s)
 						co.errObj = ev
 						return false, []Value{ev}, nil
 					}
 					out := []Value{NilValue(), NilValue(), NilValue(), NilValue()}
 					copy(out, res)
-					co.clearDeadRefs()
+					co.clearDeadRefs(s)
 					return true, out, nil
 				}
 			}
@@ -361,19 +365,17 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
-			co.stack[0] = fn
-			copy(co.stack[1:1+len(args)], args)
+			st := co.stackSlice(s.arena)
+			st[0] = fn
+			copy(st[1:1+len(args)], args)
 			res, _, err := s.callNativeHooked(co, fn, 0, len(args), 0, maxFrames+128)
 			if errors.Is(err, errYieldSentinel) {
 				co.status = ThreadSuspended
-				co.detachOpenUpvals()
 				co.yieldDst = 0
-				co.yieldNRes = -1 // MULTRET: resume args become coroutine return values
+				co.yieldNRes = -1
 				co.yieldedNative = true
 				co.yieldNativeFn = fn
-				out := co.yieldVals
-				co.yieldVals = nil
-				return true, out, nil
+				return true, s.takeYieldVals(co), nil
 			}
 			co.status = ThreadDead
 			if err != nil {
@@ -381,42 +383,42 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					return s.finishCoroCloseSelf(co)
 				}
 				if isUncatchableErr(err) {
-					co.discardTBCAtOrAbove(0)
-					co.closeUpvals(0)
-					co.clearDeadRefs()
+					co.discardTBCAtOrAbove(s, 0)
+					co.closeUpvals(s, 0)
+					co.clearDeadRefs(s)
 					return false, nil, err
 				}
-				co.stack[0] = NilValue()
+				co.stackSlice(s.arena)[0] = NilValue()
 				ev := s.runtimeErrorToValue(co, err)
-				co.clearUnusedRefs()
+				co.clearUnusedRefs(s)
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
-			if len(res) > 0 && slicesOverlapValues(res, co.stack) {
+			if len(res) > 0 && slicesOverlapValues(res, co.stackSlice(s.arena)) {
 				cp := make([]Value, len(res))
 				copy(cp, res)
 				res = cp
 			}
-			co.clearDeadRefs()
+			co.clearDeadRefs(s)
 			return true, res, nil
 		}
 		if !fn.IsClosure() {
 			co.status = ThreadDead
-			co.clearDeadRefs()
+			co.clearDeadRefs(s)
 			return false, []Value{StringValue(s.intern.Intern("cannot resume non-function coroutine"))}, nil
 		}
 		cl := s.asClosure(fn)
-		if err := s.ensureStackWithRoots(co, 1+len(args)+int(cl.bp.proto.MaxStackSize)+16, NilValue(), args); err != nil {
+		bp := s.boundProtoOf(cl)
+		if err := s.ensureStackWithRoots(co, 1+len(args)+int(bp.maxStack)+16, NilValue(), args); err != nil {
 			co.status = ThreadDead
 			ev := s.runtimeErrorToValue(co, err)
 			co.errObj = ev
 			return false, []Value{ev}, nil
 		}
-		for i, a := range args {
-			co.stack[1+i] = a
-		}
+		st := co.stackSlice(s.arena)
+		copy(st[1:1+len(args)], args)
 		co.top = 1 + len(args)
-		if err := co.pushLuaFrame(cl, 0, len(args), -1); err != nil {
+		if err := co.pushLuaFrame(s, cl, 0, len(args), -1); err != nil {
 			co.status = ThreadDead
 			ev := s.runtimeErrorToValue(co, err)
 			co.errObj = ev
@@ -429,9 +431,9 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				if isUncatchableErr(herr) {
 					co.status = ThreadDead
-					co.discardTBCAtOrAbove(0)
-					co.closeUpvals(0)
-					co.clearDeadRefs()
+					co.discardTBCAtOrAbove(s, 0)
+					co.closeUpvals(s, 0)
+					co.clearDeadRefs(s)
 					return false, nil, herr
 				}
 				if !s.handleError(co, 0, herr) {
@@ -441,23 +443,22 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					if isUncatchableErr(s.abortErr) {
 						uerr := s.abortErr
 						co.status = ThreadDead
-						co.discardTBCAtOrAbove(0)
-						co.closeUpvals(0)
-						co.clearDeadRefs()
+						co.discardTBCAtOrAbove(s, 0)
+						co.closeUpvals(s, 0)
+						co.clearDeadRefs(s)
 						return false, nil, uerr
 					}
 					co.status = ThreadDead
 					ev := s.runtimeErrorToValue(co, herr)
-					co.clearUnusedRefs()
+					co.clearUnusedRefs(s)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
 			}
 		}
 	} else if co.status == ThreadSuspended {
-		// Resuming a yielded coroutine: re-attach detached open upvalues and deliver resume args!
 		co.status = ThreadOK
-		co.attachOpenUpvals()
+		co.onResume()
 		yieldedNative := co.yieldedNative
 		yieldNativeFn := co.yieldNativeFn
 		co.yieldedNative = false
@@ -470,16 +471,17 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			} else if serr := s.ensureStackWithRoots(co, dst+1+len(args)+4, yieldNativeFn, args); serr != nil {
 				herr = serr
 			} else {
+				st := co.stackSlice(s.arena)
 				if !yieldNativeFn.IsNil() {
-					co.stack[dst] = yieldNativeFn
+					st[dst] = yieldNativeFn
 				}
 				if len(args) > 0 {
-					copy(co.stack[dst+1:dst+1+len(args)], args)
+					copy(st[dst+1:dst+1+len(args)], args)
 				}
 				if end := dst + 1 + len(args); co.top < end {
 					co.top = end
 				}
-				co.frames[co.nframe] = callFrame{
+				co.framesSlice(s.arena)[co.nframe] = callFrame{
 					kind:      frameNative,
 					base:      dst + 1,
 					funcIdx:   dst,
@@ -490,17 +492,18 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				co.nframe++
 				herr = s.fireHook(co, "return", NilValue())
+				st = co.stackSlice(s.arena)
 				if herr == nil && len(args) > 0 {
 					updated := make([]Value, len(args))
-					copy(updated, co.stack[dst+1:dst+1+len(args)])
+					copy(updated, st[dst+1:dst+1+len(args)])
 					args = updated
 				}
 				co.nframe--
 				if len(args) > 0 {
-					fillNil(co.stack[dst+1 : dst+1+len(args)])
+					fillNil(st[dst+1 : dst+1+len(args)])
 				}
 				if co.yieldNRes == 0 {
-					co.stack[dst] = NilValue()
+					st[dst] = NilValue()
 				}
 			}
 			if herr != nil {
@@ -509,9 +512,9 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				if isUncatchableErr(herr) {
 					co.status = ThreadDead
-					co.discardTBCAtOrAbove(0)
-					co.closeUpvals(0)
-					co.clearDeadRefs()
+					co.discardTBCAtOrAbove(s, 0)
+					co.closeUpvals(s, 0)
+					co.clearDeadRefs(s)
 					return false, nil, herr
 				}
 				if !s.handleError(co, 0, herr) {
@@ -521,24 +524,21 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					if isUncatchableErr(s.abortErr) {
 						uerr := s.abortErr
 						co.status = ThreadDead
-						co.discardTBCAtOrAbove(0)
-						co.closeUpvals(0)
-						co.clearDeadRefs()
+						co.discardTBCAtOrAbove(s, 0)
+						co.closeUpvals(s, 0)
+						co.clearDeadRefs(s)
 						return false, nil, uerr
 					}
 					co.status = ThreadDead
 					ev := s.runtimeErrorToValue(co, herr)
-					co.clearUnusedRefs()
+					co.clearUnusedRefs(s)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
 				goto runCoro
 			}
 		}
-		needSlots := len(args)
-		if co.yieldNRes > needSlots {
-			needSlots = co.yieldNRes
-		}
+		needSlots := max(len(args), co.yieldNRes)
 		if err := s.ensureStackWithRoots(co, co.yieldDst+needSlots+4, NilValue(), args); err != nil {
 			if !s.handleError(co, 0, err) {
 				if errors.Is(s.abortErr, errCoroCloseSelf) {
@@ -547,20 +547,20 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				if isUncatchableErr(s.abortErr) {
 					uerr := s.abortErr
 					co.status = ThreadDead
-					co.discardTBCAtOrAbove(0)
-					co.closeUpvals(0)
-					co.clearDeadRefs()
+					co.discardTBCAtOrAbove(s, 0)
+					co.closeUpvals(s, 0)
+					co.clearDeadRefs(s)
 					return false, nil, uerr
 				}
 				co.status = ThreadDead
 				ev := s.runtimeErrorToValue(co, err)
-				co.clearUnusedRefs()
+				co.clearUnusedRefs(s)
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
 			goto runCoro
 		}
-		if err := co.placeResults(co.yieldDst, args, co.yieldNRes); err != nil {
+		if err := co.placeResults(s, co.yieldDst, args, co.yieldNRes); err != nil {
 			if !s.handleError(co, 0, err) {
 				if errors.Is(s.abortErr, errCoroCloseSelf) {
 					return s.finishCoroCloseSelf(co)
@@ -568,29 +568,25 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				if isUncatchableErr(s.abortErr) {
 					uerr := s.abortErr
 					co.status = ThreadDead
-					co.discardTBCAtOrAbove(0)
-					co.closeUpvals(0)
-					co.clearDeadRefs()
+					co.discardTBCAtOrAbove(s, 0)
+					co.closeUpvals(s, 0)
+					co.clearDeadRefs(s)
 					return false, nil, uerr
 				}
 				co.status = ThreadDead
 				ev := s.runtimeErrorToValue(co, err)
-				co.clearUnusedRefs()
+				co.clearUnusedRefs(s)
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
 			goto runCoro
 		}
-		// If yielded from a native metamethod/TBC __close (e.g. func2close(coroutine.yield)), complete continuation!
-		for co.nframe > 0 && co.frames[co.nframe-1].finish != finishNone {
-			cf := &co.frames[co.nframe-1]
+		for co.nframe > 0 && co.framesSlice(s.arena)[co.nframe-1].finish != finishNone {
+			cf := &co.framesSlice(s.arena)[co.nframe-1]
 			cont, cerr := s.completeFinishOp(co, cf, 0)
 			if errors.Is(cerr, errYieldSentinel) {
 				co.status = ThreadSuspended
-				co.detachOpenUpvals()
-				out := co.yieldVals
-				co.yieldVals = nil
-				return true, out, nil
+				return true, s.takeYieldVals(co), nil
 			}
 			if cerr != nil {
 				if errors.Is(cerr, errCoroCloseSelf) {
@@ -598,9 +594,9 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				if isUncatchableErr(cerr) {
 					co.status = ThreadDead
-					co.discardTBCAtOrAbove(0)
-					co.closeUpvals(0)
-					co.clearDeadRefs()
+					co.discardTBCAtOrAbove(s, 0)
+					co.closeUpvals(s, 0)
+					co.clearDeadRefs(s)
 					return false, nil, cerr
 				}
 				if !s.handleError(co, 0, cerr) {
@@ -610,14 +606,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					if isUncatchableErr(s.abortErr) {
 						uerr := s.abortErr
 						co.status = ThreadDead
-						co.discardTBCAtOrAbove(0)
-						co.closeUpvals(0)
-						co.clearDeadRefs()
+						co.discardTBCAtOrAbove(s, 0)
+						co.closeUpvals(s, 0)
+						co.clearDeadRefs(s)
 						return false, nil, uerr
 					}
 					co.status = ThreadDead
 					ev := s.runtimeErrorToValue(co, cerr)
-					co.clearUnusedRefs()
+					co.clearUnusedRefs(s)
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -628,33 +624,29 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			}
 		}
 		if co.nframe == 0 {
-			// Completed final OP_RETURN after yielding in __close!
-			co.closeAllSync(0, NilValue(), false)
+			co.closeAllSync(s, 0, NilValue(), false)
 			co.status = ThreadDead
 			nres := co.top
 			if nres <= 0 {
-				co.clearDeadRefs()
+				co.clearDeadRefs(s)
 				return true, nil, nil
 			}
 			res := make([]Value, nres)
-			copy(res, co.stack[:nres])
-			co.clearDeadRefs()
+			copy(res, co.stackSlice(s.arena)[:nres])
+			co.clearDeadRefs(s)
 			return true, res, nil
 		}
 	}
 
 runCoro:
 	err := s.runThread(co, 0)
-	if co.uncaughtErr != nil {
-		err = co.uncaughtErr
-		co.uncaughtErr = nil
+	if uerr := co.uncaughtErr(s); uerr != nil {
+		err = uerr
+		co.setUncaughtErr(s, nil)
 	}
 	if errors.Is(err, errYieldSentinel) {
 		co.status = ThreadSuspended
-		co.detachOpenUpvals()
-		out := co.yieldVals
-		co.yieldVals = nil
-		return true, out, nil
+		return true, s.takeYieldVals(co), nil
 	}
 	if errors.Is(err, errCoroCloseSelf) || errors.Is(s.abortErr, errCoroCloseSelf) {
 		return s.finishCoroCloseSelf(co)
@@ -662,29 +654,27 @@ runCoro:
 	if err != nil {
 		if isUncatchableErr(err) {
 			co.status = ThreadDead
-			co.discardTBCAtOrAbove(0)
-			co.closeUpvals(0)
-			co.clearDeadRefs()
+			co.discardTBCAtOrAbove(s, 0)
+			co.closeUpvals(s, 0)
+			co.clearDeadRefs(s)
 			return false, nil, err
 		}
-		// Per Lua 5.5 spec, error in coroutine does NOT automatically close TBC vars until coroutine.close().
 		ev := s.runtimeErrorToValue(co, err)
 		co.status = ThreadDead
-		co.clearUnusedRefs()
+		co.clearUnusedRefs(s)
 		co.errObj = ev
 		return false, []Value{ev}, nil
 	}
-	// Normal completion: close any remaining TBC vars and mark dead.
-	co.closeAllSync(0, NilValue(), false)
+	co.closeAllSync(s, 0, NilValue(), false)
 	co.status = ThreadDead
 	nres := co.top
 	if nres <= 0 {
-		co.clearDeadRefs()
+		co.clearDeadRefs(s)
 		return true, nil, nil
 	}
 	res := make([]Value, nres)
-	copy(res, co.stack[:nres])
-	co.clearDeadRefs()
+	copy(res, co.stackSlice(s.arena)[:nres])
+	co.clearDeadRefs(s)
 	return true, res, nil
 }
 
@@ -692,15 +682,14 @@ func (s *State) finishCoroCloseSelf(co *Thread) (bool, []Value, error) {
 	if errors.Is(s.abortErr, errCoroCloseSelf) {
 		s.abortErr = nil
 	}
-	// Coroutine closed itself via coroutine.close(): run TBC finalizers (non-yieldable) and terminate!
 	co.closing = true
 	co.nframe = 0
 	co.nny++
-	errVal, hasErr, _ := co.closeAllSync(0, NilValue(), false)
+	errVal, hasErr, _ := co.closeAllSync(s, 0, NilValue(), false)
 	co.nny--
 	co.closing = false
 	co.status = ThreadDead
-	co.clearDeadRefs()
+	co.clearDeadRefs(s)
 	if hasErr {
 		co.errObj = errVal
 		return false, []Value{errVal}, nil
@@ -729,16 +718,16 @@ func nativeCoroResume(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeCoroYield(s *State, args []Value) ([]Value, error) {
-	th := s.cur
+	th := s.cur()
 	if !th.IsYieldable() {
-		if th == s.mainThread {
+		if s.isMainThread(th) {
 			return nil, &LuaError{Val: StringValue(s.intern.Intern("attempt to yield from outside a coroutine"))}
 		}
 		return nil, &LuaError{Val: StringValue(s.intern.Intern("attempt to yield across a C-call boundary"))}
 	}
-	yv := make([]Value, len(args))
-	copy(yv, args)
-	th.yieldVals = yv
+	if err := th.setYieldVals(s, args); err != nil {
+		return nil, s.memError()
+	}
 	return nil, errYieldSentinel
 }
 
@@ -754,12 +743,13 @@ func nativeCoroStatus(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeCoroRunning(s *State, _ []Value) ([]Value, error) {
-	isMain := s.cur == s.mainThread
-	return []Value{ThreadValue(s.cur), BoolValue(isMain)}, nil
+	cur := s.cur()
+	isMain := s.isMainThread(cur)
+	return []Value{ThreadValue(cur), BoolValue(isMain)}, nil
 }
 
 func nativeCoroIsYieldable(s *State, args []Value) ([]Value, error) {
-	th := s.cur
+	th := s.cur()
 	if len(args) >= 1 && !args[0].IsNil() {
 		if !args[0].IsThread() {
 			return nil, fmt.Errorf("bad argument #1 to 'isyieldable' (thread expected, got %s)", s.objTypeName(args[0]))
@@ -777,26 +767,32 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 		}
 		return nil, fmt.Errorf("bad argument #1 to 'wrap' (function expected, got %s)", got)
 	}
-	if s.memLimit > 0 || s.gc.tier1 {
-		if err := s.checkMemAndAccount(threadInitMemBytes(128, defaultFrameCap) + 48 + 16); err != nil {
-			return nil, err
-		}
+	if err := s.checkPreallocMemWithRoots(s.coroWrapPreallocBytes(), args[0], NilValue(), NilValue()); err != nil {
+		return nil, err
 	}
-	co := newThread(s, 128)
-	co.stack[0] = args[0]
+	co, err := s.newThread(128, defaultFrameCap)
+	if err != nil {
+		return nil, s.memError()
+	}
+	co.stackSlice(s.arena)[0] = args[0]
 	co.top = 1
-	var wrapper *NativeFunc
-	wrapper = &NativeFunc{
+	var selfVal Value
+	wrapper := &NativeFunc{
 		Name:        "coroutine.wrap",
 		NumUpvals:   1,
 		Collectable: true,
 		upvals:      []Value{ThreadValue(co)},
 		Fn: func(s *State, callArgs []Value) ([]Value, error) {
-			if !wrapper.upvals[0].IsThread() {
-				return nil, fmt.Errorf("thread expected, got %s", s.objTypeName(wrapper.upvals[0]))
+			uv, okUV := s.nativeUpvalGet(selfVal, 0)
+			if !okUV || !uv.IsThread() {
+				got := "no value"
+				if okUV {
+					got = s.objTypeName(uv)
+				}
+				return nil, fmt.Errorf("thread expected, got %s", got)
 			}
-			co := s.asThread(wrapper.upvals[0])
-			wasActive := co == s.cur || co.status == ThreadNormal
+			co := s.asThread(uv)
+			wasActive := co == s.cur() || co.status == ThreadNormal
 			ok, res, uerr := s.resumeThread(co, callArgs)
 			if uerr != nil {
 				return nil, uerr
@@ -809,17 +805,14 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 					errVal = StringValue(s.intern.Intern("error in wrapped coroutine"))
 				}
 				if !wasActive {
-					// Per Lua 5.5 spec, wrap closes the coroutine on error (passing original error to __close)
-					// and propagates the final error (including any new error raised by __close, locals.lua:1070)!
 					co.closing = true
 					co.nframe = 0
-					errVal, _, _ = co.closeAllSync(0, errVal, true)
+					errVal, _, _ = co.closeAllSync(s, 0, errVal, true)
 					co.closing = false
 					co.status = ThreadDead
-					co.clearDeadRefs()
+					co.clearDeadRefs(s)
 					co.errObj = NilValue()
 				}
-				// Match Lua 5.5 lcorolib.c:luaB_auxwrap: prepend caller location to string error objects.
 				if errVal.IsString() {
 					if where := s.errorWhere(1); where != "" {
 						if ls, ierr := s.TryIntern(where + s.asString(errVal).Str()); ierr == nil {
@@ -834,11 +827,16 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 			return res, nil
 		},
 	}
-	return []Value{s.NativeValue(wrapper)}, nil
+	val, err := s.allocDynNative(wrapper)
+	if err != nil {
+		return nil, s.memError()
+	}
+	selfVal = val
+	return []Value{val}, nil
 }
 
 func nativeCoroClose(s *State, args []Value) ([]Value, error) {
-	co := s.cur
+	co := s.cur()
 	if len(args) >= 1 && !args[0].IsNil() {
 		if !args[0].IsThread() {
 			return nil, fmt.Errorf("bad argument #1 to 'close' (thread expected, got %s)", s.objTypeName(args[0]))
@@ -850,10 +848,9 @@ func nativeCoroClose(s *State, args []Value) ([]Value, error) {
 	case "normal":
 		return nil, fmt.Errorf("cannot close a normal coroutine")
 	case "running":
-		if co == s.mainThread {
+		if s.isMainThread(co) {
 			return nil, fmt.Errorf("cannot close main thread")
 		}
-		// Closing self: abort coroutine execution immediately via uncatchable sentinel!
 		return nil, errCoroCloseSelf
 	case "dead", "suspended":
 		co.closing = true
@@ -861,11 +858,11 @@ func nativeCoroClose(s *State, args []Value) ([]Value, error) {
 		co.nny++
 		hasInitErr := co.status == ThreadDead && !co.errObj.IsNil()
 		errVal := co.errObj
-		errVal, hasErr, _ := co.closeAllSync(0, errVal, hasInitErr)
+		errVal, hasErr, _ := co.closeAllSync(s, 0, errVal, hasInitErr)
 		co.nny--
 		co.closing = false
 		co.status = ThreadDead
-		co.clearDeadRefs()
+		co.clearDeadRefs(s)
 		co.errObj = NilValue()
 		if s.abortErr != nil {
 			return nil, s.abortErr

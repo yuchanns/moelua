@@ -29,6 +29,8 @@ func (s *State) initStringExtraAndUTF8(strTbl *Table) {
 	s.registerFunc(utf8Tbl, "codes", intrNone, nativeUTF8Codes)
 	s.registerFunc(utf8Tbl, "offset", intrNone, nativeUTF8Offset)
 	s.SetGlobal("utf8", TableValue(utf8Tbl))
+	registerStaticNative(utf8CodesStrictIter)
+	registerStaticNative(utf8CodesLaxIter)
 }
 
 func (s *State) checkStringArg(args []Value, idx int, fnName string) (string, error) {
@@ -78,13 +80,14 @@ func (s *State) capturesToValuesRooted(caps []luastdlib.CaptureVal, srcLen int, 
 		}
 	}
 	if s.memLimit > 0 && len(caps) > 1 {
-		th := s.cur
+		th := s.cur()
 		savedTop := th.top
 		baseTop := savedTop
+		frames := th.framesSlice(s.arena)
 		for fi := range th.nframe {
-			cf := &th.frames[fi]
-			if cf.cl != nil {
-				if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+			cf := &frames[fi]
+			if cl := s.frameClosure(cf); cl != nil {
+				if end := cf.base + int(s.boundProtoOf(cl).maxStack); end > baseTop {
 					baseTop = end
 				}
 			}
@@ -95,12 +98,12 @@ func (s *State) capturesToValuesRooted(caps []luastdlib.CaptureVal, srcLen int, 
 		written := 0
 		defer func() {
 			if written > 0 {
-				fillNil(th.stack[baseTop : baseTop+written])
+				fillNil(th.stackSlice(s.arena)[baseTop : baseTop+written])
 			}
 			th.top = savedTop
 		}()
 		for _, pv := range prefix {
-			th.stack[baseTop+written] = pv
+			th.stackSlice(s.arena)[baseTop+written] = pv
 			written++
 		}
 		th.top = baseTop + written
@@ -109,12 +112,12 @@ func (s *State) capturesToValuesRooted(caps []luastdlib.CaptureVal, srcLen int, 
 			if cerr != nil {
 				return nil, cerr
 			}
-			th.stack[baseTop+written] = cv
+			th.stackSlice(s.arena)[baseTop+written] = cv
 			written++
 			th.top = baseTop + written
 		}
 		out := make([]Value, written)
-		copy(out, th.stack[baseTop:baseTop+written])
+		copy(out, th.stackSlice(s.arena)[baseTop:baseTop+written])
 		return out, nil
 	}
 	out := make([]Value, total)
@@ -250,43 +253,50 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 			pinIDs = append(pinIDs, s.Ref(patVal))
 		}
 	}
-	if s.memLimit > 0 || s.gc.tier1 {
-		if err := s.checkMemAndAccount(48 + 3*16 + 64 + 2*16); err != nil {
-			return nil, err
-		}
+	if err := s.checkPreallocMem(s.gmatchPreallocBytes()); err != nil {
+		return nil, err
 	}
 	it := luastdlib.GMatchWithCancel(str, pat, initPos, s.dynamicNativeCancelFunc())
 	// Trace subject and pattern through immutable internal gcRefs so extracting upvalue #3
 	// via debug.getupvalue(iter, 3) still accounts for both retained strings under memLimit
 	// without exposing or allowing mutation via debug.getuservalue/setuservalue.
-	stateUD := UserdataValue(&Userdata{Data: &gmatchState{it: it, srcLen: len(str)}, gcRefs: []Value{strVal, patVal}})
+	stateUD, uerr := s.TryNewUserdata(&gmatchState{it: it, srcLen: len(str)}, 0)
+	if uerr != nil {
+		return nil, uerr
+	}
+	if err := s.SetUserdataGCRefs(s.asUserdata(stateUD), []Value{strVal, patVal}); err != nil {
+		return nil, s.memError()
+	}
+	var selfVal Value
 	fn := &NativeFunc{
 		Name:        "gmatch_iter",
 		NumUpvals:   3,
 		Collectable: true,
 		upvals:      []Value{strVal, patVal, stateUD},
+		Fn: func(s *State, _ []Value) ([]Value, error) {
+			var gs *gmatchState
+			if uv, ok := s.nativeUpvalGet(selfVal, 2); ok && uv.IsUserdata() {
+				gs, _ = s.UserdataData(s.asUserdata(uv)).(*gmatchState)
+			}
+			if gs == nil {
+				return nil, fmt.Errorf("bad gmatch iterator state")
+			}
+			caps, ok, err := gs.it.Next()
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, nil
+			}
+			return s.capturesToValuesRooted(caps, gs.srcLen)
+		},
 	}
-	// Retrieve the iterator state exclusively from the live upvalue #3 (like lstrlib.c:gmatch_aux's
-	// lua_upvalueindex(3)) instead of capturing it in the Go closure, so replacing the upvalues via
-	// debug.setupvalue makes the retained subject/pattern unreachable and collectable/accounted.
-	fn.Fn = func(s *State, _ []Value) ([]Value, error) {
-		var gs *gmatchState
-		if len(fn.upvals) > 2 && fn.upvals[2].IsUserdata() {
-			gs, _ = s.UserdataData(s.asUserdata(fn.upvals[2])).(*gmatchState)
-		}
-		if gs == nil {
-			return nil, fmt.Errorf("bad gmatch iterator state")
-		}
-		caps, ok, err := gs.it.Next()
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, nil
-		}
-		return s.capturesToValuesRooted(caps, gs.srcLen)
+	val, nerr := s.allocDynNative(fn)
+	if nerr != nil {
+		return nil, s.memError()
 	}
-	return []Value{s.NativeValue(fn)}, nil
+	selfVal = val
+	return []Value{val}, nil
 }
 
 func nativeStringGSub(s *State, args []Value) ([]Value, error) {
@@ -344,7 +354,7 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 				return "", false, herr
 			}
 			val = t.RawGet(s, kv)
-			if val.IsNil() && t.meta != nil {
+			if val.IsNil() && t.hasMeta() {
 				var gerr error
 				val, gerr = s.finishGet(repl, kv)
 				if gerr != nil {
@@ -430,10 +440,11 @@ func nativeStringPack(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkMemAndAccount(int64(len(res)) + 48); err != nil {
+	ls, err := s.TryIntern(res)
+	if err != nil {
 		return nil, err
 	}
-	return []Value{StringValue(s.intern.Intern(res))}, nil
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
@@ -500,24 +511,25 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 	// when strings are interned under a memory limit so emergency GC recounts earlier strings).
 	nOut := int(count) + 1
 	if s.memLimit > 0 && strBytes > 0 {
-		th := s.cur
+		th := s.cur()
 		savedTop := th.top
 		baseTop := savedTop
+		frames := th.framesSlice(s.arena)
 		for fi := range th.nframe {
-			cf := &th.frames[fi]
-			if cf.cl != nil {
-				if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+			cf := &frames[fi]
+			if cl := s.frameClosure(cf); cl != nil {
+				if end := cf.base + int(s.boundProtoOf(cl).maxStack); end > baseTop {
 					baseTop = end
 				}
 			}
 		}
-		if err := th.ensureStack(baseTop + nOut + 2); err != nil {
+		if err := th.ensureStack(s, baseTop+nOut+2); err != nil {
 			return nil, err
 		}
 		written := 0
 		defer func() {
 			if written > 0 {
-				fillNil(th.stack[baseTop : baseTop+written])
+				fillNil(th.stackSlice(s.arena)[baseTop : baseTop+written])
 			}
 			th.top = savedTop
 		}()
@@ -543,7 +555,7 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 				}
 				v = StringValue(ls)
 			}
-			th.stack[baseTop+written] = v
+			th.stackSlice(s.arena)[baseTop+written] = v
 			written++
 			th.top = baseTop + written
 			return nil
@@ -551,11 +563,11 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		th.stack[baseTop+written] = IntValue(nextPos)
+		th.stackSlice(s.arena)[baseTop+written] = IntValue(nextPos)
 		written++
 		th.top = baseTop + written
 		out := make([]Value, written)
-		copy(out, th.stack[baseTop:baseTop+written])
+		copy(out, th.stackSlice(s.arena)[baseTop:baseTop+written])
 		return out, nil
 	}
 	out := make([]Value, nOut)
@@ -650,17 +662,9 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 			fa.ToString = lazyToStr
 			fargs[i] = fa
 		case a.IsString():
-			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgString, Str: s.asString(a).Str(), Ptr: uintptr(a.ptr), ToString: lazyToStr}
+			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgString, Str: s.asString(a).Str(), Ptr: s.valueAddr(a), ToString: lazyToStr}
 		default:
-			// Defer __tostring / __name evaluation until a %s conversion actually consumes this argument.
-			// Use logical pointer identity for encoded light userdata (debug.upvalueid tokens / NULL lightud).
-			ptrVal := uintptr(a.ptr)
-			if a.ptr == tagTokenLightUD {
-				ptrVal = uintptr(a.bits)
-			} else if a.ptr == tagNullLightUD {
-				ptrVal = 0
-			}
-			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgPointer, Ptr: ptrVal, ToString: lazyToStr}
+			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgPointer, Ptr: s.valueAddr(a), ToString: lazyToStr}
 		}
 	}
 	if err := s.preCoerceFormatArgs(fmtStr, fargs); err != nil {
@@ -1078,7 +1082,7 @@ func nativeStringDump(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'dump' (Lua function expected)")
 	}
 	strip := len(args) >= 2 && !args[1].IsFalsy()
-	p := s.asClosure(args[0]).bp.proto
+	p := s.boundProtoOf(s.asClosure(args[0])).proto
 	cancelFn := s.nativeCancelFunc()
 	if s.abortErr != nil {
 		return nil, s.abortErr

@@ -47,12 +47,12 @@ func generateRegcheck(src string) string {
 		1,
 	)
 	s = strings.ReplaceAll(s,
-		"regs = th.window(ev.base)",
-		"winGen = th.stackGen\n\tregs = th.window(ev.base)",
+		"regs = windowIn(ev.stack, ev.base)",
+		"winGen = th.stackGen\n\tregs = windowIn(ev.stack, ev.base)",
 	)
 	s = strings.ReplaceAll(s,
-		"regs = th.window(newBase)",
-		"winGen = th.stackGen\n\tregs = th.window(newBase)",
+		"regs = windowIn(ev.stack, newBase)",
+		"winGen = th.stackGen\n\tregs = windowIn(ev.stack, newBase)",
 	)
 	// Verify window generation, bounds, and PC on every single dispatch!
 	s = strings.Replace(s,
@@ -89,7 +89,7 @@ func generateHooked(src string, withRegcheck bool) string {
 	fn = strings.Replace(fn, "func (s *State) run(", "func (s *State) runHooked(", 1)
 	// Remove self-switches into runHooked (already executing in runHooked).
 	for _, block := range []string{
-		"\t\tif (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {\n\t\t\tth.frames[ev.ci].pc = pc\n\t\t\treturn s.runHooked(th, entryDepth)\n\t\t}\n",
+		"\t\tif (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {\n\t\t\tth.framesSlice(s.arena)[ev.ci].pc = pc\n\t\t\treturn s.runHooked(th, entryDepth)\n\t\t}\n",
 		"\t\tif (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {\n\t\t\treturn s.runHooked(th, entryDepth)\n\t\t}\n",
 	} {
 		fn = strings.ReplaceAll(fn, block, "")
@@ -97,7 +97,7 @@ func generateHooked(src string, withRegcheck bool) string {
 	// Inject instruction hook / interrupt check at top of dispatch loop!
 	fn = strings.Replace(fn,
 		"\tfor {\n\t\tregs = nonNilWindow(regs)\n",
-		"\tfor {\n\t\tregs = nonNilWindow(regs)\n\t\tif (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {\n\t\t\tth.frames[ev.ci].pc = pc\n\t\t\treload, err := s.checkInstructionHook(th, &ev, pc, entryDepth)\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tif reload {\n\t\t\t\tgoto reloadFrame\n\t\t\t}\n\t\t\tregs = th.window(ev.base)\n\t\t}\n",
+		"\tfor {\n\t\tregs = nonNilWindow(regs)\n\t\tif (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {\n\t\t\tev.frames[ev.ci].pc = pc\n\t\t\treload, err := s.checkInstructionHook(th, &ev, pc, entryDepth)\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tif reload {\n\t\t\t\tgoto reloadFrame\n\t\t\t}\n\t\t\tev.frames = th.framesSlice(s.arena)\n\t\t\tev.stack = th.stackSlice(s.arena)\n\t\t\tregs = windowIn(ev.stack, ev.base)\n\t\t}\n",
 		1,
 	)
 	// Disable native intrinsic fast-inlining when call/return hooks are active so native hooks fire (db.lua:554)!
@@ -114,8 +114,8 @@ func generateHooked(src string, withRegcheck bool) string {
 	)
 	// Fire call hook on inline OP_CALL Lua frame push (via noinline helper to keep runHooked compact).
 	fn = strings.Replace(fn,
-		"\t\t\t\t\t\tpc = 0\n\t\t\t\t\t\tregs = th.window(newBase)\n\t\t\t\t\t\tcontinue\n",
-		"\t\t\t\t\t\tpc = 0\n\t\t\t\t\t\tth.frames[newCI].dirty = true\n\t\t\t\t\t\tth.frames[newCI].oldPC = -1\n\t\t\t\t\t\tif reload, err := s.fireCallHook(th, newCI, nargs, nparams, entryDepth); err != nil {\n\t\t\t\t\t\t\treturn err\n\t\t\t\t\t\t} else if reload {\n\t\t\t\t\t\t\tgoto reloadFrame\n\t\t\t\t\t\t}\n\t\t\t\t\t\tregs = th.window(newBase)\n\t\t\t\t\t\tcontinue\n",
+		"\t\t\t\t\t\tpc = 0\n\t\t\t\t\t\tregs = windowIn(ev.stack, newBase)\n\t\t\t\t\t\tcontinue\n",
+		"\t\t\t\t\t\tpc = 0\n\t\t\t\t\t\tev.frames[newCI].dirty = true\n\t\t\t\t\t\tev.frames[newCI].oldPC = -1\n\t\t\t\t\t\tif reload, err := s.fireCallHook(th, newCI, nargs, nparams, entryDepth); err != nil {\n\t\t\t\t\t\t\treturn err\n\t\t\t\t\t\t} else if reload {\n\t\t\t\t\t\t\tgoto reloadFrame\n\t\t\t\t\t\t}\n\t\t\t\t\t\tev.frames = th.framesSlice(s.arena)\n\t\t\t\t\t\tev.stack = th.stackSlice(s.arena)\n\t\t\t\t\t\tregs = windowIn(ev.stack, newBase)\n\t\t\t\t\t\tcontinue\n",
 		1,
 	)
 	// Route OP_RETURN0 and OP_RETURN1 through execColdOp in runHooked so return hooks
@@ -134,12 +134,12 @@ func generateHooked(src string, withRegcheck bool) string {
 			1,
 		)
 		fn = strings.ReplaceAll(fn,
-			"regs = th.window(ev.base)",
-			"winGen = th.stackGen\n\tregs = th.window(ev.base)",
+			"regs = windowIn(ev.stack, ev.base)",
+			"winGen = th.stackGen\n\tregs = windowIn(ev.stack, ev.base)",
 		)
 		fn = strings.ReplaceAll(fn,
-			"regs = th.window(newBase)",
-			"winGen = th.stackGen\n\tregs = th.window(newBase)",
+			"regs = windowIn(ev.stack, newBase)",
+			"winGen = th.stackGen\n\tregs = windowIn(ev.stack, newBase)",
 		)
 		fn = strings.Replace(fn,
 			"\tfor {\n\t\tregs = nonNilWindow(regs)\n",

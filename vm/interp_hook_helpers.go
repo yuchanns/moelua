@@ -55,11 +55,13 @@ func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error
 	if pc == 0 && len(p.Code) > 0 && p.Code[0].Op() == bytecode.OP_VARARGPREP {
 		return nil
 	}
-	th.frames[ev.ci].dirty = true
-	th.frames[ev.ci].atCurrentPC = true
+	frames := th.framesSlice(s.arena)
+	frames[ev.ci].dirty = true
+	frames[ev.ci].atCurrentPC = true
 	defer func() {
-		if ev.ci < len(th.frames) {
-			th.frames[ev.ci].atCurrentPC = false
+		fs := th.framesSlice(s.arena)
+		if ev.ci < len(fs) {
+			fs[ev.ci].atCurrentPC = false
 		}
 	}()
 	if th.hookMask&HookMaskCount != 0 {
@@ -72,7 +74,7 @@ func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error
 		}
 	}
 	if th.hookMask&HookMaskLine != 0 && ev.bp != nil {
-		cf := &th.frames[ev.ci]
+		cf := &th.framesSlice(s.arena)[ev.ci]
 		line := getFuncLine(p, pc)
 		oldPC := cf.oldPC
 		fire := false
@@ -106,9 +108,10 @@ func (s *State) fireCallHook(th *Thread, ci, nargs, nparams, entryDepth int) (bo
 		return false, nil
 	}
 	nt := min(nargs, nparams)
-	th.frames[ci].dirty = true
-	th.frames[ci].ftransfer = 1
-	th.frames[ci].ntransfer = uint16(nt)
+	cf := &th.framesSlice(s.arena)[ci]
+	cf.dirty = true
+	cf.ftransfer = 1
+	cf.ntransfer = uint16(nt)
 	if err := s.fireHook(th, "call", NilValue()); err != nil {
 		if s.handleError(th, entryDepth, err) {
 			return true, nil
@@ -123,9 +126,10 @@ func (s *State) fireLuaCallHook(th *Thread, cl *Closure, nargs int) error {
 	if th.hookMask&HookMaskCall == 0 || th.inHook || th.suppressHook {
 		return nil
 	}
-	nt := min(nargs, int(cl.bp.proto.NumParams))
-	th.frames[th.nframe-1].ftransfer = 1
-	th.frames[th.nframe-1].ntransfer = uint16(nt)
+	nt := min(nargs, int(s.boundProtoOf(cl).numParams))
+	cf := &th.framesSlice(s.arena)[th.nframe-1]
+	cf.ftransfer = 1
+	cf.ntransfer = uint16(nt)
 	return s.fireHook(th, "call", NilValue())
 }
 
@@ -142,32 +146,35 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 	}()
 	if th.hook.IsClosure() {
 		cl := s.asClosure(th.hook)
-		p := cl.bp.proto
+		bp := s.boundProtoOf(cl)
 		savedTop := th.top
 		base := th.top
 		if th.nframe > 0 {
-			prev := &th.frames[th.nframe-1]
-			if prev.kind == frameLua && prev.cl != nil {
-				if prevEnd := prev.base + int(prev.cl.bp.proto.MaxStackSize); prevEnd > base {
-					base = prevEnd
+			prev := &th.framesSlice(s.arena)[th.nframe-1]
+			if prev.kind == frameLua {
+				if prevCL := s.frameClosure(prev); prevCL != nil {
+					if prevEnd := prev.base + int(s.boundProtoOf(prevCL).maxStack); prevEnd > base {
+						base = prevEnd
+					}
 				}
 			}
 		}
 		funcIdx := base
-		if err := s.ensureStackWithRoots(th, funcIdx+3+int(p.MaxStackSize)+8, line, nil); err != nil {
+		if err := s.ensureStackWithRoots(th, funcIdx+3+int(bp.maxStack)+8, line, nil); err != nil {
 			th.top = savedTop
 			return err
 		}
-		th.stack[funcIdx] = th.hook
-		th.stack[funcIdx+1] = StringValue(s.intern.Intern(event))
-		th.stack[funcIdx+2] = line
+		stack := th.stackSlice(s.arena)
+		stack[funcIdx] = th.hook
+		stack[funcIdx+1] = StringValue(s.intern.Intern(event))
+		stack[funcIdx+2] = line
 		th.top = funcIdx + 3
 		entryDepth := th.nframe
-		if err := th.pushLuaFrame(cl, funcIdx, 2, 0); err != nil {
+		if err := th.pushLuaFrame(s, cl, funcIdx, 2, 0); err != nil {
 			th.top = savedTop
 			return err
 		}
-		th.frames[th.nframe-1].isHook = true
+		th.framesSlice(s.arena)[th.nframe-1].isHook = true
 		var err error
 		if s.hasInterruptControl() {
 			err = s.runHooked(th, entryDepth)
@@ -179,21 +186,21 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 				if errors.Is(s.abortErr, errCoroCloseSelf) {
 					s.abortErr = nil
 				}
-				_, _, _ = th.closeAllSync(funcIdx, NilValue(), false)
+				_, _, _ = th.closeAllSync(s, funcIdx, NilValue(), false)
 				th.nframe = entryDepth
 				th.top = savedTop
 				return errCoroCloseSelf
 			}
 			if isUncatchableErr(err) {
 				s.abortErr = err
-				th.discardTBCAtOrAbove(funcIdx)
-				th.closeUpvals(funcIdx)
+				th.discardTBCAtOrAbove(s, funcIdx)
+				th.closeUpvals(s, funcIdx)
 				th.nframe = entryDepth
 				th.top = savedTop
 				return err
 			}
 			ev := s.runtimeErrorToValue(th, err)
-			ev, _, _ = th.closeAllSync(funcIdx, ev, true)
+			ev, _, _ = th.closeAllSync(s, funcIdx, ev, true)
 			th.nframe = entryDepth
 			th.top = savedTop
 			if errors.Is(s.abortErr, errCoroCloseSelf) {

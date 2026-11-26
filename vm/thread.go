@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"unsafe"
+
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
 // ThreadStatus represents the lifecycle state of a Lua 5.5 coroutine / Thread.
@@ -123,7 +125,7 @@ type Thread struct {
 	status        ThreadStatus
 	errObj        Value   // last error object when dead due to error
 	lastErrNative Value   // native function that raised an uncaught error on this thread (for dead-coro traceback)
-	uncaughtErr   error   // replacement error raised while unwinding a protected call that escaped entryDepth
+	uncaughtErrVal error   // replacement error raised while unwinding a protected call that escaped entryDepth
 	syncCloseErrs []Value // active error objects held across synchronous closeAllSync callbacks (GC-traced)
 	caller        *Thread // resuming parent thread (non-nil while running)
 
@@ -200,7 +202,7 @@ func (th *Thread) noteFrame(nf int) {
 	}
 }
 
-func (th *Thread) ensureFrameCap(need, limit int) error {
+func (th *Thread) ensureFrameCap(_ *State, need, limit int) error {
 	th.noteFrame(need)
 	if need <= len(th.frames) {
 		return nil
@@ -241,7 +243,7 @@ func (th *Thread) ensureFrameCap(need, limit int) error {
 
 const maxStackSlots = 2_000_000
 
-func (th *Thread) ensureStack(need int) error {
+func (th *Thread) ensureStack(_ *State, need int) error {
 	if need+stackSlack <= len(th.stack) {
 		return nil
 	}
@@ -295,7 +297,7 @@ func (th *Thread) clearAbandonedInitStack() {
 // If the call grew th.stack off initStack and the native returned a slice aliasing
 // initStack (e.g. returning its args slice directly), res is copied before clearing
 // the abandoned initStack storage.
-func (th *Thread) finishNativeArgs(res []Value) []Value {
+func (th *Thread) finishNativeArgs(_ *State, res []Value) []Value {
 	th.nativeArgsDepth--
 	if th.nativeArgsDepth == 0 && th.initStackAbandoned && th.initStack != nil {
 		if len(res) > 0 && slicesOverlapValues(res, th.initStack) {
@@ -342,7 +344,7 @@ func (th *Thread) findOrCreateUpval(stackIdx int) *Upvalue {
 	return uv
 }
 
-func (th *Thread) closeUpvals(level int) {
+func (th *Thread) closeUpvals(_ *State, level int) {
 	n := len(th.openUpvals)
 	for n > 0 && th.openUpvals[n-1].stackIdx >= level {
 		n--
@@ -386,7 +388,7 @@ func (th *Thread) attachOpenUpvals() {
 
 // localSlotValue reads th.stack[slot], transparently consulting detached open upvalues
 // on suspended or errored coroutines.
-func (th *Thread) localSlotValue(slot int) Value {
+func (th *Thread) localSlotValue(_ *State, slot int) Value {
 	for i := len(th.openUpvals) - 1; i >= 0; i-- {
 		uv := th.openUpvals[i]
 		if uv.stackIdx < slot {
@@ -404,7 +406,7 @@ func (th *Thread) localSlotValue(slot int) Value {
 
 // setLocalSlotValue writes val to th.stack[slot], updating detached open upvalues on
 // suspended or errored coroutines so live escaped closures observe debug.setlocal writes.
-func (th *Thread) setLocalSlotValue(slot int, val Value) {
+func (th *Thread) setLocalSlotValue(_ *State, slot int, val Value) {
 	for i := len(th.openUpvals) - 1; i >= 0; i-- {
 		uv := th.openUpvals[i]
 		if uv.stackIdx < slot {
@@ -422,7 +424,7 @@ func (th *Thread) setLocalSlotValue(slot int, val Value) {
 }
 
 // markTBC marks th.stack[idx] as a <close> to-be-closed variable (OP_TBC / OP_TFORPREP).
-func (th *Thread) markTBC(idx int) error {
+func (th *Thread) markTBC(_ *State, idx int) error {
 	v := th.stack[idx]
 	if v.IsFalsy() {
 		return nil // nil and false are ignored for <close>
@@ -436,7 +438,7 @@ func (th *Thread) markTBC(idx int) error {
 }
 
 // hasTBCAtOrAbove reports whether any <close> variable sits at stack index >= level.
-func (th *Thread) hasTBCAtOrAbove(level int) bool {
+func (th *Thread) hasTBCAtOrAbove(_ *arena.Arena, level int) bool {
 	return len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level
 }
 
@@ -444,8 +446,8 @@ func (th *Thread) hasTBCAtOrAbove(level int) bool {
 // __close callbacks (used when unwinding after an uncatchable context/instruction-limit abort).
 // Open upvalues >= level are closed first so escaped closures capture the live values
 // before the TBC stack slots are cleared.
-func (th *Thread) discardTBCAtOrAbove(level int) {
-	th.closeUpvals(level)
+func (th *Thread) discardTBCAtOrAbove(s *State, level int) {
+	th.closeUpvals(s, level)
 	for len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level {
 		idx := th.tbc[len(th.tbc)-1]
 		th.tbc = th.tbc[:len(th.tbc)-1]
@@ -459,13 +461,16 @@ func (th *Thread) discardTBCAtOrAbove(level int) {
 // If errVal is non-nil (hasErr == true), passes it as the 2nd argument to __close;
 // if __close itself raises an error, the new error replaces errVal while continuing to close remaining TBC vars!
 // Returns (finalErrVal, hasErr, newErrRaisedByClose).
-func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, bool, bool) {
+func (th *Thread) closeAllSync(s *State, level int, errVal Value, hasErr bool) (Value, bool, bool) {
+	if s == nil {
+		s = th.state
+	}
 	// Restore any detached open upvalues back onto th.stack before closing so TBC <close>
 	// variables that were also captured by escaped closures remain present in th.stack[idx].
 	th.attachOpenUpvals()
-	th.closeUpvals(level)
+	th.closeUpvals(s, level)
 	raised := false
-	prevCur := th.state.cur
+	prevCur := th.state.curThread
 	var prevStatus ThreadStatus
 	var prevCurRef int
 	if prevCur != nil && prevCur != th {
@@ -475,13 +480,13 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 		// GC triggered inside __close cannot collect live values on prevCur's stack.
 		prevCurRef = th.state.Ref(ThreadValue(prevCur))
 	}
-	th.state.cur = th
+	th.state.curThread = th
 	errSlot := len(th.syncCloseErrs)
 	th.syncCloseErrs = append(th.syncCloseErrs, errVal)
 	defer func() {
 		th.syncCloseErrs[errSlot] = NilValue()
 		th.syncCloseErrs = th.syncCloseErrs[:errSlot]
-		th.state.cur = prevCur
+		th.state.curThread = prevCur
 		if prevCur != nil && prevCur != th {
 			prevCur.status = prevStatus
 			th.state.Unref(prevCurRef)
@@ -531,7 +536,7 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 			}
 			if isUncatchableErr(err) {
 				th.state.abortErr = err
-				th.discardTBCAtOrAbove(level)
+				th.discardTBCAtOrAbove(s, level)
 				return errVal, hasErr, raised
 			}
 			errVal = errorToLuaValue(th.state, err)
@@ -548,12 +553,12 @@ func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, boo
 }
 
 // pushLuaFrame pushes a Lua closure frame onto th's flat call stack (zero Go recursion!).
-func (th *Thread) pushLuaFrame(cl *Closure, funcIdx, nargs, nresults int) error {
+func (th *Thread) pushLuaFrame(s *State, cl *Closure, funcIdx, nargs, nresults int) error {
 	limit := maxFrames
 	if th.inErrHandler {
 		limit = maxFrames + 128
 	}
-	if err := th.ensureFrameCap(th.nframe+1, limit); err != nil {
+	if err := th.ensureFrameCap(s, th.nframe+1, limit); err != nil {
 		return err
 	}
 	p := cl.bp.proto
@@ -561,12 +566,12 @@ func (th *Thread) pushLuaFrame(cl *Closure, funcIdx, nargs, nresults int) error 
 	base := funcIdx + 1
 
 	if p.IsVararg() {
-		if err := th.ensureStack(base + max(nargs, int(p.MaxStackSize)) + nparams + 8); err != nil {
+		if err := th.ensureStack(th.state, base + max(nargs, int(p.MaxStackSize)) + nparams + 8); err != nil {
 			return err
 		}
 		th.top = base + nargs
 	} else {
-		if err := th.ensureStack(base + int(p.MaxStackSize) + 8); err != nil {
+		if err := th.ensureStack(th.state, base + int(p.MaxStackSize) + 8); err != nil {
 			return err
 		}
 		if nargs < nparams {
@@ -596,13 +601,13 @@ func (th *Thread) pushLuaFrame(cl *Closure, funcIdx, nargs, nresults int) error 
 	return nil
 }
 
-func (th *Thread) placeResults(dst int, res []Value, nresults int) error {
+func (th *Thread) placeResults(_ *State, dst int, res []Value, nresults int) error {
 	if nresults < 0 {
 		if th.state != nil {
 			if err := th.state.ensureStackWithRoots(th, dst+len(res)+4, NilValue(), res); err != nil {
 				return err
 			}
-		} else if err := th.ensureStack(dst + len(res) + 4); err != nil {
+		} else if err := th.ensureStack(th.state, dst + len(res) + 4); err != nil {
 			return err
 		}
 		copy(th.stack[dst:dst+len(res)], res)
@@ -615,7 +620,7 @@ func (th *Thread) placeResults(dst int, res []Value, nresults int) error {
 		if err := th.state.ensureStackWithRoots(th, dst+nresults+4, NilValue(), res[:n]); err != nil {
 			return err
 		}
-	} else if err := th.ensureStack(dst + nresults + 4); err != nil {
+	} else if err := th.ensureStack(th.state, dst + nresults + 4); err != nil {
 		return err
 	}
 	copy(th.stack[dst:dst+n], res[:n])
@@ -636,7 +641,7 @@ func (th *Thread) IsYieldable() bool {
 // completed or closed coroutine so Go's GC can reclaim discarded arguments, locals,
 // and closures immediately in Tier 0 without waiting for State.CollectFull.
 // Preserves th.hook so debug.gethook(deadCo) remains faithful to Lua 5.5.1.
-func (th *Thread) clearDeadRefs() {
+func (th *Thread) clearDeadRefs(_ *State) {
 	fillNil(th.stack)
 	clear(th.frames)
 	th.nframe = 0
@@ -650,7 +655,7 @@ func (th *Thread) clearDeadRefs() {
 	th.yieldedNative = false
 	th.yieldNativeFn = NilValue()
 	th.lastErrNative = NilValue()
-	th.uncaughtErr = nil
+	th.uncaughtErrVal = nil
 	th.syncCloseErrs = nil
 }
 
@@ -658,7 +663,7 @@ func (th *Thread) clearDeadRefs() {
 // unused frame entries on an errored dead coroutine while keeping live frames, locals,
 // and TBC variables intact for debug.traceback(co), debug.getlocal(co, ...), and
 // deferred coroutine.close(co).
-func (th *Thread) clearUnusedRefs() {
+func (th *Thread) clearUnusedRefs(_ *State) {
 	if th.nframe < len(th.frames) {
 		clear(th.frames[th.nframe:])
 	}
@@ -688,7 +693,7 @@ func (th *Thread) clearUnusedRefs() {
 	th.yieldVals = nil
 	th.yieldedNative = false
 	th.yieldNativeFn = NilValue()
-	th.uncaughtErr = nil
+	th.uncaughtErrVal = nil
 }
 
 // Status returns the current ThreadStatus of th.
@@ -701,7 +706,7 @@ func (th *Thread) Status() ThreadStatus {
 
 // StatusString returns the Lua 5.5 coroutine.status(co) string.
 func (th *Thread) StatusString(_ *State) string {
-	if th == th.state.cur {
+	if th == th.state.curThread {
 		return "running"
 	}
 	switch th.status {
@@ -712,7 +717,7 @@ func (th *Thread) StatusString(_ *State) string {
 	default:
 		if th.nframe == 0 && th.status == ThreadOK {
 			// Freshly created coroutine (has initial function on stack[0]) or finished main thread.
-			if th == th.state.mainThread {
+			if th == th.state.mainThreadPtr {
 				return "dead"
 			}
 			if !th.stack[0].IsNil() {

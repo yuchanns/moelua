@@ -158,11 +158,12 @@ const (
 
 // State is a single-goroutine Lua 5.5.1 execution state (multiple States share immutable Protos).
 type State struct {
-	mainThread *Thread
-	cur        *Thread // currently executing Thread (mainThread or resumed coroutine)
+	mainThreadPtr *Thread
+	curThread     *Thread // currently executing Thread (mainThread or resumed coroutine)
 
-	registry   *Table
-	intern     stringInterner
+	registryTbl *Table
+	arena       *arena.Arena
+	intern      stringInterner
 	shapes     shapeRegistry
 	protoEpoch uint64
 
@@ -184,8 +185,8 @@ type State struct {
 	builtinDebugSetLocal  *NativeFunc
 	builtinDebugSetHook   *NativeFunc
 	builtinCoroYield      *NativeFunc
-	stringMeta        *Table
-	fileMeta          *Table
+	stringMetaTbl     *Table
+	fileMetaTbl       *Table
 	pkgTbl            *Table
 	typeMetas         [9]*Table // per-type metatables (debug.setmetatable on primitives!)
 	stdinInput        Value
@@ -361,14 +362,14 @@ func newBootstrapState() *State {
 	}
 	s.seedRNG(makeRandomSeed(s), 0)
 	s.shapes.root = &s.shapes.rootShape
-	s.mainThread = newThread(s, initialStackSize)
-	s.mainThread.nny = 1 // main thread is never yieldable (L->nny = 1)
-	s.cur = s.mainThread
+	s.mainThreadPtr = newThread(s, initialStackSize)
+	s.mainThreadPtr.nny = 1 // main thread is never yieldable (L->nny = 1)
+	s.curThread = s.mainThreadPtr
 	env := s.NewDictTable(64)
-	s.registry = s.NewDictTable(16)
-	s.registry.RawSetInt(s, ridxRef, FalseValue())
-	s.registry.RawSetInt(s, ridxGlobals, TableValue(env))
-	s.registry.RawSetInt(s, ridxMainThread, ThreadValue(s.mainThread))
+	s.registryTbl = s.NewDictTable(16)
+	s.registryTbl.RawSetInt(s, ridxRef, FalseValue())
+	s.registryTbl.RawSetInt(s, ridxGlobals, TableValue(env))
+	s.registryTbl.RawSetInt(s, ridxMainThread, ThreadValue(s.mainThreadPtr))
 	s.initStdlib()
 	s.gc.tier1 = false // Stdlib internal setup (e.g. fileMeta.__gc) must not activate Tier 1!
 	return s
@@ -506,13 +507,13 @@ func (s *State) ensureStackWithRoots(th *Thread, need int, extra Value, args []V
 				ids = append(ids, s.Ref(a))
 			}
 		}
-		err := th.ensureStack(need)
+		err := th.ensureStack(s, need)
 		for _, id := range ids {
 			s.Unref(id)
 		}
 		return err
 	}
-	return th.ensureStack(need)
+	return th.ensureStack(s, need)
 }
 
 // ensureFrameCapWithRoots grows th.frames to hold need entries while rooting extra and args
@@ -531,13 +532,13 @@ func (s *State) ensureFrameCapWithRoots(th *Thread, need, limit int, extra Value
 				ids = append(ids, s.Ref(a))
 			}
 		}
-		err := th.ensureFrameCap(need, limit)
+		err := th.ensureFrameCap(s, need, limit)
 		for _, id := range ids {
 			s.Unref(id)
 		}
 		return err
 	}
-	return th.ensureFrameCap(need, limit)
+	return th.ensureFrameCap(s, need, limit)
 }
 
 // SetCompiler registers a source-to-bytecode compiler for load()/loadfile()/dofile()/require().
@@ -569,10 +570,10 @@ func (s *State) ToStringValue(v Value) (string, error) { return s.toStringValue(
 // native function (skipping self if a frameNative was pushed by debug hooks).
 func (s *State) TracebackFromNative(msg string, self *NativeFunc) string {
 	level := 0
-	if topFrameIsNative(s.cur, self) {
+	if s.topFrameIsNative(s.curThread, self) {
 		level = 1
 	}
-	return s.formatTraceback(s.cur, msg, true, level)
+	return s.formatTraceback(s.curThread, msg, true, level)
 }
 
 // SetInterruptFlag attaches an atomic interrupt flag polled periodically in runHooked
@@ -731,10 +732,10 @@ func (s *State) FormatError(err error) string {
 }
 
 func (s *State) globalEnvValue() Value {
-	if s.registry == nil {
+	if s.registryTbl == nil {
 		return NilValue()
 	}
-	return s.registry.RawGetInt(s, ridxGlobals)
+	return s.registryTbl.RawGetInt(s, ridxGlobals)
 }
 
 // GlobalEnv returns the current global environment table at registry[LUA_RIDX_GLOBALS],
@@ -747,20 +748,20 @@ func (s *State) GlobalEnv() *Table {
 }
 
 // Registry returns the State's Lua registry table (LUA_REGISTRYINDEX).
-func (s *State) Registry() *Table { return s.registry }
+func (s *State) Registry() *Table { return s.registryTbl }
 
 // PreloadTable returns the State's active registry _PRELOAD table, recreating it
 // on the registry if Lua replaced or cleared debug.getregistry()._PRELOAD.
 func (s *State) PreloadTable() *Table {
-	if s.registry == nil {
+	if s.registryTbl == nil {
 		return nil
 	}
 	key := s.intern.Intern("_PRELOAD")
-	if v := s.registry.RawGetStr(s, key); v.IsTable() {
+	if v := s.registryTbl.RawGetStr(s, key); v.IsTable() {
 		return s.asTable(v)
 	}
 	t := s.NewTable(0, 4)
-	s.registry.RawSetStr(s, key, TableValue(t))
+	s.registryTbl.RawSetStr(s, key, TableValue(t))
 	return t
 }
 
@@ -950,13 +951,13 @@ func (s *State) UndumpAndLoad(chunk []byte) (*Closure, error) {
 
 // Call invokes a Lua closure or native function on the current Thread and returns its results.
 func (s *State) Call(fn Value, args ...Value) ([]Value, error) {
-	return s.callOnThread(s.cur, fn, args)
+	return s.callOnThread(s.curThread, fn, args)
 }
 
 // Call1 invokes fn(args...) and returns its first result (or NilValue if none) with zero
 // return-slice allocation on the hot Lua/FastFn paths.
 func (s *State) Call1(fn Value, args ...Value) (Value, error) {
-	return s.call1OnThread(s.cur, fn, args)
+	return s.call1OnThread(s.curThread, fn, args)
 }
 
 // CallProtected invokes fn(args...) in protected mode with message handler msgh
@@ -967,7 +968,7 @@ func (s *State) CallProtected(fn Value, msgh Value, args ...Value) ([]Value, Val
 }
 
 func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value, topProtected bool, nativeFn Value) ([]Value, Value, bool, error) {
-	th := s.cur
+	th := s.curThread
 	if s.nCcalls == 0 {
 		s.abortErr = nil
 	}
@@ -1073,8 +1074,8 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 	}
 	abortCleanup := func(uerr error) {
 		s.abortErr = uerr
-		th.discardTBCAtOrAbove(base)
-		th.closeUpvals(base)
+		th.discardTBCAtOrAbove(s, base)
+		th.closeUpvals(s, base)
 		clearTop()
 	}
 	pushed, err := s.pushProtectedCallMode(th, base, nargs, -1, isXP, entryDepth, topProtected)
@@ -1086,16 +1087,16 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 			abortCleanup(err)
 			return nil, NilValue(), false, err
 		}
-		th.discardTBCAtOrAbove(base)
-		th.closeUpvals(base)
+		th.discardTBCAtOrAbove(s, base)
+		th.closeUpvals(s, base)
 		clearTop()
 		return nil, errorToLuaValue(s, err), false, nil
 	}
 	if pushed {
 		runErr := s.runThread(th, entryDepth)
-		if th.uncaughtErr != nil {
-			runErr = th.uncaughtErr
-			th.uncaughtErr = nil
+		if th.uncaughtErrVal != nil {
+			runErr = th.uncaughtErrVal
+			th.uncaughtErrVal = nil
 		}
 		if runErr == nil && s.abortErr != nil {
 			runErr = s.abortErr
@@ -1108,8 +1109,8 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 				abortCleanup(runErr)
 				return nil, NilValue(), false, runErr
 			}
-			th.discardTBCAtOrAbove(base)
-			th.closeUpvals(base)
+			th.discardTBCAtOrAbove(s, base)
+			th.closeUpvals(s, base)
 			clearTop()
 			return nil, errorToLuaValue(s, runErr), false, nil
 		}
@@ -1280,7 +1281,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			th.inCCallback = true
 			th.nativeArgsDepth++
 			res, err = nf.callMulti(s, th.stack[base+1:base+1+len(args)])
-			res = th.finishNativeArgs(res)
+			res = th.finishNativeArgs(s, res)
 			th.inCCallback = prevCB
 		} else {
 			prevCB := th.inCCallback
@@ -1362,7 +1363,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	th.noteStack(argBase + max(len(args), int(p.MaxStackSize)))
 
 	entryDepth := th.nframe
-	if err := th.pushLuaFrame(cl, funcIdx, len(args), -1); err != nil {
+	if err := th.pushLuaFrame(s, cl, funcIdx, len(args), -1); err != nil {
 		return nil, err
 	}
 	if herr := s.fireLuaCallHook(th, cl, len(args)); herr != nil {
@@ -1388,9 +1389,9 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		}
 	}
 	err := s.runThread(th, entryDepth)
-	if th.uncaughtErr != nil {
-		err = th.uncaughtErr
-		th.uncaughtErr = nil
+	if th.uncaughtErrVal != nil {
+		err = th.uncaughtErrVal
+		th.uncaughtErrVal = nil
 	}
 	if err == nil && s.abortErr != nil {
 		err = s.abortErr
@@ -1401,8 +1402,8 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		}
 		if isUncatchableErr(err) {
 			s.abortErr = err
-			th.discardTBCAtOrAbove(funcIdx)
-			th.closeUpvals(funcIdx)
+			th.discardTBCAtOrAbove(s, funcIdx)
+			th.closeUpvals(s, funcIdx)
 			th.nframe = entryDepth
 			clearTopStack()
 			return nil, err
@@ -1413,7 +1414,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			xpHandled = true
 		}
 		ev := s.runtimeErrorToValue(th, err)
-		ev, _, raised := th.closeAllSync(funcIdx, ev, true)
+		ev, _, raised := th.closeAllSync(s, funcIdx, ev, true)
 		if raised {
 			xpHandled = false
 			isMem = false
@@ -1421,9 +1422,9 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		if s.abortErr != nil {
 			uerr := s.abortErr
 			if !errors.Is(uerr, errCoroCloseSelf) {
-				th.discardTBCAtOrAbove(funcIdx)
+				th.discardTBCAtOrAbove(s, funcIdx)
 			}
-			th.closeUpvals(funcIdx)
+			th.closeUpvals(s, funcIdx)
 			th.nframe = entryDepth
 			clearTopStack()
 			return nil, uerr
@@ -1509,9 +1510,9 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 				th.noteFrame(th.nframe)
 
 				err := s.run(th, entryDepth)
-				if th.uncaughtErr != nil {
-					err = th.uncaughtErr
-					th.uncaughtErr = nil
+				if th.uncaughtErrVal != nil {
+					err = th.uncaughtErrVal
+					th.uncaughtErrVal = nil
 				}
 				if err == nil && s.abortErr != nil {
 					err = s.abortErr
@@ -1539,8 +1540,8 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 						retErr = err
 					} else if isUncatchableErr(err) {
 						s.abortErr = err
-						th.discardTBCAtOrAbove(funcIdx)
-						th.closeUpvals(funcIdx)
+						th.discardTBCAtOrAbove(s, funcIdx)
+						th.closeUpvals(s, funcIdx)
 						th.nframe = entryDepth
 						clearTop()
 						retErr = err
@@ -1551,7 +1552,7 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 							xpHandled = true
 						}
 						ev := s.runtimeErrorToValue(th, err)
-						ev, _, raised := th.closeAllSync(funcIdx, ev, true)
+						ev, _, raised := th.closeAllSync(s, funcIdx, ev, true)
 						if raised {
 							xpHandled = false
 							isMem = false
@@ -1559,9 +1560,9 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 						if s.abortErr != nil {
 							uerr := s.abortErr
 							if !errors.Is(uerr, errCoroCloseSelf) {
-								th.discardTBCAtOrAbove(funcIdx)
+								th.discardTBCAtOrAbove(s, funcIdx)
 							}
-							th.closeUpvals(funcIdx)
+							th.closeUpvals(s, funcIdx)
 							th.nframe = entryDepth
 							clearTop()
 							retErr = uerr
@@ -1644,7 +1645,7 @@ func (s *State) getMetatableOf(v Value) *Table {
 	case v.IsUserdata():
 		return s.asUserdata(v).Meta
 	case v.IsString():
-		return s.stringMeta
+		return s.stringMetaTbl
 	default:
 		return s.typeMetas[v.TypeTag()]
 	}
@@ -1663,7 +1664,7 @@ func (s *State) setMetatableOf(v Value, mt *Table) {
 		}
 		s.protoEpoch++
 	case v.IsString():
-		s.stringMeta = mt
+		s.stringMetaTbl = mt
 		s.typeMetas[4] = mt
 		if mt != nil {
 			mt.markProto(s)

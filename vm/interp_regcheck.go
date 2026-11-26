@@ -41,14 +41,14 @@ func icAt(ic []ICEntry, slot int32) *ICEntry {
 	return &ic[idx]
 }
 
-// regcheckVerifyWindow verifies that th.stack did not reallocate since regs was taken,
-// and that base + maxStack fits safely in th.stack.
+// regcheckVerifyWindow verifies that th's stack backing did not reallocate since regs was taken,
+// and that base + maxStack fits safely in th's stack.
 func regcheckVerifyWindow(th *Thread, base int, winGen uint32, maxStack uint8, pc int, codeLen int) {
 	if th.stackGen != winGen {
 		panic(fmt.Sprintf("moelua: regcheck: stale register window (have gen %d, stack gen %d) at pc %d", winGen, th.stackGen, pc))
 	}
-	if base < 0 || base+int(maxStack) > len(th.stack) || base+256 > len(th.stack) {
-		panic(fmt.Sprintf("moelua: regcheck: frame window base=%d maxStack=%d exceeds stack len=%d", base, maxStack, len(th.stack)))
+	if base < 0 || base+int(maxStack) > th.stackSize() || base+256 > th.stackSize() {
+		panic(fmt.Sprintf("moelua: regcheck: frame window base=%d maxStack=%d exceeds stack len=%d", base, maxStack, th.stackSize()))
 	}
 	if pc < 0 || pc >= codeLen {
 		panic(fmt.Sprintf("moelua: regcheck: pc %d out of range [0, %d)", pc, codeLen))
@@ -58,7 +58,7 @@ func regcheckVerifyWindow(th *Thread, base int, winGen uint32, maxStack uint8, p
 // regcheckVerifyCleanFrame asserts the callFrame.dirty invariant: whenever fast OP_CALL reuses
 // a callFrame slot with !nf.dirty, every cold field MUST already be zero.
 func regcheckVerifyCleanFrame(nf *callFrame) {
-	if nf.kind != frameLua || nf.finish != finishNone || nf.varargTab != nil || nf.nextraargs != 0 ||
+	if nf.kind != frameLua || nf.finish != finishNone || nf.hasVarargTab() || nf.nextraargs != 0 ||
 		nf.isTailCall || nf.isHook || nf.isFinalizer || nf.atCurrentPC || nf.extraArgs != 0 || nf.ntransfer != 0 {
 		panic(fmt.Sprintf("moelua: regcheck: fast OP_CALL reused dirty callFrame without dirty flag set (kind=%d finish=%d tail=%v hook=%v fin=%v ntransfer=%d)",
 			nf.kind, nf.finish, nf.isTailCall, nf.isHook, nf.isFinalizer, nf.ntransfer))

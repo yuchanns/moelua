@@ -16,7 +16,7 @@ import (
 
 func (s *State) registerFunc(tbl *Table, name string, intr uint8, fn func(*State, []Value) ([]Value, error)) *NativeFunc {
 	nf := &NativeFunc{Name: name, Fn: fn, Intrinsic: intr}
-	tbl.RawSetStr(s, s.intern.Intern(name), s.NativeValue(nf))
+	tbl.RawSetStr(s, s.intern.Intern(name), s.allocStaticNative(nf))
 	return nf
 }
 
@@ -45,6 +45,7 @@ func (s *State) initStdlib() {
 
 	s.builtinNext = s.registerFunc(env, "next", intrNext, nativeNext)
 	s.builtinIPairsIter = &NativeFunc{Name: "ipairs_iter", Fn: nativeIPairsIter, Intrinsic: intrIPairsIter}
+	registerStaticNative(s.builtinIPairsIter)
 	s.registerFunc(env, "pairs", intrPairs, nativePairs)
 	s.registerFunc(env, "ipairs", intrNone, nativeIPairs)
 
@@ -107,11 +108,11 @@ func (s *State) initStdlib() {
 	s.initStringExtraAndUTF8(strTbl)
 	s.SetGlobal("string", TableValue(strTbl))
 
-	s.stringMeta = s.NewTable(0, 12)
-	s.stringMeta.RawSetStr(s, s.intern.tms[TMIndex], TableValue(strTbl))
-	s.initStringArithMetamethods(s.stringMeta)
-	s.stringMeta.markProto(s)
-	s.typeMetas[4] = s.stringMeta
+	strMeta := s.NewTable(0, 12)
+	strMeta.RawSetStr(s, s.intern.tms[TMIndex], TableValue(strTbl))
+	s.initStringArithMetamethods(strMeta)
+	strMeta.markProto(s)
+	s.setStringMeta(strMeta)
 
 	// coroutine, debug, io, os, package, load/loadfile/dofile/warn
 	s.initCoroLib()
@@ -237,7 +238,7 @@ func (s *State) toStringValue(v Value) (string, error) {
 			if v.IsLightUD() {
 				return s.joinStringsWithCancel(s.asString(nm).Str(), ": ", v.formatLightUDAddr())
 			}
-			return s.joinStringsWithCancel(s.asString(nm).Str(), ": ", fmt.Sprintf("%p", v.ptr))
+			return s.joinStringsWithCancel(s.asString(nm).Str(), ": ", fmt.Sprintf("0x%x", s.valueAddr(v)))
 		}
 	}
 	return s.FormatValue(v), nil
@@ -257,24 +258,28 @@ func nativeAssert(s *State, args []Value) ([]Value, error) {
 }
 
 func (s *State) errorWhere(level int) string {
-	if level <= 0 || s.cur == nil {
+	cur := s.cur()
+	if level <= 0 || cur == nil {
 		return ""
 	}
-	// Walk ALL frames (including framePCall/frameXPCall C frames!): if target level is a C frame (e.g. pcall(assert, false, "X")),
-	// luaL_where returns "" (no file:line prefix, matching errors.lua:659)!
+	frames := cur.framesSlice(s.arena)
 	target := level - 1
-	if s.cur.nframe > 0 && s.cur.frames[s.cur.nframe-1].kind == frameNative {
+	if cur.nframe > 0 && frames[cur.nframe-1].kind == frameNative {
 		target = level
 	}
-	idx := s.cur.nframe - 1 - target
-	if idx < 0 || idx >= s.cur.nframe {
+	idx := cur.nframe - 1 - target
+	if idx < 0 || idx >= cur.nframe {
 		return ""
 	}
-	cf := &s.cur.frames[idx]
-	if cf.kind != frameLua || cf.cl == nil {
+	cf := &frames[idx]
+	if cf.kind != frameLua {
 		return ""
 	}
-	p := cf.cl.bp.proto
+	cl := s.frameClosure(cf)
+	if cl == nil {
+		return ""
+	}
+	p := s.boundProtoOf(cl).proto
 	pc := cf.pc
 	if !cf.atCurrentPC && pc > 0 {
 		pc--
@@ -515,7 +520,7 @@ func nativeRawLen(s *State, args []Value) ([]Value, error) {
 		return []Value{IntValue(s.asTable(args[0]).Len(s))}, nil
 	}
 	if args[0].IsString() {
-		return []Value{IntValue(int64(len(s.asString(args[0]).Str())))}, nil
+		return []Value{IntValue(int64(s.asString(args[0]).Len))}, nil
 	}
 	return nil, fmt.Errorf("bad argument #1 to 'rawlen' (table or string expected)")
 }
@@ -537,7 +542,7 @@ func nativeSetMetatable(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #2 to 'setmetatable' (nil or table expected, got %s)", got)
 	}
 	t := s.asTable(args[0])
-	if t.meta != nil && !t.meta.RawGetStr(s, s.intern.Intern("__metatable")).IsNil() {
+	if mt := t.Metatable(s); mt != nil && !mt.RawGetStr(s, s.intern.Intern("__metatable")).IsNil() {
 		return nil, fmt.Errorf("cannot change a protected metatable")
 	}
 	if args[1].IsNil() {
@@ -622,7 +627,7 @@ func nativeIPairsIter(s *State, args []Value) ([]Value, error) {
 	if args[0].IsTable() {
 		t := s.asTable(args[0])
 		v = t.RawGetInt(s, ni)
-		if v.IsNil() && t.meta != nil {
+		if v.IsNil() && t.hasMeta() {
 			var err error
 			v, err = s.finishGet(args[0], IntValue(ni))
 			if err != nil {
@@ -1203,18 +1208,15 @@ func nativeTableCreate(s *State, args []Value) ([]Value, error) {
 	if nrec > (1<<26) || nseq > (1<<28) {
 		return nil, fmt.Errorf("table overflow")
 	}
-	actualBytes := tablePreallocBytes(nseq, nrec)
-	checkBytes := actualBytes
-	if OptimizeEnabled && nseq > 0 {
-		// Enforce requested sequence capacity up front (matching lua_createtable) even when arrHint is lazy.
-		checkBytes += nseq * 16
-	}
+	checkBytes := s.tableCreateCheckBytes(nseq, nrec)
 	if err := s.checkMem(checkBytes); err != nil {
 		return nil, err
 	}
 	t := s.NewTable(int(nseq), int(nrec))
-	s.gc.allocBytes += checkBytes
-	s.gcAddDebt(checkBytes)
+	if t == nil {
+		return nil, s.memError()
+	}
+	s.accountTableCreateDebt(checkBytes)
 	return []Value{TableValue(t)}, nil
 }
 
@@ -1243,14 +1245,14 @@ func (s *State) checkTab(v Value, what int, argNum int, globalName string) error
 
 func (s *State) tableLen(v Value) (int64, error) {
 	if v.IsString() {
-		return int64(len(s.asString(v).Str())), nil
+		return int64(s.asString(v).Len), nil
 	}
 	if v.IsTable() {
 		t := s.asTable(v)
-		if t.meta == nil {
+		if !t.hasMeta() {
 			return t.Len(s), nil
 		}
-		if tm := s.getTM(t.meta, TMLen); !tm.IsNil() {
+		if tm := s.getTM(t.Metatable(s), TMLen); !tm.IsNil() {
 			res, err := s.Call(tm, v, v)
 			if err != nil {
 				return 0, err
@@ -1291,7 +1293,7 @@ func (s *State) tableGetInt(v Value, idx int64) (Value, error) {
 	if v.IsTable() {
 		t := s.asTable(v)
 		r := t.RawGetInt(s, idx)
-		if !r.IsNil() || t.meta == nil {
+		if !r.IsNil() || !t.hasMeta() {
 			return r, nil
 		}
 	}
@@ -1301,7 +1303,7 @@ func (s *State) tableGetInt(v Value, idx int64) (Value, error) {
 func (s *State) tableSetInt(v Value, idx int64, val Value) error {
 	if v.IsTable() {
 		t := s.asTable(v)
-		if !t.RawGetInt(s, idx).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+		if !t.RawGetInt(s, idx).IsNil() || !t.hasMeta() || s.getTM(t.Metatable(s), TMNewIndex).IsNil() {
 			t.RawSetInt(s, idx, val)
 			return s.ConsumeMemErr()
 		}
@@ -1315,7 +1317,7 @@ func (s *State) tableSetInt(v Value, idx int64, val Value) error {
 			if loop > 0 && !t.RawGet(s, key).IsNil() {
 				return t.RawSet(s, key, val)
 			}
-			tm = s.getTM(t.meta, TMNewIndex)
+			tm = s.getTM(t.Metatable(s), TMNewIndex)
 			if tm.IsNil() {
 				return t.RawSet(s, key, val)
 			}
@@ -1338,7 +1340,7 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 	if len(args) < 1 {
 		return nil, s.badArgErr(1, "table.insert", "table expected, got no value")
 	}
-	if args[0].IsTable() && s.asTable(args[0]).meta == nil {
+	if args[0].IsTable() && !s.asTable(args[0]).hasMeta() {
 		if len(args) < 2 || len(args) > 3 {
 			return nil, fmt.Errorf("wrong number of arguments to 'insert'")
 		}
@@ -1418,7 +1420,7 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 		return nil, s.badArgErr(1, "table.remove", "table expected, got no value")
 	}
 	cancelFn := s.nativeCancelFunc()
-	if args[0].IsTable() && s.asTable(args[0]).meta == nil {
+	if args[0].IsTable() && !s.asTable(args[0]).hasMeta() {
 		t := s.asTable(args[0])
 		size := t.Len(s)
 		pos := size
@@ -1483,13 +1485,14 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 	}
 	// Root res on the active thread stack across subsequent __index/__newindex callbacks
 	// so GC cannot prematurely finalize or clear the removed value before return.
-	th := s.cur
+	th := s.cur()
 	savedTop := th.top
 	baseTop := savedTop
+	frames := th.framesSlice(s.arena)
 	for fi := range th.nframe {
-		cf := &th.frames[fi]
-		if cf.cl != nil {
-			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+		cf := &frames[fi]
+		if cl := s.frameClosure(cf); cl != nil {
+			if end := cf.base + int(s.boundProtoOf(cl).maxStack); end > baseTop {
 				baseTop = end
 			}
 		}
@@ -1497,10 +1500,10 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 	if err := s.ensureStackWithRoots(th, baseTop+4, res, nil); err != nil {
 		return nil, err
 	}
-	th.stack[baseTop] = res
+	th.stackSlice(s.arena)[baseTop] = res
 	th.top = baseTop + 1
 	defer func() {
-		th.stack[baseTop] = NilValue()
+		th.stackSlice(s.arena)[baseTop] = NilValue()
 		th.top = savedTop
 	}()
 	var steps int64
@@ -1532,7 +1535,7 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, s.badArgErr(1, "table.concat", "table expected, got no value")
 	}
-	rawFast := args[0].IsTable() && s.asTable(args[0]).meta == nil
+	rawFast := args[0].IsTable() && !s.asTable(args[0]).hasMeta()
 	var defaultLast int64
 	if !rawFast {
 		if err := s.checkTab(args[0], tabR|tabL, 1, "table.concat"); err != nil {
@@ -1631,10 +1634,11 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 		}
 	}
 	outStr := sb.String()
-	if err := s.checkMemAndAccount(int64(len(outStr)) + 48); err != nil {
+	ls, err := s.TryIntern(outStr)
+	if err != nil {
 		return nil, err
 	}
-	return []Value{StringValue(s.intern.Intern(outStr))}, nil
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeTableMove(s *State, args []Value) ([]Value, error) {
@@ -1690,7 +1694,7 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 		if tpos > math.MaxInt64-n+1 {
 			return nil, fmt.Errorf("bad argument #4 to 'move' (destination wrap around)")
 		}
-		rawFast := src.IsTable() && s.asTable(src).meta == nil && dst.IsTable() && s.asTable(dst).meta == nil
+		rawFast := src.IsTable() && !s.asTable(src).hasMeta() && dst.IsTable() && !s.asTable(dst).hasMeta()
 		cancelFn := s.nativeCancelFunc()
 		reverse := false
 		if tpos > f && tpos <= e {
@@ -1704,22 +1708,23 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 		var savedTop int
 		var th *Thread
 		if !rawFast {
-			th = s.cur
+			th = s.cur()
 			savedTop = th.top
 			rootSlot = savedTop
+			frames := th.framesSlice(s.arena)
 			for fi := range th.nframe {
-				cf := &th.frames[fi]
-				if cf.cl != nil {
-					if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > rootSlot {
+				cf := &frames[fi]
+				if cl := s.frameClosure(cf); cl != nil {
+					if end := cf.base + int(s.boundProtoOf(cl).proto.MaxStackSize); end > rootSlot {
 						rootSlot = end
 					}
 				}
 			}
-			if err := th.ensureStack(rootSlot + 2); err != nil {
+			if err := th.ensureStack(s, rootSlot+2); err != nil {
 				return nil, err
 			}
 			defer func() {
-				th.stack[rootSlot] = NilValue()
+				th.stackSlice(s.arena)[rootSlot] = NilValue()
 				th.top = savedTop
 			}()
 		}
@@ -1740,7 +1745,7 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 					if err != nil {
 						return nil, err
 					}
-					th.stack[rootSlot] = v
+					th.stackSlice(s.arena)[rootSlot] = v
 					th.top = rootSlot + 1
 					if err := s.tableSetInt(dst, tpos+i, v); err != nil {
 						return nil, err
@@ -1764,7 +1769,7 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 					if err != nil {
 						return nil, err
 					}
-					th.stack[rootSlot] = v
+					th.stackSlice(s.arena)[rootSlot] = v
 					th.top = rootSlot + 1
 					if err := s.tableSetInt(dst, tpos+i, v); err != nil {
 						return nil, err
@@ -1777,7 +1782,7 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeTablePack(s *State, args []Value) ([]Value, error) {
-	if err := s.checkMemAndAccount(tablePreallocBytes(int64(len(args)), 1)); err != nil {
+	if err := s.checkPreallocMem(tablePreallocBytes(int64(len(args)), 1)); err != nil {
 		return nil, err
 	}
 	cancelFn := s.nativeCancelFunc()
@@ -1804,7 +1809,7 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, s.badArgErr(1, "table.unpack", "table expected, got no value")
 	}
-	rawFast := args[0].IsTable() && s.asTable(args[0]).meta == nil
+	rawFast := args[0].IsTable() && !s.asTable(args[0]).hasMeta()
 	var defaultLen int64
 	if !rawFast {
 		if err := s.checkTab(args[0], tabR|tabL, 1, "table.unpack"); err != nil {
@@ -1868,30 +1873,31 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 					return nil, err
 				}
 			}
-			out[k] = t.RawGetInt(s, i + int64(k))
+			out[k] = t.RawGetInt(s, i+int64(k))
 		}
 		return out, nil
 	}
 	// Root accumulated results on the active thread stack across __index calls so GC
 	// cannot prematurely finalize or clear values already unpacked in earlier iterations.
-	th := s.cur
+	th := s.cur()
 	savedTop := th.top
 	baseTop := savedTop
+	frames := th.framesSlice(s.arena)
 	for fi := range th.nframe {
-		cf := &th.frames[fi]
-		if cf.cl != nil {
-			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+		cf := &frames[fi]
+		if cl := s.frameClosure(cf); cl != nil {
+			if end := cf.base + int(s.boundProtoOf(cl).proto.MaxStackSize); end > baseTop {
 				baseTop = end
 			}
 		}
 	}
-	if err := th.ensureStack(baseTop + n + 4); err != nil {
+	if err := th.ensureStack(s, baseTop+n+4); err != nil {
 		return nil, err
 	}
 	written := 0
 	defer func() {
 		if written > 0 {
-			fillNil(th.stack[baseTop : baseTop+written])
+			fillNil(th.stackSlice(s.arena)[baseTop : baseTop+written])
 		}
 		th.top = savedTop
 	}()
@@ -1907,12 +1913,12 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		th.stack[baseTop+k] = v
+		th.stackSlice(s.arena)[baseTop+k] = v
 		written = k + 1
 		th.top = baseTop + written
 	}
 	out := make([]Value, n)
-	copy(out, th.stack[baseTop:baseTop+n])
+	copy(out, th.stackSlice(s.arena)[baseTop:baseTop+n])
 	return out, nil
 }
 
@@ -2057,7 +2063,7 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 	}
 	hasComp := len(args) >= 2 && !args[1].IsNil()
 	cancelFn := s.nativeCancelFunc()
-	if args[0].IsTable() && s.asTable(args[0]).meta == nil {
+	if args[0].IsTable() && !s.asTable(args[0]).hasMeta() {
 		t := s.asTable(args[0])
 		n := int(t.Len(s))
 		if n <= 1 {
@@ -2067,7 +2073,7 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 		if OptimizeEnabled && !hasComp {
 			if t.arrKind == arrInt && int(t.arrLen) == n {
 				if cancelFn == nil {
-					slices.Sort(t.arrIntSlice())
+					slices.Sort(t.arrIntSlice(s.arena))
 					return nil, nil
 				}
 				if s.ctx != nil {
@@ -2076,11 +2082,11 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 						return nil, err
 					}
 				}
-				return nil, sortOrderedCancelable(t.arrIntSlice(), cancelFn)
+				return nil, sortOrderedCancelable(t.arrIntSlice(s.arena), cancelFn)
 			}
 			if t.arrKind == arrFloat && int(t.arrLen) == n {
 				// Fall back to auxsort when NaN is present so Lua 5.5 comparison semantics match PUC-Rio C Lua.
-				fs := t.arrFloatSlice()
+				fs := t.arrFloatSlice(s.arena)
 				if cancelFn != nil && s.ctx != nil {
 					if err := s.ctx.Err(); err != nil {
 						s.abortErr = err
@@ -2130,25 +2136,26 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 	}
 	// Root buffered sort elements on the active thread stack across __index, comparator,
 	// and __newindex callbacks so GC cannot prematurely finalize or clear them.
-	// Always index th.stack[baseTop+...] directly in case callbacks grow th.stack.
-	th := s.cur
+	// Always index th.stackSlice(s.arena)[baseTop+...] directly in case callbacks grow stackRef.
+	th := s.cur()
 	savedTop := th.top
 	baseTop := savedTop
+	frames := th.framesSlice(s.arena)
 	for fi := range th.nframe {
-		cf := &th.frames[fi]
-		if cf.cl != nil {
-			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+		cf := &frames[fi]
+		if cl := s.frameClosure(cf); cl != nil {
+			if end := cf.base + int(s.boundProtoOf(cl).proto.MaxStackSize); end > baseTop {
 				baseTop = end
 			}
 		}
 	}
-	if err := th.ensureStack(baseTop + n + 4); err != nil {
+	if err := th.ensureStack(s, baseTop+n+4); err != nil {
 		return nil, err
 	}
 	written := 0
 	defer func() {
 		if written > 0 {
-			fillNil(th.stack[baseTop : baseTop+written])
+			fillNil(th.stackSlice(s.arena)[baseTop : baseTop+written])
 		}
 		th.top = savedTop
 	}()
@@ -2163,7 +2170,7 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		th.stack[baseTop+i] = v
+		th.stackSlice(s.arena)[baseTop+i] = v
 		written = i + 1
 		th.top = baseTop + written
 	}
@@ -2188,14 +2195,15 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 		return s.lessThan(a, b)
 	}
 	swap := func(i, j int) {
-		th.stack[baseTop+i], th.stack[baseTop+j] = th.stack[baseTop+j], th.stack[baseTop+i]
+		st := th.stackSlice(s.arena)
+		st[baseTop+i], st[baseTop+j] = st[baseTop+j], st[baseTop+i]
 	}
 	// Port of PUC-Rio Lua 5.5 ltablib.c:auxsort — detects invalid order functions!
 	var auxSort func(lo, up int) error
 	auxSort = func(lo, up int) error {
 		for lo < up {
 			// Sort a[lo], a[up]
-			lt, err := comp(th.stack[baseTop+up], th.stack[baseTop+lo])
+			lt, err := comp(th.stackSlice(s.arena)[baseTop+up], th.stackSlice(s.arena)[baseTop+lo])
 			if err != nil {
 				return err
 			}
@@ -2207,14 +2215,14 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 			}
 			// Choose pivot (middle element; randomized on large subarrays).
 			p := lo + (up-lo)/2
-			lt, err = comp(th.stack[baseTop+p], th.stack[baseTop+lo])
+			lt, err = comp(th.stackSlice(s.arena)[baseTop+p], th.stackSlice(s.arena)[baseTop+lo])
 			if err != nil {
 				return err
 			}
 			if lt {
 				swap(p, lo)
 			} else {
-				lt, err = comp(th.stack[baseTop+up], th.stack[baseTop+p])
+				lt, err = comp(th.stackSlice(s.arena)[baseTop+up], th.stackSlice(s.arena)[baseTop+p])
 				if err != nil {
 					return err
 				}
@@ -2226,12 +2234,12 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 				return nil
 			}
 			swap(p, up-1)
-			// Partition [lo+1 .. up-2] around pivot (rooted at th.stack[baseTop+up-1])
+			// Partition [lo+1 .. up-2] around pivot (rooted at stack[baseTop+up-1])
 			i, j := lo, up-1
 			for {
 				for {
 					i++
-					lt, err = comp(th.stack[baseTop+i], th.stack[baseTop+up-1])
+					lt, err = comp(th.stackSlice(s.arena)[baseTop+i], th.stackSlice(s.arena)[baseTop+up-1])
 					if err != nil {
 						return err
 					}
@@ -2244,7 +2252,7 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 				}
 				for {
 					j--
-					lt, err = comp(th.stack[baseTop+up-1], th.stack[baseTop+j])
+					lt, err = comp(th.stackSlice(s.arena)[baseTop+up-1], th.stackSlice(s.arena)[baseTop+j])
 					if err != nil {
 						return err
 					}
@@ -2286,7 +2294,7 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 			}
 		}
 		th.top = baseTop + n
-		if err := s.tableSetInt(args[0], int64(i+1), th.stack[baseTop+i]); err != nil {
+		if err := s.tableSetInt(args[0], int64(i+1), th.stackSlice(s.arena)[baseTop+i]); err != nil {
 			return nil, err
 		}
 	}
@@ -2435,7 +2443,7 @@ func nativeStringChar(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{StringValue(ls)}, nil
 	}
-	if err := s.checkMemAndAccount(int64(len(args)) + 48); err != nil {
+	if err := s.checkPreallocMem(int64(len(args)) + 48); err != nil {
 		return nil, err
 	}
 	buf := make([]byte, len(args))
@@ -2446,7 +2454,11 @@ func nativeStringChar(s *State, args []Value) ([]Value, error) {
 		}
 		buf[i] = b
 	}
-	return []Value{StringValue(s.intern.Intern(string(buf)))}, nil
+	ls, err := s.TryIntern(string(buf))
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 // badArgErr mirrors Lua 5.5 lauxlib.c:luaL_argerror: resolves the callee name from the
@@ -2455,13 +2467,15 @@ func nativeStringChar(s *State, args []Value) ([]Value, error) {
 // immediate Lua call-site name exists.
 func (s *State) badArgErr(argNum int, globalName, detail string) error {
 	name := globalName
-	if s.cur != nil && !s.cur.inCCallback && s.cur.nframe > 0 {
-		idx := s.cur.nframe - 1
-		if s.cur.frames[idx].kind == frameNative {
+	th := s.cur()
+	if th != nil && !th.inCCallback && th.nframe > 0 {
+		frames := th.framesSlice(s.arena)
+		idx := th.nframe - 1
+		if frames[idx].kind == frameNative {
 			idx--
 		}
-		if idx >= 0 && s.cur.frames[idx].kind == frameLua {
-			if n, nw := funcNameFromCallerFrame(&s.cur.frames[idx]); nw != "" {
+		if idx >= 0 && frames[idx].kind == frameLua {
+			if n, nw := s.funcNameFromCallerFrame(&frames[idx]); nw != "" {
 				name = n
 				if nw == "method" {
 					if argNum == 1 {
@@ -2698,22 +2712,29 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 			}
 			return []Value{StringValue(interned)}, nil
 		}
-		if err := s.checkMemAndAccount(totalBytes + 48); err != nil {
+		if err := s.checkPreallocMem(totalBytes + 48); err != nil {
 			return nil, err
 		}
 	}
+	var out string
 	if sep == "" {
-		return []Value{StringValue(s.intern.Intern(strings.Repeat(str, int(n))))}, nil
-	}
-	var sb strings.Builder
-	sb.Grow(int(n)*len(str) + int(n-1)*len(sep))
-	for i := int64(0); i < n; i++ {
-		if i > 0 {
-			sb.WriteString(sep)
+		out = strings.Repeat(str, int(n))
+	} else {
+		var sb strings.Builder
+		sb.Grow(int(n)*len(str) + int(n-1)*len(sep))
+		for i := int64(0); i < n; i++ {
+			if i > 0 {
+				sb.WriteString(sep)
+			}
+			sb.WriteString(str)
 		}
-		sb.WriteString(str)
+		out = sb.String()
 	}
-	return []Value{StringValue(s.intern.Intern(sb.String()))}, nil
+	interned, err := s.TryIntern(out)
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(interned)}, nil
 }
 
 func nativeStringReverse(s *State, args []Value) ([]Value, error) {
@@ -2742,14 +2763,18 @@ func nativeStringReverse(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{StringValue(ls)}, nil
 	}
-	if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
+	if err := s.checkPreallocMem(int64(len(str)) + 48); err != nil {
 		return nil, err
 	}
 	b := []byte(str)
 	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
 		b[i], b[j] = b[j], b[i]
 	}
-	return []Value{StringValue(s.intern.Intern(string(b)))}, nil
+	ls, err := s.TryIntern(string(b))
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeStringLower(s *State, args []Value) ([]Value, error) {
@@ -2783,7 +2808,7 @@ func nativeStringLower(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{StringValue(ls)}, nil
 	}
-	if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
+	if err := s.checkPreallocMem(int64(len(str)) + 48); err != nil {
 		return nil, err
 	}
 	b := []byte(str)
@@ -2792,7 +2817,11 @@ func nativeStringLower(s *State, args []Value) ([]Value, error) {
 			b[i] = c + ('a' - 'A')
 		}
 	}
-	return []Value{StringValue(s.intern.Intern(string(b)))}, nil
+	ls, err := s.TryIntern(string(b))
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeStringUpper(s *State, args []Value) ([]Value, error) {
@@ -2825,7 +2854,7 @@ func nativeStringUpper(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{StringValue(ls)}, nil
 	}
-	if err := s.checkMemAndAccount(int64(len(str)) + 48); err != nil {
+	if err := s.checkPreallocMem(int64(len(str)) + 48); err != nil {
 		return nil, err
 	}
 	b := []byte(str)
@@ -2834,7 +2863,11 @@ func nativeStringUpper(s *State, args []Value) ([]Value, error) {
 			b[i] = c - ('a' - 'A')
 		}
 	}
-	return []Value{StringValue(s.intern.Intern(string(b)))}, nil
+	ls, err := s.TryIntern(string(b))
+	if err != nil {
+		return nil, err
+	}
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeOSClock(s *State, _ []Value) ([]Value, error) {
