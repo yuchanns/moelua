@@ -1,0 +1,659 @@
+package arena
+
+import (
+	"encoding/binary"
+	"errors"
+	"math"
+	"unsafe"
+)
+
+// ErrOutOfMemory is returned when an allocation would exceed the Arena's configured
+// memory limit, hard single-allocation cap, or addressable page/span capacity.
+var ErrOutOfMemory = errors.New("not enough memory")
+
+// MaxSmallSize is the largest allocation served from segregated 64 KiB slab pages.
+// Allocations strictly larger than MaxSmallSize are backed by dedicated large []byte spans.
+const MaxSmallSize = 32768
+
+// hardMaxAllocSize guards against integer overflow and pathological single allocations (1 GiB).
+const hardMaxAllocSize = 1 << 30
+
+// classSizes defines 26 segregated 8-byte-aligned size classes spanning 16 B .. 32 KiB.
+// Every class packs >= 93.75% of each 64 KiB slab page with zero external free-list overhead.
+var classSizes = [...]uint32{
+	16, 24, 32, 48, 64, 80, 96, 112,
+	128, 160, 192, 256, 384, 512, 768, 1024,
+	1536, 2048, 3072, 4096, 6144, 8192, 10920, 16384,
+	21840, 32768,
+}
+
+// NumClasses is the number of small/medium segregated size classes.
+const NumClasses = len(classSizes)
+
+var (
+	classWords       [NumClasses]uint16
+	classSlotsPerPg  [NumClasses]uint16
+	smallSizeToClass [129]uint8 // O(1) lookup for (size+7)>>3 when size <= 1024
+)
+
+func init() {
+	for i, sz := range classSizes {
+		if sz < 16 || sz%Align != 0 {
+			panic("arena: invalid size class alignment")
+		}
+		classWords[i] = uint16(sz >> alignShift)
+		classSlotsPerPg[i] = uint16(PageSize / sz)
+	}
+	cls := 0
+	for w := 0; w < len(smallSizeToClass); w++ {
+		req := uint32(w << alignShift)
+		if req == 0 {
+			req = 16
+		}
+		for uint32(classSizes[cls]) < req {
+			cls++
+		}
+		smallSizeToClass[w] = uint8(cls)
+	}
+}
+
+// SizeClassFor returns the segregated size class index and exact allocated byte size for size.
+// Returns (LargeClass, alignedSize) when size > MaxSmallSize.
+func SizeClassFor(size int) (uint8, int) {
+	if size <= 1024 {
+		if size <= 16 {
+			return 0, int(classSizes[0])
+		}
+		cls := smallSizeToClass[(size+Align-1)>>alignShift]
+		return cls, int(classSizes[cls])
+	}
+	if size > MaxSmallSize {
+		if size > math.MaxInt-(Align-1) {
+			return LargeClass, math.MaxInt &^ (Align - 1)
+		}
+		aligned := (size + Align - 1) &^ (Align - 1)
+		return LargeClass, aligned
+	}
+	// Linear scan over only 10 upper classes (1536..32768).
+	u := uint32(size)
+	for cls := 16; cls < NumClasses; cls++ {
+		if classSizes[cls] >= u {
+			return uint8(cls), int(classSizes[cls])
+		}
+	}
+	return uint8(NumClasses - 1), MaxSmallSize
+}
+
+// pageMeta tracks per-page allocation state.
+type pageMeta struct {
+	liveBits  []uint64 // 1 bit per slot (noscan []uint64); prevents double-free & free-list cycles
+	freeHead  ObjRef   // head of per-page intrusive free list (NullRef if empty)
+	prevAvail uint32   // doubly-linked list of pages in classAvail[class] with free space
+	nextAvail uint32
+	bumpOff   uint16 // next unallocated 8-byte word offset in [0..pageWords]
+	liveCount uint16 // number of live objects in this page
+	class     uint8  // size class index (0..NumClasses-1)
+	inAvail   bool   // true while linked into classAvail[class]
+	active    bool   // true while pages[pid] != nil
+}
+
+// Arena is a per-State noscan []byte memory allocator designed to keep Lua VM heaps
+// invisible to Go's GC pointer scanner while returning empty pages and large spans to Go.
+//
+// An Arena is owned by a single Lua State (single-goroutine execution). Different States
+// own completely independent Arenas and may execute concurrently across goroutines.
+type Arena struct {
+	// 1-based slab page table (pages[0] == nil sentinel so page ObjRefs are always != NullRef).
+	// Every element is a noscan []byte of length PageSize (64 KiB).
+	pages       [][]byte
+	pageMeta    []pageMeta
+	freePageIDs []uint32
+	classAvail  [NumClasses]uint32 // head pid of pages with >= 1 free slot per class
+	sparePage   []byte             // 1-page hysteresis cache to avoid empty-page thrashing
+
+	// 1-based dedicated large-object spans (> MaxSmallSize); every element is a noscan []byte.
+	largeSpans   [][]byte
+	freeLargeIDs []uint32
+
+	allocBytes  int64 // exact live bytes currently allocated across slabs and large spans
+	limit       int64 // optional hard byte limit (<= 0 disables limit)
+	liveObjects int64 // exact count of live allocations
+	activePages int   // number of non-nil 64 KiB slab pages
+	activeLarge int   // number of non-nil large spans
+}
+
+// New creates an empty noscan Arena with no memory limit (limit <= 0).
+func New() *Arena {
+	return &Arena{
+		pages:      make([][]byte, 1, 8),
+		pageMeta:   make([]pageMeta, 1, 8),
+		largeSpans: make([][]byte, 1, 4),
+	}
+}
+
+// SetLimit configures a hard byte cap for subsequent allocations (<= 0 disables the cap).
+func (a *Arena) SetLimit(limit int64) {
+	if limit < 0 {
+		limit = 0
+	}
+	a.limit = limit
+}
+
+// Limit returns the configured hard byte cap (0 if unlimited).
+func (a *Arena) Limit() int64 { return a.limit }
+
+// AllocBytes returns the exact number of live bytes currently allocated in the Arena.
+func (a *Arena) AllocBytes() int64 { return a.allocBytes }
+
+// LiveObjects returns the exact number of live allocations currently held in the Arena.
+func (a *Arena) LiveObjects() int64 { return a.liveObjects }
+
+// ActivePages returns the number of currently backed 64 KiB slab pages.
+func (a *Arena) ActivePages() int { return a.activePages }
+
+// ActiveLargeSpans returns the number of currently backed large-object spans.
+func (a *Arena) ActiveLargeSpans() int { return a.activeLarge }
+
+// BackingBytes returns the total []byte memory currently backed by Go for this Arena
+// (active slab pages + cached spare page + active large spans).
+func (a *Arena) BackingBytes() int64 {
+	total := int64(a.activePages) * PageSize
+	if a.sparePage != nil {
+		total += int64(len(a.sparePage))
+	}
+	for i := 1; i < len(a.largeSpans); i++ {
+		total += int64(len(a.largeSpans[i]))
+	}
+	return total
+}
+
+// CanAlloc reports whether allocating size bytes would stay within the configured limit
+// and single-allocation bounds without mutating Arena state.
+func (a *Arena) CanAlloc(size int) bool {
+	if size <= 0 || size > hardMaxAllocSize {
+		return false
+	}
+	_, need := SizeClassFor(size)
+	if a.limit > 0 && (int64(need) > a.limit || a.allocBytes > a.limit-int64(need)) {
+		return false
+	}
+	return true
+}
+
+func (a *Arena) ensureInit() {
+	if len(a.pages) == 0 {
+		a.pages = make([][]byte, 1, 8)
+		a.pageMeta = make([]pageMeta, 1, 8)
+	}
+	if len(a.largeSpans) == 0 {
+		a.largeSpans = make([][]byte, 1, 4)
+	}
+}
+
+// Alloc allocates at least size bytes (8-byte aligned) in noscan []byte storage.
+// Returned memory may contain stale bytes from prior freed allocations; use AllocZeroed
+// or AllocGC when zero-initialized memory is required.
+func (a *Arena) Alloc(size int) (ObjRef, error) {
+	if size <= 0 || size > hardMaxAllocSize {
+		return NullRef, ErrOutOfMemory
+	}
+	a.ensureInit()
+	cls, need := SizeClassFor(size)
+	if a.limit > 0 && (int64(need) > a.limit || a.allocBytes > a.limit-int64(need)) {
+		return NullRef, ErrOutOfMemory
+	}
+	if cls == LargeClass {
+		return a.allocLarge(need)
+	}
+	return a.allocSmall(cls, need)
+}
+
+// AllocZeroed allocates at least size bytes (8-byte aligned) and zeroes all allocated class bytes.
+func (a *Arena) AllocZeroed(size int) (ObjRef, error) {
+	ref, err := a.Alloc(size)
+	if err != nil {
+		return NullRef, err
+	}
+	clear(a.slotBytes(ref))
+	return ref, nil
+}
+
+// AllocGC allocates a zeroed GC-managed arena object of at least size bytes (>= 8),
+// initializes its GCHeader (Kind, Class, Mark=white|AgeNew), and returns its ObjRef.
+func (a *Arena) AllocGC(size int, kind uint8, currentWhite uint8) (ObjRef, error) {
+	if size < int(unsafe.Sizeof(GCHeader{})) {
+		return NullRef, ErrOutOfMemory
+	}
+	ref, err := a.AllocZeroed(size)
+	if err != nil {
+		return NullRef, err
+	}
+	cls, _ := SizeClassFor(size)
+	white := currentWhite & MarkWhiteBits
+	if white == 0 {
+		white = MarkWhite0
+	}
+	hdr := a.Header(ref)
+	hdr.Kind = kind
+	hdr.Class = cls
+	hdr.Mark = white | (AgeNew << AgeShift)
+	return ref, nil
+}
+
+func (a *Arena) allocLarge(alignedSize int) (ObjRef, error) {
+	var idx uint32
+	if n := len(a.freeLargeIDs); n > 0 {
+		idx = a.freeLargeIDs[n-1]
+		a.freeLargeIDs = a.freeLargeIDs[:n-1]
+	} else {
+		if len(a.largeSpans) > math.MaxInt32 {
+			return NullRef, ErrOutOfMemory
+		}
+		idx = uint32(len(a.largeSpans))
+		a.largeSpans = append(a.largeSpans, nil)
+	}
+	buf := make([]byte, alignedSize)
+	if uintptr(unsafe.Pointer(unsafe.SliceData(buf)))%Align != 0 {
+		panic("arena: large span not 8-byte aligned")
+	}
+	a.largeSpans[idx] = buf
+	a.allocBytes += int64(alignedSize)
+	a.liveObjects++
+	a.activeLarge++
+	return makeLargeRef(idx), nil
+}
+
+func (a *Arena) allocSmall(cls uint8, need int) (ObjRef, error) {
+	pid := a.classAvail[cls]
+	if pid == 0 {
+		var err error
+		pid, err = a.allocPage(cls)
+		if err != nil {
+			return NullRef, err
+		}
+	}
+	meta := &a.pageMeta[pid]
+	page := a.pages[pid]
+	var ref ObjRef
+	var wordOff uint16
+	if meta.freeHead != NullRef {
+		ref = meta.freeHead
+		_, wordOff = splitPageRef(ref)
+		byteOff := int(wordOff) << alignShift
+		meta.freeHead = ObjRef(binary.LittleEndian.Uint32(page[byteOff : byteOff+4]))
+	} else {
+		wordOff = meta.bumpOff
+		meta.bumpOff += classWords[cls]
+		ref = makePageRef(pid, wordOff)
+	}
+	slotIdx := uint(wordOff / classWords[cls])
+	meta.liveBits[slotIdx>>6] |= 1 << (slotIdx & 63)
+	meta.liveCount++
+	a.allocBytes += int64(need)
+	a.liveObjects++
+
+	// Unlink from classAvail once the page has neither free slots nor bump room left.
+	if meta.freeHead == NullRef && uint32(meta.bumpOff)+uint32(classWords[cls]) > pageWords {
+		a.unlinkAvail(pid)
+	}
+	return ref, nil
+}
+
+func (a *Arena) allocPage(cls uint8) (uint32, error) {
+	var pid uint32
+	reused := false
+	if n := len(a.freePageIDs); n > 0 {
+		pid = a.freePageIDs[n-1]
+		a.freePageIDs = a.freePageIDs[:n-1]
+		reused = true
+	} else {
+		if len(a.pages) > maxPageID {
+			return 0, ErrOutOfMemory
+		}
+		pid = uint32(len(a.pages))
+	}
+	var buf []byte
+	if a.sparePage != nil {
+		buf = a.sparePage
+		a.sparePage = nil
+	} else {
+		buf = make([]byte, PageSize)
+		if uintptr(unsafe.Pointer(unsafe.SliceData(buf)))%Align != 0 {
+			panic("arena: slab page not 8-byte aligned")
+		}
+	}
+	bitWords := (int(classSlotsPerPg[cls]) + 63) >> 6
+	pm := pageMeta{
+		liveBits: make([]uint64, bitWords),
+		class:    cls,
+		active:   true,
+	}
+	if reused {
+		a.pages[pid] = buf
+		a.pageMeta[pid] = pm
+	} else {
+		a.pages = append(a.pages, buf)
+		a.pageMeta = append(a.pageMeta, pm)
+	}
+	a.activePages++
+	a.linkAvail(pid)
+	return pid, nil
+}
+
+func (a *Arena) linkAvail(pid uint32) {
+	meta := &a.pageMeta[pid]
+	if meta.inAvail {
+		return
+	}
+	cls := meta.class
+	head := a.classAvail[cls]
+	meta.prevAvail = 0
+	meta.nextAvail = head
+	if head != 0 {
+		a.pageMeta[head].prevAvail = pid
+	}
+	a.classAvail[cls] = pid
+	meta.inAvail = true
+}
+
+func (a *Arena) unlinkAvail(pid uint32) {
+	meta := &a.pageMeta[pid]
+	if !meta.inAvail {
+		return
+	}
+	cls := meta.class
+	if meta.prevAvail != 0 {
+		a.pageMeta[meta.prevAvail].nextAvail = meta.nextAvail
+	} else {
+		a.classAvail[cls] = meta.nextAvail
+	}
+	if meta.nextAvail != 0 {
+		a.pageMeta[meta.nextAvail].prevAvail = meta.prevAvail
+	}
+	meta.prevAvail = 0
+	meta.nextAvail = 0
+	meta.inAvail = false
+}
+
+// Free returns ref to the Arena. Freeing NullRef is a no-op.
+// When the last live slot in a 64 KiB page is freed, the entire page is reclaimed
+// (keeping at most one spare page to avoid boundary thrashing) and its []byte span
+// is returned to Go. Freeing a large span immediately releases its []byte back to Go.
+func (a *Arena) Free(ref ObjRef) {
+	if ref == NullRef {
+		return
+	}
+	if ref.IsLarge() {
+		idx := largeRefIndex(ref)
+		if idx == 0 || int(idx) >= len(a.largeSpans) {
+			return
+		}
+		buf := a.largeSpans[idx]
+		if buf == nil {
+			return
+		}
+		a.largeSpans[idx] = nil
+		a.freeLargeIDs = append(a.freeLargeIDs, idx)
+		a.allocBytes -= int64(len(buf))
+		a.liveObjects--
+		a.activeLarge--
+		return
+	}
+	pid, wordOff := splitPageRef(ref)
+	if pid == 0 || int(pid) >= len(a.pages) {
+		return
+	}
+	meta := &a.pageMeta[pid]
+	if !meta.active || meta.liveCount == 0 {
+		return
+	}
+	cls := meta.class
+	if wordOff >= meta.bumpOff || wordOff%classWords[cls] != 0 {
+		return
+	}
+	slotIdx := uint(wordOff / classWords[cls])
+	bitMask := uint64(1) << (slotIdx & 63)
+	if meta.liveBits[slotIdx>>6]&bitMask == 0 {
+		return // already freed (idempotent against double-free)
+	}
+	meta.liveBits[slotIdx>>6] &^= bitMask
+	meta.liveCount--
+	a.allocBytes -= int64(classSizes[cls])
+	a.liveObjects--
+
+	if meta.liveCount == 0 {
+		a.unlinkAvail(pid)
+		buf := a.pages[pid]
+		a.pages[pid] = nil
+		*meta = pageMeta{}
+		a.freePageIDs = append(a.freePageIDs, pid)
+		a.activePages--
+		if a.sparePage == nil {
+			a.sparePage = buf
+		}
+		return
+	}
+
+	page := a.pages[pid]
+	byteOff := int(wordOff) << alignShift
+	binary.LittleEndian.PutUint32(page[byteOff:byteOff+4], uint32(meta.freeHead))
+	meta.freeHead = ref
+	if !meta.inAvail {
+		a.linkAvail(pid)
+	}
+}
+
+// IsLive reports whether ref currently refers to a live (allocated, not freed) arena slot.
+func (a *Arena) IsLive(ref ObjRef) bool {
+	if ref == NullRef {
+		return false
+	}
+	if ref.IsLarge() {
+		idx := largeRefIndex(ref)
+		return idx != 0 && int(idx) < len(a.largeSpans) && a.largeSpans[idx] != nil
+	}
+	pid, wordOff := splitPageRef(ref)
+	if pid == 0 || int(pid) >= len(a.pages) {
+		return false
+	}
+	meta := &a.pageMeta[pid]
+	if !meta.active || wordOff >= meta.bumpOff || wordOff%classWords[meta.class] != 0 {
+		return false
+	}
+	slotIdx := uint(wordOff / classWords[meta.class])
+	return meta.liveBits[slotIdx>>6]&(uint64(1)<<(slotIdx&63)) != 0
+}
+
+// SlotSize returns the exact allocated byte capacity of ref (0 if ref is NullRef or inactive).
+func (a *Arena) SlotSize(ref ObjRef) int {
+	if ref == NullRef {
+		return 0
+	}
+	if ref.IsLarge() {
+		idx := largeRefIndex(ref)
+		if idx == 0 || int(idx) >= len(a.largeSpans) || a.largeSpans[idx] == nil {
+			return 0
+		}
+		return len(a.largeSpans[idx])
+	}
+	pid, _ := splitPageRef(ref)
+	if pid == 0 || int(pid) >= len(a.pages) || !a.pageMeta[pid].active {
+		return 0
+	}
+	return int(classSizes[a.pageMeta[pid].class])
+}
+
+func (a *Arena) slotBytes(ref ObjRef) []byte {
+	if ref.IsLarge() {
+		return a.largeSpans[largeRefIndex(ref)]
+	}
+	pid, wordOff := splitPageRef(ref)
+	byteOff := int(wordOff) << alignShift
+	sz := int(classSizes[a.pageMeta[pid].class])
+	return a.pages[pid][byteOff : byteOff+sz]
+}
+
+// Bytes returns a slice of length n backed directly by ref's noscan []byte storage.
+// Panics if ref is invalid or n exceeds the slot size.
+func (a *Arena) Bytes(ref ObjRef, n int) []byte {
+	if ref == NullRef || n < 0 {
+		panic("arena: invalid Bytes access")
+	}
+	if ref.IsLarge() {
+		idx := largeRefIndex(ref)
+		if idx == 0 || int(idx) >= len(a.largeSpans) || a.largeSpans[idx] == nil {
+			panic("arena: invalid large Bytes ref")
+		}
+		buf := a.largeSpans[idx]
+		if n > len(buf) {
+			panic("arena: Bytes length exceeds large span size")
+		}
+		return buf[:n:n]
+	}
+	pid, wordOff := splitPageRef(ref)
+	if pid == 0 || int(pid) >= len(a.pages) || !a.pageMeta[pid].active {
+		panic("arena: invalid slab Bytes ref")
+	}
+	byteOff := int(wordOff) << alignShift
+	if n > int(classSizes[a.pageMeta[pid].class]) || byteOff+n > PageSize {
+		panic("arena: Bytes length exceeds slot size")
+	}
+	return a.pages[pid][byteOff : byteOff+n : byteOff+n]
+}
+
+// Ptr returns an 8-byte-aligned unsafe.Pointer to the start of ref's noscan storage.
+// Safe under -d=checkptr=2 when cast to any pointer-free struct T with alignof(T) <= 8
+// and sizeof(T) <= SlotSize(ref).
+func (a *Arena) Ptr(ref ObjRef) unsafe.Pointer {
+	if ref == NullRef {
+		return nil
+	}
+	if ref.IsLarge() {
+		idx := largeRefIndex(ref)
+		if idx == 0 || int(idx) >= len(a.largeSpans) || a.largeSpans[idx] == nil {
+			panic("arena: invalid large Ptr ref")
+		}
+		return unsafe.Pointer(unsafe.SliceData(a.largeSpans[idx]))
+	}
+	pid, wordOff := splitPageRef(ref)
+	if pid == 0 || int(pid) >= len(a.pages) || !a.pageMeta[pid].active {
+		panic("arena: invalid slab Ptr ref")
+	}
+	byteOff := int(wordOff) << alignShift
+	return unsafe.Pointer(&a.pages[pid][byteOff])
+}
+
+// Header returns the 8-byte GCHeader located at offset 0 of ref.
+func (a *Arena) Header(ref ObjRef) *GCHeader {
+	return (*GCHeader)(a.Ptr(ref))
+}
+
+// As casts ref's 8-byte-aligned arena slot to *T.
+// T must be a pointer-free (noscan) struct with alignof(T) <= 8 and sizeof(T) <= SlotSize(ref).
+func As[T any](a *Arena, ref ObjRef) *T {
+	return (*T)(a.Ptr(ref))
+}
+
+// Slice returns a Go slice view of length n of pointer-free element type T starting at byteOff
+// bytes inside ref's slot. byteOff must be aligned to alignof(T) and fit within SlotSize(ref).
+func Slice[T any](a *Arena, ref ObjRef, byteOff, n int) []T {
+	if n == 0 {
+		return nil
+	}
+	slotSz := a.SlotSize(ref)
+	if slotSz == 0 {
+		panic("arena: Slice on invalid ref")
+	}
+	var zero T
+	elemSize := int(unsafe.Sizeof(zero))
+	if align := int(unsafe.Alignof(zero)); align > 1 && byteOff%align != 0 {
+		panic("arena: Slice byteOff misaligned")
+	}
+	if byteOff < 0 || n < 0 || byteOff > slotSz || (elemSize > 0 && n > (slotSz-byteOff)/elemSize) {
+		panic("arena: Slice out of slot bounds")
+	}
+	base := unsafe.Add(a.Ptr(ref), byteOff)
+	return unsafe.Slice((*T)(base), n)
+}
+
+// ReleaseSpare drops the cached empty spare page back to Go.
+func (a *Arena) ReleaseSpare() {
+	a.sparePage = nil
+}
+
+// Close releases all backing slab pages, large spans, and metadata immediately back to Go.
+// After Close, the Arena is empty and ready for reuse or garbage collection.
+func (a *Arena) Close() {
+	if len(a.pages) > 0 {
+		a.pages = a.pages[:1]
+		a.pages[0] = nil
+	}
+	if len(a.pageMeta) > 0 {
+		a.pageMeta = a.pageMeta[:1]
+		a.pageMeta[0] = pageMeta{}
+	}
+	a.freePageIDs = nil
+	a.classAvail = [NumClasses]uint32{}
+	a.sparePage = nil
+	if len(a.largeSpans) > 0 {
+		a.largeSpans = a.largeSpans[:1]
+		a.largeSpans[0] = nil
+	}
+	a.freeLargeIDs = nil
+	a.allocBytes = 0
+	a.liveObjects = 0
+	a.activePages = 0
+	a.activeLarge = 0
+}
+
+// CloneSnapshot produces a completely independent deep copy of this Arena by copying
+// active noscan []byte pages and large spans directly. Because all internal links use
+// ObjRef handles rather than Go pointers, every ObjRef remains identical with zero
+// pointer relocation.
+func (a *Arena) CloneSnapshot() *Arena {
+	if len(a.pages) == 0 && len(a.largeSpans) == 0 {
+		cp := New()
+		cp.limit = a.limit
+		return cp
+	}
+	cp := &Arena{
+		pages:       make([][]byte, max(len(a.pages), 1)),
+		pageMeta:    make([]pageMeta, max(len(a.pageMeta), 1)),
+		classAvail:  a.classAvail,
+		largeSpans:  make([][]byte, max(len(a.largeSpans), 1)),
+		allocBytes:  a.allocBytes,
+		limit:       a.limit,
+		liveObjects: a.liveObjects,
+		activePages: a.activePages,
+		activeLarge: a.activeLarge,
+	}
+	copy(cp.pageMeta, a.pageMeta)
+	if len(a.freePageIDs) > 0 {
+		cp.freePageIDs = make([]uint32, len(a.freePageIDs))
+		copy(cp.freePageIDs, a.freePageIDs)
+	}
+	if len(a.freeLargeIDs) > 0 {
+		cp.freeLargeIDs = make([]uint32, len(a.freeLargeIDs))
+		copy(cp.freeLargeIDs, a.freeLargeIDs)
+	}
+	for pid := 1; pid < len(a.pages); pid++ {
+		if src := a.pages[pid]; src != nil {
+			dst := make([]byte, len(src))
+			copy(dst, src)
+			cp.pages[pid] = dst
+		}
+		if srcBits := a.pageMeta[pid].liveBits; len(srcBits) > 0 {
+			dstBits := make([]uint64, len(srcBits))
+			copy(dstBits, srcBits)
+			cp.pageMeta[pid].liveBits = dstBits
+		}
+	}
+	for idx := 1; idx < len(a.largeSpans); idx++ {
+		if src := a.largeSpans[idx]; src != nil {
+			dst := make([]byte, len(src))
+			copy(dst, src)
+			cp.largeSpans[idx] = dst
+		}
+	}
+	return cp
+}
