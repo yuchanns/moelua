@@ -1067,3 +1067,250 @@ print("pairs_ok")
 		}
 	}
 }
+
+// TestPackagePreloadAndFieldsHonorIndexMetamethod verifies that package.preload,
+// package.path, package.cpath, and package.searchers honor __index metamethods
+// (matching PUC-Rio Lua 5.5.1 loadlib.c lua_getfield).
+func TestPackagePreloadAndFieldsHonorIndexMetamethod(t *testing.T) {
+	src := `
+setmetatable(package.preload, {
+	__index = function(_, name)
+		if name == "virt_mod" then
+			return function(modname, extra)
+				return "loaded:" .. modname .. ":" .. tostring(extra)
+			end
+		end
+	end
+})
+local v, src = require("virt_mod")
+assert(v == "loaded:virt_mod::preload:" and src == ":preload:", tostring(v) .. "|" .. tostring(src))
+
+-- package.searchers resolved through __index on package
+local origSearchers = package.searchers
+package.searchers = nil
+setmetatable(package, {
+	__index = function(_, k)
+		if k == "searchers" then
+			return {
+				function(modname)
+					if modname == "via_meta_searchers" then
+						return function(n) return "ms:" .. n end, ":meta:"
+					end
+				end,
+				origSearchers[1],
+				origSearchers[2],
+				origSearchers[3],
+			}
+		elseif k == "path" then
+			return "./nonexistent_meta_dir/?.lua"
+		elseif k == "cpath" then
+			return "./nonexistent_meta_dir/?.so"
+		end
+	end
+})
+local mv, msrc = require("via_meta_searchers")
+assert(mv == "ms:via_meta_searchers" and msrc == ":meta:")
+
+-- package.path & package.cpath resolved through __index on package
+local origPath, origCPath = package.path, package.cpath
+package.path = nil
+package.cpath = nil
+local ok, err = pcall(require, "missing_meta_mod_xyz")
+assert(not ok and string.find(err, "nonexistent_meta_dir", 1, true), tostring(err))
+package.path = origPath
+package.cpath = origCPath
+package.searchers = origSearchers
+setmetatable(package, nil)
+print("pkg_meta_ok")
+`
+	got := runMoeLua(t, src)
+	if got != "pkg_meta_ok\n" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+	if hasCLua55(t) {
+		if want := runCLua55(t, src); got != want {
+			t.Fatalf("mismatch vs C Lua 5.5.1:\nwant:\n%s\ngot:\n%s", want, got)
+		}
+	}
+}
+
+// TestTableLibStringBuiltInLengthAndCheckTab verifies Lua 5.5.1 ltablib.c:checktab
+// and built-in string length handling across table.concat/unpack/move/insert/remove/sort.
+func TestTableLibStringBuiltInLengthAndCheckTab(t *testing.T) {
+	src := `
+local oldmt = debug.getmetatable("")
+debug.setmetatable("", {
+	__index = function(str, i) return string.sub(str, i, i) end,
+	__len = function() return 999 end,
+})
+assert(table.concat("abc", "-") == "a-b-c")
+local a, b, c, d = table.unpack("abc")
+assert(a == "a" and b == "b" and c == "c" and d == nil)
+local dst = table.move("abc", 1, 3, 1, {})
+assert(table.concat(dst, ",") == "a,b,c")
+
+local ok1, e1 = pcall(table.insert, "abc", "d")
+assert(not ok1 and string.find(e1, "table expected, got string", 1, true), tostring(e1))
+local ok2, e2 = pcall(table.remove, "abc")
+assert(not ok2 and string.find(e2, "table expected, got string", 1, true), tostring(e2))
+local ok3, e3 = pcall(table.sort, "abc")
+assert(not ok3 and string.find(e3, "table expected, got string", 1, true), tostring(e3))
+local ok4, e4 = pcall(table.move, "abc", 1, 2, 1)
+assert(not ok4 and string.find(e4, "table expected, got string", 1, true), tostring(e4))
+
+-- String without __index must be rejected even with explicit range.
+debug.setmetatable("", {})
+local ok5, e5 = pcall(table.concat, "abc", "", 1, 0)
+assert(not ok5 and string.find(e5, "table expected, got string", 1, true), tostring(e5))
+local ok6, e6 = pcall(table.unpack, "abc", 1, 0)
+assert(not ok6 and string.find(e6, "table expected, got string", 1, true), tostring(e6))
+
+-- Non-string with __index only (no __len) is accepted as table.move src, rejected by concat/unpack.
+debug.setmetatable(1, { __index = function(_, i) return "n" .. i end })
+local m = table.move(1, 1, 2, 1, {})
+assert(m[1] == "n1" and m[2] == "n2")
+local ok7, e7 = pcall(table.concat, 1, ",", 1, 2)
+assert(not ok7 and string.find(e7, "table expected, got number", 1, true), tostring(e7))
+local ok8, e8 = pcall(table.unpack, 1, 1, 2)
+assert(not ok8 and string.find(e8, "table expected, got number", 1, true), tostring(e8))
+debug.setmetatable(1, nil)
+debug.setmetatable("", oldmt)
+print("table_checktab_ok")
+`
+	got := runMoeLua(t, src)
+	if got != "table_checktab_ok\n" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+	if hasCLua55(t) {
+		if want := runCLua55(t, src); got != want {
+			t.Fatalf("mismatch vs C Lua 5.5.1:\nwant:\n%s\ngot:\n%s", want, got)
+		}
+	}
+}
+
+// TestGoCallXPCallRunsHandlerBeforeUnwindAndClose verifies that invoking Lua's xpcall
+// (and pcall) via Go State.Call uses a real protected-call boundary so the message handler
+// runs before frame unwinding and <close> finalizers, sees the live failing traceback frames,
+// and an inner Go State.Call(pcall, ...) does not leak to an enclosing xpcall handler.
+func TestGoCallXPCallRunsHandlerBeforeUnwindAndClose(t *testing.T) {
+	s := vm.NewState()
+	defer s.Close()
+
+	setup, err := s.LoadChunk([]byte(`
+CLOSED = false
+HANDLER_SAW_CLOSED = nil
+HANDLER_TRACE = nil
+
+function INNER_HELPER()
+	error("boom_go_xpcall")
+end
+
+function FAILING()
+	local guard <close> = setmetatable({}, {
+		__close = function() CLOSED = true end
+	})
+	INNER_HELPER()
+end
+
+function MSGH(err)
+	HANDLER_SAW_CLOSED = CLOSED
+	HANDLER_TRACE = debug.traceback(tostring(err), 1)
+	return HANDLER_SAW_CLOSED
+end
+`), "=go_xpcall_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(setup); err != nil {
+		t.Fatal(err)
+	}
+
+	xp := s.GetGlobal("xpcall")
+	fn := s.GetGlobal("FAILING")
+	msgh := s.GetGlobal("MSGH")
+
+	res, err := s.Call(xp, fn, msgh)
+	if err != nil {
+		t.Fatalf("State.Call(xpcall) returned unexpected error: %v", err)
+	}
+	if len(res) != 2 || !res[0].IsFalse() {
+		t.Fatalf("expected [false, false], got %v", res)
+	}
+	if !res[1].IsFalse() {
+		t.Fatalf("message handler ran after <close>: got HANDLER_SAW_CLOSED=%v, want false", res[1])
+	}
+	if !s.GetGlobal("CLOSED").IsTrue() {
+		t.Fatalf("<close> handler did not run after message handler")
+	}
+	trace := vm.FormatValue(s.GetGlobal("HANDLER_TRACE"))
+	if !strings.Contains(trace, "INNER_HELPER") || !strings.Contains(trace, "go_xpcall_test:") || !strings.Contains(trace, "in function 'xpcall'") {
+		t.Fatalf("traceback from State.Call(xpcall) lost live failing frames: %s", trace)
+	}
+
+	// Verify hook-enabled State.Call(xpcall) does not duplicate call/return hooks or break ordering.
+	s.SetGlobal("CLOSED", vm.FalseValue())
+	s.SetGlobal("HANDLER_SAW_CLOSED", vm.NilValue())
+	hookSetup, err := s.LoadChunk([]byte(`
+HOOK_EVENTS = {}
+debug.sethook(function(ev)
+	local info = debug.getinfo(2, "n")
+	HOOK_EVENTS[#HOOK_EVENTS + 1] = ev .. ":" .. tostring(info and info.name)
+end, "cr")
+`), "=hook_setup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(hookSetup); err != nil {
+		t.Fatal(err)
+	}
+	res2, err := s.Call(xp, fn, msgh)
+	if err != nil {
+		t.Fatalf("hooked State.Call(xpcall) error: %v", err)
+	}
+	if len(res2) != 2 || !res2[0].IsFalse() || !res2[1].IsFalse() {
+		t.Fatalf("hooked State.Call(xpcall) expected [false, false], got %v", res2)
+	}
+	clearHook, err := s.LoadChunk([]byte(`
+debug.sethook()
+local callXP, retXP = 0, 0
+for _, ev in ipairs(HOOK_EVENTS) do
+	if ev == "call:xpcall" then callXP = callXP + 1 end
+	if ev == "return:xpcall" then retXP = retXP + 1 end
+end
+assert(callXP == 1 and retXP == 1, "expected 1 call/return hook for xpcall, got " .. callXP .. "/" .. retXP)
+`), "=clear_hook")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(clearHook); err != nil {
+		t.Fatal(err)
+	}
+	// Verify nativePCall inside an outer xpcall does NOT trigger the outer xpcall's handler.
+	outerCalled := false
+	s.SetGlobal("GO_CALL_PCALL", vm.NativeValue(&vm.NativeFunc{
+		Name: "go_call_pcall",
+		Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
+			return st.Call(st.GetGlobal("pcall"), st.GetGlobal("FAILING"))
+		},
+	}))
+	s.SetGlobal("OUTER_MSGH", vm.NativeValue(&vm.NativeFunc{
+		Name: "outer_msgh",
+		Fn: func(_ *vm.State, args []vm.Value) ([]vm.Value, error) {
+			outerCalled = true
+			return args, nil
+		},
+	}))
+	checkInner, err := s.LoadChunk([]byte(`
+local ok, innerOk, innerErr = xpcall(GO_CALL_PCALL, OUTER_MSGH)
+assert(ok == true and innerOk == false and string.find(innerErr, "boom_go_xpcall", 1, true))
+`), "=check_inner_pcall")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(checkInner); err != nil {
+		t.Fatal(err)
+	}
+	if outerCalled {
+		t.Fatalf("outer xpcall handler was erroneously invoked for error caught by Go State.Call(pcall)")
+	}
+}

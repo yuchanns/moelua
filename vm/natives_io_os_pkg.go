@@ -3024,16 +3024,51 @@ func (s *State) initPackageLib() {
 	s.registerFunc(s.env, "require", intrNone, nativeRequire)
 }
 
+func (s *State) pkgField(name string) (Value, error) {
+	key := s.intern.Intern(name)
+	v := s.pkgTbl.RawGetStr(key)
+	if v.IsNil() && s.pkgTbl.meta != nil {
+		return s.finishGet(TableValue(s.pkgTbl), StringValue(key))
+	}
+	return v, nil
+}
+
 func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'searcher_preload' (string expected)")
 	}
 	name := FormatValue(args[0])
 	key := s.intern.Intern(name)
-	if err := s.ensureLookupStrKeyHash(s.preloadTbl, key); err != nil {
-		return nil, err
+	preloadKey := s.intern.Intern("_PRELOAD")
+	preloadVal := s.registry.RawGetStr(preloadKey)
+	if preloadVal.IsNil() && s.registry.meta != nil {
+		var gerr error
+		preloadVal, gerr = s.finishGet(TableValue(s.registry), StringValue(preloadKey))
+		if gerr != nil {
+			return nil, gerr
+		}
 	}
-	v := s.preloadTbl.RawGetStr(key)
+	var v Value
+	if preloadVal.IsTable() {
+		pt := preloadVal.AsTable()
+		if err := s.ensureLookupStrKeyHash(pt, key); err != nil {
+			return nil, err
+		}
+		v = pt.RawGetStr(key)
+		if v.IsNil() && pt.meta != nil {
+			var gerr error
+			v, gerr = s.finishGet(preloadVal, StringValue(key))
+			if gerr != nil {
+				return nil, gerr
+			}
+		}
+	} else {
+		var gerr error
+		v, gerr = s.finishGet(preloadVal, StringValue(key))
+		if gerr != nil {
+			return nil, gerr
+		}
+	}
 	if v.IsNil() {
 		if s.memLimit > 0 {
 			if err := s.checkMem(int64(len(name)) + 80); err != nil {
@@ -3054,11 +3089,14 @@ func nativeSearcherLua(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'searcher_lua' (string expected)")
 	}
 	name := FormatValue(args[0])
-	pathVal := s.pkgTbl.RawGetStr(s.intern.Intern("path"))
-	if !pathVal.IsString() {
+	pathVal, err := s.pkgField("path")
+	if err != nil {
+		return nil, err
+	}
+	if !pathVal.IsString() && !pathVal.IsNumber() {
 		return nil, fmt.Errorf("'package.path' must be a string")
 	}
-	fname, errmsg, err := s.searchPath(name, pathVal.AsString().S, ".", string(filepath.Separator))
+	fname, errmsg, err := s.searchPath(name, FormatValue(pathVal), ".", string(filepath.Separator))
 	if err != nil {
 		return nil, err
 	}
@@ -3088,11 +3126,14 @@ func nativeSearcherC(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'searcher_C' (string expected)")
 	}
 	name := FormatValue(args[0])
-	cpathVal := s.pkgTbl.RawGetStr(s.intern.Intern("cpath"))
-	if !cpathVal.IsString() {
+	cpathVal, err := s.pkgField("cpath")
+	if err != nil {
+		return nil, err
+	}
+	if !cpathVal.IsString() && !cpathVal.IsNumber() {
 		return nil, fmt.Errorf("'package.cpath' must be a string")
 	}
-	_, errmsg, err := s.searchPath(name, cpathVal.AsString().S, ".", string(filepath.Separator))
+	_, errmsg, err := s.searchPath(name, FormatValue(cpathVal), ".", string(filepath.Separator))
 	if err != nil {
 		return nil, err
 	}
@@ -3124,7 +3165,10 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	if !existing.IsFalsy() {
 		return []Value{existing}, nil
 	}
-	sv := s.pkgTbl.RawGetStr(s.intern.Intern("searchers"))
+	sv, err := s.pkgField("searchers")
+	if err != nil {
+		return nil, err
+	}
 	if !sv.IsTable() {
 		return nil, fmt.Errorf("'package.searchers' must be a table")
 	}

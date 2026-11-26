@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"crypto/rand"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"math"
 	"math/bits"
@@ -324,12 +323,12 @@ func nativePCall(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'pcall' (value expected)")
 	}
-	res, err := s.Call(args[0], args[1:]...)
-	if err != nil {
-		if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
-			return nil, err
-		}
-		return []Value{FalseValue(), errorToLuaValue(s, err)}, nil
+	res, errVal, ok, abortErr := s.callProtectedMode(args[0], NilValue(), false, args[1:], false, NilValue())
+	if abortErr != nil {
+		return nil, abortErr
+	}
+	if !ok {
+		return []Value{FalseValue(), errVal}, nil
 	}
 	out := make([]Value, 1+len(res))
 	out[0] = TrueValue()
@@ -341,22 +340,11 @@ func nativeXPCall(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 || !args[1].IsFunction() {
 		return nil, fmt.Errorf("bad argument #2 to 'xpcall' (function expected)")
 	}
-	res, err := s.Call(args[0], args[2:]...)
-	if err != nil {
-		if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
-			return nil, err
-		}
-		var rawErr Value
-		var le *LuaError
-		if errors.As(err, &le) {
-			rawErr = le.Val
-		} else {
-			rawErr = errorToLuaValue(s, err)
-		}
-		errVal, uerr := s.callXPCallHandler(s.cur, -1, args[1], rawErr)
-		if uerr != nil {
-			return nil, uerr
-		}
+	res, errVal, ok, abortErr := s.callProtectedMode(args[0], args[1], true, args[2:], false, NilValue())
+	if abortErr != nil {
+		return nil, abortErr
+	}
+	if !ok {
 		return []Value{FalseValue(), errVal}, nil
 	}
 	out := make([]Value, 1+len(res))
@@ -1225,7 +1213,33 @@ func nativeTableCreate(s *State, args []Value) ([]Value, error) {
 	return []Value{TableValue(t)}, nil
 }
 
+const (
+	tabR  = 1
+	tabW  = 2
+	tabL  = 4
+	tabRW = tabR | tabW
+)
+
+// checkTab mirrors Lua 5.5 ltablib.c:checktab, verifying that v is a table or
+// has a metatable defining the required raw metamethods (strings satisfy tabL natively).
+func (s *State) checkTab(v Value, what int, argNum int, fnName string) error {
+	if v.IsTable() {
+		return nil
+	}
+	mt := s.getMetatableOf(v)
+	if mt != nil &&
+		(what&tabR == 0 || !s.getTM(mt, TMIndex).IsNil()) &&
+		(what&tabW == 0 || !s.getTM(mt, TMNewIndex).IsNil()) &&
+		(what&tabL == 0 || v.IsString() || !s.getTM(mt, TMLen).IsNil()) {
+		return nil
+	}
+	return fmt.Errorf("bad argument #%d to '%s' (table expected, got %s)", argNum, fnName, s.objTypeName(v))
+}
+
 func (s *State) tableLen(v Value) (int64, error) {
+	if v.IsString() {
+		return int64(len(v.AsString().S)), nil
+	}
 	if v.IsTable() {
 		t := v.AsTable()
 		if t.meta == nil {
@@ -1265,7 +1279,7 @@ func (s *State) tableLen(v Value) (int64, error) {
 		}
 		return 0, fmt.Errorf("object length is not an integer")
 	}
-	return 0, fmt.Errorf("bad argument #1 (table expected, got %s)", v.TypeName())
+	return 0, fmt.Errorf("attempt to get length of a %s value", v.TypeName())
 }
 
 func (s *State) tableGetInt(v Value, idx int64) (Value, error) {
@@ -1317,12 +1331,12 @@ func (s *State) tableSetInt(v Value, idx int64, val Value) error {
 
 func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 	if len(args) < 1 {
-		return nil, fmt.Errorf("bad argument #1 to 'insert' (table expected)")
-	}
-	if len(args) < 2 || len(args) > 3 {
-		return nil, fmt.Errorf("wrong number of arguments to 'insert'")
+		return nil, fmt.Errorf("bad argument #1 to 'insert' (table expected, got no value)")
 	}
 	if args[0].IsTable() && args[0].AsTable().meta == nil {
+		if len(args) < 2 || len(args) > 3 {
+			return nil, fmt.Errorf("wrong number of arguments to 'insert'")
+		}
 		t := args[0].AsTable()
 		e := t.Len() + 1
 		if len(args) == 2 {
@@ -1353,9 +1367,15 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 		t.RawSetInt(s, pos, args[2])
 		return nil, s.ConsumeMemErr()
 	}
+	if err := s.checkTab(args[0], tabRW|tabL, 1, "insert"); err != nil {
+		return nil, err
+	}
 	n, err := s.tableLen(args[0])
 	if err != nil {
 		return nil, err
+	}
+	if len(args) < 2 || len(args) > 3 {
+		return nil, fmt.Errorf("wrong number of arguments to 'insert'")
 	}
 	e := n + 1
 	if len(args) == 2 {
@@ -1431,6 +1451,9 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{res}, nil
 	}
+	if err := s.checkTab(args[0], tabRW|tabL, 1, "remove"); err != nil {
+		return nil, err
+	}
 	size, err := s.tableLen(args[0])
 	if err != nil {
 		return nil, err
@@ -1502,7 +1525,19 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 
 func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("bad argument #1 to 'concat' (table expected)")
+		return nil, fmt.Errorf("bad argument #1 to 'concat' (table expected, got no value)")
+	}
+	rawFast := args[0].IsTable() && args[0].AsTable().meta == nil
+	var defaultLast int64
+	if !rawFast {
+		if err := s.checkTab(args[0], tabR|tabL, 1, "concat"); err != nil {
+			return nil, err
+		}
+		var err error
+		defaultLast, err = s.tableLen(args[0])
+		if err != nil {
+			return nil, err
+		}
 	}
 	sep := ""
 	if len(args) >= 2 && !args[1].IsNil() {
@@ -1534,15 +1569,12 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 		if !ok {
 			return nil, fmt.Errorf("bad argument #4 to 'concat' (number expected)")
 		}
+	} else if rawFast {
+		j = args[0].AsTable().Len()
 	} else {
-		var err error
-		j, err = s.tableLen(args[0])
-		if err != nil {
-			return nil, err
-		}
+		j = defaultLast
 	}
 	var sb strings.Builder
-	rawFast := args[0].IsTable() && args[0].AsTable().meta == nil
 	var t *Table
 	if rawFast {
 		t = args[0].AsTable()
@@ -1600,9 +1632,6 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'move' (table expected, got no value)")
 	}
 	src := args[0]
-	if !src.IsTable() && s.getMetatableOf(src) == nil {
-		return nil, fmt.Errorf("bad argument #1 to 'move' (table expected, got %s)", s.objTypeName(src))
-	}
 	checkMoveInt := func(argIdx int) (int64, error) {
 		if argIdx >= len(args) {
 			return 0, fmt.Errorf("bad argument #%d to 'move' (number expected, got no value)", argIdx+1)
@@ -1632,11 +1661,16 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 		return nil, err
 	}
 	dst := src
+	dstArg := 1
 	if len(args) >= 5 && !args[4].IsNil() {
 		dst = args[4]
-		if !dst.IsTable() && s.getMetatableOf(dst) == nil {
-			return nil, fmt.Errorf("bad argument #5 to 'move' (table expected, got %s)", s.objTypeName(dst))
-		}
+		dstArg = 5
+	}
+	if err := s.checkTab(src, tabR, 1, "move"); err != nil {
+		return nil, err
+	}
+	if err := s.checkTab(dst, tabW, dstArg, "move"); err != nil {
+		return nil, err
 	}
 	if e >= f {
 		if f <= 0 && e >= math.MaxInt64+f {
@@ -1760,6 +1794,18 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'unpack' (table expected, got no value)")
 	}
+	rawFast := args[0].IsTable() && args[0].AsTable().meta == nil
+	var defaultLen int64
+	if !rawFast {
+		if err := s.checkTab(args[0], tabR|tabL, 1, "unpack"); err != nil {
+			return nil, err
+		}
+		var err error
+		defaultLen, err = s.tableLen(args[0])
+		if err != nil {
+			return nil, err
+		}
+	}
 	i := int64(1)
 	if len(args) >= 2 && !args[1].IsNil() {
 		var ok bool
@@ -1783,12 +1829,10 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'unpack' (number expected)")
 		}
+	} else if rawFast {
+		j = args[0].AsTable().Len()
 	} else {
-		var err error
-		j, err = s.tableLen(args[0])
-		if err != nil {
-			return nil, err
-		}
+		j = defaultLen
 	}
 	if i > j {
 		return nil, nil
@@ -1804,7 +1848,6 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 			return nil, err
 		}
 	}
-	rawFast := args[0].IsTable() && args[0].AsTable().meta == nil
 	if rawFast {
 		out := make([]Value, n)
 		t := args[0].AsTable()
@@ -1997,10 +2040,10 @@ func sortOrderedCancelable[T cmp.Ordered](a []T, cancelFn func() error) error {
 
 func nativeTableSort(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
-		return nil, fmt.Errorf("bad argument #1 to 'table.sort' (table expected)")
+		return nil, fmt.Errorf("bad argument #1 to 'sort' (table expected, got no value)")
 	}
-	if !args[0].IsTable() && s.getMetatableOf(args[0]) == nil {
-		return nil, fmt.Errorf("bad argument #1 to 'table.sort' (table expected, got %s)", s.objTypeName(args[0]))
+	if err := s.checkTab(args[0], tabRW|tabL, 1, "sort"); err != nil {
+		return nil, err
 	}
 	hasComp := len(args) >= 2 && !args[1].IsNil()
 	cancelFn := s.nativeCancelFunc()

@@ -749,6 +749,10 @@ func (s *State) Call(fn Value, args ...Value) ([]Value, error) {
 // (analogous to lua_pcall with a C message handler, without pushing a Lua xpcall wrapper frame).
 // Returns (results, errVal, ok, abortErr).
 func (s *State) CallProtected(fn Value, msgh Value, args ...Value) ([]Value, Value, bool, error) {
+	return s.callProtectedMode(fn, msgh, !msgh.IsNil(), args, true, NilValue())
+}
+
+func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value, topProtected bool, nativeFn Value) ([]Value, Value, bool, error) {
 	th := s.cur
 	if s.nCcalls == 0 {
 		s.abortErr = nil
@@ -762,10 +766,12 @@ func (s *State) CallProtected(fn Value, msgh Value, args ...Value) ([]Value, Val
 	}
 	if s.ctx != nil {
 		if err := s.ctx.Err(); err != nil {
+			s.abortErr = err
 			return nil, NilValue(), false, err
 		}
 	}
 	if s.insnLimit > 0 && s.insnCount > s.insnLimit {
+		s.abortErr = ErrInstructionLimit
 		return nil, NilValue(), false, ErrInstructionLimit
 	}
 	cLimit := maxCCalls
@@ -794,27 +800,62 @@ func (s *State) CallProtected(fn Value, msgh Value, args ...Value) ([]Value, Val
 			}
 		}
 	}
-	rootArgs := make([]Value, 1+len(args))
-	rootArgs[0] = msgh
-	copy(rootArgs[1:], args)
-	if err := s.ensureStackWithRoots(th, base+3+len(args)+8, fn, rootArgs); err != nil {
-		return nil, errorToLuaValue(s, err), false, nil
+	var nargs int
+	if isXP {
+		rootArgs := make([]Value, 2+len(args))
+		rootArgs[0] = nativeFn
+		rootArgs[1] = msgh
+		copy(rootArgs[2:], args)
+		if err := s.ensureStackWithRoots(th, base+3+len(args)+8, fn, rootArgs); err != nil {
+			return nil, errorToLuaValue(s, err), false, nil
+		}
+		th.stack[base] = nativeFn
+		th.stack[base+1] = fn
+		th.stack[base+2] = msgh
+		copy(th.stack[base+3:base+3+len(args)], args)
+		th.top = base + 3 + len(args)
+		nargs = 2 + len(args)
+	} else {
+		rootArgs := make([]Value, 1+len(args))
+		rootArgs[0] = nativeFn
+		copy(rootArgs[1:], args)
+		if err := s.ensureStackWithRoots(th, base+2+len(args)+8, fn, rootArgs); err != nil {
+			return nil, errorToLuaValue(s, err), false, nil
+		}
+		th.stack[base] = nativeFn
+		th.stack[base+1] = fn
+		copy(th.stack[base+2:base+2+len(args)], args)
+		th.top = base + 2 + len(args)
+		nargs = 1 + len(args)
 	}
-	th.stack[base] = NilValue()
-	th.stack[base+1] = fn
-	th.stack[base+2] = msgh
-	copy(th.stack[base+3:base+3+len(args)], args)
-	th.top = base + 3 + len(args)
+	setupEnd := base + 1 + nargs
 	entryDepth := th.nframe
 	clearTop := func() {
 		th.nframe = entryDepth
-		th.top = savedTop
-		if entryDepth == 0 && th.openUpvals == nil && base < len(th.stack) {
-			fillNil(th.stack[base:])
+		if entryDepth == 0 && th.openUpvals == nil {
+			if base < len(th.stack) {
+				fillNil(th.stack[base:])
+			}
+			clear(th.frames)
+		} else {
+			if base < len(th.stack) {
+				end := max(th.top, setupEnd)
+				if end > len(th.stack) {
+					end = len(th.stack)
+				}
+				fillNil(th.stack[base:end])
+			}
+			if entryDepth < len(th.frames) {
+				clear(th.frames[entryDepth:])
+			}
 		}
+		th.top = savedTop
 	}
-	pushed, err := s.pushProtectedCallMode(th, base, 2+len(args), -1, true, entryDepth, true)
+	pushed, err := s.pushProtectedCallMode(th, base, nargs, -1, isXP, entryDepth, topProtected)
 	if err != nil {
+		if errors.Is(err, errCoroCloseSelf) {
+			return nil, NilValue(), false, err
+		}
 		clearTop()
 		if isUncatchableErr(err) {
 			return nil, NilValue(), false, err
@@ -831,6 +872,9 @@ func (s *State) CallProtected(fn Value, msgh Value, args ...Value) ([]Value, Val
 			runErr = s.abortErr
 		}
 		if runErr != nil {
+			if errors.Is(runErr, errCoroCloseSelf) {
+				return nil, NilValue(), false, runErr
+			}
 			clearTop()
 			if isUncatchableErr(runErr) {
 				return nil, NilValue(), false, runErr
@@ -964,8 +1008,35 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			res []Value
 			err error
 		)
-		if th.hookMask == 0 || th.inHook || th.suppressHook {
-			res, err = fn.AsNative().callMulti(s, th.stack[base+1:base+1+len(args)])
+		nf := fn.AsNative()
+		isDirectProtected := (nf.Intrinsic == intrPCall && len(args) >= 1) ||
+			(nf.Intrinsic == intrXPCall && len(args) >= 2 && args[1].IsFunction())
+		if isDirectProtected {
+			if nf.Intrinsic == intrXPCall {
+				pres, errVal, ok, abortErr := s.callProtectedMode(th.stack[base+1], th.stack[base+2], true, th.stack[base+3:base+1+len(args)], false, fn)
+				if abortErr != nil {
+					err = abortErr
+				} else if !ok {
+					res = []Value{FalseValue(), errVal}
+				} else {
+					res = make([]Value, 1+len(pres))
+					res[0] = TrueValue()
+					copy(res[1:], pres)
+				}
+			} else {
+				pres, errVal, ok, abortErr := s.callProtectedMode(th.stack[base+1], NilValue(), false, th.stack[base+2:base+1+len(args)], false, fn)
+				if abortErr != nil {
+					err = abortErr
+				} else if !ok {
+					res = []Value{FalseValue(), errVal}
+				} else {
+					res = make([]Value, 1+len(pres))
+					res[0] = TrueValue()
+					copy(res[1:], pres)
+				}
+			}
+		} else if th.hookMask == 0 || th.inHook || th.suppressHook {
+			res, err = nf.callMulti(s, th.stack[base+1:base+1+len(args)])
 		} else {
 			res, _, err = s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
 		}
