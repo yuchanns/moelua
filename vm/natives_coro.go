@@ -194,6 +194,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				if _, err := s.pushProtectedCall(co, 0, len(args), -1, false, 0); err != nil {
 					if errors.Is(err, errYieldSentinel) {
 						co.status = ThreadSuspended
+						co.detachOpenUpvals()
 						out := co.yieldVals
 						co.yieldVals = nil
 						return true, out, nil
@@ -226,6 +227,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				if _, err := s.pushProtectedCall(co, 0, len(args), -1, true, 0); err != nil {
 					if errors.Is(err, errYieldSentinel) {
 						co.status = ThreadSuspended
+						co.detachOpenUpvals()
 						out := co.yieldVals
 						co.yieldVals = nil
 						return true, out, nil
@@ -270,6 +272,89 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				goto runCoro
 			}
+			if nf.Intrinsic == intrPairs && len(args) >= 1 {
+				tm, cargs, tmExtra, hasTM, terr := s.resolvePairsTM(args[0])
+				if terr != nil {
+					co.status = ThreadDead
+					co.stack[0] = NilValue()
+					ev := s.runtimeErrorToValue(co, terr)
+					co.clearUnusedRefs()
+					co.errObj = ev
+					return false, []Value{ev}, nil
+				}
+				if hasTM {
+					if err := s.ensureStackWithRoots(co, 1+len(cargs)+8, tm, cargs); err != nil {
+						co.status = ThreadDead
+						ev := s.runtimeErrorToValue(co, err)
+						co.clearUnusedRefs()
+						co.errObj = ev
+						return false, []Value{ev}, nil
+					}
+					co.stack[0] = tm
+					copy(co.stack[1:1+len(cargs)], cargs)
+					co.top = 1 + len(cargs)
+					if tm.IsClosure() {
+						cl := tm.AsClosure()
+						if err := co.pushLuaFrame(cl, 0, len(cargs), 4); err != nil {
+							co.status = ThreadDead
+							ev := s.runtimeErrorToValue(co, err)
+							co.clearUnusedRefs()
+							co.errObj = ev
+							return false, []Value{ev}, nil
+						}
+						co.frames[co.nframe-1].extraArgs = tmExtra
+						if herr := s.fireLuaCallHook(co, cl, len(cargs)); herr != nil {
+							if errors.Is(herr, errCoroCloseSelf) {
+								return s.finishCoroCloseSelf(co)
+							}
+							if isUncatchableErr(herr) {
+								co.status = ThreadDead
+								co.clearDeadRefs()
+								return false, nil, herr
+							}
+							co.status = ThreadDead
+							ev := s.runtimeErrorToValue(co, herr)
+							co.clearUnusedRefs()
+							co.errObj = ev
+							return false, []Value{ev}, nil
+						}
+						goto runCoro
+					}
+					res, _, err := s.callNativeHooked(co, tm, 0, len(cargs), tmExtra, maxFrames+128)
+					if errors.Is(err, errYieldSentinel) {
+						co.status = ThreadSuspended
+						co.detachOpenUpvals()
+						co.yieldDst = 0
+						co.yieldNRes = 4
+						co.yieldedNative = true
+						co.yieldNativeFn = tm
+						out := co.yieldVals
+						co.yieldVals = nil
+						return true, out, nil
+					}
+					co.status = ThreadDead
+					if err != nil {
+						if errors.Is(err, errCoroCloseSelf) || errors.Is(s.abortErr, errCoroCloseSelf) {
+							return s.finishCoroCloseSelf(co)
+						}
+						if isUncatchableErr(err) {
+							co.discardTBCAtOrAbove(0)
+							co.closeUpvals(0)
+							co.clearDeadRefs()
+							return false, nil, err
+						}
+						co.stack[0] = NilValue()
+						ev := s.runtimeErrorToValue(co, err)
+						co.clearUnusedRefs()
+						co.errObj = ev
+						return false, []Value{ev}, nil
+					}
+					out := []Value{NilValue(), NilValue(), NilValue(), NilValue()}
+					copy(out, res)
+					co.clearDeadRefs()
+					return true, out, nil
+				}
+			}
 			if err := s.ensureStackWithRoots(co, 1+len(args)+8, NilValue(), args); err != nil {
 				co.status = ThreadDead
 				ev := s.runtimeErrorToValue(co, err)
@@ -281,6 +366,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			res, _, err := s.callNativeHooked(co, fn, 0, len(args), 0, maxFrames+128)
 			if errors.Is(err, errYieldSentinel) {
 				co.status = ThreadSuspended
+				co.detachOpenUpvals()
 				co.yieldDst = 0
 				co.yieldNRes = -1 // MULTRET: resume args become coroutine return values
 				co.yieldedNative = true
@@ -343,6 +429,9 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				if isUncatchableErr(herr) {
 					co.status = ThreadDead
+					co.discardTBCAtOrAbove(0)
+					co.closeUpvals(0)
+					co.clearDeadRefs()
 					return false, nil, herr
 				}
 				if !s.handleError(co, 0, herr) {
@@ -352,18 +441,23 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					if isUncatchableErr(s.abortErr) {
 						uerr := s.abortErr
 						co.status = ThreadDead
+						co.discardTBCAtOrAbove(0)
+						co.closeUpvals(0)
+						co.clearDeadRefs()
 						return false, nil, uerr
 					}
 					co.status = ThreadDead
 					ev := s.runtimeErrorToValue(co, herr)
+					co.clearUnusedRefs()
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
 			}
 		}
 	} else if co.status == ThreadSuspended {
-		// Resuming a yielded coroutine: deliver resume args as the results of coroutine.yield(...)!
+		// Resuming a yielded coroutine: re-attach detached open upvalues and deliver resume args!
 		co.status = ThreadOK
+		co.attachOpenUpvals()
 		yieldedNative := co.yieldedNative
 		yieldNativeFn := co.yieldNativeFn
 		co.yieldedNative = false
@@ -415,6 +509,9 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				if isUncatchableErr(herr) {
 					co.status = ThreadDead
+					co.discardTBCAtOrAbove(0)
+					co.closeUpvals(0)
+					co.clearDeadRefs()
 					return false, nil, herr
 				}
 				if !s.handleError(co, 0, herr) {
@@ -424,10 +521,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					if isUncatchableErr(s.abortErr) {
 						uerr := s.abortErr
 						co.status = ThreadDead
+						co.discardTBCAtOrAbove(0)
+						co.closeUpvals(0)
+						co.clearDeadRefs()
 						return false, nil, uerr
 					}
 					co.status = ThreadDead
 					ev := s.runtimeErrorToValue(co, herr)
+					co.clearUnusedRefs()
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -446,10 +547,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				if isUncatchableErr(s.abortErr) {
 					uerr := s.abortErr
 					co.status = ThreadDead
+					co.discardTBCAtOrAbove(0)
+					co.closeUpvals(0)
+					co.clearDeadRefs()
 					return false, nil, uerr
 				}
 				co.status = ThreadDead
 				ev := s.runtimeErrorToValue(co, err)
+				co.clearUnusedRefs()
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
@@ -463,10 +568,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				if isUncatchableErr(s.abortErr) {
 					uerr := s.abortErr
 					co.status = ThreadDead
+					co.discardTBCAtOrAbove(0)
+					co.closeUpvals(0)
+					co.clearDeadRefs()
 					return false, nil, uerr
 				}
 				co.status = ThreadDead
 				ev := s.runtimeErrorToValue(co, err)
+				co.clearUnusedRefs()
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
@@ -478,6 +587,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			cont, cerr := s.completeFinishOp(co, cf, 0)
 			if errors.Is(cerr, errYieldSentinel) {
 				co.status = ThreadSuspended
+				co.detachOpenUpvals()
 				out := co.yieldVals
 				co.yieldVals = nil
 				return true, out, nil
@@ -488,6 +598,9 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				}
 				if isUncatchableErr(cerr) {
 					co.status = ThreadDead
+					co.discardTBCAtOrAbove(0)
+					co.closeUpvals(0)
+					co.clearDeadRefs()
 					return false, nil, cerr
 				}
 				if !s.handleError(co, 0, cerr) {
@@ -497,10 +610,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					if isUncatchableErr(s.abortErr) {
 						uerr := s.abortErr
 						co.status = ThreadDead
+						co.discardTBCAtOrAbove(0)
+						co.closeUpvals(0)
+						co.clearDeadRefs()
 						return false, nil, uerr
 					}
 					co.status = ThreadDead
 					ev := s.runtimeErrorToValue(co, cerr)
+					co.clearUnusedRefs()
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
@@ -534,6 +651,7 @@ runCoro:
 	}
 	if errors.Is(err, errYieldSentinel) {
 		co.status = ThreadSuspended
+		co.detachOpenUpvals()
 		out := co.yieldVals
 		co.yieldVals = nil
 		return true, out, nil

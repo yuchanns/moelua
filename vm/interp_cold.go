@@ -1260,29 +1260,83 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				return true, nil
 			}
 			if nf.Intrinsic == intrPairs && nargs >= 1 {
-				if tm := s.getTMByObj(th.stack[funcIdx+1], TMPairs); !tm.IsNil() && tm.IsClosure() {
+				tm, cargs, extraDepth, hasTM, terr := s.resolvePairsTM(th.stack[funcIdx+1])
+				if terr != nil {
+					return s.catchSlow(th, ev, false, terr)
+				}
+				if hasTM {
+					if err := s.ensureStackWithRoots(th, funcIdx+1+len(cargs)+8, tm, cargs); err != nil {
+						return s.catchSlow(th, ev, false, err)
+					}
 					th.stack[funcIdx] = tm
-					cl := tm.AsClosure()
+					copy(th.stack[funcIdx+1:funcIdx+1+len(cargs)], cargs)
+					th.top = funcIdx + 1 + len(cargs)
 					callNRes := nresults
 					needFinish := nresults < 0 || nresults > 4
 					if needFinish {
 						callNRes = 4
-						caller := &th.frames[ev.ci]
-						caller.dirty = true
-						caller.finish = finishPairs
-						caller.oldTop = funcIdx
-						caller.closeRetN = nresults
 					}
-					if err := th.pushLuaFrame(cl, funcIdx, 1, callNRes); err != nil {
+					if tm.IsClosure() {
+						cl := tm.AsClosure()
 						if needFinish {
-							th.frames[ev.ci].finish = finishNone
+							caller := &th.frames[ev.ci]
+							caller.dirty = true
+							caller.finish = finishPairs
+							caller.oldTop = funcIdx
+							caller.closeRetN = nresults
+						}
+						if err := th.pushLuaFrame(cl, funcIdx, len(cargs), callNRes); err != nil {
+							if needFinish {
+								th.frames[ev.ci].finish = finishNone
+							}
+							return s.catchSlow(th, ev, false, err)
+						}
+						th.frames[th.nframe-1].extraArgs = extraDepth
+						if herr := s.fireLuaCallHook(th, cl, len(cargs)); herr != nil {
+							return s.catchSlow(th, ev, false, herr)
+						}
+						return true, nil
+					}
+					res, _, err := s.callNativeHooked(th, tm, funcIdx, len(cargs), extraDepth, maxFrames+128)
+					if errors.Is(err, errYieldSentinel) {
+						if needFinish {
+							caller := &th.frames[ev.ci]
+							caller.dirty = true
+							caller.finish = finishPairs
+							caller.oldTop = funcIdx
+							caller.closeRetN = nresults
+						}
+						th.yieldDst = funcIdx
+						th.yieldNRes = callNRes
+						th.yieldedNative = true
+						th.yieldNativeFn = tm
+						return false, errYieldSentinel
+					}
+					if err != nil {
+						if !errors.Is(err, errCoroCloseSelf) {
+							th.lastErrNative = tm
 						}
 						return s.catchSlow(th, ev, false, err)
 					}
-					if herr := s.fireLuaCallHook(th, cl, 1); herr != nil {
-						return s.catchSlow(th, ev, false, herr)
+					out := []Value{NilValue(), NilValue(), NilValue(), NilValue()}
+					copy(out, res)
+					if err := th.placeResults(funcIdx, out, nresults); err != nil {
+						return s.catchSlow(th, ev, false, err)
 					}
-					return true, nil
+					liveTop := th.top
+					if nresults >= 0 {
+						liveTop = funcIdx + nresults
+						if end := ev.base + int(ev.bp.proto.MaxStackSize); th.top < end {
+							th.top = end
+						}
+					}
+					if s.gc.tier1 {
+						s.gcCheckDebt(liveTop)
+						if s.abortErr != nil {
+							return false, s.abortErr
+						}
+					}
+					return false, nil
 				}
 			}
 		}
@@ -1705,6 +1759,38 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 	return res, hookedNative, err
 }
 
+// resolvePairsTM resolves obj's __pairs metamethod (including any __call chain up to 15 hops).
+// Returns hasTM == false when obj has no __pairs metamethod.
+func (s *State) resolvePairsTM(obj Value) (fn Value, args []Value, extraDepth uint8, hasTM bool, err error) {
+	tm := s.getTMByObj(obj, TMPairs)
+	if tm.IsNil() {
+		return NilValue(), nil, 0, false, nil
+	}
+	cargs := []Value{obj}
+	cur := tm
+	if !cur.IsClosure() && !cur.IsNative() {
+		for depth := 1; depth <= 15; depth++ {
+			callTM := s.getTMByObj(cur, TMCall)
+			if callTM.IsNil() {
+				return NilValue(), nil, 0, true, fmt.Errorf("attempt to call a %s value (metamethod 'pairs')", s.objTypeName(cur))
+			}
+			next := make([]Value, 1+len(cargs))
+			next[0] = cur
+			copy(next[1:], cargs)
+			cargs = next
+			cur = callTM
+			extraDepth = uint8(depth)
+			if cur.IsClosure() || cur.IsNative() {
+				break
+			}
+		}
+		if !cur.IsClosure() && !cur.IsNative() {
+			return NilValue(), nil, 0, true, fmt.Errorf("'__call' chain too long")
+		}
+	}
+	return cur, cargs, extraDepth, true, nil
+}
+
 func isFlatProtectedTarget(_ Value) bool {
 	return true
 }
@@ -1894,6 +1980,73 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 				return false, uncaught(herr)
 			}
 			return true, nil
+		}
+		if intr == intrPairs && calleeArgs >= 1 {
+			tm, cargs, tmExtra, hasTM, terr := s.resolvePairsTM(th.stack[calleeIdx+1])
+			if terr != nil {
+				if s.handleError(th, entryDepth, terr) {
+					return true, nil
+				}
+				return false, uncaught(terr)
+			}
+			if hasTM {
+				if err := s.ensureStackWithRoots(th, calleeIdx+1+len(cargs)+8, tm, cargs); err != nil {
+					if s.handleError(th, entryDepth, err) {
+						return true, nil
+					}
+					return false, uncaught(err)
+				}
+				th.stack[calleeIdx] = tm
+				copy(th.stack[calleeIdx+1:calleeIdx+1+len(cargs)], cargs)
+				th.top = calleeIdx + 1 + len(cargs)
+				if tm.IsClosure() {
+					cl := tm.AsClosure()
+					if err := th.pushLuaFrame(cl, calleeIdx, len(cargs), 4); err != nil {
+						th.nframe--
+						return false, err
+					}
+					th.frames[th.nframe-1].extraArgs = tmExtra
+					if herr := s.fireLuaCallHook(th, cl, len(cargs)); herr != nil {
+						if s.handleError(th, entryDepth, herr) {
+							return true, nil
+						}
+						return false, uncaught(herr)
+					}
+					return true, nil
+				}
+				res, _, err := s.callNativeHooked(th, tm, calleeIdx, len(cargs), tmExtra, frameLimit)
+				if errors.Is(err, errYieldSentinel) {
+					th.yieldDst = calleeIdx
+					th.yieldNRes = 4
+					th.yieldedNative = true
+					th.yieldNativeFn = tm
+					return false, errYieldSentinel
+				}
+				if err != nil {
+					if !errors.Is(err, errCoroCloseSelf) {
+						th.lastErrNative = tm
+					}
+					if s.handleError(th, entryDepth, err) {
+						return true, nil
+					}
+					return false, uncaught(err)
+				}
+				out := []Value{NilValue(), NilValue(), NilValue(), NilValue()}
+				copy(out, res)
+				if perr := th.placeResults(calleeIdx, out, 4); perr != nil {
+					if s.handleError(th, entryDepth, perr) {
+						return true, nil
+					}
+					return false, uncaught(perr)
+				}
+				if _, ferr := s.finishPCallReturn(th, entryDepth); ferr != nil {
+					if s.handleError(th, entryDepth, ferr) {
+						return true, nil
+					}
+					return false, uncaught(ferr)
+				}
+				return false, nil
+			}
 		}
 		// General native inside pcall/xpcall (e.g. xpcall(coroutine.yield, msgh) in coroutine.lua:568!):
 		res, _, err := s.callNativeHooked(th, targetVal, calleeIdx, calleeArgs, extraDepth, frameLimit)
@@ -3154,6 +3307,78 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				return coldContinue, pc, herr
 			}
 			return coldReload, 0, nil
+		}
+		if nf.Intrinsic == intrPairs && nargs >= 1 {
+			tm, cargs, tmExtra, hasTM, terr := s.resolvePairsTM(th.stack[srcStart+1])
+			if terr != nil {
+				return coldContinue, pc, terr
+			}
+			if hasTM {
+				if err := s.ensureStackWithRoots(th, srcStart+1+len(cargs)+8, tm, cargs); err != nil {
+					return coldContinue, pc, err
+				}
+				th.stack[srcStart] = tm
+				copy(th.stack[srcStart+1:srcStart+1+len(cargs)], cargs)
+				th.top = srcStart + 1 + len(cargs)
+				nextIsMatchingRet := pc < len(ev.bp.proto.Code) &&
+					ev.bp.proto.Code[pc].Op() == bytecode.OP_RETURN &&
+					ev.bp.proto.Code[pc].A() == int(a) &&
+					ev.bp.proto.Code[pc].B() == 0
+				callerCF := &th.frames[ev.ci]
+				callerCF.pc = pc
+				callerCF.dirty = true
+				callerCF.oldTop = srcStart
+				if nextIsMatchingRet {
+					callerCF.finish = finishPairs
+					callerCF.closeRetN = -1
+				} else {
+					callerCF.finish = finishTailReturn
+				}
+				if tm.IsClosure() {
+					cl := tm.AsClosure()
+					if err := th.pushLuaFrame(cl, srcStart, len(cargs), 4); err != nil {
+						th.frames[ev.ci].finish = finishNone
+						return coldContinue, pc, err
+					}
+					th.frames[th.nframe-1].extraArgs = tmExtra
+					if herr := s.fireLuaCallHook(th, cl, len(cargs)); herr != nil {
+						return coldContinue, pc, herr
+					}
+					return coldReload, 0, nil
+				}
+				res, _, err := s.callNativeHooked(th, tm, srcStart, len(cargs), tmExtra, maxFrames+128)
+				if errors.Is(err, errYieldSentinel) {
+					th.yieldDst = srcStart
+					th.yieldNRes = 4
+					th.yieldedNative = true
+					th.yieldNativeFn = tm
+					return coldContinue, pc, errYieldSentinel
+				}
+				th.frames[ev.ci].finish = finishNone
+				if err != nil {
+					if !errors.Is(err, errCoroCloseSelf) {
+						th.lastErrNative = tm
+					}
+					return coldContinue, pc, err
+				}
+				out := []Value{NilValue(), NilValue(), NilValue(), NilValue()}
+				copy(out, res)
+				if nextIsMatchingRet {
+					if perr := th.placeResults(srcStart, out, 4); perr != nil {
+						return coldContinue, pc, perr
+					}
+					return coldContinue, pc, nil
+				}
+				nres := th.frames[ev.ci].nresults
+				if perr := th.placeResults(funcIdx, out, nres); perr != nil {
+					return coldContinue, pc, perr
+				}
+				th.nframe--
+				if th.nframe <= entryDepth {
+					return coldReturn, 0, nil
+				}
+				return coldReload, 0, nil
+			}
 		}
 		nres := cf.nresults
 		th.top = srcStart + 1 + nargs

@@ -2487,14 +2487,31 @@ func nativeStringSub(s *State, args []Value) ([]Value, error) {
 	if i > j {
 		return []Value{StringValue(s.intern.Intern(""))}, nil
 	}
-	if err := s.checkMemAndAccount((j - i + 1) + 48); err != nil {
+	sub := str[i-1 : j]
+	if len(sub) == len(str) && args[0].IsString() {
+		return []Value{args[0]}, nil
+	}
+	if len(sub) > maxShortStringLen && len(sub) < len(str) {
+		if s.memLimit > 0 {
+			if err := s.checkMem(int64(len(sub)) + 48); err != nil {
+				return nil, err
+			}
+		}
+		cloned, err := s.cloneStringWithCancel(sub)
+		if err != nil {
+			return nil, err
+		}
+		ls, err := s.TryIntern(cloned)
+		if err != nil {
+			return nil, err
+		}
+		return []Value{StringValue(ls)}, nil
+	}
+	ls, err := s.TryIntern(sub)
+	if err != nil {
 		return nil, err
 	}
-	sub := str[i-1 : j]
-	if len(sub) > maxShortStringLen && len(sub) < len(str) {
-		sub = strings.Clone(sub)
-	}
-	return []Value{StringValue(s.intern.Intern(sub))}, nil
+	return []Value{StringValue(ls)}, nil
 }
 
 func nativeStringRep(s *State, args []Value) ([]Value, error) {

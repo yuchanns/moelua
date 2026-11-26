@@ -775,3 +775,295 @@ func TestDeadCoroutineClearsStackAndFramesInTier0(t *testing.T) {
 		`)
 	})
 }
+
+// TestLargeSubstringCopyCancelAndBudget verifies that copying large substrings in string.sub,
+// string.match captures, and string.unpack polls both instruction-budget and context-cancellation
+// controls (including direct State.Call into string.sub with zero Lua opcodes).
+func TestLargeSubstringCopyCancelAndBudget(t *testing.T) {
+	bigStr := "a" + strings.Repeat("b", 8*1024*1024)
+
+	t.Run("direct_state_call_string_sub", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		strSub := s.GetGlobal("string").AsTable().RawGetStr(s.Intern("sub"))
+		bigVal := vm.StringValue(s.Intern(bigStr))
+
+		s.SetInstructionLimit(100)
+		if _, err := s.Call(strSub, bigVal, vm.IntValue(2)); err == nil {
+			t.Fatalf("direct State.Call(string.sub, bigStr, 2) bypassed instruction limit 100")
+		}
+		if s.InstructionsExecuted() == 0 {
+			t.Fatalf("direct State.Call(string.sub, bigStr, 2) charged 0 instructions")
+		}
+
+		s2 := vm.NewState()
+		defer s2.Close()
+		strSub2 := s2.GetGlobal("string").AsTable().RawGetStr(s2.Intern("sub"))
+		bigVal2 := vm.StringValue(s2.Intern(bigStr))
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		s2.SetContext(ctx)
+		start := time.Now()
+		if _, err := s2.Call(strSub2, bigVal2, vm.IntValue(2)); err == nil {
+			t.Fatalf("direct State.Call(string.sub, bigStr, 2) bypassed expired context deadline")
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("direct State.Call(string.sub) took %v despite expired context", elapsed)
+		}
+	})
+
+	t.Run("lua_string_sub_and_unpack", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			src  string
+		}{
+			{"string_sub", `return string.sub(BIG, 2)`},
+			{"string_unpack", `return string.unpack("s4", PACKED)`},
+		} {
+			s := vm.NewState()
+			defer s.Close()
+			s.SetGlobal("BIG", vm.StringValue(s.Intern(bigStr)))
+			packCl, err := s.LoadChunk([]byte(`PACKED = string.pack("s4", BIG)`), "=pack")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Call(packCl); err != nil {
+				t.Fatal(err)
+			}
+			cl, err := s.LoadChunk([]byte(tc.src), "="+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetInstructionLimit(100)
+			if _, err := s.Call(cl); err == nil {
+				t.Fatalf("%s bypassed instruction limit 100", tc.name)
+			}
+			if s.InstructionsExecuted() == 0 {
+				t.Fatalf("%s charged 0 instructions", tc.name)
+			}
+		}
+	})
+}
+
+// TestUnreachableSuspendedCoroutineReclaimedInTier0 verifies that detaching open upvalues on
+// coroutine suspend/error breaks strong upvalue->Thread edges in Tier 0 so unreachable
+// coroutines and unrelated locals/arguments are reclaimed by Go's GC without State.CollectFull,
+// while live closures, debug.getlocal/setlocal, resume mutations, and <close> vars remain exact.
+func TestUnreachableSuspendedCoroutineReclaimedInTier0(t *testing.T) {
+	t.Run("reclaim_suspended_coro_keep_closure_live", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+
+		var wp weak.Pointer[vm.Table]
+		func() {
+			cl, err := s.LoadChunk([]byte(`
+				local big = { payload = string.rep("x", 65536) }
+				local co = coroutine.create(function(b)
+					local small = 41
+					coroutine.yield(function()
+						small = small + 1
+						return small
+					end)
+					return b
+				end)
+				local ok, fn = coroutine.resume(co, big)
+				assert(ok and type(fn) == "function")
+				FN = fn
+				return big
+			`), "=unreach_coro")
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := s.Call(cl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wp = weak.Make(res[0].AsTable())
+			res[0] = vm.NilValue()
+		}()
+
+		reclaimed := false
+		for range 10 {
+			runtime.GC()
+			if wp.Value() == nil {
+				reclaimed = true
+				break
+			}
+		}
+		if !reclaimed {
+			t.Fatalf("unreachable suspended coroutine retained unrelated argument in Tier 0 via escaped closure upvalue")
+		}
+
+		// The escaped closure must remain fully functional after its owning coroutine was collected.
+		check, err := s.LoadChunk([]byte(`
+			assert(FN() == 42)
+			assert(FN() == 43)
+		`), "=check_fn")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Call(check); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("suspended_upval_mutations_debug_and_tbc_close", func(t *testing.T) {
+		src := `
+local co = coroutine.create(function()
+	local x = 10
+	coroutine.yield(function(v)
+		if v ~= nil then x = v end
+		return x
+	end)
+	return x
+end)
+local ok, fn = coroutine.resume(co)
+assert(ok and fn() == 10)
+assert(fn(25) == 25)
+local name, val = debug.getlocal(co, 1, 1)
+assert(name == "x" and val == 25, "getlocal expected 25, got " .. tostring(val))
+assert(debug.setlocal(co, 1, 1, 99) == "x")
+assert(fn() == 99, "closure should observe debug.setlocal")
+local ok2, finalX = coroutine.resume(co)
+assert(ok2 and finalX == 99 and fn() == 99)
+
+-- TBC <close> variable also captured as an upvalue must still run __close on coroutine.close(co).
+local closed = 0
+local co2 = coroutine.create(function()
+	local res <close> = setmetatable({ tag = "tbc" }, {
+		__close = function(self) closed = closed + 1; assert(self.tag == "tbc") end
+	})
+	coroutine.yield(function() return res.tag end)
+end)
+local ok3, fn2 = coroutine.resume(co2)
+assert(ok3 and fn2() == "tbc")
+assert(coroutine.close(co2) == true)
+assert(closed == 1 and fn2() == "tbc")
+print("ok")
+`
+		got := runMoeLua(t, src)
+		if got != "ok\n" {
+			t.Fatalf("unexpected output: %q", got)
+		}
+		if hasCLua55(t) {
+			if want := runCLua55(t, src); got != want {
+				t.Fatalf("mismatch vs C Lua 5.5.1: want %q got %q", want, got)
+			}
+		}
+	})
+}
+
+// TestDebugGetInfoRootsInfoTableAcrossActivelinesMemLimit verifies that debug.getinfo(f, "SLufn")
+// keeps the partially constructed info table rooted across emergency GC while building activelines,
+// so succeeding calls never exceed the configured memory limit after rooting the returned table.
+func TestDebugGetInfoRootsInfoTableAcrossActivelinesMemLimit(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("local function big(x)\n")
+	for range 1000 {
+		b.WriteString("  x = x + 1\n")
+	}
+	b.WriteString("  return x\nend\nBIGFN = big\n")
+
+	s := vm.NewState()
+	defer s.Close()
+	setup, err := s.LoadChunk([]byte(b.String()), "=bigfn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(setup); err != nil {
+		t.Fatal(err)
+	}
+	caller, err := s.LoadChunk([]byte(`RES = debug.getinfo(BIGFN, "SLufn")`), "=getinfo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.SetMemoryLimit(64 << 20)
+	s.CollectFull()
+	baseMem := s.MemoryUsage()
+
+	// Sweep tight headrooms around the info+activelines allocation size: if debug.getinfo succeeds,
+	// its retained RES table MUST fit within limit after a full collection.
+	for _, headroom := range []int64{1024, 2048, 3000, 4096, 6144, 8192} {
+		s.SetGlobal("RES", vm.NilValue())
+		s.SetMemoryLimit(64 << 20)
+		s.CollectFull()
+		baseMem = s.MemoryUsage()
+
+		limit := baseMem + headroom
+		s.SetMemoryLimit(limit)
+		_, callErr := s.Call(caller)
+		if callErr == nil {
+			s.CollectFull()
+			after := s.MemoryUsage()
+			if after > limit {
+				t.Fatalf("headroom=%d: debug.getinfo succeeded but rooted result uses %d bytes > limit %d (delta=%d)",
+					headroom, after, limit, after-baseMem)
+			}
+		}
+	}
+}
+
+// TestYieldablePairsInTailProtectedAndCoroCalls verifies that yielding __pairs metamethods
+// (Lua closures, callable tables, and native coroutine.yield) suspend cleanly across direct calls,
+// tail calls, pcall/xpcall, and coroutine.create(pairs), normalizing results to exactly 4 values.
+func TestYieldablePairsInTailProtectedAndCoroCalls(t *testing.T) {
+	src := `
+local t = setmetatable({}, {
+	__pairs = function(self)
+		local x = coroutine.yield("from_pairs")
+		return x, self, 1, 2, 3, 4
+	end
+})
+local ct = setmetatable({}, {
+	__pairs = setmetatable({}, {
+		__call = function(_, self)
+			local x = coroutine.yield("from_callable_pairs")
+			return x, self
+		end
+	})
+})
+local nt = setmetatable({}, { __pairs = coroutine.yield })
+
+local function run2(co, a, b)
+	local r1 = table.pack(coroutine.resume(co, a))
+	local r2 = table.pack(coroutine.resume(co, b))
+	return r1, r2
+end
+
+local r1, r2 = run2(coroutine.create(function() return pairs(t) end), nil, "iter_tail")
+assert(r1[1] == true and r1[2] == "from_pairs")
+assert(r2.n == 5 and r2[1] == true and r2[2] == "iter_tail" and r2[3] == t and r2[4] == 1 and r2[5] == 2)
+
+local p1, p2 = run2(coroutine.create(function() return pcall(pairs, t) end), nil, "iter_pcall")
+assert(p1[1] == true and p1[2] == "from_pairs")
+assert(p2.n == 6 and p2[1] == true and p2[2] == true and p2[3] == "iter_pcall" and p2[4] == t and p2[5] == 1 and p2[6] == 2)
+
+local x1, x2 = run2(coroutine.create(function() return xpcall(pairs, tostring, t) end), nil, "iter_xpcall")
+assert(x1[1] == true and x1[2] == "from_pairs")
+assert(x2.n == 6 and x2[1] == true and x2[2] == true and x2[3] == "iter_xpcall" and x2[4] == t and x2[5] == 1 and x2[6] == 2)
+
+local c1, c2 = run2(coroutine.create(pairs), t, "iter_coro")
+assert(c1[1] == true and c1[2] == "from_pairs")
+assert(c2.n == 5 and c2[1] == true and c2[2] == "iter_coro" and c2[3] == t and c2[4] == 1 and c2[5] == 2)
+
+local k1, k2 = run2(coroutine.create(function() return pairs(ct) end), nil, "iter_call")
+assert(k1[1] == true and k1[2] == "from_callable_pairs")
+assert(k2.n == 5 and k2[1] == true and k2[2] == "iter_call" and k2[3] == ct and k2[4] == nil and k2[5] == nil)
+
+local n1, n2 = run2(coroutine.create(function() return pcall(pairs, nt) end), nil, "iter_native")
+assert(n1[1] == true and n1[2] == nt)
+assert(n2.n == 6 and n2[1] == true and n2[2] == true and n2[3] == "iter_native" and n2[4] == nil and n2[5] == nil and n2[6] == nil)
+
+print("pairs_ok")
+`
+	got := runMoeLua(t, src)
+	if got != "pairs_ok\n" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+	if hasCLua55(t) {
+		if want := runCLua55(t, src); got != want {
+			t.Fatalf("mismatch vs C Lua 5.5.1:\nwant:\n%s\ngot:\n%s", want, got)
+		}
+	}
+}

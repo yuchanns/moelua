@@ -343,6 +343,10 @@ func fillCFrameInfo(s *State, what string, cfunc Value, cname, namewhat string, 
 	if err != nil {
 		return nil, err
 	}
+	if s.memLimit > 0 {
+		ref := s.Ref(TableValue(info))
+		defer s.Unref(ref)
+	}
 	nups := int64(0)
 	if cfunc.IsNative() {
 		nups = int64(nativeUpvalueCount(cfunc.AsNative()))
@@ -507,6 +511,10 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.memLimit > 0 {
+		infoRef := s.Ref(TableValue(info))
+		defer s.Unref(infoRef)
+	}
 	if fn.IsClosure() {
 		p := fn.AsClosure().bp.proto
 		if strings.ContainsRune(what, 'S') {
@@ -577,11 +585,23 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Link activelines onto the rooted info table before populating it so both info
+			// and al remain rooted across any emergency GC triggered while growing al.
+			info.RawSetStr(s, s.intern.Intern("activelines"), TableValue(al))
+			if err := s.ConsumeMemErr(); err != nil {
+				return nil, err
+			}
 			startPC := 0
 			if len(p.Code) > 0 && p.Code[0].Op() == bytecode.OP_VARARGPREP {
 				startPC = 1
 			}
+			cancelFn := s.nativeCancelFunc()
 			for pc := startPC; pc < len(p.LineInfo); pc++ {
+				if cancelFn != nil && pc > startPC && ((pc-startPC)&1023) == 0 {
+					if cerr := cancelFn(); cerr != nil {
+						return nil, cerr
+					}
+				}
 				ln := getFuncLine(p, pc)
 				if ln > 0 {
 					al.RawSetInt(s, int64(ln), TrueValue())
@@ -590,7 +610,6 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 					}
 				}
 			}
-			info.RawSetStr(s, s.intern.Intern("activelines"), TableValue(al))
 		}
 	} else {
 		// Native Go function
@@ -1016,9 +1035,9 @@ func nativeDebugGetLocal(s *State, args []Value) ([]Value, error) {
 		return []Value{NilValue()}, nil
 	}
 	if name, ok := findLocalName(p, int(idx), pc); ok {
-		return []Value{StringValue(s.intern.Intern(name)), th.stack[cf.base+int(idx)-1]}, nil
+		return []Value{StringValue(s.intern.Intern(name)), th.localSlotValue(cf.base + int(idx) - 1)}, nil
 	}
-	return []Value{StringValue(s.intern.Intern("(temporary)")), th.stack[cf.base+int(idx)-1]}, nil
+	return []Value{StringValue(s.intern.Intern("(temporary)")), th.localSlotValue(cf.base + int(idx) - 1)}, nil
 }
 
 func nativeDebugSetLocal(s *State, args []Value) ([]Value, error) {
@@ -1070,7 +1089,7 @@ func nativeDebugSetLocal(s *State, args []Value) ([]Value, error) {
 	if idx < 1 || idx > int64(limit) {
 		return []Value{NilValue()}, nil
 	}
-	th.stack[cf.base+int(idx)-1] = rest[2]
+	th.setLocalSlotValue(cf.base+int(idx)-1, rest[2])
 	pc := cf.pc
 	if !cf.atCurrentPC && pc > 0 {
 		pc--

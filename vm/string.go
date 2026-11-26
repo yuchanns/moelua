@@ -100,6 +100,27 @@ var tmNames = [tmCount]string{
 
 const strHashCancelChunk = 4096
 const strCmpCancelChunk = 65536
+const strCloneCancelChunk = 65536
+
+// cloneStringWithCancel clones src while polling execution controls every 64 KiB
+// when a context deadline or instruction budget is active.
+func (s *State) cloneStringWithCancel(src string) (string, error) {
+	cancelFn := s.nativeCancelFunc()
+	if cancelFn == nil || len(src) <= strCloneCancelChunk {
+		return strings.Clone(src), nil
+	}
+	var sb strings.Builder
+	for off := 0; off < len(src); off += strCloneCancelChunk {
+		if off > 0 {
+			if err := cancelFn(); err != nil {
+				return "", err
+			}
+		}
+		end := min(off+strCloneCancelChunk, len(src))
+		sb.WriteString(src[off:end])
+	}
+	return sb.String(), nil
+}
 
 // compareStrings compares two Lua strings lexicographically (matching Lua's l_strcmp),
 // polling State execution controls every 64 KiB for long strings with shared prefixes.

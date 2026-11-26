@@ -270,10 +270,69 @@ func (th *Thread) closeUpvals(level int) {
 	for th.openUpvals != nil && th.openUpvals.stackIdx >= level {
 		uv := th.openUpvals
 		th.openUpvals = uv.next
-		uv.closed = th.stack[uv.stackIdx]
-		uv.owner = nil
+		if uv.owner == th {
+			uv.closed = th.stack[uv.stackIdx]
+			uv.owner = nil
+		}
 		uv.next = nil
 	}
+}
+
+// detachOpenUpvals snapshots open upvalues into uv.closed, clears uv.owner = nil, and
+// nils the shadowed stack slot while keeping th.openUpvals intact. Breaking strong
+// uv -> Thread edges while a coroutine is suspended or errored lets Go's Tier 0 GC
+// reclaim unreachable coroutines and unrelated locals/arguments even if escaped closures
+// survive.
+func (th *Thread) detachOpenUpvals() {
+	for uv := th.openUpvals; uv != nil; uv = uv.next {
+		if uv.owner == th {
+			uv.closed = th.stack[uv.stackIdx]
+			th.stack[uv.stackIdx] = NilValue()
+			uv.owner = nil
+		}
+	}
+}
+
+// attachOpenUpvals re-attaches detached open upvalues back to th.stack when a suspended
+// coroutine resumes (or before closing TBC vars), syncing any mutations written to
+// uv.closed while suspended.
+func (th *Thread) attachOpenUpvals() {
+	for uv := th.openUpvals; uv != nil; uv = uv.next {
+		if uv.owner == nil {
+			th.stack[uv.stackIdx] = uv.closed
+			uv.closed = NilValue()
+			uv.owner = th
+		}
+	}
+}
+
+// localSlotValue reads th.stack[slot], transparently consulting detached open upvalues
+// on suspended or errored coroutines.
+func (th *Thread) localSlotValue(slot int) Value {
+	for uv := th.openUpvals; uv != nil && uv.stackIdx >= slot; uv = uv.next {
+		if uv.stackIdx == slot {
+			if uv.owner == nil {
+				return uv.closed
+			}
+			break
+		}
+	}
+	return th.stack[slot]
+}
+
+// setLocalSlotValue writes val to th.stack[slot], updating detached open upvalues on
+// suspended or errored coroutines so live escaped closures observe debug.setlocal writes.
+func (th *Thread) setLocalSlotValue(slot int, val Value) {
+	for uv := th.openUpvals; uv != nil && uv.stackIdx >= slot; uv = uv.next {
+		if uv.stackIdx == slot {
+			if uv.owner == nil {
+				uv.closed = val
+				return
+			}
+			break
+		}
+	}
+	th.stack[slot] = val
 }
 
 // markTBC marks th.stack[idx] as a <close> to-be-closed variable (OP_TBC / OP_TFORPREP).
@@ -312,6 +371,9 @@ func (th *Thread) discardTBCAtOrAbove(level int) {
 // if __close itself raises an error, the new error replaces errVal while continuing to close remaining TBC vars!
 // Returns (finalErrVal, hasErr, newErrRaisedByClose).
 func (th *Thread) closeAllSync(level int, errVal Value, hasErr bool) (Value, bool, bool) {
+	// Restore any detached open upvalues back onto th.stack before closing so TBC <close>
+	// variables that were also captured by escaped closures remain present in th.stack[idx].
+	th.attachOpenUpvals()
 	th.closeUpvals(level)
 	raised := false
 	prevCur := th.state.cur
@@ -523,6 +585,7 @@ func (th *Thread) clearUnusedRefs() {
 	if liveTop < len(th.stack) {
 		fillNil(th.stack[liveTop:])
 	}
+	th.detachOpenUpvals()
 	th.yieldVals = nil
 	th.yieldedNative = false
 	th.yieldNativeFn = NilValue()

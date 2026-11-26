@@ -2639,6 +2639,10 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 		if err != nil {
 			return nil, err
 		}
+		if s.memLimit > 0 {
+			ref := s.Ref(TableValue(tbl))
+			defer s.Unref(ref)
+		}
 		tbl.RawSetStr(s, s.intern.Intern("year"), IntValue(int64(tm.Year())))
 		tbl.RawSetStr(s, s.intern.Intern("month"), IntValue(int64(tm.Month())))
 		tbl.RawSetStr(s, s.intern.Intern("day"), IntValue(int64(tm.Day())))

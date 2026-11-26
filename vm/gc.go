@@ -768,7 +768,9 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 		if tr.cancelFn != nil && tr.tickCancel() {
 			return
 		}
-		if uv.stackIdx < len(th.stack) {
+		if uv.owner == nil {
+			tr.mark(uv.closed)
+		} else if uv.stackIdx < len(th.stack) {
 			tr.mark(th.stack[uv.stackIdx])
 		}
 		if uv.stackIdx > maxOpenUpvalIdx {

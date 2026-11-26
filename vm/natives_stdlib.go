@@ -51,7 +51,11 @@ func captureToValue(s *State, c luastdlib.CaptureVal, srcLen int) (Value, error)
 	}
 	str := c.Str
 	if len(str) > maxShortStringLen && len(str) < srcLen {
-		str = strings.Clone(str)
+		var err error
+		str, err = s.cloneStringWithCancel(str)
+		if err != nil {
+			return NilValue(), err
+		}
 	}
 	ls, err := s.TryIntern(str)
 	if err != nil {
@@ -516,7 +520,11 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 			case luastdlib.PackString:
 				str := pv.Str
 				if len(str) > maxShortStringLen && len(str) < len(data) {
-					str = strings.Clone(str)
+					var cerr error
+					str, cerr = s.cloneStringWithCancel(str)
+					if cerr != nil {
+						return cerr
+					}
 				}
 				ls, ierr := s.TryIntern(str)
 				if ierr != nil {
@@ -550,7 +558,11 @@ func nativeStringUnpack(s *State, args []Value) ([]Value, error) {
 		case luastdlib.PackString:
 			str := pv.Str
 			if len(str) > maxShortStringLen && len(str) < len(data) {
-				str = strings.Clone(str)
+				var cerr error
+				str, cerr = s.cloneStringWithCancel(str)
+				if cerr != nil {
+					return cerr
+				}
 			}
 			ls, ierr := s.TryIntern(str)
 			if ierr != nil {
