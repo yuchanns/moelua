@@ -194,8 +194,10 @@ func TestCoroutineStackShrinkWithOpenUpvalues(t *testing.T) {
 	defer s.Close()
 
 	cl, err := s.LoadChunk([]byte(`
-		-- Activate Tier 1 GC via a dummy weak table so CollectFull traces and shrinks threads.
+		-- Activate Tier 1 GC via a dummy weak table, then pause automatic debt GC so
+		-- beforeLen is measured deterministically before explicit CollectFull shrinks co.stack.
 		local _ = setmetatable({}, { __mode = "v" })
+		collectgarbage("stop")
 
 		local getter, setter
 		local function deep(n)
