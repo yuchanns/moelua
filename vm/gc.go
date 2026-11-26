@@ -121,6 +121,11 @@ func (s *State) gcAuxBytes(a *arena.Arena, ref arena.ObjRef) int64 {
 		if ap.subRef != arena.NullRef {
 			total += int64(a.SlotSize(ap.subRef))
 		}
+		if int(ap.protoIdx) > 0 && int(ap.protoIdx) < len(s.protos) {
+			if bp := s.protos[ap.protoIdx]; bp != nil {
+				total += bp.goBytes
+			}
+		}
 		return total
 	default:
 		return 0

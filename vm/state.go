@@ -1292,9 +1292,11 @@ func (s *State) bindProtoWithCache(p *bytecode.Proto, longStrs map[string]*LuaSt
 	}
 
 	var ics []ICEntry
+	var icBytes int64
 	if OptimizeEnabled && p.ICCount > 0 {
 		ics = make([]ICEntry, p.ICCount)
 		ap.nIC = uint32(p.ICCount)
+		icBytes = int64(len(ics)) * int64(unsafe.Sizeof(ICEntry{}))
 	}
 
 	var subs []arena.ObjRef
@@ -1316,7 +1318,7 @@ func (s *State) bindProtoWithCache(p *bytecode.Proto, longStrs map[string]*LuaSt
 		}
 	}
 
-	goBytes := protoGoBytes(p)
+	goBytes := protoGoBytes(p) + icBytes
 	bp := &boundProto{
 		proto:     p,
 		insns:     codeOf(p.Code),

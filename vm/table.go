@@ -402,14 +402,18 @@ func (t *Table) hashFindStrSlot(s *State, k *LuaString) (int, bool) {
 	}
 	mask := h.mask
 	idx := k.hash() & mask
-	kv := StringValue(k)
+	hasRef := k.self != arena.NullRef
+	var kv Value
+	if hasRef {
+		kv = StringValue(k)
+	}
 	for {
 		nd := &h.nodes[idx]
 		if !nd.used {
 			return -1, false
 		}
 		if !nd.dead {
-			if nd.key == kv {
+			if hasRef && nd.key == kv {
 				return int(idx), true
 			}
 			if !k.IsShort() && nd.key.IsString() {
@@ -624,14 +628,21 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 			return
 		}
 	}
-	slot, err := t.hashSetChecked(s, StringValue(k), val)
-	if err != nil {
-		s.memExceeded = true
+	if val.IsNil() {
+		// Delete via hashFindStrSlot directly so transient non-Arena long strings
+		// from State.LookupString never enter StringValue(k).
+		if slot, ok := t.hashFindStrSlot(s, k); ok {
+			t.hash.markDead(slot)
+			if s != nil {
+				t.flags |= tblFlagHasDeadKeys
+				s.hasDeadHashKeys = true
+			}
+		}
 		return
 	}
-	if val.IsNil() && slot >= 0 && s != nil {
-		t.flags |= tblFlagHasDeadKeys
-		s.hasDeadHashKeys = true
+	if _, err := t.hashSetChecked(s, StringValue(k), val); err != nil {
+		s.memExceeded = true
+		return
 	}
 }
 

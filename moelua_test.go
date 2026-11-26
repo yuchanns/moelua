@@ -1616,3 +1616,122 @@ func TestStateFormatValueRawEqualAndLuaErrorStability(t *testing.T) {
 		t.Fatalf("LuaError messages corrupted after Close: %q / %q / %q", callErr.Error(), call1Err.Error(), coroErr.Error())
 	}
 }
+
+func TestDeleteLongStringKeyViaLookupString(t *testing.T) {
+	s := moelua.New()
+	defer s.Close()
+
+	longKey := strings.Repeat("k", 64)
+	missingKey := strings.Repeat("m", 64)
+
+	tbl := s.NewTable(0, 4)
+	if err := tbl.SetString(longKey, moelua.Int(123)); err != nil {
+		t.Fatalf("SetString insert: %v", err)
+	}
+	if got := tbl.GetString(longKey); !got.IsInt() || got.Int() != 123 {
+		t.Fatalf("GetString before delete = %v, want 123", got)
+	}
+	// Delete existing >40-byte key through LookupString transient probe.
+	if err := tbl.SetString(longKey, moelua.Nil()); err != nil {
+		t.Fatalf("SetString delete: %v", err)
+	}
+	if got := tbl.GetString(longKey); !got.IsNil() {
+		t.Fatalf("GetString after delete = %v, want nil", got)
+	}
+	// Deleting an absent >40-byte key must be a clean no-op.
+	if err := tbl.SetString(missingKey, moelua.Nil()); err != nil {
+		t.Fatalf("SetString delete missing: %v", err)
+	}
+
+	// Same path through TrySetGlobal and Preload.
+	if err := s.TrySetGlobal(longKey, moelua.Int(456)); err != nil {
+		t.Fatalf("TrySetGlobal insert: %v", err)
+	}
+	if got := s.GetGlobal(longKey); !got.IsInt() || got.Int() != 456 {
+		t.Fatalf("GetGlobal before delete = %v, want 456", got)
+	}
+	if err := s.TrySetGlobal(longKey, moelua.Nil()); err != nil {
+		t.Fatalf("TrySetGlobal delete: %v", err)
+	}
+	if got := s.GetGlobal(longKey); !got.IsNil() {
+		t.Fatalf("GetGlobal after delete = %v, want nil", got)
+	}
+	if err := s.Preload(longKey, func(_ *moelua.State, _ []moelua.Value) ([]moelua.Value, error) {
+		return []moelua.Value{moelua.Bool(true)}, nil
+	}); err != nil {
+		t.Fatalf("Preload insert: %v", err)
+	}
+	if err := s.Preload(longKey, nil); err != nil {
+		t.Fatalf("Preload delete: %v", err)
+	}
+}
+
+func TestRetainedInlineCachesAccountedInMemoryLimit(t *testing.T) {
+	// Generate a chunk with many distinct GETFIELD/SETFIELD IC sites.
+	var sb strings.Builder
+	sb.WriteString("local t = {a=1}\n")
+	for i := range 64 {
+		fmt.Fprintf(&sb, "t.f%d = t.a\n", i)
+	}
+	sb.WriteString("return t.a\n")
+	chunk, err := moelua.Compile("=ic_heavy", sb.String())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	// Verify MemoryUsage grows with retained IC slices and drops when unpinned & collected.
+	s := moelua.New()
+	defer s.Close()
+	s.CollectGarbage()
+	base := s.MemoryUsage()
+
+	var pins []*moelua.Handle
+	for range 20 {
+		fn, err := s.Load(chunk)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		pins = append(pins, s.Pin(fn))
+	}
+	s.CollectGarbage()
+	withPins := s.MemoryUsage()
+	if withPins <= base {
+		t.Fatalf("expected MemoryUsage to grow with retained IC chunks: base=%d withPins=%d", base, withPins)
+	}
+	// Under a tight memory limit just above base, pinning many copies must hit OOM
+	// rather than letting uncounted IC slices exceed the limit.
+	limit := base + (withPins-base)/2
+	sLim := moelua.New(moelua.WithMemoryLimit(limit))
+	defer sLim.Close()
+	var limPins []*moelua.Handle
+	oom := false
+	for range 30 {
+		fn, err := sLim.Load(chunk)
+		if err != nil {
+			if strings.Contains(err.Error(), "not enough memory") {
+				oom = true
+				break
+			}
+			t.Fatalf("unexpected Load error: %v", err)
+		}
+		limPins = append(limPins, sLim.Pin(fn))
+	}
+	if !oom {
+		t.Fatalf("expected OOM loading IC-heavy chunks under limit=%d (usage=%d)", limit, sLim.MemoryUsage())
+	}
+	sLim.CollectGarbage()
+	if usage := sLim.MemoryUsage(); usage > limit {
+		t.Fatalf("retained IC chunks exceeded memory limit: usage=%d limit=%d", usage, limit)
+	}
+	for _, h := range limPins {
+		h.Release()
+	}
+	for _, h := range pins {
+		h.Release()
+	}
+	s.CollectGarbage()
+	afterFree := s.MemoryUsage()
+	if afterFree > base+256 {
+		t.Fatalf("expected IC memory reclaimed after unpinning: base=%d afterFree=%d", base, afterFree)
+	}
+}
