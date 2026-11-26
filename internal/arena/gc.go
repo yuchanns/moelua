@@ -815,11 +815,23 @@ func (c *Collector) markBeingFnz() {
 }
 
 func (c *Collector) abortAtomic(savedGrayAgain []ObjRef) {
-	for _, ref := range savedGrayAgain {
-		if !slices.Contains(c.grayAgain, ref) {
-			c.grayAgain = append(c.grayAgain, ref)
+	requeue := func(list []ObjRef) {
+		for _, ref := range list {
+			c.arena.Header(ref).SetGray()
+			if !slices.Contains(c.grayAgain, ref) {
+				c.grayAgain = append(c.grayAgain, ref)
+			}
 		}
 	}
+	requeue(savedGrayAgain)
+	requeue(c.weak)
+	requeue(c.ephemeron)
+	requeue(c.ephemeronClear)
+	requeue(c.allWeak)
+	c.weak = c.weak[:0]
+	c.ephemeron = c.ephemeron[:0]
+	c.ephemeronClear = c.ephemeronClear[:0]
+	c.allWeak = c.allWeak[:0]
 	c.state = GCSPropagate
 }
 
@@ -1097,6 +1109,9 @@ func (c *Collector) runOneFinalizer() bool {
 
 func (c *Collector) callAllPendingFinalizers() {
 	for c.tobefnz != NullRef && !c.emergency {
+		if c.cancelErr != nil {
+			break
+		}
 		if c.cb.CancelCheck != nil {
 			if err := c.cb.CancelCheck(); err != nil {
 				c.cancelErr = err
@@ -1434,6 +1449,9 @@ func (c *Collector) singleStep(fast bool) int64 {
 		res = gcSweepMax
 	case GCSCallFin:
 		if c.tobefnz != NullRef && !c.emergency {
+			if c.cancelErr != nil {
+				return 0
+			}
 			if c.cb.CancelCheck != nil {
 				if err := c.cb.CancelCheck(); err != nil {
 					c.cancelErr = err
@@ -1668,6 +1686,8 @@ func (c *Collector) FreeAll() {
 			c.callAllPendingFinalizers()
 			return
 		}
+	} else if !wasInFin {
+		c.cancelErr = nil
 	}
 	c.closing = true
 	c.inGC = true

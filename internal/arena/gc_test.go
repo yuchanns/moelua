@@ -1355,4 +1355,141 @@ func TestGCCancelPreservesFinalizersAndLiveObjectsAcrossModes(t *testing.T) {
 			})
 		}
 	})
+
+	t.Run("atomic_abort_requeues_weak_tables_for_subsequent_strong_keys", func(t *testing.T) {
+		a := arena.New()
+		defer a.Close()
+
+		var (
+			weakValRoot arena.ObjRef
+			cancelAfter bool
+		)
+		var c *arena.Collector
+		c = arena.NewCollector(a, arena.Callbacks{
+			MarkAtomicRoots: func(c *arena.Collector) {
+				// Root discovered only during atomic phase (not in savedGrayAgain).
+				c.MarkObject(weakValRoot)
+			},
+			Traverse: func(c *arena.Collector, ref arena.ObjRef) int64 {
+				tbl := arena.As[toyTable](a, ref)
+				if tbl.weak == arena.WeakValues {
+					for i := range tbl.len {
+						c.MarkObject(tbl.entries[i].key)
+					}
+					c.MarkWeakValues(ref, false)
+				}
+				return int64(tbl.len) + 1
+			},
+			AfterGrayAgain: func(c *arena.Collector) {
+				if cancelAfter {
+					c.SetCancelErr(errCanceled)
+				}
+			},
+			FreeObject: func(a *arena.Arena, ref arena.ObjRef) {
+				a.Free(ref)
+			},
+		})
+
+		allocTbl := func(wk arena.WeakKind) arena.ObjRef {
+			ref, err := c.Alloc(int(unsafe.Sizeof(toyTable{})), toyKindTable)
+			if err != nil {
+				t.Fatal(err)
+			}
+			arena.As[toyTable](a, ref).weak = wk
+			return ref
+		}
+		weakValRoot = allocTbl(arena.WeakValues)
+
+		// Drive into atomic where weakValRoot is discovered by MarkAtomicRoots and AfterGrayAgain cancels.
+		cancelAfter = true
+		for range 50 {
+			c.StepBytes(128)
+			if c.HasCancelErr() {
+				break
+			}
+		}
+		if !errors.Is(c.CancelErr(), errCanceled) {
+			t.Fatalf("expected cancel error in AfterGrayAgain")
+		}
+
+		// Mutator inserts a brand-new strong key into the already-gray weak-v table while canceled.
+		newStrongKey := allocTbl(arena.WeakNone)
+		wt := arena.As[toyTable](a, weakValRoot)
+		wt.entries[0] = toyEntry{key: newStrongKey, val: weakValRoot}
+		wt.len = 1
+		c.BarrierBack(weakValRoot) // no-op when weakValRoot is already gray
+
+		// Resume incremental collection -> weakValRoot MUST be re-traversed and keep newStrongKey alive!
+		cancelAfter = false
+		finished := false
+		for range 100 {
+			if c.StepBytes(128) {
+				finished = true
+				break
+			}
+		}
+		if !finished {
+			t.Fatalf("resumed StepBytes did not complete; state=%v", c.State())
+		}
+		if !a.IsLive(weakValRoot) || !a.IsLive(newStrongKey) {
+			t.Fatalf("weak table strong key swept after atomic abort: weakValRoot=%v newStrongKey=%v",
+				a.IsLive(weakValRoot), a.IsLive(newStrongKey))
+		}
+		c.FreeAll()
+	})
+
+	t.Run("generational_finalizer_setCancelErr_stops_draining_remaining_finalizers", func(t *testing.T) {
+		a := arena.New()
+		defer a.Close()
+
+		var (
+			cancelOnFirst = true
+			finOrder      []uint32
+		)
+		var c *arena.Collector
+		c = arena.NewCollector(a, arena.Callbacks{
+			FreeObject: func(a *arena.Arena, ref arena.ObjRef) {
+				a.Free(ref)
+			},
+			RunFinalizer: func(c *arena.Collector, ref arena.ObjRef) {
+				id := arena.As[toyUserdata](a, ref).id
+				finOrder = append(finOrder, id)
+				if cancelOnFirst {
+					c.SetCancelErr(errCanceled)
+				}
+			},
+		})
+
+		c.SetParam(arena.ParamMinorMajor, 0, true) // stay in minor mode across resumed StepBytes
+		c.SetMode(arena.ModeGenMinor)
+		for i := uint32(1); i <= 3; i++ {
+			ref, err := c.Alloc(int(unsafe.Sizeof(toyUserdata{})), toyKindUD)
+			if err != nil {
+				t.Fatal(err)
+			}
+			arena.As[toyUserdata](a, ref).id = i
+			c.RegisterFinalizer(ref)
+		}
+
+		// First minor collection runs only the first (LIFO id=3) finalizer, which calls SetCancelErr.
+		if finished := c.StepBytes(0); finished {
+			t.Fatalf("expected StepBytes to report finished=false after finalizer SetCancelErr")
+		}
+		if !errors.Is(c.CancelErr(), errCanceled) {
+			t.Fatalf("expected cancel error from generational RunFinalizer")
+		}
+		if !slices.Equal(finOrder, []uint32{3}) {
+			t.Fatalf("expected only first finalizer [3] to run before stopping, got %v", finOrder)
+		}
+
+		// Clear cancellation and resume -> remaining finalizers [2, 1] must still run in LIFO order.
+		cancelOnFirst = false
+		if finished := c.StepBytes(0); !finished {
+			t.Fatalf("expected resumed generational StepBytes to finish")
+		}
+		if !slices.Equal(finOrder, []uint32{3, 2, 1}) {
+			t.Fatalf("expected all 3 finalizers in LIFO order [3 2 1], got %v", finOrder)
+		}
+		c.FreeAll()
+	})
 }
