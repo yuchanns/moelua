@@ -514,3 +514,115 @@ func TestTryNewUserdataInitializesUValuesToNil(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestCanceledGCSeparationPreservesAllFinalizers verifies PR #4 Round 38 P2:
+// if a full GC is cancelled mid-Step-3 (finalizer/file separation), no gcFnzed flags
+// are left mutated, so a subsequent uncancelled collection runs 100% of finalizers.
+func TestCanceledGCSeparationPreservesAllFinalizers(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "probe.txt")
+	if err := os.WriteFile(tmpFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewState()
+	defer s.Close()
+	s.SetGlobal("PROBE_PATH", StringValue(s.Intern(tmpFile)))
+	cl, err := s.LoadChunk([]byte(`
+		collectgarbage("stop")
+		TBL_FNZ = 0
+		FILE_FNZ = 0
+		local tmt = { __gc = function() TBL_FNZ = TBL_FNZ + 1 end }
+		local sample = assert(io.open(PROBE_PATH, "r"))
+		local fmt = debug.getmetatable(sample)
+		local origGC = fmt.__gc
+		fmt.__gc = function(f)
+			FILE_FNZ = FILE_FNZ + 1
+			return origGC(f)
+		end
+		sample:close()
+		-- Interleave discarded files and finalizable tables (> 4096 total entries so
+		-- Step 3 hits tickCancel mid-loop under SetInstructionLimit(1)).
+		for i = 1, 50 do
+			assert(io.open(PROBE_PATH, "r"))
+		end
+		for i = 1, 5000 do
+			setmetatable({}, tmt)
+		end
+		for i = 1, 50 do
+			assert(io.open(PROBE_PATH, "r"))
+		end
+	`), "=cancel_gc_sep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(cl); err != nil {
+		t.Fatal(err)
+	}
+
+	// Abort CollectFull mid-way with a 1-instruction budget.
+	s.SetInstructionLimit(1)
+	s.CollectFull()
+
+	// Disable budget and collect cleanly: every single table & file finalizer must run.
+	s.SetInstructionLimit(0)
+	s.CollectFull()
+
+	tblCount := s.GetGlobal("TBL_FNZ").Int()
+	fileCount := s.GetGlobal("FILE_FNZ").Int()
+	if tblCount != 5000 {
+		t.Fatalf("lost table finalizers after cancelled GC separation: got %d, want 5000", tblCount)
+	}
+	// sample + 50 + 50 = 101 files total
+	if fileCount < 100 {
+		t.Fatalf("lost file finalizers after cancelled GC separation: got %d, want >= 100", fileCount)
+	}
+}
+
+// TestCloseAllSyncRootsCallingCoroutine verifies PR #4 Round 38 P1:
+// when a Go-resumed coroutine (reachable only via s.cur) closes another suspended
+// coroutine whose __close runs collectgarbage(), live locals on the calling coroutine's
+// stack are NOT prematurely finalized or collected.
+func TestCloseAllSyncRootsCallingCoroutine(t *testing.T) {
+	s := NewState()
+	defer s.Close()
+	cl, err := s.LoadChunk([]byte(`
+		PREMATURE_GC = false
+		return function()
+			local alive = setmetatable({ tag = "still-alive" }, {
+				__gc = function() PREMATURE_GC = true end,
+			})
+			local coB = coroutine.create(function()
+				local _ <close> = setmetatable({}, {
+					__close = function()
+						collectgarbage("collect")
+					end,
+				})
+				coroutine.yield("ready")
+			end)
+			assert(coroutine.resume(coB))
+			local ok, err = coroutine.close(coB)
+			assert(ok, tostring(err))
+			assert(not PREMATURE_GC, "calling coroutine's live local was finalized during coroutine.close")
+			return alive.tag
+		end
+	`), "=close_roots_caller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Call(cl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coA, err := s.NewThread(res[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Do NOT store coA in globals; resume directly from Go so s.cur is its sole root!
+	out, yielded, err := s.Resume(coA)
+	if err != nil || yielded {
+		t.Fatalf("Resume failed: yielded=%v out=%v err=%v", yielded, out, err)
+	}
+	if len(out) != 1 || !out[0].IsString() || out[0].AsString().S != "still-alive" {
+		t.Fatalf("unexpected coroutine result: %v", out)
+	}
+}
