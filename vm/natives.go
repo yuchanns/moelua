@@ -1575,10 +1575,8 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeTablePack(s *State, args []Value) ([]Value, error) {
-	if s.memLimit > 0 {
-		if err := s.checkMemAndAccount(int64(96 + len(args)*16)); err != nil {
-			return nil, err
-		}
+	if err := s.checkMemAndAccount(int64(96 + len(args)*16)); err != nil {
+		return nil, err
 	}
 	cancelFn := s.nativeCancelFunc()
 	t := s.NewTable(len(args), 1)

@@ -944,6 +944,7 @@ func (s *State) setMetatableOf(v Value, mt *Table) {
 			mt.markProto(s)
 			s.registerFinalizable(v, mt)
 		}
+		s.protoEpoch++
 	case v.IsString():
 		s.stringMeta = mt
 		s.typeMetas[4] = mt
