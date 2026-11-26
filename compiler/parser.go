@@ -122,6 +122,7 @@ func (ls *lexState) codeName(e *expDesc) {
 
 func (fs *funcState) registerLocalVar(varname string) int16 {
 	fs.checkLimit(int(fs.ndebugvars)+1, math.MaxInt16, "local variables")
+	fs.ls.accountMem(32)
 	fs.f.LocVars = append(fs.f.LocVars, bytecode.LocVar{
 		Name:    varname,
 		StartPC: fs.pc,
@@ -138,6 +139,18 @@ func (ls *lexState) newVarKind(name string, hasName bool, kind uint8) int {
 		kind:    kind,
 		name:    name,
 		hasName: hasName,
+	}
+	var charge int64
+	if hasName && len(name) > 0 {
+		charge += int64(len(name))
+	}
+	if !vd.inReg() {
+		charge += 32
+	} else if ls.dyd.actvarN >= len(ls.dyd.actvar) {
+		charge += 40
+	}
+	if charge > 0 {
+		ls.accountMem(charge)
 	}
 	if ls.dyd.actvarN < len(ls.dyd.actvar) {
 		ls.dyd.actvar[ls.dyd.actvarN] = vd
@@ -158,6 +171,7 @@ func (fs *funcState) getLocalVarDesc(vidx int) *varDesc {
 
 func (fs *funcState) regLevel(nvar int) uint8 {
 	for nvar > 0 {
+		fs.ls.tickCancel()
 		nvar--
 		vd := fs.getLocalVarDesc(nvar)
 		if vd.inReg() {
@@ -260,11 +274,13 @@ func (fs *funcState) searchUpvalue(name string) int {
 
 func (fs *funcState) allocUpvalue() *bytecode.UpvalDesc {
 	fs.checkLimit(len(fs.f.Upvalues)+1, maxUpval, "upvalues")
+	fs.ls.accountMem(24)
 	fs.f.Upvalues = append(fs.f.Upvalues, bytecode.UpvalDesc{})
 	return &fs.f.Upvalues[len(fs.f.Upvalues)-1]
 }
 
 func (fs *funcState) newUpvalue(name string, v *expDesc) int {
+	fs.ls.accountMem(int64(len(name)))
 	up := fs.allocUpvalue()
 	prev := fs.prev
 	if v.k == vLocal {
@@ -282,6 +298,7 @@ func (fs *funcState) newUpvalue(name string, v *expDesc) int {
 
 func (fs *funcState) searchVar(n string, v *expDesc) int {
 	for i := int(fs.nactvar) - 1; i >= 0; i-- {
+		fs.ls.tickCancel()
 		vd := fs.getLocalVarDesc(i)
 		if vd.isGlobal() {
 			if !vd.hasName { // collective global *
@@ -433,11 +450,13 @@ func (ls *lexState) closeGoto(g int, label *labelDesc, bup bool) {
 	}
 	fs.patchList(gt.pc, label.pc)
 	copy(ls.dyd.gt[g:], ls.dyd.gt[g+1:])
+	ls.dyd.gt[len(ls.dyd.gt)-1] = labelDesc{}
 	ls.dyd.gt = ls.dyd.gt[:len(ls.dyd.gt)-1]
 }
 
 func (ls *lexState) findLabel(name string, ilb int) *labelDesc {
 	for ; ilb < len(ls.dyd.label); ilb++ {
+		ls.tickCancel()
 		if ls.dyd.label[ilb].name == name {
 			return &ls.dyd.label[ilb]
 		}
@@ -448,6 +467,7 @@ func (ls *lexState) findLabel(name string, ilb int) *labelDesc {
 func (ls *lexState) newLabelEntry(list *[]labelDesc, name string, line, pc int) int {
 	n := len(*list)
 	ls.fs.checkLimit(n+1, math.MaxInt16, "labels/gotos")
+	ls.accountMem(40 + int64(len(name)))
 	*list = append(*list, labelDesc{
 		name:    name,
 		line:    line,
@@ -478,6 +498,7 @@ func (fs *funcState) solveGotos(bl *blockCnt) {
 	outlevel := fs.regLevel(int(bl.nactvar))
 	igt := bl.firstgoto
 	for igt < len(ls.dyd.gt) {
+		ls.tickCancel()
 		gt := &ls.dyd.gt[igt]
 		lb := ls.findLabel(gt.name, bl.firstlabel)
 		if lb != nil {
@@ -489,6 +510,9 @@ func (fs *funcState) solveGotos(bl *blockCnt) {
 			gt.nactvar = bl.nactvar
 			igt++
 		}
+	}
+	if bl.firstlabel < len(ls.dyd.label) {
+		clear(ls.dyd.label[bl.firstlabel:])
 	}
 	ls.dyd.label = ls.dyd.label[:bl.firstlabel]
 }
@@ -516,11 +540,15 @@ func (fs *funcState) leaveBlock() {
 		fs.codeABC(bytecode.OP_CLOSE, int(stklevel), 0, 0)
 	}
 	fs.freereg = stklevel
+	oldActvarN := ls.dyd.actvarN
 	fs.removeVars(int(bl.nactvar))
 	if bl.isloop == 2 {
 		ls.createLabel("break", 0, false)
 	}
 	fs.solveGotos(bl)
+	if ls.dyd.actvarN < oldActvarN {
+		clear(ls.dyd.actvar[ls.dyd.actvarN:oldActvarN])
+	}
 	if bl.previous == nil {
 		if bl.firstgoto < len(ls.dyd.gt) {
 			ls.undefGoto(&ls.dyd.gt[bl.firstgoto])
@@ -531,7 +559,8 @@ func (fs *funcState) leaveBlock() {
 
 func (ls *lexState) addPrototype() *bytecode.Proto {
 	fs := ls.fs
-	fs.checkLimit(len(fs.f.Protos)+1, bytecode.MaxArgBx+1, "functions")
+	fs.checkLimit(len(fs.f.Protos)+1, bytecode.MaxArgBx, "functions")
+	ls.accountMem(8)
 	clp := &bytecode.Proto{}
 	fs.f.Protos = append(fs.f.Protos, clp)
 	return clp
@@ -544,6 +573,7 @@ func (ls *lexState) codeClosure(v *expDesc) {
 }
 
 func (ls *lexState) openFunc(fs *funcState, bl *blockCnt) {
+	ls.accountMem(192)
 	f := fs.f
 	fs.prev = ls.fs
 	fs.ls = ls
@@ -1399,6 +1429,9 @@ func (ls *lexState) localStat() {
 	vd := fs.getLocalVarDesc(vidx)
 	if nvars == nexps && vd.kind == rdkConst {
 		if kval, ok := fs.exp2Const(&e); ok {
+			if kval.Kind == bytecode.ConstString {
+				ls.accountMem(48 + int64(len(kval.Str)))
+			}
 			vd.kind = rdkCTC
 			vd.kVal = kval
 			ls.adjustLocalVars(nvars - 1)

@@ -2,6 +2,7 @@ package compiler
 
 import (
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/yuchanns/moelua/bytecode"
@@ -19,6 +20,8 @@ type config struct {
 	maxRecursion     int
 	skipFileHeader   bool
 	hasSkipHeaderOpt bool
+	checkMem         func(int64) error
+	cancelFn         func() error
 }
 
 // Option configures compilation behavior.
@@ -53,6 +56,23 @@ func MaxRecursionDepth(depth int) Option {
 	}
 }
 
+// WithMemoryCheck registers an optional callback invoked with estimated bytes
+// allocated during compilation (e.g. token buffer, bytecode, and constant pools)
+// so callers can enforce memory limits incrementally while streaming input.
+func WithMemoryCheck(fn func(int64) error) Option {
+	return func(c *config) {
+		c.checkMem = fn
+	}
+}
+
+// WithCancel registers an optional cooperative cancellation callback polled
+// periodically during lexical scanning and compilation.
+func WithCancel(fn func() error) Option {
+	return func(c *config) {
+		c.cancelFn = fn
+	}
+}
+
 // SyntaxError represents a Lua 5.5.1 lexical, syntactic, or semantic compile error.
 type SyntaxError struct {
 	Source string
@@ -75,11 +95,10 @@ func (e *SyntaxError) Error() string {
 }
 
 type compilePanic struct {
-	err *SyntaxError
+	err error
 }
 
-// Compile compiles Lua 5.5.1 source code into a verified PUC-Rio Lua 5.5.1 Proto.
-func Compile(name string, src string, opts ...Option) (proto *bytecode.Proto, err error) {
+func defaultConfig(opts []Option) config {
 	cfg := config{
 		compatGlobal: true,
 		maxRecursion: defaultMaxRecursion,
@@ -89,6 +108,13 @@ func Compile(name string, src string, opts ...Option) (proto *bytecode.Proto, er
 			opt(&cfg)
 		}
 	}
+	return cfg
+}
+
+// Compile compiles Lua 5.5.1 source code into a verified PUC-Rio Lua 5.5.1 Proto
+// using the zero-copy string fast path.
+func Compile(name string, src string, opts ...Option) (proto *bytecode.Proto, err error) {
+	cfg := defaultConfig(opts)
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -103,7 +129,46 @@ func Compile(name string, src string, opts ...Option) (proto *bytecode.Proto, er
 
 	ls := newLexState(name, src, cfg)
 	p := ls.parseMain()
-	if verr := bytecode.Verify(p); verr != nil {
+	var verifyMem func(int64) error
+	if cfg.checkMem != nil {
+		verifyMem = func(extra int64) error {
+			return cfg.checkMem(ls.memUsed + extra)
+		}
+	}
+	if verr := bytecode.VerifyWithControls(p, verifyMem, cfg.cancelFn); verr != nil {
+		return nil, verr
+	}
+	return p, nil
+}
+
+// CompileReader streams Lua 5.5.1 source code from r into a verified PUC-Rio Lua 5.5.1
+// Proto using a ZIO-style chunk buffer without reading the entire input into memory first.
+func CompileReader(name string, r io.Reader, opts ...Option) (proto *bytecode.Proto, err error) {
+	if r == nil {
+		return nil, fmt.Errorf("compile: nil reader")
+	}
+	cfg := defaultConfig(opts)
+
+	defer func() {
+		if r := recover(); r != nil {
+			if cp, ok := r.(compilePanic); ok {
+				proto = nil
+				err = cp.err
+				return
+			}
+			panic(r)
+		}
+	}()
+
+	ls := newLexStateReader(name, r, cfg)
+	p := ls.parseMain()
+	var verifyMem func(int64) error
+	if cfg.checkMem != nil {
+		verifyMem = func(extra int64) error {
+			return cfg.checkMem(ls.memUsed + extra)
+		}
+	}
+	if verr := bytecode.VerifyWithControls(p, verifyMem, cfg.cancelFn); verr != nil {
 		return nil, verr
 	}
 	return p, nil

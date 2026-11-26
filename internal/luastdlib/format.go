@@ -204,35 +204,72 @@ func formatArgToString(arg FormatArg) string {
 	}
 }
 
+func writeStringChunked(b *strings.Builder, s string, cancelFn func() error) error {
+	const copyChunk = 65536
+	if cancelFn == nil || len(s) <= copyChunk {
+		b.WriteString(s)
+		return nil
+	}
+	for off := 0; off < len(s); off += copyChunk {
+		if err := cancelFn(); err != nil {
+			return err
+		}
+		end := min(len(s), off+copyChunk)
+		b.WriteString(s[off:end])
+	}
+	return nil
+}
+
+func hasZeroByteChunked(s string, cancelFn func() error) (bool, error) {
+	const scanChunk = 65536
+	if cancelFn == nil || len(s) <= scanChunk {
+		return strings.IndexByte(s, 0) >= 0, nil
+	}
+	for off := 0; off < len(s); off += scanChunk {
+		if err := cancelFn(); err != nil {
+			return false, err
+		}
+		end := min(len(s), off+scanChunk)
+		if strings.IndexByte(s[off:end], 0) >= 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func writePadded(b *strings.Builder, prefix, body string, width int, flagMinus, flagZero bool) {
+	_ = writePaddedWithCancel(b, prefix, body, width, flagMinus, flagZero, nil)
+}
+
+func writePaddedWithCancel(b *strings.Builder, prefix, body string, width int, flagMinus, flagZero bool, cancelFn func() error) error {
 	total := len(prefix) + len(body)
 	pad := width - total
 	if pad <= 0 {
 		b.WriteString(prefix)
-		b.WriteString(body)
-		return
+		return writeStringChunked(b, body, cancelFn)
 	}
 	if flagMinus {
 		b.WriteString(prefix)
-		b.WriteString(body)
+		if err := writeStringChunked(b, body, cancelFn); err != nil {
+			return err
+		}
 		for i := 0; i < pad; i++ {
 			b.WriteByte(' ')
 		}
-		return
+		return nil
 	}
 	if flagZero {
 		b.WriteString(prefix)
 		for i := 0; i < pad; i++ {
 			b.WriteByte('0')
 		}
-		b.WriteString(body)
-		return
+		return writeStringChunked(b, body, cancelFn)
 	}
 	for i := 0; i < pad; i++ {
 		b.WriteByte(' ')
 	}
 	b.WriteString(prefix)
-	b.WriteString(body)
+	return writeStringChunked(b, body, cancelFn)
 }
 
 func formatInteger(b *strings.Builder, pf parsedFormat, n int64) {
@@ -540,9 +577,42 @@ func formatDecFloat(b *strings.Builder, pf parsedFormat, f float64) {
 	writePadded(b, prefix, body, pf.width, pf.flagMinus, pf.flagZero && !pf.flagMinus)
 }
 
-func addQuotedString(b *strings.Builder, s string) {
+func quotedStringLen(s string, checkCancel func() error) (int, error) {
+	n := 2 // opening and closing quotes
+	for i := 0; i < len(s); i++ {
+		if checkCancel != nil && (i&4095) == 4095 {
+			if err := checkCancel(); err != nil {
+				return 0, err
+			}
+		}
+		c := s[i]
+		if c == '"' || c == '\\' || c == '\n' {
+			n += 2
+		} else if isCntrl(c) {
+			if i+1 < len(s) && isDigit(s[i+1]) {
+				n += 4
+			} else if c >= 100 {
+				n += 4
+			} else if c >= 10 {
+				n += 3
+			} else {
+				n += 2
+			}
+		} else {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func addQuotedString(b *strings.Builder, s string, checkCancel func() error) error {
 	b.WriteByte('"')
 	for i := 0; i < len(s); i++ {
+		if checkCancel != nil && (i&4095) == 4095 {
+			if err := checkCancel(); err != nil {
+				return err
+			}
+		}
 		c := s[i]
 		if c == '"' || c == '\\' || c == '\n' {
 			b.WriteByte('\\')
@@ -561,13 +631,13 @@ func addQuotedString(b *strings.Builder, s string) {
 		}
 	}
 	b.WriteByte('"')
+	return nil
 }
 
-func addLiteral(b *strings.Builder, arg FormatArg, argIdx int) error {
+func addLiteral(b *strings.Builder, arg FormatArg, argIdx int, checkCancel func() error) error {
 	switch arg.Kind {
 	case ArgString:
-		addQuotedString(b, arg.Str)
-		return nil
+		return addQuotedString(b, arg.Str, checkCancel)
 	case ArgInt:
 		if arg.Int == math.MinInt64 {
 			b.WriteString("0x8000000000000000")
@@ -605,17 +675,65 @@ func addLiteral(b *strings.Builder, arg FormatArg, argIdx int) error {
 
 // Format implements Lua 5.5.1 string.format(fmtStr, args...).
 func Format(fmtStr string, args []FormatArg) (string, error) {
+	return FormatWithLimits(fmtStr, args, nil)
+}
+
+// FormatWithLimits implements Lua 5.5.1 string.format(fmtStr, args...) while invoking
+// checkSize(newLen) before growing the output buffer so callers can enforce memory limits
+// before allocating large formatted results.
+func FormatWithLimits(fmtStr string, args []FormatArg, checkSize func(int64) error) (string, error) {
+	return FormatWithControls(fmtStr, args, checkSize, nil)
+}
+
+// FormatWithControls is like FormatWithLimits, additionally polling cancelFn periodically
+// while scanning the format string.
+func FormatWithControls(fmtStr string, args []FormatArg, checkSize func(int64) error, cancelFn func() error) (string, error) {
 	var b strings.Builder
+	checkGrow := func(add int) error {
+		if checkSize == nil || add <= 0 {
+			return nil
+		}
+		return checkSize(int64(b.Len()) + int64(add))
+	}
 	argIdx := 0
 	i := 0
+	var steps int64
 	for i < len(fmtStr) {
+		steps++
+		if cancelFn != nil && (steps&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return "", err
+			}
+		}
 		if fmtStr[i] != lEsc {
-			b.WriteByte(fmtStr[i])
-			i++
+			start := i
+			if cancelFn == nil {
+				for i < len(fmtStr) && fmtStr[i] != lEsc {
+					i++
+				}
+			} else {
+				const litChunk = 65536
+				limit := min(len(fmtStr), i+litChunk)
+				for i < limit && fmtStr[i] != lEsc {
+					i++
+				}
+				if i == limit && i < len(fmtStr) && fmtStr[i] != lEsc {
+					if err := cancelFn(); err != nil {
+						return "", err
+					}
+				}
+			}
+			if err := checkGrow(i - start); err != nil {
+				return "", err
+			}
+			b.WriteString(fmtStr[start:i])
 			continue
 		}
 		i++ // skip '%'
 		if i < len(fmtStr) && fmtStr[i] == lEsc {
+			if err := checkGrow(1); err != nil {
+				return "", err
+			}
 			b.WriteByte(lEsc)
 			i++
 			continue
@@ -647,6 +765,9 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 			if err != nil {
 				return "", err
 			}
+			if err := checkGrow(max(1, pf.width)); err != nil {
+				return "", err
+			}
 			writePadded(&b, "", string([]byte{byte(n)}), pf.width, pf.flagMinus, false)
 
 		case 'd', 'i':
@@ -656,6 +777,9 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 			}
 			n, err := formatArgToInt(arg, argNum)
 			if err != nil {
+				return "", err
+			}
+			if err := checkGrow(max(32, max(pf.width, pf.prec+4))); err != nil {
 				return "", err
 			}
 			formatInteger(&b, pf, n)
@@ -669,6 +793,9 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 			if err != nil {
 				return "", err
 			}
+			if err := checkGrow(max(32, max(pf.width, pf.prec+4))); err != nil {
+				return "", err
+			}
 			formatInteger(&b, pf, n)
 
 		case 'o', 'x', 'X':
@@ -678,6 +805,9 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 			}
 			n, err := formatArgToInt(arg, argNum)
 			if err != nil {
+				return "", err
+			}
+			if err := checkGrow(max(32, max(pf.width, pf.prec+4))); err != nil {
 				return "", err
 			}
 			formatInteger(&b, pf, n)
@@ -691,6 +821,9 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 			if err != nil {
 				return "", err
 			}
+			if err := checkGrow(max(64, max(pf.width, pf.prec+32))); err != nil {
+				return "", err
+			}
 			formatHexFloat(&b, pf, f)
 
 		case 'f', 'e', 'E', 'g', 'G':
@@ -702,7 +835,15 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 			if err != nil {
 				return "", err
 			}
+			if err := checkGrow(max(64, max(pf.width, pf.prec+32))); err != nil {
+				return "", err
+			}
 			formatDecFloat(&b, pf, f)
+			if checkSize != nil {
+				if err := checkSize(int64(b.Len())); err != nil {
+					return "", err
+				}
+			}
 
 		case 'p':
 			pf, err := checkAndParseFormat(form, fmtFlagsC, false)
@@ -715,13 +856,34 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 			} else {
 				ps = "(null)"
 			}
+			if err := checkGrow(max(len(ps), pf.width)); err != nil {
+				return "", err
+			}
 			writePadded(&b, "", ps, pf.width, pf.flagMinus, false)
 
 		case 'q':
 			if len(form) != 2 {
 				return "", errors.New("specifier '%q' cannot have modifiers")
 			}
-			if err := addLiteral(&b, arg, argNum); err != nil {
+			if cancelFn != nil {
+				if err := cancelFn(); err != nil {
+					return "", err
+				}
+			}
+			if checkSize != nil {
+				est := 32
+				if arg.Kind == ArgString {
+					var qerr error
+					est, qerr = quotedStringLen(arg.Str, cancelFn)
+					if qerr != nil {
+						return "", qerr
+					}
+				}
+				if err := checkGrow(est); err != nil {
+					return "", err
+				}
+			}
+			if err := addLiteral(&b, arg, argNum, cancelFn); err != nil {
 				return "", err
 			}
 
@@ -737,9 +899,18 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 				s = formatArgToString(arg)
 			}
 			if len(form) == 2 {
-				b.WriteString(s)
+				if err := checkGrow(len(s)); err != nil {
+					return "", err
+				}
+				if err := writeStringChunked(&b, s, cancelFn); err != nil {
+					return "", err
+				}
 			} else {
-				if strings.IndexByte(s, 0) >= 0 {
+				hasZero, zerr := hasZeroByteChunked(s, cancelFn)
+				if zerr != nil {
+					return "", zerr
+				}
+				if hasZero {
 					return "", fmt.Errorf("bad argument #%d to 'format' (string contains zeros)", argNum)
 				}
 				pf, err := checkAndParseFormat(form, fmtFlagsC, true)
@@ -749,7 +920,12 @@ func Format(fmtStr string, args []FormatArg) (string, error) {
 				if pf.hasPrec && pf.prec < len(s) {
 					s = s[:pf.prec]
 				}
-				writePadded(&b, "", s, pf.width, pf.flagMinus, false)
+				if err := checkGrow(max(len(s), pf.width)); err != nil {
+					return "", err
+				}
+				if err := writePaddedWithCancel(&b, "", s, pf.width, pf.flagMinus, false, cancelFn); err != nil {
+					return "", err
+				}
 			}
 
 		default:

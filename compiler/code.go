@@ -83,6 +83,7 @@ func (fs *funcState) concat(l1 *int, l2 int) {
 	}
 	list := *l1
 	for {
+		fs.ls.tickCancel()
 		next := fs.getJump(list)
 		if next == noJump {
 			break
@@ -147,6 +148,7 @@ func (fs *funcState) patchTestReg(node, reg int) bool {
 
 func (fs *funcState) removeValues(list int) {
 	for list != noJump {
+		fs.ls.tickCancel()
 		fs.patchTestReg(list, noReg)
 		list = fs.getJump(list)
 	}
@@ -154,6 +156,7 @@ func (fs *funcState) removeValues(list int) {
 
 func (fs *funcState) patchListAux(list, vtarget, reg, dtarget int) {
 	for list != noJump {
+		fs.ls.tickCancel()
 		next := fs.getJump(list)
 		if fs.patchTestReg(list, reg) {
 			fs.fixJump(list, vtarget)
@@ -183,6 +186,7 @@ func (fs *funcState) saveLineInfo(line int) {
 		fs.iwthabs++
 	}
 	if needAbs {
+		fs.ls.accountMem(8)
 		f.AbsLineInfo = append(f.AbsLineInfo, bytecode.AbsLineInfo{
 			PC:   int32(pc),
 			Line: int32(line),
@@ -219,6 +223,10 @@ func (fs *funcState) fixLine(line int) {
 }
 
 func (fs *funcState) code(i bytecode.Instruction) int {
+	if fs.ls.checkMem != nil && len(fs.f.Code) == cap(fs.f.Code) {
+		grow := max(cap(fs.f.Code), 8)
+		fs.ls.accountMem(int64(grow) * 5) // 4B Instruction + 1B LineInfo
+	}
 	fs.f.Code = append(fs.f.Code, i)
 	fs.pc++
 	fs.saveLineInfo(fs.ls.lastline)
@@ -311,7 +319,14 @@ func (fs *funcState) freeExps(e1, e2 *expDesc) {
 
 func (fs *funcState) addK(c bytecode.Constant) int {
 	k := len(fs.f.Consts)
-	fs.checkLimit(k+1, bytecode.MaxArgAx+1, "constants")
+	fs.checkLimit(k+1, bytecode.MaxArgAx, "constants")
+	if fs.ls.checkMem != nil {
+		extra := int64(32)
+		if c.Kind == bytecode.ConstString {
+			extra += int64(len(c.Str)) + 48
+		}
+		fs.ls.accountMem(extra)
+	}
 	fs.f.Consts = append(fs.f.Consts, c)
 	return k
 }

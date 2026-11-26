@@ -2,7 +2,9 @@ package compiler
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 )
@@ -99,9 +101,14 @@ type token struct {
 }
 
 type lexState struct {
-	src        string
+	src        string // string fast path (r == nil)
 	pos        int
-	current    int // current byte (0..255) or eoz (-1)
+	r          io.Reader // streaming ZIO path (nil on string fast path)
+	rbuf       []byte    // 4 KiB chunk buffer when r != nil
+	rlen       int       // valid bytes in rbuf[0:rlen]
+	pendingErr error     // deferred non-EOF error from r after draining buffered bytes
+	reof       bool      // true once r has returned io.EOF
+	current    int       // current byte (0..255) or eoz (-1)
 	linenumber int
 	lastline   int
 	t          token
@@ -112,6 +119,10 @@ type lexState struct {
 	compatGlobal bool
 	maxRecursion int
 	nCcalls      int
+	checkMem     func(int64) error
+	memUsed      int64
+	cancelFn     func() error
+	scanSteps    int64
 
 	fs  *funcState
 	dyd dynData
@@ -125,6 +136,8 @@ func newLexState(name string, src string, cfg config) *lexState {
 		source:       name,
 		compatGlobal: cfg.compatGlobal,
 		maxRecursion: cfg.maxRecursion,
+		checkMem:     cfg.checkMem,
+		cancelFn:     cfg.cancelFn,
 		buff:         make([]byte, 0, 64),
 	}
 	ls.lookahead.tok = tkEOS
@@ -146,6 +159,7 @@ func newLexState(name string, src string, cfg config) *lexState {
 		isShebang := ls.pos+1 < len(ls.src) && ls.src[ls.pos+1] == '!'
 		if allowAnyHash || (allowShebang && isShebang) {
 			for ls.pos < len(ls.src) && ls.src[ls.pos] != '\n' {
+				ls.tickCancel()
 				ls.pos++
 			}
 			// Leave the '\n' for the lexer so line 2 stays line 2 (matching luaL_loadfilex).
@@ -156,14 +170,187 @@ func newLexState(name string, src string, cfg config) *lexState {
 	return ls
 }
 
-func (ls *lexState) nextChar() int {
-	if ls.pos >= len(ls.src) {
-		ls.current = eoz
-	} else {
-		ls.current = int(ls.src[ls.pos])
-		ls.pos++
+func newLexStateReader(name string, r io.Reader, cfg config) *lexState {
+	ls := &lexState{
+		r:            r,
+		rbuf:         make([]byte, 4096),
+		linenumber:   1,
+		lastline:     1,
+		source:       name,
+		compatGlobal: cfg.compatGlobal,
+		maxRecursion: cfg.maxRecursion,
+		checkMem:     cfg.checkMem,
+		cancelFn:     cfg.cancelFn,
+		buff:         make([]byte, 0, 64),
 	}
-	return ls.current
+	ls.lookahead.tok = tkEOS
+
+	allowBOM := true
+	allowAnyHash := strings.HasPrefix(name, "@")
+	allowShebang := true
+	if cfg.hasSkipHeaderOpt {
+		allowBOM = cfg.skipFileHeader
+		allowAnyHash = cfg.skipFileHeader
+		allowShebang = cfg.skipFileHeader
+	}
+
+	if allowBOM {
+		ls.ensureStreamBytes(3)
+		if ls.rlen-ls.pos >= 3 && ls.rbuf[ls.pos] == 0xef && ls.rbuf[ls.pos+1] == 0xbb && ls.rbuf[ls.pos+2] == 0xbf {
+			ls.pos += 3
+		}
+	}
+	if allowAnyHash || allowShebang {
+		ls.ensureStreamBytes(2)
+		if ls.pos < ls.rlen && ls.rbuf[ls.pos] == '#' {
+			isShebang := ls.pos+1 < ls.rlen && ls.rbuf[ls.pos+1] == '!'
+			if allowAnyHash || (allowShebang && isShebang) {
+				ls.nextChar()
+				for ls.current != eoz && ls.current != '\n' {
+					ls.nextChar()
+				}
+				return ls
+			}
+		}
+	}
+
+	ls.nextChar()
+	return ls
+}
+
+func (ls *lexState) accountMem(delta int64) {
+	if ls.checkMem == nil || delta <= 0 {
+		return
+	}
+	if err := ls.checkMem(ls.memUsed + delta); err != nil {
+		panic(compilePanic{err: err})
+	}
+	ls.memUsed += delta
+}
+
+func (ls *lexState) tickCancel() {
+	if ls.cancelFn == nil {
+		return
+	}
+	ls.scanSteps++
+	if (ls.scanSteps & 4095) == 0 {
+		if err := ls.cancelFn(); err != nil {
+			panic(compilePanic{err: err})
+		}
+	}
+}
+
+func (ls *lexState) copyTokenBytes(b []byte) string {
+	if ls.checkMem != nil && len(b) > 0 {
+		if err := ls.checkMem(ls.memUsed + int64(len(b)) + 48); err != nil {
+			panic(compilePanic{err: err})
+		}
+	}
+	return string(b)
+}
+
+// ensureStreamBytes fills ls.rbuf until at least need unread bytes are buffered or EOF is reached.
+func (ls *lexState) ensureStreamBytes(need int) {
+	emptyReads := 0
+	for ls.rlen-ls.pos < need && !ls.reof {
+		if ls.pos > 0 {
+			rem := copy(ls.rbuf, ls.rbuf[ls.pos:ls.rlen])
+			ls.pos = 0
+			ls.rlen = rem
+		}
+		if ls.pendingErr != nil {
+			if ls.rlen > 0 {
+				return
+			}
+			err := ls.pendingErr
+			ls.pendingErr = nil
+			panic(compilePanic{err: err})
+		}
+		n, err := ls.r.Read(ls.rbuf[ls.rlen:])
+		if n > 0 {
+			ls.rlen += n
+			emptyReads = 0
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				ls.reof = true
+				return
+			}
+			if ls.rlen-ls.pos > 0 {
+				ls.pendingErr = err
+				return
+			}
+			panic(compilePanic{err: err})
+		}
+		if n == 0 {
+			emptyReads++
+			if emptyReads >= 100 {
+				panic(compilePanic{err: io.ErrNoProgress})
+			}
+		}
+	}
+}
+
+func (ls *lexState) nextChar() int {
+	if ls.cancelFn != nil {
+		ls.tickCancel()
+	}
+	if ls.r == nil {
+		if ls.pos >= len(ls.src) {
+			ls.current = eoz
+		} else {
+			ls.current = int(ls.src[ls.pos])
+			ls.pos++
+		}
+		return ls.current
+	}
+	return ls.nextCharStream()
+}
+
+func (ls *lexState) nextCharStream() int {
+	if ls.pos < ls.rlen {
+		ls.current = int(ls.rbuf[ls.pos])
+		ls.pos++
+		return ls.current
+	}
+	if ls.pendingErr != nil {
+		err := ls.pendingErr
+		ls.pendingErr = nil
+		panic(compilePanic{err: err})
+	}
+	if ls.reof {
+		ls.current = eoz
+		return eoz
+	}
+	emptyReads := 0
+	for {
+		n, err := ls.r.Read(ls.rbuf)
+		if n > 0 {
+			ls.rlen = n
+			ls.pos = 1
+			ls.current = int(ls.rbuf[0])
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					ls.reof = true
+				} else {
+					ls.pendingErr = err
+				}
+			}
+			return ls.current
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				ls.reof = true
+				ls.current = eoz
+				return eoz
+			}
+			panic(compilePanic{err: err})
+		}
+		emptyReads++
+		if emptyReads >= 100 {
+			panic(compilePanic{err: io.ErrNoProgress})
+		}
+	}
 }
 
 func (ls *lexState) currIsNewline() bool {
@@ -171,6 +358,11 @@ func (ls *lexState) currIsNewline() bool {
 }
 
 func (ls *lexState) save(c int) {
+	if ls.checkMem != nil && len(ls.buff) == cap(ls.buff) && cap(ls.buff) >= 1024 {
+		if err := ls.checkMem(ls.memUsed + int64(cap(ls.buff))*2); err != nil {
+			panic(compilePanic{err: err})
+		}
+	}
 	ls.buff = append(ls.buff, byte(c))
 }
 
@@ -332,9 +524,12 @@ func (ls *lexState) readLongString(tok *token, sep int) {
 			if ls.skipSep() == sep {
 				ls.saveAndNext() // skip 2nd ']'
 				if tok != nil {
-					tok.s = string(ls.buff[sep : len(ls.buff)-sep])
+					tok.s = ls.copyTokenBytes(ls.buff[sep : len(ls.buff)-sep])
 				}
 				return
+			}
+			if tok == nil {
+				ls.resetBuffer()
 			}
 		case '\n', '\r':
 			ls.save('\n')
@@ -500,7 +695,7 @@ func (ls *lexState) readString(del int, tok *token) {
 		}
 	}
 	ls.saveAndNext() // skip closing delimiter
-	tok.s = string(ls.buff[1 : len(ls.buff)-1])
+	tok.s = ls.copyTokenBytes(ls.buff[1 : len(ls.buff)-1])
 }
 
 func (ls *lexState) llex(tok *token) int {
@@ -609,13 +804,12 @@ func (ls *lexState) llex(tok *token) int {
 						break
 					}
 				}
-				name := string(ls.buff)
-				if kw, ok := reservedWords[name]; ok {
+				if kw, ok := reservedWords[string(ls.buff)]; ok {
 					if kw != tkGlobal || !ls.compatGlobal {
 						return kw
 					}
 				}
-				tok.s = name
+				tok.s = ls.copyTokenBytes(ls.buff)
 				return tkName
 			}
 			c := ls.current

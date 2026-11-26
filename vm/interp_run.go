@@ -1,0 +1,1115 @@
+//go:build !moeluaregcheck
+
+//go:generate go run ../internal/gen/interpgen
+
+package vm
+
+import (
+	"math"
+	"sync/atomic"
+
+	"github.com/yuchanns/moelua/bytecode"
+)
+
+// frameEnv holds frame metadata in stack memory so Go's register allocator does
+// not spill/reload loop-carried variables across every dispatch back-edge.
+type frameEnv struct {
+	cl         *Closure
+	bp         *boundProto
+	consts     []Value
+	insns      codeWords
+	base       int
+	ci         int
+	entryDepth int
+}
+
+// run executes Lua frames on Thread th's flat call stack until returning below entryDepth.
+// Lua->Lua calls push CallFrames and continue in this single loop (zero Go recursion).
+func (s *State) run(th *Thread, entryDepth int) error {
+	var ev frameEnv
+	ev.entryDepth = entryDepth
+	var regs *[256]Value
+	var pc int
+
+reloadFrame:
+	if th.nframe <= entryDepth {
+		return nil
+	}
+	cf := &th.frames[th.nframe-1]
+	if cf.kind != frameLua || cf.finish != finishNone {
+		done, err := s.prepareLuaFrame(th, entryDepth)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {
+			return s.runHooked(th, entryDepth)
+		}
+		cf = &th.frames[th.nframe-1]
+	}
+	ev.ci = th.nframe - 1
+	ev.cl = cf.cl
+	if cf.cl.bp != ev.bp {
+		ev.bp = cf.cl.bp
+		ev.consts = ev.bp.consts
+		ev.insns = ev.bp.insns
+	}
+	ev.base = cf.base
+	pc = cf.pc
+	regs = th.window(ev.base)
+
+	for {
+		regs = nonNilWindow(regs)
+		w, nextPC := ev.insns.at(pc), pc+1
+		pc = nextPC
+		a := uint8(w >> bytecode.PosA)
+
+		switch bytecode.OpCode(w & 0x7f) {
+		case bytecode.OP_MOVE:
+			regs[a] = regs[uint8(w>>bytecode.PosB)]
+			continue
+
+		case bytecode.OP_LOADI:
+			regs[a].SetInt(int64(w.SBx()))
+			continue
+
+		case bytecode.OP_LOADF:
+			regs[a].SetFloat(float64(w.SBx()))
+			continue
+
+		case bytecode.OP_LOADK:
+			regs[a] = ev.consts[w.Bx()]
+			continue
+
+		case bytecode.OP_LOADFALSE:
+			regs[a].SetBool(false)
+			continue
+
+		case bytecode.OP_LFALSESKIP:
+			regs[a].SetBool(false)
+			pc++
+			continue
+
+		case bytecode.OP_LOADTRUE:
+			regs[a].SetBool(true)
+			continue
+
+		case bytecode.OP_LOADNIL:
+			b := int(uint8(w >> bytecode.PosB))
+			for i := 0; i <= b; i++ {
+				regs[uint8(int(a)+i)].SetNil()
+			}
+			continue
+
+		case bytecode.OP_GETUPVAL:
+			uv := ev.cl.upvals[uint8(w>>bytecode.PosB)]
+			if ow := uv.owner; ow != nil {
+				regs[a] = ow.stack[uv.stackIdx]
+			} else {
+				regs[a] = uv.closed
+			}
+			continue
+
+		case bytecode.OP_SETUPVAL:
+			uv := ev.cl.upvals[uint8(w>>bytecode.PosB)]
+			if ow := uv.owner; ow != nil {
+				ow.stack[uv.stackIdx] = regs[a]
+			} else {
+				uv.closed = regs[a]
+			}
+			continue
+
+		case bytecode.OP_GETTABUP:
+			uv := ev.cl.upvals[uint8(w>>bytecode.PosB)]
+			var tv Value
+			if ow := uv.owner; ow != nil {
+				tv = ow.stack[uv.stackIdx]
+			} else {
+				tv = uv.closed
+			}
+			if tv.IsTable() {
+				t := tv.AsTable()
+				if OptimizeEnabled {
+					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getTabUpFast(t); ok {
+						regs[a] = v
+						continue
+					}
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
+						regs[a] = v
+						continue
+					}
+				}
+			}
+			th.frames[ev.ci].pc = pc
+			pushed, err := s.getTabUpSlow(th, &ev, pc-1, w, regs)
+			if err != nil {
+				return err
+			}
+			if pushed {
+				goto slowReload
+			}
+			goto slowContinue
+
+		case bytecode.OP_GETFIELD:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			if rb.IsTable() {
+				t := rb.AsTable()
+				if OptimizeEnabled {
+					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getFieldFast(t, s.protoEpoch); ok {
+						regs[a] = v
+						continue
+					}
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
+						regs[a] = v
+						continue
+					}
+				}
+			}
+			th.frames[ev.ci].pc = pc
+			pushed, err := s.getFieldSlow(th, &ev, pc-1, w, regs)
+			if err != nil {
+				return err
+			}
+			if pushed {
+				goto slowReload
+			}
+			goto slowContinue
+
+		case bytecode.OP_SETFIELD:
+			ra := regs[a]
+			if ra.IsTable() {
+				t := ra.AsTable()
+				var val Value
+				if w.K() {
+					val = ev.consts[uint8(w>>bytecode.PosC)]
+				} else {
+					val = regs[uint8(w>>bytecode.PosC)]
+				}
+				if OptimizeEnabled {
+					if icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).setFieldFast(t, val, s.protoEpoch) {
+						continue
+					}
+				}
+			}
+			th.frames[ev.ci].pc = pc
+			pushed, err := s.setFieldSlow(th, &ev, pc-1, w, regs)
+			if err != nil {
+				return err
+			}
+			if pushed {
+				goto slowReload
+			}
+			goto slowContinue
+
+		case bytecode.OP_NEWTABLE:
+			if OptimizeEnabled && !s.gc.tier1 && s.memLimit == 0 && !w.K() && w.VC() == 0 && w.VB() <= 2 {
+				t := &Table{shape: s.shapes.root}
+				t.slots = t.inlineSlots[:0]
+				regs[a] = TableValue(t)
+				pc++
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_SELF:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			regs[a+1] = rb
+			if rb.IsTable() {
+				t := rb.AsTable()
+				if OptimizeEnabled {
+					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getFieldFast(t, s.protoEpoch); ok {
+						regs[a] = v
+						continue
+					}
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
+						regs[a] = v
+						continue
+					}
+				}
+			}
+			th.frames[ev.ci].pc = pc
+			pushed, err := s.selfSlow(th, &ev, pc-1, w, regs)
+			if err != nil {
+				return err
+			}
+			if pushed {
+				goto slowReload
+			}
+			goto slowContinue
+
+		case bytecode.OP_GETI:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			if rb.IsTable() {
+				t := rb.AsTable()
+				idx := uint64(int64(uint8(w>>bytecode.PosC)) - 1)
+				if idx < uint64(t.arrLen) {
+					if OptimizeEnabled {
+						if t.arrKind == arrInt {
+							regs[a].SetInt(t.arrIntSlice()[idx])
+							continue
+						}
+						if t.arrKind == arrFloat {
+							regs[a].SetFloat(t.arrFloatSlice()[idx])
+							continue
+						}
+					}
+					if !OptimizeEnabled || t.arrKind == arrGeneric {
+						v := t.arrValSlice()[idx]
+						if !v.IsNil() || t.meta == nil {
+							regs[a] = v
+							continue
+						}
+					}
+				}
+			}
+			th.frames[ev.ci].pc = pc
+			pushed, err := s.getISlow(th, &ev, w, regs)
+			if err != nil {
+				return err
+			}
+			if pushed {
+				goto slowReload
+			}
+			goto slowContinue
+
+		case bytecode.OP_GETTABLE:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			rc := regs[uint8(w>>bytecode.PosC)]
+			if rb.IsTable() && rc.IsInt() {
+				t := rb.AsTable()
+				idx := uint64(rc.Int() - 1)
+				if idx < uint64(t.arrLen) {
+					if OptimizeEnabled {
+						if t.arrKind == arrInt {
+							regs[a].SetInt(t.arrIntSlice()[idx])
+							continue
+						}
+						if t.arrKind == arrFloat {
+							regs[a].SetFloat(t.arrFloatSlice()[idx])
+							continue
+						}
+						if t.arrKind == arrBool {
+							regs[a].SetBool(t.arrBoolSlice()[idx])
+							continue
+						}
+					}
+					if !OptimizeEnabled || t.arrKind == arrGeneric {
+						v := t.arrValSlice()[idx]
+						if !v.IsNil() || t.meta == nil {
+							regs[a] = v
+							continue
+						}
+					}
+				}
+			}
+			th.frames[ev.ci].pc = pc
+			pushed, err := s.getTableSlow(th, &ev, w, regs)
+			if err != nil {
+				return err
+			}
+			if pushed {
+				goto slowReload
+			}
+			goto slowContinue
+
+		case bytecode.OP_SETI:
+			ra := regs[a]
+			if ra.IsTable() {
+				t := ra.AsTable()
+				var val Value
+				if w.K() {
+					val = ev.consts[uint8(w>>bytecode.PosC)]
+				} else {
+					val = regs[uint8(w>>bytecode.PosC)]
+				}
+				idx := uint64(int64(uint8(w>>bytecode.PosB)) - 1)
+				if idx < uint64(t.arrLen) {
+					if OptimizeEnabled && t.flags&tblFlagIsProto == 0 {
+						if t.arrKind == arrInt && val.IsInt() {
+							t.arrIntSlice()[idx] = val.Int()
+							continue
+						}
+						if t.arrKind == arrFloat && val.IsFloat() {
+							t.arrFloatSlice()[idx] = val.Float()
+							continue
+						}
+					}
+					if !OptimizeEnabled || (t.flags&tblFlagIsProto == 0 && t.arrKind == arrGeneric) {
+						arr := t.arrValSlice()
+						if !arr[idx].IsNil() || t.meta == nil {
+							arr[idx] = val
+							continue
+						}
+					}
+				}
+			}
+			th.frames[ev.ci].pc = pc
+			pushed, err := s.setISlow(th, &ev, w, regs)
+			if err != nil {
+				return err
+			}
+			if pushed {
+				goto slowReload
+			}
+			goto slowContinue
+
+		case bytecode.OP_SETTABLE:
+			ra := regs[a]
+			rb := regs[uint8(w>>bytecode.PosB)]
+			if ra.IsTable() && rb.IsInt() {
+				t := ra.AsTable()
+				var val Value
+				if w.K() {
+					val = ev.consts[uint8(w>>bytecode.PosC)]
+				} else {
+					val = regs[uint8(w>>bytecode.PosC)]
+				}
+				idx := uint64(rb.Int() - 1)
+				n := uint64(t.arrLen)
+				if t.flags&tblFlagIsProto == 0 {
+					canAppend := idx == n && n < uint64(t.arrCap) && t.hash == nil && t.meta == nil
+					if OptimizeEnabled {
+						if t.arrKind == arrInt && val.IsInt() {
+							if canAppend {
+								t.arrLen = uint32(n + 1)
+								n++
+							}
+							if idx < n {
+								t.arrIntSlice()[idx] = val.Int()
+								continue
+							}
+						} else if t.arrKind == arrFloat && val.IsFloat() {
+							if canAppend {
+								t.arrLen = uint32(n + 1)
+								n++
+							}
+							if idx < n {
+								t.arrFloatSlice()[idx] = val.Float()
+								continue
+							}
+						} else if t.arrKind == arrBool && val.IsBool() {
+							if canAppend {
+								t.arrLen = uint32(n + 1)
+								n++
+							}
+							if idx < n {
+								t.arrBoolSlice()[idx] = val.IsTrue()
+								continue
+							}
+						}
+					}
+					if !OptimizeEnabled || t.arrKind == arrGeneric {
+						if OptimizeEnabled && canAppend && !val.IsNil() {
+							t.arrLen = uint32(n + 1)
+							n++
+						}
+						if idx < n {
+							arr := t.arrValSlice()
+							if !arr[idx].IsNil() || t.meta == nil {
+								arr[idx] = val
+								continue
+							}
+						}
+					}
+				}
+			}
+			th.frames[ev.ci].pc = pc
+			pushed, err := s.setTableSlow(th, &ev, w, regs)
+			if err != nil {
+				return err
+			}
+			if pushed {
+				goto slowReload
+			}
+			goto slowContinue
+
+		case bytecode.OP_ADDI:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			sc := int64(w.SC())
+			if rb.IsInt() {
+				regs[a].SetInt(rb.Int() + sc)
+				pc++
+				continue
+			}
+			if rb.IsFloat() {
+				regs[a].SetFloat(rb.Float() + float64(sc))
+				pc++
+				continue
+			}
+			continue
+
+		case bytecode.OP_ADDK:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			kc := ev.consts[uint8(w>>bytecode.PosC)]
+			if BothInt(rb, kc) {
+				regs[a].SetInt(rb.Int() + kc.Int())
+				pc++
+				continue
+			}
+			if BothFloat(rb, kc) {
+				regs[a].SetFloat(rb.Float() + kc.Float())
+				pc++
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_SUBK:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			kc := ev.consts[uint8(w>>bytecode.PosC)]
+			if BothInt(rb, kc) {
+				regs[a].SetInt(rb.Int() - kc.Int())
+				pc++
+				continue
+			}
+			if BothFloat(rb, kc) {
+				regs[a].SetFloat(rb.Float() - kc.Float())
+				pc++
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_MULK:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			kc := ev.consts[uint8(w>>bytecode.PosC)]
+			if BothInt(rb, kc) {
+				regs[a].SetInt(rb.Int() * kc.Int())
+				pc++
+				continue
+			}
+			if kc.IsFloat() {
+				if rb.IsFloat() {
+					regs[a].SetFloat(rb.Float() * kc.Float())
+					pc++
+					continue
+				}
+				if rb.IsInt() {
+					regs[a].SetFloat(float64(rb.Int()) * kc.Float())
+					pc++
+					continue
+				}
+			}
+			goto cold
+
+		case bytecode.OP_DIVK:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			kc := ev.consts[uint8(w>>bytecode.PosC)]
+			if BothFloat(rb, kc) {
+				regs[a].SetFloat(rb.Float() / kc.Float())
+				pc++
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_BANDK:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			kc := ev.consts[uint8(w>>bytecode.PosC)]
+			if rb.IsInt() {
+				regs[a].SetInt(rb.Int() & kc.Int())
+				pc++
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_SHRI:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			sc := w.SC()
+			if rb.IsInt() && uint(sc) < 64 {
+				regs[a].SetInt(int64(uint64(rb.Int()) >> uint(sc)))
+				pc++
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_ADD:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			rc := regs[uint8(w>>bytecode.PosC)]
+			if BothInt(rb, rc) {
+				regs[a].SetInt(rb.Int() + rc.Int())
+				pc++
+				continue
+			}
+			if BothFloat(rb, rc) {
+				regs[a].SetFloat(rb.Float() + rc.Float())
+				pc++
+				continue
+			}
+			if rb.IsFloat() && rc.IsInt() {
+				regs[a].SetFloat(rb.Float() + float64(rc.Int()))
+				pc++
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_SUB:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			rc := regs[uint8(w>>bytecode.PosC)]
+			if BothInt(rb, rc) {
+				regs[a].SetInt(rb.Int() - rc.Int())
+				pc++
+				continue
+			}
+			if BothFloat(rb, rc) {
+				regs[a].SetFloat(rb.Float() - rc.Float())
+				pc++
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_MUL:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			rc := regs[uint8(w>>bytecode.PosC)]
+			if BothInt(rb, rc) {
+				regs[a].SetInt(rb.Int() * rc.Int())
+				pc++
+				continue
+			}
+			if BothFloat(rb, rc) {
+				regs[a].SetFloat(rb.Float() * rc.Float())
+				pc++
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_DIV:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			rc := regs[uint8(w>>bytecode.PosC)]
+			if BothFloat(rb, rc) {
+				regs[a].SetFloat(rb.Float() / rc.Float())
+				pc++
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_UNM:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			if rb.IsInt() {
+				regs[a].SetInt(-rb.Int())
+				continue
+			}
+			if rb.IsFloat() {
+				regs[a].SetFloat(-rb.Float())
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_NOT:
+			regs[a].SetBool(regs[uint8(w>>bytecode.PosB)].IsFalsy())
+			continue
+
+		case bytecode.OP_LEN:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			if rb.IsTable() {
+				t := rb.AsTable()
+				if t.meta == nil || s.getTM(t.meta, TMLen).IsNil() {
+					regs[a].SetInt(t.Len())
+					continue
+				}
+			} else if rb.IsString() {
+				regs[a].SetInt(int64(len(rb.AsString().S)))
+				continue
+			}
+			goto cold
+
+		case bytecode.OP_JMP:
+			pc += w.SJ()
+			continue
+
+		case bytecode.OP_EQ:
+			ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
+			var cond bool
+			if BothInt(ra, rb) {
+				cond = ra.Int() == rb.Int()
+			} else if ra.ptr == rb.ptr && (ra.IsNil() || ra.IsBool() || ra.IsString()) {
+				cond = true
+			} else if ra.IsTable() && rb.IsTable() && ra.ptr != rb.ptr {
+				if ra.AsTable().meta != nil || rb.AsTable().meta != nil {
+					goto cold
+				}
+				cond = false
+			} else if ra.IsUserdata() && rb.IsUserdata() && ra.ptr != rb.ptr {
+				goto cold
+			} else if ra.IsString() && rb.IsString() && !ra.AsString().Short {
+				goto cold
+			} else {
+				cond = RawEqual(ra, rb)
+			}
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_LT:
+			ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
+			var cond bool
+			if BothInt(ra, rb) {
+				cond = ra.Int() < rb.Int()
+			} else if BothFloat(ra, rb) {
+				cond = ra.Float() < rb.Float()
+			} else {
+				goto cold
+			}
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_LE:
+			ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
+			var cond bool
+			if BothInt(ra, rb) {
+				cond = ra.Int() <= rb.Int()
+			} else if BothFloat(ra, rb) {
+				cond = ra.Float() <= rb.Float()
+			} else {
+				goto cold
+			}
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_EQK:
+			ra, rb := regs[a], ev.consts[uint8(w>>bytecode.PosB)]
+			if ra.IsString() && rb.IsString() && ra.ptr != rb.ptr && !ra.AsString().Short {
+				goto cold
+			}
+			cond := RawEqual(ra, rb)
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_EQI:
+			ra := regs[a]
+			im := int64(w.SB())
+			var cond bool
+			if ra.IsInt() {
+				cond = ra.Int() == im
+			} else if ra.IsFloat() {
+				cond = ra.Float() == float64(im)
+			}
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_LTI:
+			ra := regs[a]
+			im := int64(w.SB())
+			var cond bool
+			if ra.IsInt() {
+				cond = ra.Int() < im
+			} else if ra.IsFloat() {
+				cond = ra.Float() < float64(im)
+			} else {
+				goto cold
+			}
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_LEI:
+			ra := regs[a]
+			im := int64(w.SB())
+			var cond bool
+			if ra.IsInt() {
+				cond = ra.Int() <= im
+			} else if ra.IsFloat() {
+				cond = ra.Float() <= float64(im)
+			} else {
+				goto cold
+			}
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_GTI:
+			ra := regs[a]
+			im := int64(w.SB())
+			var cond bool
+			if ra.IsInt() {
+				cond = ra.Int() > im
+			} else if ra.IsFloat() {
+				cond = ra.Float() > float64(im)
+			} else {
+				goto cold
+			}
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_GEI:
+			ra := regs[a]
+			im := int64(w.SB())
+			var cond bool
+			if ra.IsInt() {
+				cond = ra.Int() >= im
+			} else if ra.IsFloat() {
+				cond = ra.Float() >= float64(im)
+			} else {
+				goto cold
+			}
+			if cond != w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_TEST:
+			if regs[a].IsFalsy() == w.K() {
+				pc++
+			} else {
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_TESTSET:
+			rb := regs[uint8(w>>bytecode.PosB)]
+			if rb.IsFalsy() == w.K() {
+				pc++
+			} else {
+				regs[a] = rb
+				pc += 1 + ev.insns.at(pc).SJ()
+			}
+			continue
+
+		case bytecode.OP_CALL:
+			fn := regs[a]
+			b := int(uint8(w >> bytecode.PosB))
+			c := int(uint8(w >> bytecode.PosC))
+			nargs := b - 1
+			if b == 0 {
+				nargs = max(0, th.top-(ev.base+int(a)+1))
+			}
+			if fn.IsClosure() {
+				callee := fn.AsClosure()
+				bp := callee.bp
+				if !bp.isVararg && th.nframe < len(th.frames) {
+					funcIdx := ev.base + int(a)
+					newBase := funcIdx + 1
+					need := newBase + int(bp.maxStack) + stackSlack
+					if need <= len(th.stack) {
+						nparams := int(bp.numParams)
+						if nargs < nparams {
+							fillNil(th.stack[newBase+nargs : newBase+nparams])
+						}
+						th.frames[ev.ci].pc = pc
+						newCI := th.nframe
+						nf := &th.frames[newCI]
+						if nf.dirty {
+							*nf = callFrame{}
+						}
+						nf.cl = callee
+						nf.base = newBase
+						nf.funcIdx = funcIdx
+						nf.pc = 0
+						nf.nresults = c - 1
+						th.nframe = newCI + 1
+						ev.ci = newCI
+						ev.cl = callee
+						if bp != ev.bp {
+							ev.bp = bp
+							ev.consts = bp.consts
+							ev.insns = bp.insns
+						}
+						ev.base = newBase
+						pc = 0
+						regs = th.window(newBase)
+						continue
+					}
+				}
+			} else if OptimizeEnabled && fn.IsNative() {
+				nf := fn.AsNative()
+				if nf.Intrinsic != intrNone && (c == 2 || c == 0) && nargs >= 1 {
+					if ok := execIntrinsic1(nf.Intrinsic, regs, a, nargs); ok {
+						if c == 0 {
+							th.top = ev.base + int(a) + 1
+						} else if b == 0 {
+							if end := ev.base + int(ev.bp.maxStack); th.top < end {
+								th.top = end
+							}
+						}
+						continue
+					}
+				}
+			}
+			th.frames[ev.ci].pc = pc
+			pushed, err := s.callSlow(th, &ev, w, int(a), nargs, c-1)
+			if err != nil {
+				return err
+			}
+			if pushed {
+				goto slowReload
+			}
+			goto slowContinue
+
+		case bytecode.OP_RETURN0:
+			nres := th.frames[ev.ci].nresults
+			funcIdx := th.frames[ev.ci].funcIdx
+			th.nframe--
+			if nres > 0 {
+				fillNil(th.stack[funcIdx : funcIdx+nres])
+				th.top = funcIdx + nres
+			} else {
+				th.top = funcIdx
+			}
+			if th.nframe <= entryDepth {
+				return nil
+			}
+			goto reloadFrame
+
+		case bytecode.OP_RETURN1:
+			retVal := regs[a]
+			nres := th.frames[ev.ci].nresults
+			funcIdx := th.frames[ev.ci].funcIdx
+			th.nframe--
+			if nres == 0 {
+				th.top = funcIdx
+			} else {
+				th.stack[funcIdx] = retVal
+				if nres > 1 {
+					fillNil(th.stack[funcIdx+1 : funcIdx+nres])
+					th.top = funcIdx + nres
+				} else {
+					th.top = funcIdx + 1
+				}
+			}
+			if th.nframe <= entryDepth {
+				return nil
+			}
+			goto reloadFrame
+
+		case bytecode.OP_FORLOOP:
+			if regs[a+1].IsInt() {
+				if regs[a].IsInt() && regs[a+2].IsInt() {
+					cnt := uint64(regs[a].Int())
+					if cnt > 0 {
+						regs[a].SetInt(int64(cnt - 1))
+						regs[a+2].SetInt(regs[a+2].Int() + regs[a+1].Int())
+						pc -= w.Bx()
+					}
+				}
+				continue
+			}
+			if regs[a+1].IsFloat() && regs[a].IsFloat() && regs[a+2].IsFloat() {
+				step := regs[a+1].Float()
+				idx := regs[a+2].Float() + step
+				lim := regs[a].Float()
+				if (step > 0 && idx <= lim) || (step <= 0 && idx >= lim) {
+					regs[a+2].SetFloat(idx)
+					pc -= w.Bx()
+				}
+			}
+			continue
+
+		case bytecode.OP_FORPREP:
+			th.frames[ev.ci].pc = pc
+			skip, err := s.forPrepSlow(regs, a)
+			if err != nil {
+				if s.handleError(th, entryDepth, err) {
+					goto slowReload
+				}
+				return err
+			}
+			if skip {
+				pc += w.Bx() + 1
+			}
+			continue
+
+		case bytecode.OP_TFORCALL:
+			fn := regs[a]
+			c := int(uint8(w >> bytecode.PosC))
+			if OptimizeEnabled && fn.IsNative() && fn.AsNative().Intrinsic == intrIPairsIter && regs[a+1].IsTable() {
+				t := regs[a+1].AsTable()
+				if t.meta == nil && regs[a+3].IsInt() {
+					ni := regs[a+3].Int() + 1
+					v := t.RawGetInt(ni)
+					if v.IsNil() {
+						regs[a+3].SetNil()
+					} else {
+						regs[a+3].SetInt(ni)
+						if c >= 2 {
+							regs[a+4] = v
+							for k := 2; k < c; k++ {
+								regs[int(a)+3+k].SetNil()
+							}
+						}
+					}
+					w2 := ev.insns.at(pc)
+					pc++
+					if !regs[a+3].IsNil() {
+						pc -= w2.Bx()
+					}
+					continue
+				}
+			}
+			th.frames[ev.ci].pc = pc
+			pushed, err := s.tforCallSlow(th, &ev, a, c)
+			if err != nil {
+				return err
+			}
+			if pushed {
+				goto slowReload
+			}
+			goto slowContinue
+
+		case bytecode.OP_TFORLOOP:
+			if !regs[a+3].IsNil() {
+				pc -= w.Bx()
+			}
+			continue
+
+		default:
+			goto cold
+		}
+
+	cold:
+		{
+			th.frames[ev.ci].pc = pc
+			action, newPC, err := s.coldOp(th, &ev, pc-1, w, regs, entryDepth)
+			if err != nil {
+				return err
+			}
+			switch action {
+			case coldContinue:
+				pc = newPC
+				goto slowContinue
+			case coldReload:
+				goto slowReload
+			case coldReturn:
+				return nil
+			}
+		}
+		continue
+
+	slowContinue:
+		if (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {
+			th.frames[ev.ci].pc = pc
+			return s.runHooked(th, entryDepth)
+		}
+		regs = th.window(ev.base)
+		continue
+
+	slowReload:
+		if (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {
+			return s.runHooked(th, entryDepth)
+		}
+		goto reloadFrame
+	}
+}
+
+// execIntrinsic1 runs single-result hot stdlib intrinsics directly on registers with zero call/slice overhead.
+func execIntrinsic1(intr uint8, regs *[256]Value, a uint8, nargs int) bool {
+	arg0 := regs[a+1]
+	switch intr {
+	case intrMathFloor:
+		if arg0.IsInt() {
+			regs[a] = arg0
+			return true
+		}
+		if arg0.IsFloat() {
+			fl := math.Floor(arg0.Float())
+			if i, ok := FloatToIntExact(fl); ok {
+				regs[a].SetInt(i)
+			} else {
+				regs[a].SetFloat(fl)
+			}
+			return true
+		}
+	case intrMathCeil:
+		if arg0.IsInt() {
+			regs[a] = arg0
+			return true
+		}
+		if arg0.IsFloat() {
+			cl := math.Ceil(arg0.Float())
+			if i, ok := FloatToIntExact(cl); ok {
+				regs[a].SetInt(i)
+			} else {
+				regs[a].SetFloat(cl)
+			}
+			return true
+		}
+	case intrMathAbs:
+		if arg0.IsInt() {
+			x := arg0.Int()
+			if x < 0 {
+				x = -x
+			}
+			regs[a].SetInt(x)
+			return true
+		}
+		if arg0.IsFloat() {
+			regs[a].SetFloat(math.Abs(arg0.Float()))
+			return true
+		}
+	case intrMathSqrt:
+		if f, ok := arg0.ToFloat(); ok {
+			regs[a].SetFloat(math.Sqrt(f))
+			return true
+		}
+	case intrMathSin:
+		if f, ok := arg0.ToFloat(); ok {
+			regs[a].SetFloat(math.Sin(f))
+			return true
+		}
+	case intrMathCos:
+		if f, ok := arg0.ToFloat(); ok {
+			regs[a].SetFloat(math.Cos(f))
+			return true
+		}
+	case intrRawGet:
+		if nargs >= 2 && arg0.IsTable() {
+			t := arg0.AsTable()
+			k := regs[a+2]
+			if t.hash != nil && k.IsString() {
+				ls := k.AsString()
+				if !ls.Short && len(ls.S) > strHashCancelChunk && atomic.LoadUint32(&ls.Hash) == 0 {
+					return false
+				}
+			}
+			regs[a] = t.RawGet(k)
+			return true
+		}
+	case intrRawLen:
+		if arg0.IsTable() {
+			regs[a].SetInt(arg0.AsTable().Len())
+			return true
+		}
+		if arg0.IsString() {
+			regs[a].SetInt(int64(len(arg0.AsString().S)))
+			return true
+		}
+	case intrStringLen:
+		if arg0.IsString() {
+			regs[a].SetInt(int64(len(arg0.AsString().S)))
+			return true
+		}
+	}
+	return false
+}

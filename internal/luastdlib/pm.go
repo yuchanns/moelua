@@ -540,6 +540,35 @@ func FindWithCancel(s, pattern string, init int, plain bool, checkCancel func() 
 		return 0, 0, nil, false, nil
 	}
 	if plain || !strings.ContainsAny(pattern, specials) {
+		if checkCancel != nil {
+			if err := checkCancel(); err != nil {
+				return 0, 0, nil, false, err
+			}
+			const chunkSize = 65536
+			rem := len(s) - init0
+			if rem > chunkSize && len(pattern) > 0 && len(pattern) < chunkSize {
+				step := chunkSize - (len(pattern) - 1)
+				for pos := init0; pos < len(s); pos += step {
+					if pos > init0 {
+						if err := checkCancel(); err != nil {
+							return 0, 0, nil, false, err
+						}
+					}
+					end := pos + chunkSize
+					if end > len(s) {
+						end = len(s)
+					}
+					if idx := strings.Index(s[pos:end], pattern); idx >= 0 {
+						st := pos + idx
+						return st + 1, st + len(pattern), nil, true, nil
+					}
+					if end == len(s) {
+						return 0, 0, nil, false, nil
+					}
+				}
+				return 0, 0, nil, false, nil
+			}
+		}
 		idx := strings.Index(s[init0:], pattern)
 		if idx < 0 {
 			return 0, 0, nil, false, nil

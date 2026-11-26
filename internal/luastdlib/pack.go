@@ -358,14 +358,27 @@ func Pack(fmtStr string, args ...PackValue) (string, error) {
 // PackWithLimits implements Lua 5.5.1 string.pack with an optional output size-limit
 // callback invoked before appending any bytes to the output buffer.
 func PackWithLimits(fmtStr string, checkSize func(int64) error, args ...PackValue) (string, error) {
+	return PackWithControls(fmtStr, checkSize, nil, args...)
+}
+
+// PackWithControls implements Lua 5.5.1 string.pack with optional output size-limit
+// and cooperative cancellation callbacks polled during format scanning.
+func PackWithControls(fmtStr string, checkSize func(int64) error, cancelFn func() error, args ...PackValue) (string, error) {
 	fmtStr = trimAtNUL(fmtStr)
 	h := initPackHeader()
 	var buf []byte
 	var totalSize uint64
 	argIdx := 0
 	pos := 0
+	var steps int64
 
 	for pos < len(fmtStr) {
+		steps++
+		if cancelFn != nil && (steps&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return "", err
+			}
+		}
 		opt, size, nToAlign, nextPos, err := packGetDetails(&h, totalSize, fmtStr, pos)
 		if err != nil {
 			return "", err
@@ -464,6 +477,9 @@ func PackWithLimits(fmtStr string, checkSize func(int64) error, args ...PackValu
 			}
 			buf = append(buf, s...)
 			if pad := size - uint64(len(s)); pad > 0 {
+				if pad > (1 << 30) {
+					return "", errors.New("result too long")
+				}
 				buf = append(buf, make([]byte, pad)...)
 			}
 
@@ -515,11 +531,24 @@ func PackWithLimits(fmtStr string, checkSize func(int64) error, args ...PackValu
 
 // PackSize implements Lua 5.5.1 string.packsize(fmt).
 func PackSize(fmtStr string) (int64, error) {
+	return PackSizeWithCancel(fmtStr, nil)
+}
+
+// PackSizeWithCancel implements Lua 5.5.1 string.packsize(fmt), polling cancelFn
+// periodically while scanning the format string (including no-output options).
+func PackSizeWithCancel(fmtStr string, cancelFn func() error) (int64, error) {
 	fmtStr = trimAtNUL(fmtStr)
 	h := initPackHeader()
 	var totalSize uint64
 	pos := 0
+	var steps int64
 	for pos < len(fmtStr) {
+		steps++
+		if cancelFn != nil && (steps&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return 0, err
+			}
+		}
 		opt, size, nToAlign, nextPos, err := packGetDetails(&h, totalSize, fmtStr, pos)
 		if err != nil {
 			return 0, err
@@ -540,28 +569,41 @@ func PackSize(fmtStr string) (int64, error) {
 	return int64(totalSize), nil
 }
 
-// Unpack implements Lua 5.5.1 string.unpack(fmt, s [, pos]).
-// init is a 1-based Lua byte position (negative counts from end; 0 clips to 1).
-// Returns the unpacked values and the 1-based index of the first unread byte.
-func Unpack(fmtStr, data string, init int64) ([]PackValue, int64, error) {
+// UnpackEach implements Lua 5.5.1 string.unpack(fmt, s [, pos]), invoking emit(val) for
+// each decoded item without allocating an intermediate []PackValue slice. Decoding stops
+// immediately if emit returns a non-nil error.
+// Returns the 1-based index of the first unread byte.
+func UnpackEach(fmtStr, data string, init int64, emit func(PackValue) error) (int64, error) {
+	return UnpackEachWithCancel(fmtStr, data, init, nil, emit)
+}
+
+// UnpackEachWithCancel is like UnpackEach, additionally polling cancelFn periodically
+// while scanning the format string (including options that emit no values).
+func UnpackEachWithCancel(fmtStr, data string, init int64, cancelFn func() error, emit func(PackValue) error) (int64, error) {
 	fmtStr = trimAtNUL(fmtStr)
 	pos := posrelatI(init, len(data)) - 1
 	if pos > len(data) {
-		return nil, 0, errors.New("initial position out of string")
+		return 0, errors.New("initial position out of string")
 	}
 	h := initPackHeader()
-	var results []PackValue
 	fpos := 0
+	var steps int64
 
 	for fpos < len(fmtStr) {
+		steps++
+		if cancelFn != nil && (steps&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return 0, err
+			}
+		}
 		opt, size, nToAlign, nextPos, err := packGetDetails(&h, uint64(pos), fmtStr, fpos)
 		if err != nil {
-			return nil, 0, err
+			return 0, err
 		}
 		fpos = nextPos
 		rem := uint64(len(data) - pos)
 		if nToAlign > rem || size > rem-nToAlign {
-			return nil, 0, errors.New("data string too short")
+			return 0, errors.New("data string too short")
 		}
 		pos += int(nToAlign)
 
@@ -569,9 +611,11 @@ func Unpack(fmtStr, data string, init int64) ([]PackValue, int64, error) {
 		case kInt, kUint:
 			val, err := unpackIntBytes(data[pos:pos+int(size)], h.isLittle, int(size), opt == kInt)
 			if err != nil {
-				return nil, 0, err
+				return 0, err
 			}
-			results = append(results, PackIntVal(val))
+			if err := emit(PackIntVal(val)); err != nil {
+				return 0, err
+			}
 
 		case kFloat:
 			var bits uint32
@@ -580,7 +624,9 @@ func Unpack(fmtStr, data string, init int64) ([]PackValue, int64, error) {
 			} else {
 				bits = binary.BigEndian.Uint32([]byte(data[pos : pos+4]))
 			}
-			results = append(results, PackFloatVal(float64(math.Float32frombits(bits))))
+			if err := emit(PackFloatVal(float64(math.Float32frombits(bits)))); err != nil {
+				return 0, err
+			}
 
 		case kNumber, kDouble:
 			var bits uint64
@@ -589,31 +635,39 @@ func Unpack(fmtStr, data string, init int64) ([]PackValue, int64, error) {
 			} else {
 				bits = binary.BigEndian.Uint64([]byte(data[pos : pos+8]))
 			}
-			results = append(results, PackFloatVal(math.Float64frombits(bits)))
+			if err := emit(PackFloatVal(math.Float64frombits(bits))); err != nil {
+				return 0, err
+			}
 
 		case kChar:
-			results = append(results, PackStringVal(data[pos:pos+int(size)]))
+			if err := emit(PackStringVal(data[pos : pos+int(size)])); err != nil {
+				return 0, err
+			}
 
 		case kString:
 			rawLen, err := unpackIntBytes(data[pos:pos+int(size)], h.isLittle, int(size), false)
 			if err != nil {
-				return nil, 0, err
+				return 0, err
 			}
 			slen := uint64(rawLen)
 			avail := uint64(len(data) - pos - int(size))
 			if slen > avail {
-				return nil, 0, errors.New("data string too short")
+				return 0, errors.New("data string too short")
 			}
 			start := pos + int(size)
-			results = append(results, PackStringVal(data[start:start+int(slen)]))
+			if err := emit(PackStringVal(data[start : start+int(slen)])); err != nil {
+				return 0, err
+			}
 			pos += int(slen)
 
 		case kZstr:
 			idx := strings.IndexByte(data[pos:], 0)
 			if idx < 0 {
-				return nil, 0, errors.New("unfinished string for format 'z'")
+				return 0, errors.New("unfinished string for format 'z'")
 			}
-			results = append(results, PackStringVal(data[pos:pos+idx]))
+			if err := emit(PackStringVal(data[pos : pos+idx])); err != nil {
+				return 0, err
+			}
 			pos += idx + 1
 
 		case kPaddAlign, kPadding, kNop:
@@ -621,5 +675,20 @@ func Unpack(fmtStr, data string, init int64) ([]PackValue, int64, error) {
 		}
 		pos += int(size)
 	}
-	return results, int64(pos) + 1, nil
+	return int64(pos) + 1, nil
+}
+
+// Unpack implements Lua 5.5.1 string.unpack(fmt, s [, pos]).
+// init is a 1-based Lua byte position (negative counts from end; 0 clips to 1).
+// Returns the unpacked values and the 1-based index of the first unread byte.
+func Unpack(fmtStr, data string, init int64) ([]PackValue, int64, error) {
+	var results []PackValue
+	nextPos, err := UnpackEach(fmtStr, data, init, func(pv PackValue) error {
+		results = append(results, pv)
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return results, nextPos, nil
 }
