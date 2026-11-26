@@ -609,7 +609,7 @@ func (s *State) readBoundedStream(r io.Reader) ([]byte, error) {
 				return nil, merr
 			}
 			if readBytes+int64(n) > (1 << 30) {
-				return nil, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+				return nil, s.memError()
 			}
 			prevStride := readBytes / 4096
 			buf.Write(tmp[:n])
@@ -1560,7 +1560,7 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 	case "full", "line":
 		if sz > maxSetVBufSize {
 			if s.memLimit > 0 {
-				return nil, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+				return nil, s.memError()
 			}
 			return nil, fmt.Errorf("bad argument #3 to 'setvbuf' (buffer size too large)")
 		}
@@ -1872,7 +1872,7 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		const maxReadBytes = int64(1 << 30)
 		if n > maxReadBytes {
 			if s.memLimit > 0 {
-				return NilValue(), false, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+				return NilValue(), false, s.memError()
 			}
 			return NilValue(), false, fmt.Errorf("resulting string too large")
 		}
@@ -3331,7 +3331,7 @@ func (s *State) checkedReplaceSize(src, oldStr, newStr string) (int64, error) {
 	}
 	diff := int64(len(newStr)) - int64(len(oldStr))
 	if diff > 0 && cnt > (math.MaxInt64-baseLen)/diff {
-		return 0, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+		return 0, s.memError()
 	}
 	outLen := baseLen + cnt*diff
 	if s.memLimit > 0 {

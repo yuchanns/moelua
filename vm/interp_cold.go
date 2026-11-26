@@ -283,6 +283,7 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 		return false
 	}
 	var alreadyXPHandled bool
+	isMem := isMemError(err)
 	if le, ok := err.(*LuaError); ok && le.xpHandled {
 		alreadyXPHandled = true
 	} else {
@@ -304,7 +305,8 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 		// If this error is escaping a nested Go->Lua callback (e.g. table.sort/string.gsub)
 		// beneath an enclosing xpcall frame, invoke that xpcall's message handler NOW while
 		// the full nested call stack (including native frames) is still intact (ldebug.c:luaG_errormsg).
-		if !alreadyXPHandled && entryDepth > 0 && th.uncaughtErr == nil {
+		// Per Lua 5.5 §2.3, memory-allocation errors (LUA_ERRMEM) never invoke message handlers.
+		if !alreadyXPHandled && !isMem && entryDepth > 0 && th.uncaughtErr == nil {
 			outerCatch := -1
 			for j := entryDepth - 1; j >= 0; j-- {
 				if th.frames[j].kind == framePCall || th.frames[j].kind == frameXPCall {
@@ -327,7 +329,7 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 	isXP := th.frames[catchIdx].kind == frameXPCall
 	var msgh Value
 	var errVal Value
-	if isXP && !alreadyXPHandled {
+	if isXP && !alreadyXPHandled && !isMem {
 		msgh = th.frames[catchIdx].errFunc
 		// Call xpcall message handler BEFORE unwinding so debug.traceback/getinfo see full stack,
 		// passing raw error value (including nil) per ldebug.c:luaG_errormsg.
@@ -912,7 +914,11 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 				}
 				if next != nil {
 					if (s.memLimit > 0 || s.gc.tier1) && len(t.slots) == cap(t.slots) {
-						if err := s.checkMemAndAccountWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(key), val); err != nil {
+						prevPinned := s.gc.pinnedShape
+						s.gc.pinnedShape = next
+						err := s.checkMemAndAccountWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(key), val)
+						s.gc.pinnedShape = prevPinned
+						if err != nil {
 							return s.catchSlow(th, ev, false, err)
 						}
 					}
@@ -3612,7 +3618,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			t.RawSetInt(s, int64(last+i), th.stack[ev.base+int(a)+i])
 			if s.memExceeded {
 				s.memExceeded = false
-				return coldContinue, pc, &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+				return coldContinue, pc, s.memError()
 			}
 		}
 		return coldContinue, pc, nil

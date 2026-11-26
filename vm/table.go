@@ -671,7 +671,11 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 			}
 			if next != nil {
 				if (s.memLimit > 0 || s.gc.tier1) && len(t.slots) == cap(t.slots) {
-					if err := s.checkMemAndAccountWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(k), val); err != nil {
+					prevPinned := s.gc.pinnedShape
+					s.gc.pinnedShape = next
+					err := s.checkMemAndAccountWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(k), val)
+					s.gc.pinnedShape = prevPinned
+					if err != nil {
 						s.memExceeded = true
 						return
 					}

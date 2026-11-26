@@ -275,6 +275,18 @@ func (s *State) MemoryUsage() int64 {
 	return s.gc.allocBytes + s.gc.tempBytes
 }
 
+func (s *State) memError() *LuaError {
+	return &LuaError{Val: StringValue(s.intern.Intern("not enough memory")), isMemErr: true}
+}
+
+func isMemError(err error) bool {
+	if le, ok := err.(*LuaError); ok && le.isMemErr {
+		return true
+	}
+	var le2 *LuaError
+	return errors.As(err, &le2) && le2.isMemErr
+}
+
 // ConsumeMemErr returns and clears a pending deferred memory-limit error (or uncatchable abort error)
 // from table mutation.
 func (s *State) ConsumeMemErr() error {
@@ -288,7 +300,7 @@ func (s *State) ConsumeMemErr() error {
 	}
 	if s.memExceeded {
 		s.memExceeded = false
-		return &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+		return s.memError()
 	}
 	return nil
 }
@@ -299,7 +311,7 @@ func (s *State) ConsumeMemErr() error {
 func (s *State) checkMem(delta int64) error {
 	const hardSingleAllocLimit = 1 << 30 // 1 GiB single allocation guard against Go OOM fatal
 	if delta < 0 || delta > hardSingleAllocLimit {
-		return &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+		return s.memError()
 	}
 	if s.memLimit > 0 && s.gc.allocBytes+s.gc.tempBytes+delta > s.memLimit {
 		s.collectEmergency()
@@ -307,7 +319,7 @@ func (s *State) checkMem(delta int64) error {
 			return s.abortErr
 		}
 		if s.gc.allocBytes+s.gc.tempBytes+delta > s.memLimit {
-			return &LuaError{Val: StringValue(s.intern.Intern("not enough memory"))}
+			return s.memError()
 		}
 	}
 	return nil
@@ -1171,6 +1183,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			return nil, err
 		}
 		var xpHandled bool
+		isMem := isMemError(err)
 		if le, ok := err.(*LuaError); ok && le.xpHandled {
 			xpHandled = true
 		}
@@ -1178,6 +1191,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		ev, _, raised := th.closeAllSync(funcIdx, ev, true)
 		if raised {
 			xpHandled = false
+			isMem = false
 		}
 		if s.abortErr != nil {
 			uerr := s.abortErr
@@ -1191,7 +1205,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		}
 		th.nframe = entryDepth
 		clearTopStack()
-		return nil, &LuaError{Val: ev, xpHandled: xpHandled}
+		return nil, &LuaError{Val: ev, xpHandled: xpHandled, isMemErr: isMem}
 	}
 	if s.gc.tier1 {
 		s.gcCheckDebt(th.top)

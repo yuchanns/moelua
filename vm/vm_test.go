@@ -2540,3 +2540,127 @@ func TestSetMemoryLimitRecountsExistingAllocations(t *testing.T) {
 		}
 	})
 }
+
+func TestStringFormatLargeStringCancelAndBudget(t *testing.T) {
+	big := strings.Repeat("a", 4*1024*1024)
+	for _, spec := range []string{"%s", "%-10s", "%10s"} {
+		t.Run("limit_"+spec, func(t *testing.T) {
+			s := vm.NewState()
+			defer s.Close()
+			s.SetInstructionLimit(100)
+			strTbl := s.GetGlobal("string").AsTable()
+			fmtFn := strTbl.RawGetStr(s.Intern("format"))
+			_, err := s.Call(fmtFn, vm.StringValue(s.Intern(spec)), vm.StringValue(s.Intern(big)))
+			if !errors.Is(err, vm.ErrInstructionLimit) {
+				t.Fatalf("string.format(%q, 4MiB) expected ErrInstructionLimit, got %v", spec, err)
+			}
+		})
+		t.Run("cancel_"+spec, func(t *testing.T) {
+			s := vm.NewState()
+			defer s.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			s.SetContext(ctx)
+			strTbl := s.GetGlobal("string").AsTable()
+			fmtFn := strTbl.RawGetStr(s.Intern("format"))
+			_, err := s.Call(fmtFn, vm.StringValue(s.Intern(spec)), vm.StringValue(s.Intern(big)))
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("string.format(%q, 4MiB) expected context.Canceled, got %v", spec, err)
+			}
+		})
+	}
+}
+
+func TestShapeTransitionRootsNewShapeAcrossSlotGrowthMemLimit(t *testing.T) {
+	runCase := func(t *testing.T, viaRawSet bool) {
+		for _, headroom := range []int64{64, 128, 160, 200, 256, 320, 400, 512} {
+			s := vm.NewState()
+			defer s.Close()
+			setup, err := s.LoadChunk([]byte(`
+				t = {a = 1, b = 2}
+				function add() t.c = 42 end
+			`), "=shape_root")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Call(setup); err != nil {
+				t.Fatal(err)
+			}
+			s.SetMemoryLimit(64 << 20)
+			s.CollectFull()
+			base := s.MemoryUsage()
+			limit := base + headroom
+			s.SetMemoryLimit(limit)
+
+			var opErr error
+			if viaRawSet {
+				tbl := s.GetGlobal("t").AsTable()
+				k := s.Intern("c")
+				tbl.RawSetStr(s, k, vm.IntValue(42))
+				opErr = s.ConsumeMemErr()
+			} else {
+				addFn := s.GetGlobal("add")
+				_, opErr = s.Call(addFn)
+			}
+			if opErr == nil {
+				s.CollectFull()
+				if used := s.MemoryUsage(); used > limit {
+					t.Fatalf("headroom=%d viaRawSet=%v: assignment succeeded but post-GC live memory %d > limit %d (delta=%d)",
+						headroom, viaRawSet, used, limit, used-base)
+				}
+			}
+		}
+	}
+	t.Run("setfield", func(t *testing.T) { runCase(t, false) })
+	t.Run("rawsetstr", func(t *testing.T) { runCase(t, true) })
+}
+
+func TestXPCallBypassesMessageHandlerOnAllocationError(t *testing.T) {
+	s := vm.NewState()
+	defer s.Close()
+	cl, err := s.LoadChunk([]byte(`
+		local direct_called = false
+		local ok1, err1 = xpcall(function()
+			return string.rep("x", 65536)
+		end, function(e)
+			direct_called = true
+			return 42
+		end)
+		assert(not ok1, "expected allocation error")
+		assert(err1 == "not enough memory", "expected raw 'not enough memory', got: " .. tostring(err1))
+		assert(not direct_called, "xpcall msgh must NOT be called for LUA_ERRMEM")
+
+		local nested_called = false
+		local ok2, err2 = xpcall(function()
+			table.sort({2, 1}, function()
+				return string.rep("x", 65536)
+			end)
+		end, function(e)
+			nested_called = true
+			return 99
+		end)
+		assert(not ok2, "expected nested allocation error")
+		assert(err2 == "not enough memory", "expected raw 'not enough memory' from nested callback, got: " .. tostring(err2))
+		assert(not nested_called, "outer xpcall msgh must NOT be called for nested LUA_ERRMEM")
+
+		-- Contrast: explicit user error("not enough memory") IS LUA_ERRRUN and MUST invoke msgh!
+		local user_called = false
+		local ok3, err3 = xpcall(function()
+			error("not enough memory", 0)
+		end, function(e)
+			user_called = true
+			return "handled:" .. tostring(e)
+		end)
+		assert(not ok3 and user_called and err3 == "handled:not enough memory")
+	`), "=xpcall_errmem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetMemoryLimit(64 << 20)
+	s.CollectFull()
+	base := s.MemoryUsage()
+	s.SetMemoryLimit(base + 16*1024)
+	if _, err := s.Call(cl); err != nil {
+		t.Fatalf("xpcall LUA_ERRMEM contract test failed: %v", err)
+	}
+}

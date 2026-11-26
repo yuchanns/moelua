@@ -204,35 +204,72 @@ func formatArgToString(arg FormatArg) string {
 	}
 }
 
+func writeStringChunked(b *strings.Builder, s string, cancelFn func() error) error {
+	const copyChunk = 65536
+	if cancelFn == nil || len(s) <= copyChunk {
+		b.WriteString(s)
+		return nil
+	}
+	for off := 0; off < len(s); off += copyChunk {
+		if err := cancelFn(); err != nil {
+			return err
+		}
+		end := min(len(s), off+copyChunk)
+		b.WriteString(s[off:end])
+	}
+	return nil
+}
+
+func hasZeroByteChunked(s string, cancelFn func() error) (bool, error) {
+	const scanChunk = 65536
+	if cancelFn == nil || len(s) <= scanChunk {
+		return strings.IndexByte(s, 0) >= 0, nil
+	}
+	for off := 0; off < len(s); off += scanChunk {
+		if err := cancelFn(); err != nil {
+			return false, err
+		}
+		end := min(len(s), off+scanChunk)
+		if strings.IndexByte(s[off:end], 0) >= 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func writePadded(b *strings.Builder, prefix, body string, width int, flagMinus, flagZero bool) {
+	_ = writePaddedWithCancel(b, prefix, body, width, flagMinus, flagZero, nil)
+}
+
+func writePaddedWithCancel(b *strings.Builder, prefix, body string, width int, flagMinus, flagZero bool, cancelFn func() error) error {
 	total := len(prefix) + len(body)
 	pad := width - total
 	if pad <= 0 {
 		b.WriteString(prefix)
-		b.WriteString(body)
-		return
+		return writeStringChunked(b, body, cancelFn)
 	}
 	if flagMinus {
 		b.WriteString(prefix)
-		b.WriteString(body)
+		if err := writeStringChunked(b, body, cancelFn); err != nil {
+			return err
+		}
 		for i := 0; i < pad; i++ {
 			b.WriteByte(' ')
 		}
-		return
+		return nil
 	}
 	if flagZero {
 		b.WriteString(prefix)
 		for i := 0; i < pad; i++ {
 			b.WriteByte('0')
 		}
-		b.WriteString(body)
-		return
+		return writeStringChunked(b, body, cancelFn)
 	}
 	for i := 0; i < pad; i++ {
 		b.WriteByte(' ')
 	}
 	b.WriteString(prefix)
-	b.WriteString(body)
+	return writeStringChunked(b, body, cancelFn)
 }
 
 func formatInteger(b *strings.Builder, pf parsedFormat, n int64) {
@@ -865,9 +902,15 @@ func FormatWithControls(fmtStr string, args []FormatArg, checkSize func(int64) e
 				if err := checkGrow(len(s)); err != nil {
 					return "", err
 				}
-				b.WriteString(s)
+				if err := writeStringChunked(&b, s, cancelFn); err != nil {
+					return "", err
+				}
 			} else {
-				if strings.IndexByte(s, 0) >= 0 {
+				hasZero, zerr := hasZeroByteChunked(s, cancelFn)
+				if zerr != nil {
+					return "", zerr
+				}
+				if hasZero {
 					return "", fmt.Errorf("bad argument #%d to 'format' (string contains zeros)", argNum)
 				}
 				pf, err := checkAndParseFormat(form, fmtFlagsC, true)
@@ -880,7 +923,9 @@ func FormatWithControls(fmtStr string, args []FormatArg, checkSize func(int64) e
 				if err := checkGrow(max(len(s), pf.width)); err != nil {
 					return "", err
 				}
-				writePadded(&b, "", s, pf.width, pf.flagMinus, false)
+				if err := writePaddedWithCancel(&b, "", s, pf.width, pf.flagMinus, false, cancelFn); err != nil {
+					return "", err
+				}
 			}
 
 		default:

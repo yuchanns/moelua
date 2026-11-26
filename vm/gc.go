@@ -79,6 +79,8 @@ type gcState struct {
 	// Host-pinned references (analog of luaL_ref) so Tier 1 marker keeps host-held Lua values alive.
 	pinnedRefs map[int]Value
 	nextRefID  int
+	// Transient shape pinned while table slot growth checks memory limits (may trigger emergency GC).
+	pinnedShape *Shape
 }
 
 const (
@@ -536,6 +538,9 @@ func (tr *gcTracer) markRoots() {
 			return
 		}
 		tr.mark(v)
+	}
+	if s.gc.pinnedShape != nil {
+		tr.markShape(s.gc.pinnedShape)
 	}
 }
 
