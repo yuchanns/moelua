@@ -6732,3 +6732,49 @@ func TestCodexReviewRound32VMRegressions(t *testing.T) {
 		runtime.KeepAlive(s)
 	})
 }
+
+func TestCodexReviewRound34VMRegressions(t *testing.T) {
+	run := func(t *testing.T, src string) []Value {
+		t.Helper()
+		s := NewState()
+		t.Cleanup(s.Close)
+		cl, err := s.LoadChunk([]byte(src), "=round34")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	t.Run("userdata_metatable_change_invalidates_inherited_cache", func(t *testing.T) {
+		res := run(t, `
+local ma = {__index = {x = 1}}
+local mb = {__index = {x = 2}}
+local u = io.stdout
+debug.setmetatable(u, mb)
+debug.setmetatable(u, ma)
+local t = setmetatable({}, {__index = u})
+local function get(t) return t.x end
+for _ = 1, 100 do get(t) end
+debug.setmetatable(u, mb)
+return get(t)`)
+		if len(res) != 1 || !res[0].IsInt() || res[0].Int() != 2 {
+			t.Fatalf("t.x after userdata metatable change = %v, want 2", res)
+		}
+	})
+
+	t.Run("table_pack_drives_automatic_collection_without_limit", func(t *testing.T) {
+		res := run(t, `
+local w = setmetatable({}, {__mode = "v"})
+for i = 1, 100000 do w[i] = table.pack(i) end
+local n = 0
+for _ in pairs(w) do n = n + 1 end
+return n`)
+		if len(res) != 1 || !res[0].IsInt() || res[0].Int() >= 100000 {
+			t.Fatalf("weakly held table.pack results = %v, want automatic collection to clear some", res)
+		}
+	})
+}
