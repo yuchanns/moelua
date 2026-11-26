@@ -626,3 +626,116 @@ func TestCloseAllSyncRootsCallingCoroutine(t *testing.T) {
 		t.Fatalf("unexpected coroutine result: %v", out)
 	}
 }
+
+// TestNumericConcatRespectsMemLimit verifies PR #4 Round 39 P2:
+// numeric operands in OP_CONCAT fast path are included in the memory-limit check.
+func TestNumericConcatRespectsMemLimit(t *testing.T) {
+	s := NewState()
+	defer s.Close()
+	cl, err := s.LoadChunk([]byte(`
+		local n = 9223372036854775807
+		return n..n..n..n..n..n..n..n..n..n..n..n..n..n..n..n..n..n..n..n
+	`), "=num_concat_mem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetMemoryLimit(1 << 30)
+	s.CollectFull()
+	limit := s.MemoryUsage() + 100
+	s.SetMemoryLimit(limit)
+
+	_, err = s.Call(cl)
+	if err == nil || !errors.Is(err, err) || err.Error() != "not enough memory" {
+		t.Fatalf("expected 'not enough memory', got %v", err)
+	}
+	s.CollectFull()
+	if usage := s.MemoryUsage(); usage > limit {
+		t.Fatalf("MemoryUsage=%d exceeded limit=%d", usage, limit)
+	}
+}
+
+// TestIOPopenOOMDoesNotWaitOnLongChild verifies PR #4 Round 39 P2:
+// io.popen and tryNewFileUD OOM error paths terminate any started child before waiting,
+// returning promptly with "not enough memory" instead of blocking until the child finishes.
+func TestIOPopenOOMDoesNotWaitOnLongChild(t *testing.T) {
+	sleepCmd := "sleep 3"
+	if runtime.GOOS == "windows" {
+		sleepCmd = "ping -n 4 127.0.0.1 > NUL"
+	}
+
+	t.Run("io_popen_oom", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cl, err := s.LoadChunk([]byte(fmt.Sprintf(`return io.popen(%q, "r")`, sleepCmd)), "=popen_oom")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetMemoryLimit(1)
+		start := time.Now()
+		_, err = s.Call(cl)
+		elapsed := time.Since(start)
+		if err == nil || err.Error() != "not enough memory" {
+			t.Fatalf("expected 'not enough memory', got %v", err)
+		}
+		if elapsed > time.Second {
+			t.Fatalf("io.popen OOM blocked too long: %v", elapsed)
+		}
+	})
+
+	t.Run("tryNewFileUD_kills_started_child_before_wait", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+		cmd := shellCommand(context.Background(), sleepCmd)
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd.Stdout = pw
+		if err := cmd.Start(); err != nil {
+			_ = pr.Close()
+			_ = pw.Close()
+			t.Fatal(err)
+		}
+		_ = pw.Close()
+
+		s.SetMemoryLimit(1)
+		start := time.Now()
+		_, err = s.tryNewFileUD(&luaFile{f: pr, cmd: cmd})
+		elapsed := time.Since(start)
+		if err == nil || err.Error() != "not enough memory" {
+			t.Fatalf("expected 'not enough memory', got %v", err)
+		}
+		if elapsed > time.Second {
+			t.Fatalf("tryNewFileUD OOM waited for child instead of killing it: %v", elapsed)
+		}
+	})
+}
+
+// TestFormatPLightUserdataLogicalIdentity verifies PR #4 Round 39 P2:
+// string.format("%p", x) formats encoded light userdata (debug.upvalueid tokens and
+// NULL light userdata) using their logical pointer identity rather than the tag sentinel.
+func TestFormatPLightUserdataLogicalIdentity(t *testing.T) {
+	s := NewState()
+	defer s.Close()
+	s.SetGlobal("NULL_LUD", LightUDValue(nil))
+	cl, err := s.LoadChunk([]byte(`
+		local g1 = string.gmatch("a", "a")
+		local g2 = string.gmatch("b", "b")
+		local id1 = debug.upvalueid(g1, 1)
+		local id2 = debug.upvalueid(g2, 1)
+		assert(id1 ~= id2, "distinct gmatch closures must have distinct upvalueid tokens")
+		local p1 = string.format("%p", id1)
+		local p2 = string.format("%p", id2)
+		assert(p1 ~= p2, "distinct upvalueid tokens formatted identically: " .. p1 .. " == " .. p2)
+		assert(tostring(id1) == "userdata: " .. p1, "tostring/format mismatch: " .. tostring(id1) .. " vs " .. p1)
+		assert(tostring(id2) == "userdata: " .. p2, "tostring/format mismatch: " .. tostring(id2) .. " vs " .. p2)
+		assert(string.format("%p", NULL_LUD) == "(null)", "NULL lightud formatted as: " .. string.format("%p", NULL_LUD))
+		return "ok"
+	`), "=fmt_p_lud")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(cl); err != nil {
+		t.Fatal(err)
+	}
+}
