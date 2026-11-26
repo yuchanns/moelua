@@ -141,7 +141,7 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 		th.inHook = false
 	}()
 	if th.hook.IsClosure() {
-		cl := th.hook.AsClosure()
+		cl := s.asClosure(th.hook)
 		p := cl.bp.proto
 		savedTop := th.top
 		base := th.top

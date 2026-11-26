@@ -449,7 +449,7 @@ func (s *State) stringsEqual(a, b *LuaString) (bool, error) {
 // rawEqual implements Lua 5.5 rawequal(a, b) with cooperative cancel polling on long strings.
 func (s *State) rawEqual(a, b Value) (bool, error) {
 	if a.IsString() && b.IsString() {
-		return s.stringsEqual(a.AsString(), b.AsString())
+		return s.stringsEqual(s.asString(a), s.asString(b))
 	}
 	return RawEqual(a, b), nil
 }
@@ -727,7 +727,7 @@ func (s *State) checkTableLongStrProbe(t *Table, ls *LuaString) error {
 			return nil
 		}
 		if nd.key.IsString() {
-			other := nd.key.AsString()
+			other := s.asString(nd.key)
 			if other != ls && !other.IsShort() && other.Len == ls.Len {
 				eq, err := s.stringsEqual(other, ls)
 				if err != nil {
@@ -756,7 +756,7 @@ func (s *State) ensureLookupKeyHash(t *Table, key Value) error {
 	if !key.IsString() {
 		return nil
 	}
-	return s.ensureLookupStrKeyHash(t, key.AsString())
+	return s.ensureLookupStrKeyHash(t, s.asString(key))
 }
 
 func (s *State) ensureWriteStrKeyHash(t *Table, ls *LuaString, valNil bool) error {

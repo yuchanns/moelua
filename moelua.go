@@ -225,7 +225,7 @@ func (s *State) AddSearcher(name string, fn GoFunc) {
 		return
 	}
 	defer s.pinTemps(v)()
-	s.vm.AddSearcher(v.AsNative())
+	s.vm.AddSearcher(s.vm.AsNative(v))
 	_ = s.vm.ConsumeMemErr()
 }
 
@@ -487,8 +487,8 @@ func (s *State) TryNewMetatable(name string) (*Table, bool, error) {
 		return nil, false, err
 	}
 	reg := s.vm.Registry()
-	if existing := reg.RawGetStr(key); existing.IsTable() {
-		return &Table{state: s, raw: existing.AsTable()}, false, nil
+	if existing := reg.RawGetStr(s.vm, key); existing.IsTable() {
+		return &Table{state: s, raw: s.vm.AsTable(existing)}, false, nil
 	}
 	// Root the interned name across the metatable allocation and insertions (emergency GC recount).
 	defer s.pinTemps(vm.StringValue(key))()
@@ -536,8 +536,8 @@ func (s *State) GetMetatableByName(name string) *Table {
 	if !ok {
 		return nil
 	}
-	if existing := s.vm.Registry().RawGetStr(ls); existing.IsTable() {
-		return &Table{state: s, raw: existing.AsTable()}
+	if existing := s.vm.Registry().RawGetStr(s.vm, ls); existing.IsTable() {
+		return &Table{state: s, raw: s.vm.AsTable(existing)}
 	}
 	return nil
 }
@@ -552,7 +552,7 @@ func (s *State) CheckUserdata(v Value, name string) (any, bool) {
 	if mt == nil || s.vm.GetMetatableOf(v) != mt.raw {
 		return nil, false
 	}
-	return s.vm.UserdataData(v.AsUserdata()), true
+	return s.vm.UserdataData(s.vm.AsUserdata(v)), true
 }
 
 // Handle is a GC-anchored host reference to a Lua Value (analogous to luaL_ref).
@@ -801,7 +801,7 @@ func (s *State) ToString(v Value) (string, bool) {
 	if !s.ready() || !v.IsString() {
 		return "", false
 	}
-	return strings.Clone(v.AsString().Str()), true
+	return strings.Clone(s.vm.AsString(v).Str()), true
 }
 
 // Call invokes a Lua function, GoFunc, or callable table/userdata with args.
@@ -920,7 +920,7 @@ func (s *State) TableOf(v Value) *Table {
 	if !s.ready() || !v.IsTable() {
 		return nil
 	}
-	return &Table{state: s, raw: v.AsTable()}
+	return &Table{state: s, raw: s.vm.AsTable(v)}
 }
 
 // Value returns the underlying Lua Value (Nil if t is nil or its State is closed).
@@ -944,7 +944,7 @@ func (t *Table) Len() int64 {
 	if !t.ready() {
 		return 0
 	}
-	return t.raw.Len()
+	return t.raw.Len(t.state.vm)
 }
 
 // Get returns rawget(t, key).
@@ -952,7 +952,7 @@ func (t *Table) Get(key Value) Value {
 	if !t.ready() {
 		return vm.NilValue()
 	}
-	return t.raw.RawGet(key)
+	return t.raw.RawGet(t.state.vm, key)
 }
 
 // Set performs rawset(t, key, val), returning an error if the State is closed, key is invalid,
@@ -975,7 +975,7 @@ func (t *Table) GetInt(i int64) Value {
 	if !t.ready() {
 		return vm.NilValue()
 	}
-	return t.raw.RawGetInt(i)
+	return t.raw.RawGetInt(t.state.vm, i)
 }
 
 // SetInt performs rawset(t, i, val), returning an error if the State is closed or memory limit is exceeded.
@@ -998,7 +998,7 @@ func (t *Table) GetString(key string) Value {
 	if !ok {
 		return vm.NilValue()
 	}
-	return t.raw.RawGetStr(ls)
+	return t.raw.RawGetStr(t.state.vm, ls)
 }
 
 // SetString performs rawset(t, key, val), returning an error if the State is closed or memory limit is exceeded.
@@ -1033,7 +1033,7 @@ func (t *Table) Metatable() *Table {
 	if !t.ready() {
 		return nil
 	}
-	mt := t.raw.Metatable()
+	mt := t.raw.Metatable(t.state.vm)
 	if mt == nil {
 		return nil
 	}
@@ -1054,7 +1054,7 @@ func (t *Table) Next(key Value) (nextKey, nextVal Value, ok bool, err error) {
 	if !t.ready() {
 		return vm.NilValue(), vm.NilValue(), false, ErrStateClosed
 	}
-	nk, nv, err := t.raw.Next(key)
+	nk, nv, err := t.raw.Next(t.state.vm, key)
 	if err != nil {
 		return vm.NilValue(), vm.NilValue(), false, err
 	}
@@ -1129,7 +1129,7 @@ func (s *State) ThreadOf(v Value) *Thread {
 	if !s.ready() || !v.IsThread() {
 		return nil
 	}
-	return &Thread{state: s, raw: v.AsThread()}
+	return &Thread{state: s, raw: s.vm.AsThread(v)}
 }
 
 // Value returns the underlying Lua thread Value (Nil if th is nil or its State is closed).
@@ -1163,7 +1163,7 @@ func (th *Thread) StatusString() string {
 	if !th.ready() {
 		return "dead"
 	}
-	return th.raw.StatusString()
+	return th.raw.StatusString(th.state.vm)
 }
 
 // Resume starts or resumes th with args. When err is nil, yielded is true if th suspended
@@ -1191,7 +1191,7 @@ func (s *State) FormatValue(v Value) string {
 	if !s.ready() {
 		return vm.FormatValue(v)
 	}
-	return s.vm.FormatValue(v)
+	return strings.Clone(s.vm.FormatValue(v))
 }
 
 // RawEqual implements Lua 5.5 rawequal(a, b) for Values owned by s.

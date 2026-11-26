@@ -406,7 +406,7 @@ func TestLua55SemanticParityRegressions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parity regressions failed: %v", err)
 	}
-	if len(res) != 1 || res[0].AsString().Str() != "ok" {
+	if len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 		t.Fatalf("unexpected res: %v", res)
 	}
 
@@ -622,7 +622,7 @@ func TestCloseAllSyncRootsCallingCoroutine(t *testing.T) {
 	if err != nil || yielded {
 		t.Fatalf("Resume failed: yielded=%v out=%v err=%v", yielded, out, err)
 	}
-	if len(out) != 1 || !out[0].IsString() || out[0].AsString().Str() != "still-alive" {
+	if len(out) != 1 || !out[0].IsString() || s.AsString(out[0]).Str() != "still-alive" {
 		t.Fatalf("unexpected coroutine result: %v", out)
 	}
 }

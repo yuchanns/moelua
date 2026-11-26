@@ -134,14 +134,14 @@ reloadFrame:
 				tv = uv.closed
 			}
 			if tv.IsTable() {
-				t := tv.AsTable()
+				t := s.asTable(tv)
 				if OptimizeEnabled {
 					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getTabUpFast(t); ok {
 						regs[a] = v
 						continue
 					}
 				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.IsShort() {
-					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
+					if v := t.RawGetStr(s, k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
 					}
@@ -160,14 +160,14 @@ reloadFrame:
 		case bytecode.OP_GETFIELD:
 			rb := regs[uint8(w>>bytecode.PosB)]
 			if rb.IsTable() {
-				t := rb.AsTable()
+				t := s.asTable(rb)
 				if OptimizeEnabled {
 					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getFieldFast(t, s.protoEpoch); ok {
 						regs[a] = v
 						continue
 					}
 				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.IsShort() {
-					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
+					if v := t.RawGetStr(s, k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
 					}
@@ -186,7 +186,7 @@ reloadFrame:
 		case bytecode.OP_SETFIELD:
 			ra := regs[a]
 			if ra.IsTable() {
-				t := ra.AsTable()
+				t := s.asTable(ra)
 				var val Value
 				if w.K() {
 					val = ev.consts[uint8(w>>bytecode.PosC)]
@@ -223,14 +223,14 @@ reloadFrame:
 			rb := regs[uint8(w>>bytecode.PosB)]
 			regs[a+1] = rb
 			if rb.IsTable() {
-				t := rb.AsTable()
+				t := s.asTable(rb)
 				if OptimizeEnabled {
 					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getFieldFast(t, s.protoEpoch); ok {
 						regs[a] = v
 						continue
 					}
 				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.IsShort() {
-					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
+					if v := t.RawGetStr(s, k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
 					}
@@ -249,7 +249,7 @@ reloadFrame:
 		case bytecode.OP_GETI:
 			rb := regs[uint8(w>>bytecode.PosB)]
 			if rb.IsTable() {
-				t := rb.AsTable()
+				t := s.asTable(rb)
 				idx := uint64(int64(uint8(w>>bytecode.PosC)) - 1)
 				if idx < uint64(t.arrLen) {
 					if OptimizeEnabled {
@@ -285,7 +285,7 @@ reloadFrame:
 			rb := regs[uint8(w>>bytecode.PosB)]
 			rc := regs[uint8(w>>bytecode.PosC)]
 			if rb.IsTable() && rc.IsInt() {
-				t := rb.AsTable()
+				t := s.asTable(rb)
 				idx := uint64(rc.Int() - 1)
 				if idx < uint64(t.arrLen) {
 					if OptimizeEnabled {
@@ -324,7 +324,7 @@ reloadFrame:
 		case bytecode.OP_SETI:
 			ra := regs[a]
 			if ra.IsTable() {
-				t := ra.AsTable()
+				t := s.asTable(ra)
 				var val Value
 				if w.K() {
 					val = ev.consts[uint8(w>>bytecode.PosC)]
@@ -366,7 +366,7 @@ reloadFrame:
 			ra := regs[a]
 			rb := regs[uint8(w>>bytecode.PosB)]
 			if ra.IsTable() && rb.IsInt() {
-				t := ra.AsTable()
+				t := s.asTable(ra)
 				var val Value
 				if w.K() {
 					val = ev.consts[uint8(w>>bytecode.PosC)]
@@ -608,13 +608,13 @@ reloadFrame:
 		case bytecode.OP_LEN:
 			rb := regs[uint8(w>>bytecode.PosB)]
 			if rb.IsTable() {
-				t := rb.AsTable()
+				t := s.asTable(rb)
 				if t.meta == nil || s.getTM(t.meta, TMLen).IsNil() {
-					regs[a].SetInt(t.Len())
+					regs[a].SetInt(t.Len(s))
 					continue
 				}
 			} else if rb.IsString() {
-				regs[a].SetInt(int64(rb.AsString().Len))
+				regs[a].SetInt(int64(s.asString(rb).Len))
 				continue
 			}
 			goto cold
@@ -631,13 +631,13 @@ reloadFrame:
 			} else if ra.ptr == rb.ptr && (ra.IsNil() || ra.IsBool() || ra.IsString()) {
 				cond = true
 			} else if ra.IsTable() && rb.IsTable() && ra.ptr != rb.ptr {
-				if ra.AsTable().meta != nil || rb.AsTable().meta != nil {
+				if s.asTable(ra).meta != nil || s.asTable(rb).meta != nil {
 					goto cold
 				}
 				cond = false
 			} else if ra.IsUserdata() && rb.IsUserdata() && ra.ptr != rb.ptr {
 				goto cold
-			} else if ra.IsString() && rb.IsString() && !ra.AsString().IsShort() {
+			} else if ra.IsString() && rb.IsString() && !s.asString(ra).IsShort() {
 				goto cold
 			} else {
 				cond = RawEqual(ra, rb)
@@ -685,7 +685,7 @@ reloadFrame:
 
 		case bytecode.OP_EQK:
 			ra, rb := regs[a], ev.consts[uint8(w>>bytecode.PosB)]
-			if ra.IsString() && rb.IsString() && ra.ptr != rb.ptr && !ra.AsString().IsShort() {
+			if ra.IsString() && rb.IsString() && ra.ptr != rb.ptr && !s.asString(ra).IsShort() {
 				goto cold
 			}
 			cond := RawEqual(ra, rb)
@@ -811,7 +811,7 @@ reloadFrame:
 				nargs = max(0, th.top-(ev.base+int(a)+1))
 			}
 			if fn.IsClosure() {
-				callee := fn.AsClosure()
+				callee := s.asClosure(fn)
 				bp := callee.bp
 				if !bp.isVararg && th.nframe < len(th.frames) {
 					funcIdx := ev.base + int(a)
@@ -857,9 +857,9 @@ reloadFrame:
 					}
 				}
 			} else if OptimizeEnabled && fn.IsNative() {
-				nf := fn.AsNative()
+				nf := s.asNative(fn)
 				if nf.Intrinsic != intrNone && (c == 2 || c == 0) && nargs >= 1 {
-					if ok := execIntrinsic1(nf.Intrinsic, regs, a, nargs); ok {
+					if ok := execIntrinsic1(s, nf.Intrinsic, regs, a, nargs); ok {
 						if c == 0 {
 							th.top = ev.base + int(a) + 1
 						} else if b == 0 {
@@ -957,11 +957,11 @@ reloadFrame:
 		case bytecode.OP_TFORCALL:
 			fn := regs[a]
 			c := int(uint8(w >> bytecode.PosC))
-			if OptimizeEnabled && fn.IsNative() && fn.AsNative().Intrinsic == intrIPairsIter && regs[a+1].IsTable() {
-				t := regs[a+1].AsTable()
+			if OptimizeEnabled && fn.IsNative() && s.asNative(fn).Intrinsic == intrIPairsIter && regs[a+1].IsTable() {
+				t := s.asTable(regs[a+1])
 				if t.meta == nil && regs[a+3].IsInt() {
 					ni := regs[a+3].Int() + 1
-					v := t.RawGetInt(ni)
+					v := t.RawGetInt(s, ni)
 					if v.IsNil() {
 						regs[a+3].SetNil()
 					} else {
@@ -1038,7 +1038,7 @@ reloadFrame:
 }
 
 // execIntrinsic1 runs single-result hot stdlib intrinsics directly on registers with zero call/slice overhead.
-func execIntrinsic1(intr uint8, regs *[256]Value, a uint8, nargs int) bool {
+func execIntrinsic1(s *State, intr uint8, regs *[256]Value, a uint8, nargs int) bool {
 	arg0 := regs[a+1]
 	switch intr {
 	case intrMathFloor:
@@ -1099,29 +1099,29 @@ func execIntrinsic1(intr uint8, regs *[256]Value, a uint8, nargs int) bool {
 		}
 	case intrRawGet:
 		if nargs >= 2 && arg0.IsTable() {
-			t := arg0.AsTable()
+			t := s.asTable(arg0)
 			k := regs[a+2]
 			if t.hash != nil && k.IsString() {
-				ls := k.AsString()
+				ls := s.asString(k)
 				if !ls.IsShort() && int(ls.Len) > strHashCancelChunk && atomic.LoadUint32(&ls.Hash) == 0 {
 					return false
 				}
 			}
-			regs[a] = t.RawGet(k)
+			regs[a] = t.RawGet(s, k)
 			return true
 		}
 	case intrRawLen:
 		if arg0.IsTable() {
-			regs[a].SetInt(arg0.AsTable().Len())
+			regs[a].SetInt(s.asTable(arg0).Len(s))
 			return true
 		}
 		if arg0.IsString() {
-			regs[a].SetInt(int64(arg0.AsString().Len))
+			regs[a].SetInt(int64(s.asString(arg0).Len))
 			return true
 		}
 	case intrStringLen:
 		if arg0.IsString() {
-			regs[a].SetInt(int64(arg0.AsString().Len))
+			regs[a].SetInt(int64(s.asString(arg0).Len))
 			return true
 		}
 	}

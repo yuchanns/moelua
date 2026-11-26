@@ -93,20 +93,20 @@ func shortSrc(source string) string {
 func (s *State) initDebugLib() {
 	dbg := s.NewTable(0, 16)
 	s.registerFunc(dbg, "getinfo", intrNone, nativeDebugGetInfo)
-	if v := dbg.RawGetStr(s.intern.Intern("getinfo")); v.IsNative() {
-		s.builtinDebugGetInfo = v.AsNative()
+	if v := dbg.RawGetStr(s, s.intern.Intern("getinfo")); v.IsNative() {
+		s.builtinDebugGetInfo = s.asNative(v)
 	}
 	s.registerFunc(dbg, "traceback", intrNone, nativeDebugTraceback)
-	if v := dbg.RawGetStr(s.intern.Intern("traceback")); v.IsNative() {
-		s.builtinDebugTraceback = v.AsNative()
+	if v := dbg.RawGetStr(s, s.intern.Intern("traceback")); v.IsNative() {
+		s.builtinDebugTraceback = s.asNative(v)
 	}
 	s.registerFunc(dbg, "getlocal", intrNone, nativeDebugGetLocal)
-	if v := dbg.RawGetStr(s.intern.Intern("getlocal")); v.IsNative() {
-		s.builtinDebugGetLocal = v.AsNative()
+	if v := dbg.RawGetStr(s, s.intern.Intern("getlocal")); v.IsNative() {
+		s.builtinDebugGetLocal = s.asNative(v)
 	}
 	s.registerFunc(dbg, "setlocal", intrNone, nativeDebugSetLocal)
-	if v := dbg.RawGetStr(s.intern.Intern("setlocal")); v.IsNative() {
-		s.builtinDebugSetLocal = v.AsNative()
+	if v := dbg.RawGetStr(s, s.intern.Intern("setlocal")); v.IsNative() {
+		s.builtinDebugSetLocal = s.asNative(v)
 	}
 	s.registerFunc(dbg, "getupvalue", intrNone, nativeDebugGetUpvalue)
 	s.registerFunc(dbg, "setupvalue", intrNone, nativeDebugSetUpvalue)
@@ -118,8 +118,8 @@ func (s *State) initDebugLib() {
 	s.registerFunc(dbg, "getuservalue", intrNone, nativeDebugGetUserValue)
 	s.registerFunc(dbg, "setuservalue", intrNone, nativeDebugSetUserValue)
 	s.registerFunc(dbg, "sethook", intrNone, nativeDebugSetHook)
-	if v := dbg.RawGetStr(s.intern.Intern("sethook")); v.IsNative() {
-		s.builtinDebugSetHook = v.AsNative()
+	if v := dbg.RawGetStr(s, s.intern.Intern("sethook")); v.IsNative() {
+		s.builtinDebugSetHook = s.asNative(v)
 	}
 	s.registerFunc(dbg, "gethook", intrNone, nativeDebugGetHook)
 	s.registerFunc(dbg, "debug", intrNone, nativeDebugDebug)
@@ -138,12 +138,12 @@ func topFrameIsNative(th *Thread, fn *NativeFunc) bool {
 		return false
 	}
 	top := &th.frames[th.nframe-1]
-	return top.kind == frameNative && top.nativeFn.IsNative() && top.nativeFn.AsNative() == fn
+	return top.kind == frameNative && top.nativeFn.IsNative() && (*NativeFunc)(top.nativeFn.ptr) == fn
 }
 
 func optThreadArg(s *State, args []Value) (*Thread, []Value) {
 	if len(args) > 0 && args[0].IsThread() {
-		return args[0].AsThread(), args[1:]
+		return s.asThread(args[0]), args[1:]
 	}
 	return s.cur, args
 }
@@ -182,7 +182,7 @@ func (s *State) formatTracebackWithCancel(th *Thread, msg string, hasMsg bool, l
 			}
 			entries = append(entries, fmt.Sprintf("\n\t[C]: in %s '%s'", namewhat, name))
 		} else if th.status == ThreadDead && !th.errObj.IsNil() && th.lastErrNative.IsNative() {
-			name, namewhat := th.lastErrNative.AsNative().Name, "function"
+			name, namewhat := s.asNative(th.lastErrNative).Name, "function"
 			if th.nframe > 0 && th.frames[th.nframe-1].kind == frameLua {
 				if n, nw := funcNameFromCallerFrame(&th.frames[th.nframe-1]); nw != "" {
 					name, namewhat = n, nw
@@ -216,7 +216,7 @@ func (s *State) formatTracebackWithCancel(th *Thread, msg string, hasMsg bool, l
 			} else if cf.kind == frameXPCall {
 				cname = "xpcall"
 			} else if cf.kind == frameNative && cf.nativeFn.IsNative() {
-				cname = cf.nativeFn.AsNative().Name
+				cname = s.asNative(cf.nativeFn).Name
 			}
 			if cname != "" {
 				entries = append(entries, fmt.Sprintf("\n\t[C]: in function '%s'", cname))
@@ -415,7 +415,7 @@ func fillCFrameInfo(s *State, flags uint8, cfunc Value, cname, namewhat string, 
 	}
 	nups := int64(0)
 	if cfunc.IsNative() {
-		nups = int64(nativeUpvalueCount(cfunc.AsNative()))
+		nups = int64(nativeUpvalueCount(s.asNative(cfunc)))
 	}
 	if flags&infoFlagS != 0 {
 		info.RawSetStr(s, s.intern.Intern("what"), StringValue(s.intern.Intern("C")))
@@ -466,7 +466,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #2 to 'getinfo' (string expected)")
 		}
 		var err error
-		flags, err = parseGetInfoWhat(rest[1].AsString().Str(), s.nativeCancelFunc())
+		flags, err = parseGetInfoWhat(s.asString(rest[1]).Str(), s.nativeCancelFunc())
 		if err != nil {
 			return nil, err
 		}
@@ -488,7 +488,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			// Level 0 is debug.getinfo itself (C/Go function).
 			cfunc := NilValue()
 			if s.builtinDebugGetInfo != nil {
-				cfunc = NativeValue(s.builtinDebugGetInfo)
+				cfunc = s.NativeValue(s.builtinDebugGetInfo)
 			}
 			info, err := fillCFrameInfo(s, flags, cfunc, "getinfo", "field", 0, 0)
 			if err != nil {
@@ -500,7 +500,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		if th != s.cur && th.status == ThreadSuspended && lvl == 0 {
 			cfunc := NilValue()
 			if s.builtinCoroYield != nil {
-				cfunc = NativeValue(s.builtinCoroYield)
+				cfunc = s.NativeValue(s.builtinCoroYield)
 			}
 			info, err := fillCFrameInfo(s, flags, cfunc, "yield", "field", 0, 0)
 			if err != nil {
@@ -576,7 +576,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		defer s.Unref(infoRef)
 	}
 	if fn.IsClosure() {
-		p := fn.AsClosure().bp.proto
+		p := s.asClosure(fn).bp.proto
 		if flags&infoFlagS != 0 {
 			src := p.Source
 			if p.NoSource {
@@ -686,7 +686,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		if flags&infoFlagU != 0 {
 			nups := int64(0)
 			if fn.IsNative() {
-				nups = int64(nativeUpvalueCount(fn.AsNative()))
+				nups = int64(nativeUpvalueCount(s.asNative(fn)))
 			}
 			info.RawSetStr(s, s.intern.Intern("nups"), IntValue(nups))
 			info.RawSetStr(s, s.intern.Intern("nparams"), IntValue(0))
@@ -1030,7 +1030,7 @@ func nativeDebugGetLocal(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument to 'getlocal' (number expected)")
 	}
 	if rest[0].IsClosure() {
-		p := rest[0].AsClosure().bp.proto
+		p := s.asClosure(rest[0]).bp.proto
 		if idx < 1 || int(idx) > int(p.NumParams) {
 			return []Value{NilValue()}, nil
 		}
@@ -1178,7 +1178,7 @@ func nativeDebugGetUpvalue(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'getupvalue' (function expected, got %s)", s.objTypeName(args[0]))
 	}
 	if args[0].IsNative() {
-		nf := args[0].AsNative()
+		nf := s.asNative(args[0])
 		n := nativeUpvalueCount(nf)
 		if idx >= 1 && int(idx) <= n {
 			val := NilValue()
@@ -1189,7 +1189,7 @@ func nativeDebugGetUpvalue(s *State, args []Value) ([]Value, error) {
 		}
 		return nil, nil
 	}
-	cl := args[0].AsClosure()
+	cl := s.asClosure(args[0])
 	if idx < 1 || int(idx) > len(cl.upvals) {
 		return nil, nil
 	}
@@ -1200,7 +1200,7 @@ func nativeDebugGetUpvalue(s *State, args []Value) ([]Value, error) {
 	if name == "" {
 		name = "(no name)"
 	}
-	return []Value{StringValue(s.intern.Intern(name)), cl.upvals[idx-1].Get()}, nil
+	return []Value{StringValue(s.intern.Intern(name)), cl.upvals[idx-1].Get(s)}, nil
 }
 
 func nativeDebugSetUpvalue(s *State, args []Value) ([]Value, error) {
@@ -1218,7 +1218,7 @@ func nativeDebugSetUpvalue(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'setupvalue' (function expected, got %s)", s.objTypeName(args[0]))
 	}
 	if args[0].IsNative() {
-		nf := args[0].AsNative()
+		nf := s.asNative(args[0])
 		n := nativeUpvalueCount(nf)
 		if idx >= 1 && int(idx) <= n {
 			if int(idx)-1 < len(nf.upvals) {
@@ -1228,11 +1228,11 @@ func nativeDebugSetUpvalue(s *State, args []Value) ([]Value, error) {
 		}
 		return nil, nil
 	}
-	cl := args[0].AsClosure()
+	cl := s.asClosure(args[0])
 	if idx < 1 || int(idx) > len(cl.upvals) {
 		return nil, nil
 	}
-	cl.upvals[idx-1].Set(args[2])
+	cl.upvals[idx-1].Set(s, args[2])
 	s.protoEpoch++ // invalidate any upvalue-dependent IC
 	name := ""
 	if int(idx)-1 < len(cl.bp.proto.Upvalues) {
@@ -1256,7 +1256,7 @@ func nativeDebugUpvalueID(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #2 to 'upvalueid'")
 	}
 	if args[0].IsNative() {
-		nf := args[0].AsNative()
+		nf := s.asNative(args[0])
 		n := nativeUpvalueCount(nf)
 		if idx < 1 || int(idx) > n {
 			return []Value{NilValue()}, nil
@@ -1291,7 +1291,7 @@ func nativeDebugUpvalueID(s *State, args []Value) ([]Value, error) {
 	if !args[0].IsClosure() {
 		return []Value{NilValue()}, nil
 	}
-	cl := args[0].AsClosure()
+	cl := s.asClosure(args[0])
 	if idx < 1 || int(idx) > len(cl.upvals) {
 		return []Value{NilValue()}, nil
 	}
@@ -1313,10 +1313,10 @@ func nativeDebugUpvalueJoin(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'upvaluejoin' (function expected, got %s)", s.objTypeName(args[0]))
 	}
 	if !args[0].IsClosure() {
-		if n1 < 1 || int(n1) > nativeUpvalueCount(args[0].AsNative()) {
+		if n1 < 1 || int(n1) > nativeUpvalueCount(s.asNative(args[0])) {
 			return nil, fmt.Errorf("bad argument #2 to 'upvaluejoin' (invalid upvalue index)")
 		}
-	} else if n1 < 1 || int(n1) > len(args[0].AsClosure().upvals) {
+	} else if n1 < 1 || int(n1) > len(s.asClosure(args[0]).upvals) {
 		return nil, fmt.Errorf("bad argument #2 to 'upvaluejoin' (invalid upvalue index)")
 	}
 	if len(args) < 4 {
@@ -1333,10 +1333,10 @@ func nativeDebugUpvalueJoin(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #3 to 'upvaluejoin' (function expected, got %s)", s.objTypeName(args[2]))
 	}
 	if !args[2].IsClosure() {
-		if n2 < 1 || int(n2) > nativeUpvalueCount(args[2].AsNative()) {
+		if n2 < 1 || int(n2) > nativeUpvalueCount(s.asNative(args[2])) {
 			return nil, fmt.Errorf("bad argument #4 to 'upvaluejoin' (invalid upvalue index)")
 		}
-	} else if n2 < 1 || int(n2) > len(args[2].AsClosure().upvals) {
+	} else if n2 < 1 || int(n2) > len(s.asClosure(args[2]).upvals) {
 		return nil, fmt.Errorf("bad argument #4 to 'upvaluejoin' (invalid upvalue index)")
 	}
 	if !args[0].IsClosure() {
@@ -1345,7 +1345,7 @@ func nativeDebugUpvalueJoin(s *State, args []Value) ([]Value, error) {
 	if !args[2].IsClosure() {
 		return nil, fmt.Errorf("bad argument #3 to 'upvaluejoin' (Lua function expected)")
 	}
-	c1, c2 := args[0].AsClosure(), args[2].AsClosure()
+	c1, c2 := s.asClosure(args[0]), s.asClosure(args[2])
 	c1.upvals[n1-1] = c2.upvals[n2-1]
 	s.protoEpoch++
 	return nil, nil
@@ -1371,7 +1371,7 @@ func nativeDebugSetMetatable(s *State, args []Value) ([]Value, error) {
 		if !args[1].IsTable() {
 			return nil, fmt.Errorf("bad argument #2 to 'setmetatable' (nil or table expected)")
 		}
-		mt = args[1].AsTable()
+		mt = s.asTable(args[1])
 	}
 	s.setMetatableOf(args[0], mt)
 	if err := s.ConsumeMemErr(); err != nil {
@@ -1403,7 +1403,7 @@ func nativeDebugGetUserValue(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || !args[0].IsUserdata() {
 		return []Value{NilValue()}, nil
 	}
-	u := args[0].AsUserdata()
+	u := s.asUserdata(args[0])
 	if n < 1 || int(n) > len(u.UValues) {
 		return []Value{NilValue()}, nil
 	}
@@ -1418,7 +1418,7 @@ func nativeDebugSetUserValue(s *State, args []Value) ([]Value, error) {
 		}
 		return nil, fmt.Errorf("bad argument #1 to 'setuservalue' (userdata expected, got %s)", got)
 	}
-	u := args[0].AsUserdata()
+	u := s.asUserdata(args[0])
 	n := int64(1)
 	if len(args) >= 3 && !args[2].IsNil() {
 		var err error

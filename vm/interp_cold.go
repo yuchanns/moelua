@@ -619,7 +619,7 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 		cf.finish = fk
 		cf.finishReg = reg
 		cf.finishFlag = flag
-		cl := tm.AsClosure()
+		cl := s.asClosure(tm)
 		if err := th.pushLuaFrame(cl, slot, len(args), 1); err != nil {
 			fillNil(th.stack[slot : slot+1+len(args)])
 			th.top = slot
@@ -694,10 +694,10 @@ func (s *State) getTabUpSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 	b := uint8(w >> bytecode.PosB)
 	c := uint8(w >> bytecode.PosC)
 	uv := ev.cl.upvals[b]
-	tv := uv.Get()
+	tv := uv.Get(s)
 	key := ev.bp.strConsts[c]
 	if tv.IsTable() {
-		t := tv.AsTable()
+		t := s.asTable(tv)
 		if err := s.ensureLookupStrKeyHash(t, key); err != nil {
 			return s.catchSlow(th, ev, false, err)
 		}
@@ -723,7 +723,7 @@ func (s *State) getTabUpSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 				}
 			}
 		}
-		v := t.RawGetStr(key)
+		v := t.RawGetStr(s, key)
 		if !v.IsNil() || t.meta == nil {
 			regs[a] = v
 			return false, nil
@@ -741,7 +741,7 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 	rb := regs[b]
 	key := ev.bp.strConsts[c]
 	if rb.IsTable() {
-		t := rb.AsTable()
+		t := s.asTable(rb)
 		if OptimizeEnabled && t.shape != nil && key.IsShort() {
 			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
 			if ic.polyLookup(t.shape.id) {
@@ -803,7 +803,7 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 		if err := s.ensureLookupStrKeyHash(t, key); err != nil {
 			return s.catchSlow(th, ev, false, err)
 		}
-		v := t.RawGetStr(key)
+		v := t.RawGetStr(s, key)
 		if !v.IsNil() || t.meta == nil {
 			regs[a] = v
 			return false, nil
@@ -823,13 +823,13 @@ func (s *State) walkIndexChainOrFn(orig *Table, key *LuaString) (val Value, fnTM
 	for loop := 0; loop < 2000; loop++ {
 		var tm Value
 		if cur.IsTable() {
-			t := cur.AsTable()
+			t := s.asTable(cur)
 			if loop > 0 {
 				t.markProto(s)
 				if herr := s.ensureLookupStrKeyHash(t, key); herr != nil {
 					return NilValue(), NilValue(), NilValue(), false, herr
 				}
-				v := t.RawGetStr(key)
+				v := t.RawGetStr(s, key)
 				if !v.IsNil() {
 					return v, NilValue(), NilValue(), true, nil
 				}
@@ -873,7 +873,7 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 	}
 	key := ev.bp.strConsts[b]
 	if ra.IsTable() {
-		t := ra.AsTable()
+		t := s.asTable(ra)
 		if OptimizeEnabled && t.shape != nil && key.IsShort() {
 			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
 			if !t.isProto() && ic.polyLookup(t.shape.id) {
@@ -965,7 +965,7 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 			if err := s.ensureLookupStrKeyHash(t, key); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
-			if !t.RawGetStr(key).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+			if !t.RawGetStr(s, key).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 				t.RawSetStr(s, key, val)
 				if err := s.ConsumeMemErr(); err != nil {
 					return s.catchSlow(th, ev, false, err)
@@ -984,8 +984,8 @@ func (s *State) getISlow(th *Thread, ev *frameEnv, w bytecode.Instruction, regs 
 	rb := regs[uint8(w>>bytecode.PosB)]
 	c := int64(uint8(w >> bytecode.PosC))
 	if rb.IsTable() {
-		t := rb.AsTable()
-		v := t.RawGetInt(c)
+		t := s.asTable(rb)
+		v := t.RawGetInt(s, c)
 		if !v.IsNil() || t.meta == nil {
 			regs[a] = v
 			return false, nil
@@ -1001,11 +1001,11 @@ func (s *State) getTableSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, r
 	rb := regs[uint8(w>>bytecode.PosB)]
 	rc := regs[uint8(w>>bytecode.PosC)]
 	if rb.IsTable() {
-		t := rb.AsTable()
+		t := s.asTable(rb)
 		if err := s.ensureLookupKeyHash(t, rc); err != nil {
 			return s.catchSlow(th, ev, false, err)
 		}
-		v := t.RawGet(rc)
+		v := t.RawGet(s, rc)
 		if !v.IsNil() || t.meta == nil {
 			regs[a] = v
 			return false, nil
@@ -1028,8 +1028,8 @@ func (s *State) setISlow(th *Thread, ev *frameEnv, w bytecode.Instruction, regs 
 	}
 	ra := regs[a]
 	if ra.IsTable() {
-		t := ra.AsTable()
-		if !t.RawGetInt(b).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+		t := s.asTable(ra)
+		if !t.RawGetInt(s, b).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 			t.RawSetInt(s, b, val)
 			if err := s.ConsumeMemErr(); err != nil {
 				return s.catchSlow(th, ev, false, err)
@@ -1054,11 +1054,11 @@ func (s *State) setTableSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, r
 	}
 	ra := regs[a]
 	if ra.IsTable() {
-		t := ra.AsTable()
+		t := s.asTable(ra)
 		if err := s.ensureLookupKeyHash(t, rb); err != nil {
 			return s.catchSlow(th, ev, false, err)
 		}
-		if !t.RawGet(rb).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+		if !t.RawGet(s, rb).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 			return s.catchSlow(th, ev, false, t.RawSet(s, rb, val))
 		}
 	}
@@ -1098,12 +1098,12 @@ func (s *State) finishGetYieldable(th *Thread, ev *frameEnv, obj, key Value, dst
 	for loop := 0; loop < 2000; loop++ {
 		var tm Value
 		if cur.IsTable() {
-			t := cur.AsTable()
+			t := s.asTable(cur)
 			if loop > 0 {
 				if err := s.ensureLookupKeyHash(t, key); err != nil {
 					return false, err
 				}
-				v := t.RawGet(key)
+				v := t.RawGet(s, key)
 				if !v.IsNil() {
 					th.stack[ev.base+int(dstReg)] = v
 					return false, nil
@@ -1137,12 +1137,12 @@ func (s *State) finishSetYieldable(th *Thread, ev *frameEnv, obj, key, val Value
 	for loop := 0; loop < 2000; loop++ {
 		var tm Value
 		if cur.IsTable() {
-			t := cur.AsTable()
+			t := s.asTable(cur)
 			if loop > 0 {
 				if err := s.ensureLookupKeyHash(t, key); err != nil {
 					return false, err
 				}
-				if !t.RawGet(key).IsNil() {
+				if !t.RawGet(s, key).IsNil() {
 					return false, t.RawSet(s, key, val)
 				}
 			}
@@ -1173,12 +1173,12 @@ func (s *State) finishGet(obj, key Value) (Value, error) {
 	for loop := 0; loop < 2000; loop++ {
 		var tm Value
 		if cur.IsTable() {
-			t := cur.AsTable()
+			t := s.asTable(cur)
 			if loop > 0 {
 				if err := s.ensureLookupKeyHash(t, key); err != nil {
 					return NilValue(), err
 				}
-				v := t.RawGet(key)
+				v := t.RawGet(s, key)
 				if !v.IsNil() {
 					return v, nil
 				}
@@ -1217,7 +1217,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 	fn := th.stack[funcIdx]
 
 	if fn.IsClosure() {
-		cl := fn.AsClosure()
+		cl := s.asClosure(fn)
 		if err := th.pushLuaFrame(cl, funcIdx, nargs, nresults); err != nil {
 			return s.catchSlow(th, ev, false, err)
 		}
@@ -1227,7 +1227,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		return true, nil
 	}
 	if fn.IsNative() {
-		nf := fn.AsNative()
+		nf := s.asNative(fn)
 		if nf.Intrinsic != intrNone {
 			// Yieldable flat-stack pcall / xpcall (including nested pcall(pcall, ...) / xpcall(pcall, ...))!
 			if nf.Intrinsic == intrPCall && nargs >= 1 && isFlatProtectedTarget(th.stack[funcIdx+1]) {
@@ -1251,7 +1251,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					return s.catchSlow(th, ev, false, fmt.Errorf("dofile failed"))
 				}
 				th.stack[funcIdx] = loaded[0]
-				cl := loaded[0].AsClosure()
+				cl := s.asClosure(loaded[0])
 				if err := th.pushLuaFrame(cl, funcIdx, 0, nresults); err != nil {
 					return s.catchSlow(th, ev, false, err)
 				}
@@ -1278,7 +1278,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 						callNRes = 4
 					}
 					if tm.IsClosure() {
-						cl := tm.AsClosure()
+						cl := s.asClosure(tm)
 						if needFinish {
 							caller := &th.frames[ev.ci]
 							caller.dirty = true
@@ -1623,7 +1623,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 		}
 		fn = tm
 		if fn.IsClosure() {
-			cl := fn.AsClosure()
+			cl := s.asClosure(fn)
 			if err := th.pushLuaFrame(cl, funcIdx, nargs, nresults); err != nil {
 				return s.catchSlow(th, ev, false, err)
 			}
@@ -1675,7 +1675,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 // call and returning (results, hookedNative, err).
 func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extraDepth uint8, frameLimit int) ([]Value, bool, error) {
 	th.top = funcIdx + 1 + nargs
-	nf := fn.AsNative()
+	nf := s.asNative(fn)
 	hookedNative := th.hookMask != 0 && th.hookMask&(HookMaskCall|HookMaskRet) != 0 && !th.inHook && !th.suppressHook
 	pushedFrame := hookedNative || (nf.FastFn == nil && nf.Intrinsic == intrNone)
 	if pushedFrame {
@@ -1923,7 +1923,7 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 		}
 	}
 	if targetVal.IsNative() {
-		nf := targetVal.AsNative()
+		nf := s.asNative(targetVal)
 		intr := nf.Intrinsic
 		if (intr == intrPCall && calleeArgs >= 1 && isFlatProtectedTarget(th.stack[calleeIdx+1])) ||
 			(intr == intrXPCall && calleeArgs >= 2 && isFlatProtectedTarget(th.stack[calleeIdx+1]) && th.stack[calleeIdx+2].IsFunction()) {
@@ -1975,7 +1975,7 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 				return false, uncaught(derr)
 			}
 			th.stack[calleeIdx] = loaded[0]
-			cl := loaded[0].AsClosure()
+			cl := s.asClosure(loaded[0])
 			if err := th.pushLuaFrame(cl, calleeIdx, 0, -1); err != nil {
 				th.nframe--
 				return false, err
@@ -2007,7 +2007,7 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 				copy(th.stack[calleeIdx+1:calleeIdx+1+len(cargs)], cargs)
 				th.top = calleeIdx + 1 + len(cargs)
 				if tm.IsClosure() {
-					cl := tm.AsClosure()
+					cl := s.asClosure(tm)
 					if err := th.pushLuaFrame(cl, calleeIdx, len(cargs), 4); err != nil {
 						th.nframe--
 						return false, err
@@ -2124,7 +2124,7 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 		}
 		return false, nil
 	}
-	cl := targetVal.AsClosure()
+	cl := s.asClosure(targetVal)
 	if err := th.pushLuaFrame(cl, calleeIdx, calleeArgs, -1); err != nil {
 		th.nframe--
 		return false, err
@@ -2144,13 +2144,13 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 	base := ev.base
 	fnIdx := base + int(a) + 3
 	fn := th.stack[base+int(a)]
-	if OptimizeEnabled && (th.hookMask&(HookMaskCall|HookMaskRet) == 0 || th.inHook || th.suppressHook) && fn.IsNative() && fn.AsNative().Intrinsic == intrNext && th.stack[base+int(a)+1].IsTable() {
-		t := th.stack[base+int(a)+1].AsTable()
+	if OptimizeEnabled && (th.hookMask&(HookMaskCall|HookMaskRet) == 0 || th.inHook || th.suppressHook) && fn.IsNative() && s.asNative(fn).Intrinsic == intrNext && th.stack[base+int(a)+1].IsTable() {
+		t := s.asTable(th.stack[base+int(a)+1])
 		ctrl := th.stack[base+int(a)+3]
 		if herr := s.ensureLookupKeyHash(t, ctrl); herr != nil {
 			return s.catchSlow(th, ev, false, herr)
 		}
-		k, v, err := t.Next(ctrl)
+		k, v, err := t.Next(s, ctrl)
 		if err == nil {
 			th.stack[fnIdx] = k
 			if c >= 2 {
@@ -2202,7 +2202,7 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 		return false, nil
 	}
 	if fn.IsClosure() {
-		cl := fn.AsClosure()
+		cl := s.asClosure(fn)
 		if err := th.pushLuaFrame(cl, fnIdx, 2, c); err != nil {
 			return s.catchSlow(th, ev, false, err)
 		}
@@ -2291,7 +2291,7 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 			cf.dirty = true
 			cf.oldTop = slot
 			cf.finish = finishClose
-			cl := tm.AsClosure()
+			cl := s.asClosure(tm)
 			if err := th.pushLuaFrame(cl, slot, len(cargs), 0); err != nil {
 				fillNil(th.stack[slot : slot+1+len(cargs)])
 				th.top = slot
@@ -2395,7 +2395,7 @@ func (s *State) strToNumForLoop(v Value) (Value, error) {
 	if !v.IsString() {
 		return v, nil
 	}
-	iv, fv, isInt, ok, err := s.strToNum(v.AsString().Str())
+	iv, fv, isInt, ok, err := s.strToNum(s.asString(v).Str())
 	if err != nil {
 		return NilValue(), err
 	}
@@ -2549,7 +2549,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 
 	case bytecode.OP_SETTABUP:
 		uv := ev.cl.upvals[a]
-		tv := uv.Get()
+		tv := uv.Get(s)
 		b := uint8(w >> bytecode.PosB)
 		c := uint8(w >> bytecode.PosC)
 		var val Value
@@ -2560,11 +2560,11 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		}
 		key := ev.bp.strConsts[b]
 		if tv.IsTable() {
-			t := tv.AsTable()
+			t := s.asTable(tv)
 			if err := s.ensureLookupStrKeyHash(t, key); err != nil {
 				return coldContinue, pc, err
 			}
-			if !t.RawGetStr(key).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+			if !t.RawGetStr(s, key).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 				t.RawSetStr(s, key, val)
 				if err := s.ConsumeMemErr(); err != nil {
 					return coldContinue, pc, err
@@ -3056,7 +3056,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 	case bytecode.OP_LT:
 		ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
 		if ra.IsString() && rb.IsString() {
-			cmp, err := s.compareStrings(ra.AsString(), rb.AsString())
+			cmp, err := s.compareStrings(s.asString(ra), s.asString(rb))
 			if err != nil {
 				return coldContinue, pc, err
 			}
@@ -3105,7 +3105,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 	case bytecode.OP_LE:
 		ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
 		if ra.IsString() && rb.IsString() {
-			cmp, err := s.compareStrings(ra.AsString(), rb.AsString())
+			cmp, err := s.compareStrings(s.asString(ra), s.asString(rb))
 			if err != nil {
 				return coldContinue, pc, err
 			}
@@ -3227,7 +3227,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			}
 		}
 		if fn.IsClosure() {
-			callee := fn.AsClosure()
+			callee := s.asClosure(fn)
 			p := callee.bp.proto
 			if err := th.ensureStack(funcIdx + 1 + max(nargs, int(p.MaxStackSize)) + int(p.NumParams) + 8); err != nil {
 				return coldContinue, pc, err
@@ -3266,7 +3266,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			return coldReload, 0, nil
 		}
 		// Tailcall to native (check yieldable pcall/xpcall and coroutine.yield!)
-		nf := fn.AsNative()
+		nf := s.asNative(fn)
 		if nf.Intrinsic == intrPCall && nargs >= 1 && isFlatProtectedTarget(th.stack[srcStart+1]) {
 			if pc < len(ev.bp.proto.Code) && ev.bp.proto.Code[pc].Op() == bytecode.OP_RETURN {
 				// Keep caller Lua frame alive across C pcall so stack trace & return hooks match Lua 5.5!
@@ -3341,7 +3341,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			}
 			th.stack[funcIdx] = loaded[0]
 			th.nframe--
-			cl := loaded[0].AsClosure()
+			cl := s.asClosure(loaded[0])
 			if err := th.pushLuaFrame(cl, funcIdx, 0, nres); err != nil {
 				return coldContinue, pc, err
 			}
@@ -3377,7 +3377,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 					callerCF.finish = finishTailReturn
 				}
 				if tm.IsClosure() {
-					cl := tm.AsClosure()
+					cl := s.asClosure(tm)
 					if err := th.pushLuaFrame(cl, srcStart, len(cargs), 4); err != nil {
 						th.frames[ev.ci].finish = finishNone
 						return coldContinue, pc, err
@@ -3671,7 +3671,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		if ev.base+int(a)+n >= len(th.stack) {
 			n = max(0, len(th.stack)-1-(ev.base+int(a)))
 		}
-		t := regs[a].AsTable()
+		t := s.asTable(regs[a])
 		cancelFn := s.nativeCancelFunc()
 		for i := 1; i <= n; i++ {
 			if cancelFn != nil && (i&1023) == 0 {
@@ -3813,8 +3813,8 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			if !vtv.IsTable() {
 				return coldContinue, pc, fmt.Errorf("vararg table expected")
 			}
-			vt := vtv.AsTable()
-			nv := vt.RawGetStr(s.intern.Intern("n"))
+			vt := s.asTable(vtv)
+			nv := vt.RawGetStr(s, s.intern.Intern("n"))
 			if !nv.IsInt() || nv.Int() < 0 || nv.Int() > math.MaxInt32/2 {
 				return coldContinue, pc, fmt.Errorf("vararg table has no proper 'n'")
 			}
@@ -3840,7 +3840,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 					}
 				}
 				if i < n {
-					th.stack[ev.base+int(a)+i] = vt.RawGetInt(int64(i + 1))
+					th.stack[ev.base+int(a)+i] = vt.RawGetInt(s, int64(i + 1))
 				} else {
 					th.stack[ev.base+int(a)+i] = NilValue()
 				}
@@ -3889,7 +3889,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			} else {
 				regs[a] = NilValue()
 			}
-		} else if rc.IsString() && rc.AsString().Str() == "n" {
+		} else if rc.IsString() && s.asString(rc).Str() == "n" {
 			regs[a] = IntValue(int64(cf.nextraargs))
 		} else {
 			regs[a] = NilValue()
@@ -3928,8 +3928,8 @@ func (s *State) objTypeName(v Value) string {
 		return "light userdata"
 	}
 	if mt := s.getMetatableOf(v); mt != nil {
-		if nm := mt.RawGetStr(s.intern.Intern("__name")); nm.IsString() {
-			return nm.AsString().Str()
+		if nm := mt.RawGetStr(s, s.intern.Intern("__name")); nm.IsString() {
+			return s.asString(nm).Str()
 		}
 	}
 	return v.TypeName()
@@ -3972,7 +3972,7 @@ func (s *State) compareError(a, b Value) error {
 
 func (s *State) lessThan(a, b Value) (bool, error) {
 	if a.IsString() && b.IsString() {
-		cmp, err := s.compareStrings(a.AsString(), b.AsString())
+		cmp, err := s.compareStrings(s.asString(a), s.asString(b))
 		if err != nil {
 			return false, err
 		}
@@ -4041,7 +4041,7 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 	for i := 0; i < n; i++ {
 		v := th.stack[start+i]
 		if v.IsString() {
-			totalLen += len(v.AsString().Str())
+			totalLen += len(s.asString(v).Str())
 		} else if v.IsNumber() {
 			ns := s.FormatValue(v)
 			totalLen += len(ns)
@@ -4075,7 +4075,7 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 			v := th.stack[start+i]
 			var part string
 			if v.IsString() {
-				part = v.AsString().Str()
+				part = s.asString(v).Str()
 			} else {
 				part = numStrs[ni]
 				ni++
@@ -4202,7 +4202,7 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			cf.finish = finishConcat
 			cf.concatStart = start
 			cf.concatIdx = cur - 1
-			cl := tm.AsClosure()
+			cl := s.asClosure(tm)
 			if err := th.pushLuaFrame(cl, slot, len(cargs), 1); err != nil {
 				fillNil(th.stack[slot : slot+1+len(cargs)])
 				th.top = slot

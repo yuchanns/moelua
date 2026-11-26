@@ -37,7 +37,7 @@ func (s *State) checkStringArg(args []Value, idx int, fnName string) (string, er
 	}
 	v := args[idx]
 	if v.IsString() {
-		return v.AsString().Str(), nil
+		return s.asString(v).Str(), nil
 	}
 	if v.IsNumber() {
 		return s.FormatValue(v), nil
@@ -272,7 +272,7 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 	fn.Fn = func(s *State, _ []Value) ([]Value, error) {
 		var gs *gmatchState
 		if len(fn.upvals) > 2 && fn.upvals[2].IsUserdata() {
-			gs, _ = s.UserdataData(fn.upvals[2].AsUserdata()).(*gmatchState)
+			gs, _ = s.UserdataData(s.asUserdata(fn.upvals[2])).(*gmatchState)
 		}
 		if gs == nil {
 			return nil, fmt.Errorf("bad gmatch iterator state")
@@ -286,7 +286,7 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 		}
 		return s.capturesToValuesRooted(caps, gs.srcLen)
 	}
-	return []Value{NativeValue(fn)}, nil
+	return []Value{s.NativeValue(fn)}, nil
 }
 
 func nativeStringGSub(s *State, args []Value) ([]Value, error) {
@@ -339,11 +339,11 @@ func nativeStringGSub(s *State, args []Value) ([]Value, error) {
 				return "", false, kerr
 			}
 			var val Value
-			t := repl.AsTable()
+			t := s.asTable(repl)
 			if herr := s.ensureLookupKeyHash(t, kv); herr != nil {
 				return "", false, herr
 			}
-			val = t.RawGet(kv)
+			val = t.RawGet(s, kv)
 			if val.IsNil() && t.meta != nil {
 				var gerr error
 				val, gerr = s.finishGet(repl, kv)
@@ -408,7 +408,7 @@ func nativeStringPack(s *State, args []Value) ([]Value, error) {
 		case a.IsFloat():
 			pargs[i] = luastdlib.PackFloatVal(a.Float())
 		case a.IsString():
-			pargs[i] = luastdlib.PackStringVal(a.AsString().Str())
+			pargs[i] = luastdlib.PackStringVal(s.asString(a).Str())
 		default:
 			// Preserve an invalid PackKind so PackWithLimits rejects unsupported values iff consumed,
 			// without rejecting unused trailing arguments.
@@ -650,7 +650,7 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 			fa.ToString = lazyToStr
 			fargs[i] = fa
 		case a.IsString():
-			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgString, Str: a.AsString().Str(), Ptr: uintptr(a.ptr), ToString: lazyToStr}
+			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgString, Str: s.asString(a).Str(), Ptr: uintptr(a.ptr), ToString: lazyToStr}
 		default:
 			// Defer __tostring / __name evaluation until a %s conversion actually consumes this argument.
 			// Use logical pointer identity for encoded light userdata (debug.upvalueid tokens / NULL lightud).
@@ -895,7 +895,7 @@ func nativeUTF8Codes(s *State, args []Value) ([]Value, error) {
 	if lax {
 		iter = utf8CodesLaxIter
 	}
-	return []Value{NativeValue(iter), strVal, IntValue(0)}, nil
+	return []Value{s.NativeValue(iter), strVal, IntValue(0)}, nil
 }
 
 // nativeUTF8Offset implements Lua 5.5.1 two-return utf8.offset(s, n [, i]) -> start, end!
@@ -1078,7 +1078,7 @@ func nativeStringDump(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'dump' (Lua function expected)")
 	}
 	strip := len(args) >= 2 && !args[1].IsFalsy()
-	p := args[0].AsClosure().bp.proto
+	p := s.asClosure(args[0]).bp.proto
 	cancelFn := s.nativeCancelFunc()
 	if s.abortErr != nil {
 		return nil, s.abortErr

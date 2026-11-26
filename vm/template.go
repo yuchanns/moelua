@@ -114,13 +114,13 @@ func buildStdTemplate() *stdTemplate {
 	b := newBootstrapState()
 
 	// Locate the 3 standard file userdata instances created during initIOLib().
-	stdinUD := b.defaultInput.AsUserdata()
-	stdoutUD := b.defaultOutput.AsUserdata()
+	stdinUD := b.asUserdata(b.defaultInput)
+	stdoutUD := b.asUserdata(b.defaultOutput)
 	var stderrUD *Userdata
 	if env := b.GlobalEnv(); env != nil {
-		if ioVal := env.RawGetStr(b.intern.Intern("io")); ioVal.IsTable() {
-			if se := ioVal.AsTable().RawGetStr(b.intern.Intern("stderr")); se.IsUserdata() {
-				stderrUD = se.AsUserdata()
+		if ioVal := env.RawGetStr(b, b.intern.Intern("io")); ioVal.IsTable() {
+			if se := b.asTable(ioVal).RawGetStr(b, b.intern.Intern("stderr")); se.IsUserdata() {
+				stderrUD = b.asUserdata(se)
 			}
 		}
 	}
@@ -153,13 +153,13 @@ func buildStdTemplate() *stdTemplate {
 		}
 		for _, v := range t.slots {
 			if v.IsTable() {
-				addTable(v.AsTable())
+				addTable(b.asTable(v))
 			}
 		}
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
 			for _, v := range t.arrValSlice() {
 				if v.IsTable() {
-					addTable(v.AsTable())
+					addTable(b.asTable(v))
 				}
 			}
 		}
@@ -168,10 +168,10 @@ func buildStdTemplate() *stdTemplate {
 				nd := &t.hash.nodes[k]
 				if nd.used && !nd.dead {
 					if nd.key.IsTable() {
-						addTable(nd.key.AsTable())
+						addTable(b.asTable(nd.key))
 					}
 					if nd.val.IsTable() {
-						addTable(nd.val.AsTable())
+						addTable(b.asTable(nd.val))
 					}
 				}
 			}
@@ -209,15 +209,15 @@ func buildStdTemplate() *stdTemplate {
 	classifyReloc := func(v Value) (tmplRelocKind, int, bool) {
 		switch {
 		case v.IsTable():
-			if idx, ok := tableIdx[v.AsTable()]; ok {
+			if idx, ok := tableIdx[b.asTable(v)]; ok {
 				return relocTable, idx, true
 			}
 		case v.IsThread():
-			if v.AsThread() == b.mainThread {
+			if b.asThread(v) == b.mainThread {
 				return relocMainThread, 0, true
 			}
 		case v.IsUserdata():
-			u := v.AsUserdata()
+			u := b.asUserdata(v)
 			switch u {
 			case stdinUD:
 				return relocStdIn, 0, true

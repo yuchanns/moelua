@@ -47,15 +47,15 @@ type tableHash struct {
 func makeDeadKeyRef(key Value) (any, bool) {
 	switch {
 	case key.IsTable():
-		return weak.Make(key.AsTable()), true
+		return weak.Make((*Table)(key.ptr)), true
 	case key.IsClosure():
-		return weak.Make(key.AsClosure()), true
-	case key.IsNative() && key.AsNative().Collectable:
-		return weak.Make(key.AsNative()), true
+		return weak.Make((*Closure)(key.ptr)), true
+	case key.IsNative() && (*NativeFunc)(key.ptr).Collectable:
+		return weak.Make((*NativeFunc)(key.ptr)), true
 	case key.IsUserdata():
-		return weak.Make(key.AsUserdata()), true
+		return weak.Make((*Userdata)(key.ptr)), true
 	case key.IsThread():
-		return weak.Make(key.AsThread()), true
+		return weak.Make((*Thread)(key.ptr)), true
 	default:
 		return nil, false
 	}
@@ -73,7 +73,7 @@ func deadKeyValue(ref any) (Value, bool) {
 		}
 	case weak.Pointer[NativeFunc]:
 		if p := wp.Value(); p != nil {
-			return NativeValue(p), true
+			return Value{ptr: unsafe.Pointer(p), bits: kindNative}, true
 		}
 	case weak.Pointer[Userdata]:
 		if p := wp.Value(); p != nil {
@@ -283,7 +283,7 @@ func fillNil(vs []Value) {
 	}
 }
 
-func (t *Table) Metatable() *Table { return t.meta }
+func (t *Table) Metatable(_ *State) *Table { return t.meta }
 
 // SetMetatable sets t's metatable, updating Shape (in opt mode), tmFlags, proto flags, and Tier 1 GC.
 // When shape allocation fails under a memory limit, t's metatable and shape remain unchanged so
@@ -301,11 +301,11 @@ func (s *State) SetMetatable(t, mt *Table) {
 	if mt != nil {
 		mt.markProto(s)
 		// If mt.__index is a table, mark it as proto too so writes to it bump protoEpoch.
-		if idx := mt.RawGetStr(s.intern.tms[TMIndex]); idx.IsTable() {
-			idx.AsTable().markProto(s)
+		if idx := mt.RawGetStr(s, s.intern.tms[TMIndex]); idx.IsTable() {
+			s.asTable(idx).markProto(s)
 		}
-		if nidx := mt.RawGetStr(s.intern.tms[TMNewIndex]); nidx.IsTable() {
-			nidx.AsTable().markProto(s)
+		if nidx := mt.RawGetStr(s, s.intern.tms[TMNewIndex]); nidx.IsTable() {
+			s.asTable(nidx).markProto(s)
 		}
 		s.registerFinalizable(TableValue(t), mt)
 		s.registerWeakCandidate(t, mt)
@@ -401,7 +401,7 @@ func hashValue(v Value) uint32 {
 		x ^= x >> 33
 		return uint32(x)
 	case v.IsString():
-		return v.AsString().hash()
+		return (*LuaString)(v.ptr).hash()
 	case v.IsFloat():
 		f := v.Float()
 		if f == 0 {
@@ -465,7 +465,7 @@ func (t *Table) hashFindStrSlot(k *LuaString) (int, bool) {
 			if nd.key.ptr == kv.ptr {
 				return int(idx), true
 			}
-			if !k.IsShort() && nd.key.IsString() && nd.key.AsString().Len == k.Len && nd.key.AsString().Str() == k.Str() {
+			if !k.IsShort() && nd.key.IsString() && (*LuaString)(nd.key.ptr).Len == k.Len && (*LuaString)(nd.key.ptr).Str() == k.Str() {
 				return int(idx), true
 			}
 		}
@@ -610,7 +610,7 @@ func (t *Table) appendSlot(val Value) {
 }
 
 // RawGetStr looks up a LuaString key (fast path for GETFIELD/SELF/GETTABUP).
-func (t *Table) RawGetStr(k *LuaString) Value {
+func (t *Table) RawGetStr(_ *State, k *LuaString) Value {
 	if OptimizeEnabled && t.shape != nil {
 		if k.IsShort() {
 			if idx := t.shape.Lookup(k); idx >= 0 {
@@ -641,7 +641,7 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 		s.protoEpoch++
 		if k == s.intern.tms[TMIndex] || k == s.intern.tms[TMNewIndex] {
 			if val.IsTable() {
-				val.AsTable().markProto(s)
+				s.asTable(val).markProto(s)
 			}
 		}
 	}
@@ -697,7 +697,7 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 }
 
 // RawGetInt looks up integer key i (1-based dense array fast path).
-func (t *Table) RawGetInt(i int64) Value {
+func (t *Table) RawGetInt(_ *State, i int64) Value {
 	if i >= 1 {
 		idx := uint64(i - 1)
 		if idx < uint64(t.arrLen) {
@@ -1128,19 +1128,19 @@ func (t *Table) setArrGeneric(idx int64, val Value) {
 }
 
 // RawGet looks up any Lua Value key.
-func (t *Table) RawGet(key Value) Value {
+func (t *Table) RawGet(s *State, key Value) Value {
 	switch {
 	case key.IsInt():
-		return t.RawGetInt(key.Int())
+		return t.RawGetInt(s, key.Int())
 	case key.IsString():
-		return t.RawGetStr(key.AsString())
+		return t.RawGetStr(s, s.asString(key))
 	case key.IsFloat():
 		f := key.Float()
 		if math.IsNaN(f) {
 			return NilValue()
 		}
 		if i, ok := FloatToIntExact(f); ok {
-			return t.RawGetInt(i)
+			return t.RawGetInt(s, i)
 		}
 		if slot, ok := t.hashFindSlot(key); ok {
 			return t.hash.nodes[slot].val
@@ -1163,10 +1163,10 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 		t.RawSetInt(s, key.Int(), val)
 		return s.ConsumeMemErr()
 	case key.IsString():
-		if err := s.ensureWriteStrKeyHash(t, key.AsString(), val.IsNil()); err != nil {
+		if err := s.ensureWriteStrKeyHash(t, s.asString(key), val.IsNil()); err != nil {
 			return err
 		}
-		t.RawSetStr(s, key.AsString(), val)
+		t.RawSetStr(s, s.asString(key), val)
 		return s.ConsumeMemErr()
 	case key.IsFloat():
 		f := key.Float()
@@ -1222,15 +1222,15 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 }
 
 // Len computes Lua's raw #t (border search across dense array + hash part).
-func (t *Table) Len() int64 {
+func (t *Table) Len(s *State) int64 {
 	if OptimizeEnabled {
 		switch t.arrKind {
 		case arrInt, arrFloat, arrBool:
 			n := int64(t.arrLen)
-			if t.hash == nil || t.RawGetInt(n+1).IsNil() {
+			if t.hash == nil || t.RawGetInt(s, n+1).IsNil() {
 				return n
 			}
-			return t.hashBorder(n)
+			return t.hashBorder(s, n)
 		}
 	}
 	n := int(t.arrLen)
@@ -1250,20 +1250,20 @@ func (t *Table) Len() int64 {
 			return int64(lo)
 		}
 	}
-	if t.hash == nil || t.RawGetInt(int64(n)+1).IsNil() {
+	if t.hash == nil || t.RawGetInt(s, int64(n)+1).IsNil() {
 		return int64(n)
 	}
-	return t.hashBorder(int64(n))
+	return t.hashBorder(s, int64(n))
 }
 
-func (t *Table) hashBorder(j int64) int64 {
+func (t *Table) hashBorder(s *State, j int64) int64 {
 	i := j
 	j++
-	for !t.RawGetInt(j).IsNil() {
+	for !t.RawGetInt(s, j).IsNil() {
 		i = j
 		if j > math.MaxInt64/2 {
 			// Linear fallback near MaxInt64.
-			for j = 1; !t.RawGetInt(j).IsNil(); j++ {
+			for j = 1; !t.RawGetInt(s, j).IsNil(); j++ {
 			}
 			return j - 1
 		}
@@ -1271,7 +1271,7 @@ func (t *Table) hashBorder(j int64) int64 {
 	}
 	for j-i > 1 {
 		m := i + (j-i)/2
-		if t.RawGetInt(m).IsNil() {
+		if t.RawGetInt(s, m).IsNil() {
 			j = m
 		} else {
 			i = m
@@ -1321,7 +1321,7 @@ func (t *Table) hashFindSlotForNext(key Value) (int, bool) {
 }
 
 // Next implements Lua's next(t, key) across array, shape slots, and hash nodes.
-func (t *Table) Next(key Value) (Value, Value, error) {
+func (t *Table) Next(s *State, key Value) (Value, Value, error) {
 	arrLen := int(t.arrLen)
 	startPhase := 0 // 0=array, 1=shape, 2=hash
 	startIdx := 0
@@ -1337,8 +1337,8 @@ func (t *Table) Next(key Value) (Value, Value, error) {
 				found = true
 			}
 		}
-		if !found && OptimizeEnabled && t.shape != nil && key.IsString() && key.AsString().IsShort() {
-			if slot := t.shape.Lookup(key.AsString()); slot >= 0 {
+		if !found && OptimizeEnabled && t.shape != nil && key.IsString() && s.asString(key).IsShort() {
+			if slot := t.shape.Lookup(s.asString(key)); slot >= 0 {
 				startPhase = 1
 				startIdx = int(slot) + 1
 				found = true

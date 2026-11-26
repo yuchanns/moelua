@@ -85,7 +85,7 @@ func TestArenaStringsInternSweepAutoPacingAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err := s.Call(cl)
-	if err != nil || len(res) != 1 || res[0].AsString().Str() != "ephem_key_40000" {
+	if err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ephem_key_40000" {
 		t.Fatalf("auto-pace loop failed: res=%v err=%v", res, err)
 	}
 	if st := s.ArenaStats(); st.AllocBytes > 1024*1024 {
@@ -275,7 +275,7 @@ func TestArenaStringAutoPaceInNativeCallLoops(t *testing.T) {
 	defer s.Close()
 
 	var peakDirect, peakPCall, peakGMatch int64
-	s.SetGlobal("sample_arena", vm.NativeValue(&vm.NativeFunc{
+	s.SetGlobal("sample_arena", s.NativeValue(&vm.NativeFunc{
 		Name: "sample_arena",
 		FastFn: func(st *vm.State, args []vm.Value) (vm.Value, error) {
 			cur := st.ArenaStats().AllocBytes

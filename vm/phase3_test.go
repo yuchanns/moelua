@@ -85,7 +85,7 @@ func TestArrBoolLifecycleAndPromotion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call: %v", err)
 	}
-	if len(res) != 1 || res[0].AsString().Str() != "ok" {
+	if len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 		t.Fatalf("unexpected res: %v", res)
 	}
 }
@@ -94,7 +94,7 @@ func TestFastNativeFuncSemantics(t *testing.T) {
 	s := NewState()
 	defer s.Close()
 
-	s.SetGlobal("fast_add", NativeValue(&NativeFunc{
+	s.SetGlobal("fast_add", s.NativeValue(&NativeFunc{
 		Name: "fast_add",
 		FastFn: func(_ *State, args []Value) (Value, error) {
 			if len(args) < 2 {
@@ -145,7 +145,7 @@ func TestFastNativeFuncSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call: %v", err)
 	}
-	if len(res) != 1 || res[0].AsString().Str() != "ok" {
+	if len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 		t.Fatalf("unexpected res: %v", res)
 	}
 }
@@ -184,7 +184,7 @@ func TestIntrinsicMultretAndMixedArith(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call: %v", err)
 	}
-	if len(res) != 1 || res[0].AsString().Str() != "ok" {
+	if len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 		t.Fatalf("unexpected res: %v", res)
 	}
 }
@@ -230,7 +230,7 @@ func TestCoroutineStackShrinkWithOpenUpvalues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call: %v", err)
 	}
-	co := res[0].AsThread()
+	co := s.AsThread(res[0])
 	getter := res[1]
 	setter := res[2]
 
@@ -270,7 +270,7 @@ func TestCoroutineStackShrinkWithOpenUpvalues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call verify: %v", err)
 	}
-	if len(out) != 1 || out[0].AsString().Str() != "shrunk-ok" {
+	if len(out) != 1 || s.AsString(out[0]).Str() != "shrunk-ok" {
 		t.Fatalf("unexpected verify res: %v", out)
 	}
 }
@@ -328,7 +328,7 @@ func TestTablePairsClearLastAndHashArrayMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Call: %v", err)
 	}
-	if len(res) != 1 || res[0].AsString().Str() != "ok" {
+	if len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 		t.Fatalf("unexpected res: %v", res)
 	}
 }
@@ -356,7 +356,7 @@ func TestCodexReviewVMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -385,7 +385,7 @@ func TestCodexReviewVMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -438,7 +438,7 @@ func TestCodexReviewVMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -459,7 +459,7 @@ func TestCodexReviewVMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -490,7 +490,7 @@ func TestCodexReviewVMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -539,7 +539,7 @@ func TestCodexReviewRound2VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 		if used := s.MemoryUsage(); used > 131072 {
@@ -566,7 +566,7 @@ func TestCodexReviewRound2VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -591,7 +591,7 @@ func TestCodexReviewRound2VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -631,7 +631,7 @@ func TestCodexReviewRound2VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -658,7 +658,7 @@ func TestCodexReviewRound2VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -683,7 +683,7 @@ func TestCodexReviewRound2VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -710,7 +710,7 @@ func TestCodexReviewRound3VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -800,7 +800,7 @@ func TestCodexReviewRound3VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -824,7 +824,7 @@ func TestCodexReviewRound3VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -853,7 +853,7 @@ func TestCodexReviewRound3VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -876,7 +876,7 @@ func TestCodexReviewRound3VMRegressions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+			if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 				t.Fatalf("Call failed: res=%v err=%v", res, err)
 			}
 		})
@@ -902,7 +902,7 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -923,7 +923,7 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1021,7 +1021,7 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1074,7 +1074,7 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1154,7 +1154,7 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1188,7 +1188,7 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1224,7 +1224,7 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+			if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 				t.Fatalf("Call failed: res=%v err=%v", res, err)
 			}
 			if got := outBuf.String(); got != "exec_ok|pipe_write" {
@@ -1241,7 +1241,7 @@ func TestCodexReviewRound5VMRegressions(t *testing.T) {
 		defer s.Close()
 		s.SetMemoryLimit(65536)
 		var peakMem int64
-		s.SetGlobal("recordMem", NativeValue(&NativeFunc{
+		s.SetGlobal("recordMem", s.NativeValue(&NativeFunc{
 			Name: "recordMem",
 			Fn: func(s *State, _ []Value) ([]Value, error) {
 				if u := s.MemoryUsage(); u > peakMem {
@@ -1269,7 +1269,7 @@ func TestCodexReviewRound5VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 		if peakMem < 16384 {
@@ -1311,7 +1311,7 @@ func TestCodexReviewRound5VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Call failed: %v", err)
 		}
-		if len(res) != 2 || res[0].AsString().Str() != "X" || res[1].Int() != 42 {
+		if len(res) != 2 || s.AsString(res[0]).Str() != "X" || res[1].Int() != 42 {
 			t.Fatalf("expected ('X', 42), got %v", res)
 		}
 	})
@@ -1346,7 +1346,7 @@ func TestCodexReviewRound5VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1392,7 +1392,7 @@ func TestCodexReviewRound5VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1415,7 +1415,7 @@ func TestCodexReviewRound6VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1456,7 +1456,7 @@ func TestCodexReviewRound6VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1480,7 +1480,7 @@ func TestCodexReviewRound6VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1498,7 +1498,7 @@ func TestCodexReviewRound6VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 		if s.gc.tier1 {
@@ -1553,7 +1553,7 @@ func TestCodexReviewRound7VMRegressions(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+				if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 					t.Fatalf("Call failed: res=%v err=%v", res, err)
 				}
 			})
@@ -1589,7 +1589,7 @@ func TestCodexReviewRound7VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1612,7 +1612,7 @@ func TestCodexReviewRound7VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 
@@ -1629,7 +1629,7 @@ func TestCodexReviewRound7VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || s2.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1660,7 +1660,7 @@ func TestCodexReviewRound7VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1688,7 +1688,7 @@ func TestCodexReviewRound7VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1709,7 +1709,7 @@ func TestCodexReviewRound8VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 
@@ -1724,7 +1724,7 @@ func TestCodexReviewRound8VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || s2.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1746,7 +1746,7 @@ func TestCodexReviewRound8VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1785,7 +1785,7 @@ func TestCodexReviewRound8VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1813,7 +1813,7 @@ func TestCodexReviewRound8VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1841,7 +1841,7 @@ func TestCodexReviewRound8VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1876,7 +1876,7 @@ func TestCodexReviewRound8VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1914,7 +1914,7 @@ func TestCodexReviewRound9VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1943,7 +1943,7 @@ func TestCodexReviewRound9VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -1977,7 +1977,7 @@ func TestCodexReviewRound9VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2009,7 +2009,7 @@ func TestCodexReviewRound9VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2018,7 +2018,7 @@ func TestCodexReviewRound9VMRegressions(t *testing.T) {
 	t.Run("os_clock_measures_cpu_not_wall_sleep", func(t *testing.T) {
 		s := NewState()
 		defer s.Close()
-		s.SetGlobal("hostSleep", NativeValue(&NativeFunc{
+		s.SetGlobal("hostSleep", s.NativeValue(&NativeFunc{
 			Name: "hostSleep",
 			Fn: func(_ *State, _ []Value) ([]Value, error) {
 				time.Sleep(150 * time.Millisecond)
@@ -2035,7 +2035,7 @@ func TestCodexReviewRound9VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2092,7 +2092,7 @@ func TestCodexReviewRound9VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2132,7 +2132,7 @@ func TestCodexReviewRound10VMRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.SetMemoryLimit(65536)
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2176,7 +2176,7 @@ func TestCodexReviewRound10VMRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.SetMemoryLimit(98304)
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2241,7 +2241,7 @@ func TestCodexReviewRound10VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2262,7 +2262,7 @@ func TestCodexReviewRound10VMRegressions(t *testing.T) {
 		if err != nil || len(res) != 1 {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
-		name := res[0].AsString().Str()
+		name := s.AsString(res[0]).Str()
 		defer os.Remove(name)
 		if runtime.GOOS != "windows" {
 			if _, err := os.Stat(name); err != nil {
@@ -2318,7 +2318,7 @@ func TestCodexReviewRound10VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2367,7 +2367,7 @@ func TestCodexReviewRound11VMRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.SetMemoryLimit(262144)
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2404,7 +2404,7 @@ func TestCodexReviewRound11VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2441,7 +2441,7 @@ func TestCodexReviewRound11VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2526,7 +2526,7 @@ func TestCodexReviewRound11VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2609,7 +2609,7 @@ func TestCodexReviewRound12VMRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.SetMemoryLimit(131072)
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2639,7 +2639,7 @@ func TestCodexReviewRound12VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2682,7 +2682,7 @@ func TestCodexReviewRound12VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2704,7 +2704,7 @@ func TestCodexReviewRound12VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2776,7 +2776,7 @@ func TestCodexReviewRound12VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2814,7 +2814,7 @@ func TestCodexReviewRound13VMRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.SetMemoryLimit(131072)
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2906,7 +2906,7 @@ func TestCodexReviewRound13VMRegressions(t *testing.T) {
 		s.CollectFull()
 		base := s.MemoryUsage()
 		s.SetMemoryLimit(base + 131072)
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2969,7 +2969,7 @@ func TestCodexReviewRound13VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -2996,7 +2996,7 @@ func TestCodexReviewRound13VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3028,7 +3028,7 @@ func TestCodexReviewRound13VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3053,7 +3053,7 @@ func TestCodexReviewRound13VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3086,7 +3086,7 @@ func TestCodexReviewRound13VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 		if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
@@ -3160,7 +3160,7 @@ func TestCodexReviewRound14VMRegressions(t *testing.T) {
 		s.SetMemoryLimit(131072)
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 		runtime.ReadMemStats(&after)
@@ -3189,7 +3189,7 @@ func TestCodexReviewRound14VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3214,7 +3214,7 @@ func TestCodexReviewRound14VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3285,11 +3285,11 @@ func TestCodexReviewRound15VMRegressions(t *testing.T) {
 		}
 		tblVal := res[0]
 		liveDuringCall := false
-		consumer := NativeValue(&NativeFunc{
+		consumer := s.NativeValue(&NativeFunc{
 			Name: "gc_consumer",
 			Fn: func(st *State, args []Value) ([]Value, error) {
 				st.CollectFull()
-				v := args[0].AsTable().RawGetStr(st.Intern("live"))
+				v := s.AsTable(args[0]).RawGetStr(s, st.Intern("live"))
 				liveDuringCall = v.IsTrue()
 				return []Value{BoolValue(liveDuringCall)}, nil
 			},
@@ -3300,7 +3300,7 @@ func TestCodexReviewRound15VMRegressions(t *testing.T) {
 		}
 		// Once the call returns and the table is no longer referenced in the VM, GC finalizes it.
 		s.CollectFull()
-		if tblVal.AsTable().RawGetStr(s.Intern("live")).IsTrue() {
+		if s.AsTable(tblVal).RawGetStr(s, s.Intern("live")).IsTrue() {
 			t.Fatalf("expected table to finalize after State.Call returned")
 		}
 	})
@@ -3343,7 +3343,7 @@ func TestCodexReviewRound15VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3387,7 +3387,7 @@ func TestCodexReviewRound15VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3422,7 +3422,7 @@ func TestCodexReviewRound15VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3449,7 +3449,7 @@ func TestCodexReviewRound15VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3479,7 +3479,7 @@ func TestCodexReviewRound15VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3643,7 +3643,7 @@ func TestStreamingLoadAndDump(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("Call failed: res=%v err=%v", res, err)
 		}
 
@@ -3693,7 +3693,7 @@ func TestStreamingLoadAndDump(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(clFile); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(clFile); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("loadfile binary shebang failed: res=%v err=%v", res, err)
 		}
 		if runtime.GOOS != "windows" {
@@ -3705,7 +3705,7 @@ func TestStreamingLoadAndDump(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res, err := s.Call(clDir); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+			if res, err := s.Call(clDir); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 				t.Fatalf("loadfile dir check failed: res=%v err=%v", res, err)
 			}
 		}
@@ -3743,7 +3743,7 @@ func TestCodexReviewRound16VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl1); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl1); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("os.date retain OOM failed: res=%v err=%v", res, err)
 		}
 
@@ -3761,7 +3761,7 @@ func TestCodexReviewRound16VMRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		s2.SetMemoryLimit(262144)
-		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || s2.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("os.date single OOM failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3791,7 +3791,7 @@ func TestCodexReviewRound16VMRegressions(t *testing.T) {
 		runtime.ReadMemStats(&before)
 		res, err := s.Call(cl)
 		runtime.ReadMemStats(&after)
-		if err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("utf8.codepoint OOM failed: res=%v err=%v", res, err)
 		}
 		// Previously allocated ~1.16 MB before failing; zero-alloc pass 1 must stay far below 256 KiB.
@@ -3822,7 +3822,7 @@ func TestCodexReviewRound16VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("package.searchers parity failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3873,7 +3873,7 @@ func TestCodexReviewRound16VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("native closure upvalues failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3900,7 +3900,7 @@ func TestCodexReviewRound16VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("io.popen flush failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3934,7 +3934,7 @@ func TestCodexReviewRound16VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("os.difftime precision failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3969,7 +3969,7 @@ func TestCodexReviewRound17VMRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.SetMemoryLimit(131072)
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("multi-format file:read rooting failed: res=%v err=%v", res, err)
 		}
 	})
@@ -3998,7 +3998,7 @@ func TestCodexReviewRound17VMRegressions(t *testing.T) {
 		runtime.ReadMemStats(&before)
 		res, err := s.Call(cl)
 		runtime.ReadMemStats(&after)
-		if err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("string.unpack OOM failed: res=%v err=%v", res, err)
 		}
 		// Previously allocated ~6.7 MB before failing; zero-alloc pass 1 must stay well under 512 KiB.
@@ -4027,7 +4027,7 @@ func TestCodexReviewRound17VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("math.modf parity failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4055,7 +4055,7 @@ func TestCodexReviewRound17VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := sOK.Call(clOK); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := sOK.Call(clOK); err != nil || len(res) != 1 || sOK.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("cancelable sort correctness failed: res=%v err=%v", res, err)
 		}
 		if sOK.InstructionsExecuted() <= 0 {
@@ -4118,7 +4118,7 @@ func TestCodexReviewRound17VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(clFmt); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(clFmt); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("warn formatting failed: res=%v err=%v", res, err)
 		}
 		if got := buf.String(); got != "Lua warning: hello 123!\n" {
@@ -4146,7 +4146,7 @@ func TestCodexReviewRound17VMRegressions(t *testing.T) {
 		runtime.ReadMemStats(&before)
 		res, err := s2.Call(clBig)
 		runtime.ReadMemStats(&after)
-		if err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("warn big failed: res=%v err=%v", res, err)
 		}
 		if delta := after.TotalAlloc - before.TotalAlloc; delta > 2*1024*1024 {
@@ -4189,13 +4189,13 @@ func TestCodexReviewRound18VMRegressions(t *testing.T) {
 		if !keptVal.IsTable() {
 			t.Fatalf("expected kept table")
 		}
-		keptTbl := keptVal.AsTable()
+		keptTbl := s.AsTable(keptVal)
 		for i := int64(1); i <= 61; i++ {
-			tv := keptTbl.RawGetInt(i)
+			tv := keptTbl.RawGetInt(s, i)
 			if !tv.IsTable() {
 				t.Fatalf("entry %d not a table", i)
 			}
-			tbl := tv.AsTable()
+			tbl := s.AsTable(tv)
 			if (!tbl.inlineSlots[0].IsNil() && tbl.inlineSlots[0].ptr != nil) || (!tbl.inlineSlots[1].IsNil() && tbl.inlineSlots[1].ptr != nil) {
 				t.Fatalf("table %d retained stale inlineSlots pointer after growth/demotion: %v", i, tbl.inlineSlots)
 			}
@@ -4238,7 +4238,7 @@ func TestCodexReviewRound18VMRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.SetMemoryLimit(131072)
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("capture rooting OOM failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4279,7 +4279,7 @@ func TestCodexReviewRound18VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("xpcall self-close failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4313,7 +4313,7 @@ func TestCodexReviewRound18VMRegressions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+			if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 				t.Fatalf("weak table __mode=%s string accounting failed: res=%v err=%v", mode, res, err)
 			}
 		}
@@ -4334,7 +4334,7 @@ func TestCodexReviewRound18VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || s2.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("weak kv dead keys check failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4363,7 +4363,7 @@ func TestCodexReviewRound19VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(clOK); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(clOK); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("AddFS small/streaming comment modules failed: res=%v err=%v", res, err)
 		}
 
@@ -4381,7 +4381,7 @@ func TestCodexReviewRound19VMRegressions(t *testing.T) {
 		runtime.ReadMemStats(&before)
 		res, err := s.Call(clHuge)
 		runtime.ReadMemStats(&after)
-		if err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("AddFS huge module OOM check failed: res=%v err=%v", res, err)
 		}
 		// Previously allocated ~2.1 MB via fs.ReadFile; streaming must stay far below 512 KiB.
@@ -4418,7 +4418,7 @@ func TestCodexReviewRound19VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("package GC root check failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4443,7 +4443,7 @@ func TestCodexReviewRound19VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("emergency weak clear failed: res=%v err=%v", res, err)
 		}
 
@@ -4467,7 +4467,7 @@ func TestCodexReviewRound19VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s2.Call(cl2); err != nil || len(res) != 1 || s2.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("emergency weak pending-__gc accounting failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4525,7 +4525,7 @@ func TestCodexReviewRound19VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("coroutine resumed return-hook unwind failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4579,7 +4579,7 @@ func TestCodexReviewRound20VMRegressions(t *testing.T) {
 		runtime.ReadMemStats(&b2)
 		res, err := s2.Call(cl)
 		runtime.ReadMemStats(&a2)
-		if err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if err != nil || len(res) != 1 || s2.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("load(binStr) OOM check failed: res=%v err=%v", res, err)
 		}
 		if delta := a2.TotalAlloc - b2.TotalAlloc; delta > 524288 {
@@ -4658,7 +4658,7 @@ func TestCodexReviewRound20VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("sync close self-close failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4696,7 +4696,7 @@ func TestCodexReviewRound20VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("nested pcall/xpcall failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4714,8 +4714,8 @@ func TestCodexReviewRound21VMRegressions(t *testing.T) {
 			for i := int64(1); i <= n; i++ {
 				tbl.RawSetInt(s, i, IntValue(i))
 			}
-			tableLib := s.GetGlobal("table").AsTable()
-			fn := tableLib.RawGetStr(s.Intern(op))
+			tableLib := s.AsTable(s.GetGlobal("table"))
+			fn := tableLib.RawGetStr(s, s.Intern(op))
 			callArgs := []Value{TableValue(tbl), IntValue(1)}
 			if op == "insert" {
 				callArgs = append(callArgs, IntValue(0))
@@ -4765,7 +4765,7 @@ func TestCodexReviewRound21VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("small table.insert/remove under insnLimit=500 failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4781,49 +4781,49 @@ func TestCodexReviewRound21VMRegressions(t *testing.T) {
 			{
 				name: "string.rep_plain",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("rep")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("rep")),
 						[]Value{StringValue(s.Intern("a")), IntValue(2_000_000)}
 				},
 			},
 			{
 				name: "string.rep_sep",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("rep")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("rep")),
 						[]Value{StringValue(s.Intern("a")), IntValue(2_000_000), StringValue(s.Intern(","))}
 				},
 			},
 			{
 				name: "string.byte",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("byte")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("byte")),
 						[]Value{StringValue(s.Intern(bigStr)), IntValue(1), IntValue(500_000)}
 				},
 			},
 			{
 				name: "string.reverse",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("reverse")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("reverse")),
 						[]Value{StringValue(s.Intern(bigStr))}
 				},
 			},
 			{
 				name: "string.lower",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("lower")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("lower")),
 						[]Value{StringValue(s.Intern(bigStr))}
 				},
 			},
 			{
 				name: "string.upper",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("upper")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("upper")),
 						[]Value{StringValue(s.Intern(bigStr))}
 				},
 			},
 			{
 				name: "os.date",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("os").AsTable().RawGetStr(s.Intern("date")),
+					return s.AsTable(s.GetGlobal("os")).RawGetStr(s, s.Intern("date")),
 						[]Value{StringValue(s.Intern(bigFmt)), IntValue(1_700_000_000)}
 				},
 			},
@@ -4872,7 +4872,7 @@ func TestCodexReviewRound21VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("small string ops under insnLimit failed: res=%v err=%v", res, err)
 		}
 	})
@@ -4892,35 +4892,35 @@ func TestCodexReviewRound22VMRegressions(t *testing.T) {
 			{
 				name: "string.packsize_spaces",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("packsize")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("packsize")),
 						[]Value{StringValue(s.Intern(bigSpaces))}
 				},
 			},
 			{
 				name: "string.pack_spaces",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("pack")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("pack")),
 						[]Value{StringValue(s.Intern(bigSpaces))}
 				},
 			},
 			{
 				name: "string.unpack_spaces",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("unpack")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("unpack")),
 						[]Value{StringValue(s.Intern(bigSpaces)), StringValue(s.Intern(""))}
 				},
 			},
 			{
 				name: "string.format_percent",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("format")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("format")),
 						[]Value{StringValue(s.Intern(bigPct))}
 				},
 			},
 			{
 				name: "string.format_literal",
 				fn: func(s *State) (Value, []Value) {
-					return s.GetGlobal("string").AsTable().RawGetStr(s.Intern("format")),
+					return s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("format")),
 						[]Value{StringValue(s.Intern(bigLit))}
 				},
 			},
@@ -5027,7 +5027,7 @@ func TestCodexReviewRound22VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("self-close paths failed: res=%v err=%v", res, err)
 		}
 	})
@@ -5089,7 +5089,7 @@ func TestCodexReviewRound22VMRegressions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if r, err := s.Call(clCheckConsistent); err != nil || len(r) != 1 || r[0].AsString().Str() != "ok" {
+			if r, err := s.Call(clCheckConsistent); err != nil || len(r) != 1 || s.AsString(r[0]).Str() != "ok" {
 				t.Fatalf("cache consistency check failed: res=%v err=%v", r, err)
 			}
 		}
@@ -5130,7 +5130,7 @@ func TestCodexReviewRound22VMRegressions(t *testing.T) {
 		s.SetMemoryLimit(131072)
 
 		mt := s.NewTable(0, 1)
-		mt.RawSetStr(s, s.Intern("__gc"), NativeValue(&NativeFunc{
+		mt.RawSetStr(s, s.Intern("__gc"), s.NativeValue(&NativeFunc{
 			Name: "noop_gc",
 			Fn:   func(_ *State, _ []Value) ([]Value, error) { return nil, nil },
 		}))
@@ -5213,14 +5213,14 @@ func TestCodexReviewRound23VMRegressions(t *testing.T) {
 		}
 		s.SetMemoryLimit(131072)
 		res, err := s.Call(cl)
-		if err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("searchpath memory budget check failed: res=%v err=%v", res, err)
 		}
 
 		// Also verify execution controls on many ';' templates.
 		s2 := NewState()
 		defer s2.Close()
-		searchPathFn := s2.GetGlobal("package").AsTable().RawGetStr(s2.Intern("searchpath"))
+		searchPathFn := s2.AsTable(s2.GetGlobal("package")).RawGetStr(s, s2.Intern("searchpath"))
 		manySep := StringValue(s2.Intern(strings.Repeat(";", 200_000)))
 		s2.SetInstructionLimit(100)
 		_, err = s2.Call(searchPathFn, StringValue(s2.Intern("m")), manySep)
@@ -5273,7 +5273,7 @@ func TestCodexReviewRound23VMRegressions(t *testing.T) {
 		}
 		s.SetMemoryLimit(163840)
 		res, err := s.Call(cl)
-		if err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("error/traceback memory budget check failed: res=%v err=%v", res, err)
 		}
 	})
@@ -5307,7 +5307,7 @@ func TestCodexReviewRound23VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("hook currentline check failed: res=%v err=%v", res, err)
 		}
 	})
@@ -5365,7 +5365,7 @@ func TestCodexReviewRound23VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("protected call frame identity check failed: res=%v err=%v", res, err)
 		}
 	})
@@ -5400,7 +5400,7 @@ func TestCodexReviewRound24VMRegressions(t *testing.T) {
 		runtime.ReadMemStats(&before)
 		res, err := s.Call(cl)
 		runtime.ReadMemStats(&after)
-		if err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 		if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
@@ -5466,7 +5466,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -5483,7 +5483,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -5520,7 +5520,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -5581,7 +5581,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -5609,7 +5609,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil || len(res) != 2 {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
-		wco := weak.Make(res[0].AsThread())
+		wco := weak.Make(s.AsThread(res[0]))
 		fn := res[1]
 		res = nil
 		s.SetGlobal("kept_fn", fn)
@@ -5620,7 +5620,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		s.collectEmergency()
 		// Verify open upvalue was closed and captured value survived.
 		got, err := s.Call(fn)
-		if err != nil || len(got) != 1 || got[0].AsString().Str() != "captured-value" {
+		if err != nil || len(got) != 1 || s.AsString(got[0]).Str() != "captured-value" {
 			t.Fatalf("captured value corrupted: got=%v err=%v", got, err)
 		}
 		for range 10 {
@@ -5642,7 +5642,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		dumpFn := s.GetGlobal("string").AsTable().RawGetStr(s.Intern("dump"))
+		dumpFn := s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("dump"))
 		s.SetInstructionLimit(100)
 		_, err = s.Call(dumpFn, fn)
 		if !errors.Is(err, ErrInstructionLimit) {
@@ -5658,7 +5658,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		s2.SetContext(ctx)
-		_, err = s2.Call(s2.GetGlobal("string").AsTable().RawGetStr(s2.Intern("dump")), fn2)
+		_, err = s2.Call(s2.AsTable(s2.GetGlobal("string")).RawGetStr(s, s2.Intern("dump")), fn2)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected context.Canceled from string.dump, got %v", err)
 		}
@@ -5679,7 +5679,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -5716,7 +5716,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -5746,7 +5746,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 			t.Fatal(err)
 		}
 		start := time.Now()
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 		if elapsed := time.Since(start); elapsed > 2*time.Second {
@@ -5797,7 +5797,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -5839,7 +5839,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -5945,7 +5945,7 @@ func TestAuditAndRound25VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 		if !strings.Contains(warnBuf.String(), "error in __gc (attempt to call a number value") {
@@ -5965,7 +5965,7 @@ func TestCodexReviewRound26VMRegressions(t *testing.T) {
 				s := NewState()
 				defer s.Close()
 				var finalized bool
-				gcFn := NativeValue(&NativeFunc{
+				gcFn := s.NativeValue(&NativeFunc{
 					Name: "mark_gc",
 					Fn: func(_ *State, _ []Value) ([]Value, error) {
 						finalized = true
@@ -5986,7 +5986,7 @@ func TestCodexReviewRound26VMRegressions(t *testing.T) {
 					}
 				}
 
-				maker := NativeValue(&NativeFunc{
+				maker := s.NativeValue(&NativeFunc{
 					Name: "make_pair",
 					Fn: func(st *State, _ []Value) ([]Value, error) {
 						tbl := st.NewTable(0, 1)
@@ -6006,7 +6006,7 @@ func TestCodexReviewRound26VMRegressions(t *testing.T) {
 				if finalized {
 					t.Fatalf("returned table's __gc ran prematurely before State.Call returned")
 				}
-				if len(res) != 2 || !res[0].IsTable() || !res[1].IsString() || len(res[1].AsString().Str()) != 128*1024 {
+				if len(res) != 2 || !res[0].IsTable() || !res[1].IsString() || len(s.AsString(res[1]).Str()) != 128*1024 {
 					t.Fatalf("unexpected native return values: %v", res)
 				}
 				// Now drop references and verify __gc runs on explicit GC.
@@ -6069,7 +6069,7 @@ return "ok"
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -6077,7 +6077,7 @@ return "ok"
 	t.Run("file_and_table_finalizer_lifo_order", func(t *testing.T) {
 		s := NewState()
 		var closeOrder []string
-		s.SetGlobal("record_close", NativeValue(&NativeFunc{
+		s.SetGlobal("record_close", s.NativeValue(&NativeFunc{
 			Name: "record_close",
 			Fn: func(_ *State, args []Value) ([]Value, error) {
 				closeOrder = append(closeOrder, FormatValue(args[0]))
@@ -6113,7 +6113,7 @@ return "ok"
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 		closeOrder = nil
@@ -6189,7 +6189,7 @@ return "ok"
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -6202,11 +6202,11 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		s.SetMemoryLimit(131072)
 
 		var watched []weak.Pointer[LuaString]
-		s.SetGlobal("watch_str", NativeValue(&NativeFunc{
+		s.SetGlobal("watch_str", s.NativeValue(&NativeFunc{
 			Name: "watch_str",
 			Fn: func(_ *State, args []Value) ([]Value, error) {
 				if len(args) > 0 && args[0].IsString() {
-					watched = append(watched, weak.Make(args[0].AsString()))
+					watched = append(watched, weak.Make(s.AsString(args[0])))
 				}
 				return args, nil
 			},
@@ -6238,7 +6238,7 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 		if len(watched) != 7 {
@@ -6300,7 +6300,7 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 			t.Fatalf("expected ErrInstructionLimit from no-base hex tonumber, got %v", err)
 		}
 		s.SetInstructionLimit(100)
-		mathToInt := s.GetGlobal("math").AsTable().RawGetStr(s.Intern("tointeger"))
+		mathToInt := s.AsTable(s.GetGlobal("math")).RawGetStr(s, s.Intern("tointeger"))
 		if _, err := s.Call(mathToInt, bigDec); !errors.Is(err, ErrInstructionLimit) {
 			t.Fatalf("expected ErrInstructionLimit from math.tointeger, got %v", err)
 		}
@@ -6322,7 +6322,7 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -6331,7 +6331,7 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		s := NewState()
 		defer s.Close()
 
-		s.SetGlobal("force_go_gc", NativeValue(&NativeFunc{
+		s.SetGlobal("force_go_gc", s.NativeValue(&NativeFunc{
 			Name: "force_go_gc",
 			Fn: func(_ *State, _ []Value) ([]Value, error) {
 				for range 4 {
@@ -6364,7 +6364,7 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -6375,11 +6375,11 @@ func TestCodexReviewRound27VMRegressions(t *testing.T) {
 		s.SetMemoryLimit(131072)
 
 		var watched []weak.Pointer[LuaString]
-		s.SetGlobal("watch_str", NativeValue(&NativeFunc{
+		s.SetGlobal("watch_str", s.NativeValue(&NativeFunc{
 			Name: "watch_str",
 			Fn: func(_ *State, args []Value) ([]Value, error) {
 				if len(args) > 0 && args[0].IsString() {
-					watched = append(watched, weak.Make(args[0].AsString()))
+					watched = append(watched, weak.Make(s.AsString(args[0])))
 				}
 				return args, nil
 			},
@@ -6512,7 +6512,7 @@ func TestCodexReviewRound28VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -6573,7 +6573,7 @@ func TestCodexReviewRound29VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -6599,7 +6599,7 @@ func TestCodexReviewRound29VMRegressions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res, err := s.Call(cl); err != nil || len(res) != 1 || res[0].AsString().Str() != "ok" {
+		if res, err := s.Call(cl); err != nil || len(res) != 1 || s.AsString(res[0]).Str() != "ok" {
 			t.Fatalf("res=%v err=%v", res, err)
 		}
 	})
@@ -6656,7 +6656,7 @@ func TestCodexReviewRound30VMRegressions(t *testing.T) {
 			t.Fatalf("read('n') over 32MiB whitespace ignored instruction limit: err=%v", err)
 		}
 		s.SetInstructionLimit(0)
-		if _, err := s.Call(s.GetGlobal("io").AsTable().RawGetStr(s.intern.Intern("close")), res[0]); err != nil {
+		if _, err := s.Call(s.AsTable(s.GetGlobal("io")).RawGetStr(s, s.intern.Intern("close")), res[0]); err != nil {
 			t.Fatalf("close: %v", err)
 		}
 	})

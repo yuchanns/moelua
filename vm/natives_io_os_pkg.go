@@ -232,7 +232,7 @@ func nativeWarn(s *State, args []Value) ([]Value, error) {
 		}
 	}
 	if len(args) == 1 && args[0].IsString() {
-		first := args[0].AsString().Str()
+		first := s.asString(args[0]).Str()
 		if strings.HasPrefix(first, "@") {
 			switch first {
 			case "@on":
@@ -254,7 +254,7 @@ func nativeWarn(s *State, args []Value) ([]Value, error) {
 	for _, a := range args {
 		var str string
 		if a.IsString() {
-			str = a.AsString().Str()
+			str = s.asString(a).Str()
 		} else {
 			str = s.FormatValue(a)
 		}
@@ -1070,10 +1070,10 @@ func (s *State) flushOpenFiles() {
 		_ = lf.flushWriter()
 	}
 	if env := s.GlobalEnv(); env != nil {
-		if ioVal := env.RawGetStr(s.intern.Intern("io")); ioVal.IsTable() {
-			ioTbl := ioVal.AsTable()
+		if ioVal := env.RawGetStr(s, s.intern.Intern("io")); ioVal.IsTable() {
+			ioTbl := s.asTable(ioVal)
 			for _, name := range [...]string{"stdout", "stderr"} {
-				if lf, ok := s.asLuaFile(ioTbl.RawGetStr(s.intern.Intern(name))); ok && !lf.closed {
+				if lf, ok := s.asLuaFile(ioTbl.RawGetStr(s, s.intern.Intern(name))); ok && !lf.closed {
 					_ = lf.flushWriter()
 				}
 			}
@@ -1092,7 +1092,7 @@ func (s *State) asLuaFile(v Value) (*luaFile, bool) {
 	if !v.IsUserdata() {
 		return nil, false
 	}
-	lf, ok := s.UserdataData(v.AsUserdata()).(*luaFile)
+	lf, ok := s.UserdataData(s.asUserdata(v)).(*luaFile)
 	return lf, ok
 }
 
@@ -1190,7 +1190,7 @@ func nativeIOOpen(s *State, args []Value) ([]Value, error) {
 	if !isValidIOMode(mode) {
 		return nil, fmt.Errorf("bad argument #2 to 'open' (invalid mode)")
 	}
-	lf, err := openFileWithMode(args[0].AsString().Str(), mode)
+	lf, err := openFileWithMode(s.asString(args[0]).Str(), mode)
 	if err != nil {
 		return ioFail(s, err), nil
 	}
@@ -1569,7 +1569,7 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 	if lf.w != nil {
 		oldSz = int64(lf.w.Size())
 	}
-	mode := args[1].AsString().Str()
+	mode := s.asString(args[1]).Str()
 	switch mode {
 	case "no":
 		lf.bufMode = bufModeNo
@@ -2395,7 +2395,7 @@ func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) ([]Val
 			}
 			if len(res) >= 2 && res[0].IsNil() && res[1].IsString() {
 				// Propagate I/O error from f:lines() iterator (files.lua:386)!
-				return nil, fmt.Errorf("%s", res[1].AsString().Str())
+				return nil, fmt.Errorf("%s", s.asString(res[1]).Str())
 			}
 			if len(res) == 0 || res[0].IsNil() {
 				if curAutoClose && !lf.closed && !lf.isStd {
@@ -2410,7 +2410,7 @@ func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) ([]Val
 	if autoClose {
 		closeVar = fileVal
 	}
-	return []Value{NativeValue(iter), NilValue(), NilValue(), closeVar}, nil
+	return []Value{s.NativeValue(iter), NilValue(), NilValue(), closeVar}, nil
 }
 
 func nativeFileLines(s *State, args []Value) ([]Value, error) {
@@ -2489,10 +2489,10 @@ func nativeOSTime(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'os.time' (table expected)")
 	}
 	tblVal := args[0]
-	t := tblVal.AsTable()
+	t := s.asTable(tblVal)
 	readField := func(name string) (Value, error) {
 		k := s.intern.Intern(name)
-		v := t.RawGetStr(k)
+		v := t.RawGetStr(s, k)
 		if v.IsNil() && t.meta != nil {
 			return s.finishGet(tblVal, StringValue(k))
 		}
@@ -3097,9 +3097,9 @@ func (s *State) initPackageLib() {
 	pkg.RawSetStr(s, s.intern.Intern("config"), StringValue(s.intern.Intern("/\n;\n?\n!\n-\n")))
 
 	// Stateless searchers & require (safe to share across States via frozen stdlib template!).
-	searchers.RawSetInt(s, 1, NativeValue(&NativeFunc{Name: "searcher_preload", Fn: nativeSearcherPreload}))
-	searchers.RawSetInt(s, 2, NativeValue(&NativeFunc{Name: "searcher_lua", Fn: nativeSearcherLua}))
-	searchers.RawSetInt(s, 3, NativeValue(&NativeFunc{Name: "searcher_c", Fn: nativeSearcherC}))
+	searchers.RawSetInt(s, 1, s.NativeValue(&NativeFunc{Name: "searcher_preload", Fn: nativeSearcherPreload}))
+	searchers.RawSetInt(s, 2, s.NativeValue(&NativeFunc{Name: "searcher_lua", Fn: nativeSearcherLua}))
+	searchers.RawSetInt(s, 3, s.NativeValue(&NativeFunc{Name: "searcher_c", Fn: nativeSearcherC}))
 	pkg.RawSetStr(s, s.intern.Intern("searchers"), TableValue(searchers))
 	s.registerFunc(pkg, "searchpath", intrNone, nativePackageSearchPath)
 	s.registerFunc(pkg, "loadlib", intrNone, nativePackageLoadLib)
@@ -3114,7 +3114,7 @@ func (s *State) initPackageLib() {
 
 func (s *State) pkgField(name string) (Value, error) {
 	key := s.intern.Intern(name)
-	v := s.pkgTbl.RawGetStr(key)
+	v := s.pkgTbl.RawGetStr(s, key)
 	if v.IsNil() && s.pkgTbl.meta != nil {
 		return s.finishGet(TableValue(s.pkgTbl), StringValue(key))
 	}
@@ -3123,7 +3123,7 @@ func (s *State) pkgField(name string) (Value, error) {
 
 func (s *State) registryField(name string) (Value, error) {
 	key := s.intern.Intern(name)
-	v := s.registry.RawGetStr(key)
+	v := s.registry.RawGetStr(s, key)
 	if v.IsNil() && s.registry.meta != nil {
 		return s.finishGet(TableValue(s.registry), StringValue(key))
 	}
@@ -3132,11 +3132,11 @@ func (s *State) registryField(name string) (Value, error) {
 
 func (s *State) tableGetStrAny(obj Value, key *LuaString) (Value, error) {
 	if obj.IsTable() {
-		t := obj.AsTable()
+		t := s.asTable(obj)
 		if err := s.ensureLookupStrKeyHash(t, key); err != nil {
 			return NilValue(), err
 		}
-		v := t.RawGetStr(key)
+		v := t.RawGetStr(s, key)
 		if !v.IsNil() || t.meta == nil {
 			return v, nil
 		}
@@ -3154,7 +3154,7 @@ func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
 		err  error
 	)
 	if args[0].IsString() {
-		key = args[0].AsString()
+		key = s.asString(args[0])
 		name = key.Str()
 	} else {
 		name = s.FormatValue(args[0])
@@ -3259,7 +3259,7 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 		err  error
 	)
 	if args[0].IsString() {
-		key = args[0].AsString()
+		key = s.asString(args[0])
 		name = key.Str()
 	} else {
 		name = s.FormatValue(args[0])
@@ -3312,7 +3312,7 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	if !sv.IsTable() {
 		return nil, fmt.Errorf("'package.searchers' must be a table")
 	}
-	st := sv.AsTable()
+	st := s.asTable(sv)
 	th.stack[baseTop+1] = sv
 	cancelFn := s.nativeCancelFunc()
 	var errs strings.Builder
@@ -3342,7 +3342,7 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 				return nil, cerr
 			}
 		}
-		searcher := st.RawGetInt(i)
+		searcher := st.RawGetInt(s, i)
 		if searcher.IsNil() {
 			if cerr := ensureErrPrefix(); cerr != nil {
 				return nil, cerr
@@ -3644,11 +3644,11 @@ func (s *State) AddFS(fsys fs.FS) {
 	if fsys == nil || s.pkgTbl == nil {
 		return
 	}
-	sv := s.pkgTbl.RawGetStr(s.intern.Intern("searchers"))
+	sv := s.pkgTbl.RawGetStr(s, s.intern.Intern("searchers"))
 	if !sv.IsTable() {
 		return
 	}
-	st := sv.AsTable()
+	st := s.asTable(sv)
 	searcher, err := s.TryAllocNative(&NativeFunc{
 		Name:        "searcher_fs",
 		Collectable: true,
@@ -3665,7 +3665,7 @@ func (s *State) AddFS(fsys fs.FS) {
 		pinID = s.Ref(searcher)
 		defer s.Unref(pinID)
 	}
-	n := st.Len()
+	n := st.Len(s)
 	pos := min(int64(2+s.fsSearchers), n+1)
 	if pos < 1 {
 		pos = 1
@@ -3673,12 +3673,12 @@ func (s *State) AddFS(fsys fs.FS) {
 	// Grow slot n+1 first; if allocation fails under memLimit, abort before overwriting any
 	// existing searcher slot and consume the deferred memExceeded flag cleanly.
 	if pos <= n {
-		st.RawSetInt(s, n+1, st.RawGetInt(n))
+		st.RawSetInt(s, n+1, st.RawGetInt(s, n))
 		if err := s.ConsumeMemErr(); err != nil {
 			return
 		}
 		for i := n - 1; i >= pos; i-- {
-			st.RawSetInt(s, i+1, st.RawGetInt(i))
+			st.RawSetInt(s, i+1, st.RawGetInt(s, i))
 			if err := s.ConsumeMemErr(); err != nil {
 				return
 			}
@@ -3696,17 +3696,17 @@ func (s *State) AddSearcher(fn *NativeFunc) {
 	if fn == nil || s.pkgTbl == nil {
 		return
 	}
-	sv := s.pkgTbl.RawGetStr(s.intern.Intern("searchers"))
+	sv := s.pkgTbl.RawGetStr(s, s.intern.Intern("searchers"))
 	if !sv.IsTable() {
 		return
 	}
-	st := sv.AsTable()
-	v := NativeValue(fn)
+	st := s.asTable(sv)
+	v := s.NativeValue(fn)
 	if s.memLimit > 0 {
 		id := s.Ref(v)
 		defer s.Unref(id)
 	}
-	st.RawSetInt(s, st.Len()+1, v)
+	st.RawSetInt(s, st.Len(s)+1, v)
 	_ = s.ConsumeMemErr()
 }
 
@@ -3716,8 +3716,8 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 	}
 	name := s.FormatValue(args[0])
 	pathStr := defaultLuaPath
-	if pv := s.pkgTbl.RawGetStr(s.intern.Intern("path")); pv.IsString() {
-		pathStr = pv.AsString().Str()
+	if pv := s.pkgTbl.RawGetStr(s, s.intern.Intern("path")); pv.IsString() {
+		pathStr = s.asString(pv).Str()
 	}
 	cancelFn := s.nativeCancelFunc()
 	if _, err := s.checkedReplaceSize(name, ".", "/"); err != nil {

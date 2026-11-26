@@ -107,7 +107,6 @@ func BoolValue(b bool) Value {
 func StringValue(s *LuaString) Value   { return Value{ptr: unsafe.Pointer(s), bits: kindString} }
 func TableValue(t *Table) Value        { return Value{ptr: unsafe.Pointer(t), bits: kindTable} }
 func ClosureValue(c *Closure) Value    { return Value{ptr: unsafe.Pointer(c), bits: kindClosure} }
-func NativeValue(f *NativeFunc) Value  { return Value{ptr: unsafe.Pointer(f), bits: kindNative} }
 func ThreadValue(th *Thread) Value     { return Value{ptr: unsafe.Pointer(th), bits: kindThread} }
 func UserdataValue(u *Userdata) Value  { return Value{ptr: unsafe.Pointer(u), bits: kindUserdata} }
 func LightUDValue(p unsafe.Pointer) Value {
@@ -148,12 +147,6 @@ func (v Value) IsLightUD() bool {
 }
 func (v Value) IsFunction() bool { return v.IsClosure() || v.IsNative() }
 
-func (v Value) AsString() *LuaString  { return (*LuaString)(v.ptr) }
-func (v Value) AsTable() *Table       { return (*Table)(v.ptr) }
-func (v Value) AsClosure() *Closure   { return (*Closure)(v.ptr) }
-func (v Value) AsNative() *NativeFunc { return (*NativeFunc)(v.ptr) }
-func (v Value) AsThread() *Thread     { return (*Thread)(v.ptr) }
-func (v Value) AsUserdata() *Userdata { return (*Userdata)(v.ptr) }
 func (v Value) AsLightUD() unsafe.Pointer {
 	if v.ptr == tagNullLightUD || v.ptr == tagTokenLightUD {
 		return nil
@@ -225,7 +218,7 @@ func (v Value) CoerceFloat() (float64, bool) {
 		return float64(v.Int()), true
 	}
 	if v.IsString() {
-		if i, f, isInt, ok := luastdlib.StrToNum(v.AsString().Str()); ok {
+		if i, f, isInt, ok := luastdlib.StrToNum((*LuaString)(v.ptr).Str()); ok {
 			if isInt {
 				return float64(i), true
 			}
@@ -244,7 +237,7 @@ func (v Value) CoerceInt() (int64, bool) {
 		return FloatToIntExact(v.Float())
 	}
 	if v.IsString() {
-		if i, f, isInt, ok := luastdlib.StrToNum(v.AsString().Str()); ok {
+		if i, f, isInt, ok := luastdlib.StrToNum((*LuaString)(v.ptr).Str()); ok {
 			if isInt {
 				return i, true
 			}
@@ -326,7 +319,7 @@ func RawEqual(a, b Value) bool {
 	}
 	// Two long strings with different pointers may still have equal contents.
 	if a.IsString() && b.IsString() {
-		sa, sb := a.AsString(), b.AsString()
+		sa, sb := (*LuaString)(a.ptr), (*LuaString)(b.ptr)
 		if sa.IsShort() && sb.IsShort() {
 			return false // short strings are interned per State
 		}
@@ -537,15 +530,15 @@ func FormatValue(v Value) string {
 	case v.IsFloat():
 		return FormatFloat(v.Float())
 	case v.IsString():
-		return strings.Clone(v.AsString().Str())
+		return strings.Clone((*LuaString)(v.ptr).Str())
 	case v.IsTable():
-		return fmt.Sprintf("table: %p", v.AsTable())
+		return fmt.Sprintf("table: %p", v.ptr)
 	case v.IsClosure():
-		return fmt.Sprintf("function: %p", v.AsClosure())
+		return fmt.Sprintf("function: %p", v.ptr)
 	case v.IsNative():
-		return fmt.Sprintf("function: %p", v.AsNative())
+		return fmt.Sprintf("function: %p", v.ptr)
 	case v.IsThread():
-		return fmt.Sprintf("thread: %p", v.AsThread())
+		return fmt.Sprintf("thread: %p", v.ptr)
 	case v.IsLightUD():
 		return "userdata: " + v.formatLightUDAddr()
 	default:

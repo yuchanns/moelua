@@ -376,7 +376,7 @@ func TestAuditParallelStatesRace(t *testing.T) {
 				errs <- fmt.Errorf("g%d call: %w", id, err)
 				return
 			}
-			if len(res) != 1 || !strings.Contains(vm.FormatValue(res[0]), "[20101]:[20]:[30]") {
+			if len(res) != 1 || !strings.Contains(s.FormatValue(res[0]), "[20101]:[20]:[30]") {
 				errs <- fmt.Errorf("g%d unexpected result: %v", id, res)
 			}
 		}(g)

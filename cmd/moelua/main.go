@@ -214,7 +214,7 @@ func newCLIState(noEnv bool) *cliState {
 				msg = s.FormatValue(errVal)
 			} else {
 				if mt := s.GetMetatableOf(errVal); mt != nil {
-					tm := mt.RawGetStr(s.Intern("__tostring"))
+					tm := mt.RawGetStr(s, s.Intern("__tostring"))
 					if !tm.IsNil() {
 						r, err := s.Call(tm, errVal)
 						if err != nil {
@@ -231,7 +231,9 @@ func newCLIState(noEnv bool) *cliState {
 			return []vm.Value{vm.StringValue(s.Intern(tb))}, nil
 		},
 	}
-	return &cliState{s: s, msgh: vm.NativeValue(msghNF)}
+	msgh := s.NativeValue(msghNF)
+	s.Ref(msgh)
+	return &cliState{s: s, msgh: msgh}
 }
 
 func (c *cliState) doCall(progName string, fn vm.Value, args ...vm.Value) ([]vm.Value, bool) {
@@ -320,10 +322,10 @@ func (c *cliState) doChunkFile(progName, path string, literalFile, passArgs bool
 			return false
 		}
 		if n > 0 {
-			argTbl := argVal.AsTable()
+			argTbl := c.s.AsTable(argVal)
 			args = make([]vm.Value, n)
 			for i := int64(1); i <= n; i++ {
-				args[i-1] = argTbl.RawGetInt(i)
+				args[i-1] = argTbl.RawGetInt(c.s, i)
 			}
 		}
 	}

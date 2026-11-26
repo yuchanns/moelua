@@ -234,11 +234,11 @@ func TestMemErrAddFSAndAddSearcherPreservesSearchers(t *testing.T) {
 	for _, delta := range []int64{0, 16, 48, 96, 160, 256, 512, 2048} {
 		s := NewState()
 		s.CollectFull()
-		origSearchers := s.GetGlobal("package").AsTable().RawGetStr(s.Intern("searchers")).AsTable()
-		origLen := origSearchers.Len()
+		origSearchers := s.AsTable(s.AsTable(s.GetGlobal("package")).RawGetStr(s, s.Intern("searchers")))
+		origLen := origSearchers.Len(s)
 		origVals := make([]Value, origLen)
 		for i := int64(1); i <= origLen; i++ {
-			origVals[i-1] = origSearchers.RawGetInt(i)
+			origVals[i-1] = origSearchers.RawGetInt(s, i)
 		}
 
 		s.SetMemoryLimit(s.MemoryUsage() + delta)
@@ -249,25 +249,25 @@ func TestMemErrAddFSAndAddSearcherPreservesSearchers(t *testing.T) {
 		}
 
 		// Every original searcher must still be present (either in-place on OOM, or shifted +1 on success).
-		curLen := origSearchers.Len()
+		curLen := origSearchers.Len(s)
 		if curLen != origLen && curLen != origLen+1 {
 			s.Close()
 			t.Fatalf("AddFS delta=%d corrupted searchers length: orig=%d cur=%d", delta, origLen, curLen)
 		}
 		if curLen == origLen {
 			for i := int64(1); i <= origLen; i++ {
-				if origSearchers.RawGetInt(i) != origVals[i-1] {
+				if origSearchers.RawGetInt(s, i) != origVals[i-1] {
 					s.Close()
 					t.Fatalf("AddFS delta=%d OOM overwrote searcher slot %d", delta, i)
 				}
 			}
 		} else {
-			if origSearchers.RawGetInt(1) != origVals[0] {
+			if origSearchers.RawGetInt(s, 1) != origVals[0] {
 				s.Close()
 				t.Fatalf("AddFS delta=%d moved preload searcher", delta)
 			}
 			for i := int64(2); i <= origLen; i++ {
-				if origSearchers.RawGetInt(i+1) != origVals[i-1] {
+				if origSearchers.RawGetInt(s, i+1) != origVals[i-1] {
 					s.Close()
 					t.Fatalf("AddFS delta=%d lost searcher %d", delta, i)
 				}
@@ -275,14 +275,14 @@ func TestMemErrAddFSAndAddSearcherPreservesSearchers(t *testing.T) {
 		}
 
 		// Also exercise AddSearcher under tight memory.
-		beforeLen := origSearchers.Len()
+		beforeLen := origSearchers.Len(s)
 		nf := &NativeFunc{Name: "custom_searcher", Fn: func(*State, []Value) ([]Value, error) { return nil, nil }}
 		s.AddSearcher(nf)
 		if leaked := s.ConsumeMemErr(); leaked != nil {
 			s.Close()
 			t.Fatalf("AddSearcher delta=%d leaked mem error: %v", delta, leaked)
 		}
-		if cur := origSearchers.Len(); cur != beforeLen && cur != beforeLen+1 {
+		if cur := origSearchers.Len(s); cur != beforeLen && cur != beforeLen+1 {
 			s.Close()
 			t.Fatalf("AddSearcher delta=%d corrupted searchers length: before=%d cur=%d", delta, beforeLen, cur)
 		}

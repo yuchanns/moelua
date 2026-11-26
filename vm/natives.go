@@ -16,7 +16,7 @@ import (
 
 func (s *State) registerFunc(tbl *Table, name string, intr uint8, fn func(*State, []Value) ([]Value, error)) *NativeFunc {
 	nf := &NativeFunc{Name: name, Fn: fn, Intrinsic: intr}
-	tbl.RawSetStr(s, s.intern.Intern(name), NativeValue(nf))
+	tbl.RawSetStr(s, s.intern.Intern(name), s.NativeValue(nf))
 	return nf
 }
 
@@ -233,11 +233,11 @@ func (s *State) toStringValue(v Value) (string, error) {
 		return s.FormatValue(v), nil
 	}
 	if mt := s.getMetatableOf(v); mt != nil {
-		if nm := mt.RawGetStr(s.intern.Intern("__name")); nm.IsString() {
+		if nm := mt.RawGetStr(s, s.intern.Intern("__name")); nm.IsString() {
 			if v.IsLightUD() {
-				return s.joinStringsWithCancel(nm.AsString().Str(), ": ", v.formatLightUDAddr())
+				return s.joinStringsWithCancel(s.asString(nm).Str(), ": ", v.formatLightUDAddr())
 			}
-			return s.joinStringsWithCancel(nm.AsString().Str(), ": ", fmt.Sprintf("%p", v.ptr))
+			return s.joinStringsWithCancel(s.asString(nm).Str(), ": ", fmt.Sprintf("%p", v.ptr))
 		}
 	}
 	return s.FormatValue(v), nil
@@ -306,7 +306,7 @@ func nativeError(s *State, args []Value) ([]Value, error) {
 	}
 	if level > 0 && args[0].IsString() {
 		if where := s.errorWhere(level); where != "" {
-			msg := args[0].AsString().Str()
+			msg := s.asString(args[0]).Str()
 			joined, err := s.joinStringsWithCancel(where, msg)
 			if err != nil {
 				return nil, err
@@ -392,7 +392,7 @@ func nativeToNumber(s *State, args []Value) ([]Value, error) {
 		if !v.IsString() {
 			return []Value{NilValue()}, nil
 		}
-		iv, fv, isInt, ok, err := s.strToNum(v.AsString().Str())
+		iv, fv, isInt, ok, err := s.strToNum(s.asString(v).Str())
 		if err != nil {
 			return nil, err
 		}
@@ -421,7 +421,7 @@ func nativeToNumber(s *State, args []Value) ([]Value, error) {
 	if base < 2 || base > 36 {
 		return nil, fmt.Errorf("bad argument #2 to 'tonumber' (base out of range)")
 	}
-	iv, ok, err := s.strToIntBase(v.AsString().Str(), int(base))
+	iv, ok, err := s.strToIntBase(s.asString(v).Str(), int(base))
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +435,7 @@ func nativeSelect(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'select'")
 	}
-	if args[0].IsString() && strings.HasPrefix(args[0].AsString().Str(), "#") {
+	if args[0].IsString() && strings.HasPrefix(s.asString(args[0]).Str(), "#") {
 		return []Value{IntValue(int64(len(args) - 1))}, nil
 	}
 	idx, ok, err := s.coerceInt(args[0])
@@ -469,11 +469,11 @@ func nativeRawGet(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad argument #2 to 'rawget' (value expected)")
 	}
-	t := args[0].AsTable()
+	t := s.asTable(args[0])
 	if err := s.ensureLookupKeyHash(t, args[1]); err != nil {
 		return nil, err
 	}
-	return []Value{t.RawGet(args[1])}, nil
+	return []Value{t.RawGet(s, args[1])}, nil
 }
 
 func nativeRawSet(s *State, args []Value) ([]Value, error) {
@@ -490,7 +490,7 @@ func nativeRawSet(s *State, args []Value) ([]Value, error) {
 	if len(args) < 3 {
 		return nil, fmt.Errorf("bad argument #3 to 'rawset' (value expected)")
 	}
-	if err := args[0].AsTable().RawSet(s, args[1], args[2]); err != nil {
+	if err := s.asTable(args[0]).RawSet(s, args[1], args[2]); err != nil {
 		return nil, err
 	}
 	return []Value{args[0]}, nil
@@ -507,15 +507,15 @@ func nativeRawEqual(s *State, args []Value) ([]Value, error) {
 	return []Value{BoolValue(eq)}, nil
 }
 
-func nativeRawLen(_ *State, args []Value) ([]Value, error) {
+func nativeRawLen(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'rawlen'")
 	}
 	if args[0].IsTable() {
-		return []Value{IntValue(args[0].AsTable().Len())}, nil
+		return []Value{IntValue(s.asTable(args[0]).Len(s))}, nil
 	}
 	if args[0].IsString() {
-		return []Value{IntValue(int64(len(args[0].AsString().Str())))}, nil
+		return []Value{IntValue(int64(len(s.asString(args[0]).Str())))}, nil
 	}
 	return nil, fmt.Errorf("bad argument #1 to 'rawlen' (table or string expected)")
 }
@@ -536,8 +536,8 @@ func nativeSetMetatable(s *State, args []Value) ([]Value, error) {
 		}
 		return nil, fmt.Errorf("bad argument #2 to 'setmetatable' (nil or table expected, got %s)", got)
 	}
-	t := args[0].AsTable()
-	if t.meta != nil && !t.meta.RawGetStr(s.intern.Intern("__metatable")).IsNil() {
+	t := s.asTable(args[0])
+	if t.meta != nil && !t.meta.RawGetStr(s, s.intern.Intern("__metatable")).IsNil() {
 		return nil, fmt.Errorf("cannot change a protected metatable")
 	}
 	if args[1].IsNil() {
@@ -547,7 +547,7 @@ func nativeSetMetatable(s *State, args []Value) ([]Value, error) {
 		}
 		return []Value{args[0]}, nil
 	}
-	s.SetMetatable(t, args[1].AsTable())
+	s.SetMetatable(t, s.asTable(args[1]))
 	if err := s.ConsumeMemErr(); err != nil {
 		return nil, err
 	}
@@ -562,7 +562,7 @@ func nativeGetMetatable(s *State, args []Value) ([]Value, error) {
 	if mt == nil {
 		return []Value{NilValue()}, nil
 	}
-	if protected := mt.RawGetStr(s.intern.Intern("__metatable")); !protected.IsNil() {
+	if protected := mt.RawGetStr(s, s.intern.Intern("__metatable")); !protected.IsNil() {
 		return []Value{protected}, nil
 	}
 	return []Value{TableValue(mt)}, nil
@@ -576,11 +576,11 @@ func nativeNext(s *State, args []Value) ([]Value, error) {
 	if len(args) >= 2 {
 		key = args[1]
 	}
-	t := args[0].AsTable()
+	t := s.asTable(args[0])
 	if err := s.ensureLookupKeyHash(t, key); err != nil {
 		return nil, err
 	}
-	k, v, err := t.Next(key)
+	k, v, err := t.Next(s, key)
 	if err != nil {
 		return nil, err
 	}
@@ -603,7 +603,7 @@ func nativePairs(s *State, args []Value) ([]Value, error) {
 		copy(out, res)
 		return out, nil
 	}
-	return []Value{NativeValue(s.builtinNext), args[0], NilValue(), NilValue()}, nil
+	return []Value{s.NativeValue(s.builtinNext), args[0], NilValue(), NilValue()}, nil
 }
 
 func nativeIPairsIter(s *State, args []Value) ([]Value, error) {
@@ -620,8 +620,8 @@ func nativeIPairsIter(s *State, args []Value) ([]Value, error) {
 	ni := i + 1
 	var v Value
 	if args[0].IsTable() {
-		t := args[0].AsTable()
-		v = t.RawGetInt(ni)
+		t := s.asTable(args[0])
+		v = t.RawGetInt(s, ni)
 		if v.IsNil() && t.meta != nil {
 			var err error
 			v, err = s.finishGet(args[0], IntValue(ni))
@@ -646,7 +646,7 @@ func nativeIPairs(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'ipairs'")
 	}
-	return []Value{NativeValue(s.builtinIPairsIter), args[0], IntValue(0)}, nil
+	return []Value{s.NativeValue(s.builtinIPairsIter), args[0], IntValue(0)}, nil
 }
 
 // --- math ---
@@ -986,7 +986,7 @@ func nativeMathToInteger(s *State, args []Value) ([]Value, error) {
 		return []Value{IntValue(i)}, nil
 	}
 	if args[0].IsString() {
-		iv, fv, isInt, ok, err := s.strToNum(args[0].AsString().Str())
+		iv, fv, isInt, ok, err := s.strToNum(s.asString(args[0]).Str())
 		if err != nil {
 			return nil, err
 		}
@@ -1243,12 +1243,12 @@ func (s *State) checkTab(v Value, what int, argNum int, globalName string) error
 
 func (s *State) tableLen(v Value) (int64, error) {
 	if v.IsString() {
-		return int64(len(v.AsString().Str())), nil
+		return int64(len(s.asString(v).Str())), nil
 	}
 	if v.IsTable() {
-		t := v.AsTable()
+		t := s.asTable(v)
 		if t.meta == nil {
-			return t.Len(), nil
+			return t.Len(s), nil
 		}
 		if tm := s.getTM(t.meta, TMLen); !tm.IsNil() {
 			res, err := s.Call(tm, v, v)
@@ -1266,7 +1266,7 @@ func (s *State) tableLen(v Value) (int64, error) {
 			}
 			return 0, fmt.Errorf("object length is not an integer")
 		}
-		return t.Len(), nil
+		return t.Len(s), nil
 	}
 	if tm := s.getTMByObj(v, TMLen); !tm.IsNil() {
 		res, err := s.Call(tm, v, v)
@@ -1289,8 +1289,8 @@ func (s *State) tableLen(v Value) (int64, error) {
 
 func (s *State) tableGetInt(v Value, idx int64) (Value, error) {
 	if v.IsTable() {
-		t := v.AsTable()
-		r := t.RawGetInt(idx)
+		t := s.asTable(v)
+		r := t.RawGetInt(s, idx)
 		if !r.IsNil() || t.meta == nil {
 			return r, nil
 		}
@@ -1300,8 +1300,8 @@ func (s *State) tableGetInt(v Value, idx int64) (Value, error) {
 
 func (s *State) tableSetInt(v Value, idx int64, val Value) error {
 	if v.IsTable() {
-		t := v.AsTable()
-		if !t.RawGetInt(idx).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+		t := s.asTable(v)
+		if !t.RawGetInt(s, idx).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 			t.RawSetInt(s, idx, val)
 			return s.ConsumeMemErr()
 		}
@@ -1311,8 +1311,8 @@ func (s *State) tableSetInt(v Value, idx int64, val Value) error {
 	for loop := 0; loop < 2000; loop++ {
 		var tm Value
 		if cur.IsTable() {
-			t := cur.AsTable()
-			if loop > 0 && !t.RawGet(key).IsNil() {
+			t := s.asTable(cur)
+			if loop > 0 && !t.RawGet(s, key).IsNil() {
 				return t.RawSet(s, key, val)
 			}
 			tm = s.getTM(t.meta, TMNewIndex)
@@ -1338,12 +1338,12 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 	if len(args) < 1 {
 		return nil, s.badArgErr(1, "table.insert", "table expected, got no value")
 	}
-	if args[0].IsTable() && args[0].AsTable().meta == nil {
+	if args[0].IsTable() && s.asTable(args[0]).meta == nil {
 		if len(args) < 2 || len(args) > 3 {
 			return nil, fmt.Errorf("wrong number of arguments to 'insert'")
 		}
-		t := args[0].AsTable()
-		e := t.Len() + 1
+		t := s.asTable(args[0])
+		e := t.Len(s) + 1
 		if len(args) == 2 {
 			t.RawSetInt(s, e, args[1])
 			return nil, s.ConsumeMemErr()
@@ -1364,7 +1364,7 @@ func nativeTableInsert(s *State, args []Value) ([]Value, error) {
 					return nil, err
 				}
 			}
-			t.RawSetInt(s, i, t.RawGetInt(i-1))
+			t.RawSetInt(s, i, t.RawGetInt(s, i-1))
 			if err := s.ConsumeMemErr(); err != nil {
 				return nil, err
 			}
@@ -1418,9 +1418,9 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 		return nil, s.badArgErr(1, "table.remove", "table expected, got no value")
 	}
 	cancelFn := s.nativeCancelFunc()
-	if args[0].IsTable() && args[0].AsTable().meta == nil {
-		t := args[0].AsTable()
-		size := t.Len()
+	if args[0].IsTable() && s.asTable(args[0]).meta == nil {
+		t := s.asTable(args[0])
+		size := t.Len(s)
 		pos := size
 		if len(args) >= 2 && !args[1].IsNil() {
 			var ok bool
@@ -1436,7 +1436,7 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 		if pos != size && (pos < 1 || pos > size+1) {
 			return nil, fmt.Errorf("bad argument #2 to 'remove' (position out of bounds)")
 		}
-		res := t.RawGetInt(pos)
+		res := t.RawGetInt(s, pos)
 		var steps int64
 		for ; pos < size; pos++ {
 			steps++
@@ -1445,7 +1445,7 @@ func nativeTableRemove(s *State, args []Value) ([]Value, error) {
 					return nil, err
 				}
 			}
-			t.RawSetInt(s, pos, t.RawGetInt(pos+1))
+			t.RawSetInt(s, pos, t.RawGetInt(s, pos+1))
 			if err := s.ConsumeMemErr(); err != nil {
 				return nil, err
 			}
@@ -1532,7 +1532,7 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, s.badArgErr(1, "table.concat", "table expected, got no value")
 	}
-	rawFast := args[0].IsTable() && args[0].AsTable().meta == nil
+	rawFast := args[0].IsTable() && s.asTable(args[0]).meta == nil
 	var defaultLast int64
 	if !rawFast {
 		if err := s.checkTab(args[0], tabR|tabL, 1, "table.concat"); err != nil {
@@ -1575,14 +1575,14 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #4 to 'concat' (number expected)")
 		}
 	} else if rawFast {
-		j = args[0].AsTable().Len()
+		j = s.asTable(args[0]).Len(s)
 	} else {
 		j = defaultLast
 	}
 	var sb strings.Builder
 	var t *Table
 	if rawFast {
-		t = args[0].AsTable()
+		t = s.asTable(args[0])
 	}
 	cancelFn := s.nativeCancelFunc()
 	var iterCount int64
@@ -1606,7 +1606,7 @@ func nativeTableConcat(s *State, args []Value) ([]Value, error) {
 		}
 		var v Value
 		if rawFast {
-			v = t.RawGetInt(k)
+			v = t.RawGetInt(s, k)
 		} else {
 			var err error
 			v, err = s.tableGetInt(args[0], k)
@@ -1690,7 +1690,7 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 		if tpos > math.MaxInt64-n+1 {
 			return nil, fmt.Errorf("bad argument #4 to 'move' (destination wrap around)")
 		}
-		rawFast := src.IsTable() && src.AsTable().meta == nil && dst.IsTable() && dst.AsTable().meta == nil
+		rawFast := src.IsTable() && s.asTable(src).meta == nil && dst.IsTable() && s.asTable(dst).meta == nil
 		cancelFn := s.nativeCancelFunc()
 		reverse := false
 		if tpos > f && tpos <= e {
@@ -1731,7 +1731,7 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 					}
 				}
 				if rawFast {
-					dst.AsTable().RawSetInt(s, tpos+i, src.AsTable().RawGetInt(f+i))
+					s.asTable(dst).RawSetInt(s, tpos+i, s.asTable(src).RawGetInt(s, f+i))
 					if err := s.ConsumeMemErr(); err != nil {
 						return nil, err
 					}
@@ -1755,7 +1755,7 @@ func nativeTableMove(s *State, args []Value) ([]Value, error) {
 					}
 				}
 				if rawFast {
-					dst.AsTable().RawSetInt(s, tpos+i, src.AsTable().RawGetInt(f+i))
+					s.asTable(dst).RawSetInt(s, tpos+i, s.asTable(src).RawGetInt(s, f+i))
 					if err := s.ConsumeMemErr(); err != nil {
 						return nil, err
 					}
@@ -1804,7 +1804,7 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, s.badArgErr(1, "table.unpack", "table expected, got no value")
 	}
-	rawFast := args[0].IsTable() && args[0].AsTable().meta == nil
+	rawFast := args[0].IsTable() && s.asTable(args[0]).meta == nil
 	var defaultLen int64
 	if !rawFast {
 		if err := s.checkTab(args[0], tabR|tabL, 1, "table.unpack"); err != nil {
@@ -1840,7 +1840,7 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #3 to 'unpack' (number expected)")
 		}
 	} else if rawFast {
-		j = args[0].AsTable().Len()
+		j = s.asTable(args[0]).Len(s)
 	} else {
 		j = defaultLen
 	}
@@ -1860,7 +1860,7 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 	}
 	if rawFast {
 		out := make([]Value, n)
-		t := args[0].AsTable()
+		t := s.asTable(args[0])
 		cancelFn := s.nativeCancelFunc()
 		for k := 0; k < n; k++ {
 			if cancelFn != nil && (k&1023) == 0 {
@@ -1868,7 +1868,7 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 					return nil, err
 				}
 			}
-			out[k] = t.RawGetInt(i + int64(k))
+			out[k] = t.RawGetInt(s, i + int64(k))
 		}
 		return out, nil
 	}
@@ -2057,9 +2057,9 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 	}
 	hasComp := len(args) >= 2 && !args[1].IsNil()
 	cancelFn := s.nativeCancelFunc()
-	if args[0].IsTable() && args[0].AsTable().meta == nil {
-		t := args[0].AsTable()
-		n := int(t.Len())
+	if args[0].IsTable() && s.asTable(args[0]).meta == nil {
+		t := s.asTable(args[0])
+		n := int(t.Len(s))
 		if n <= 1 {
 			return nil, nil
 		}
@@ -2309,7 +2309,7 @@ func nativeStringByte(s *State, args []Value) ([]Value, error) {
 	}
 	var str string
 	if args[0].IsString() {
-		str = args[0].AsString().Str()
+		str = s.asString(args[0]).Str()
 	} else if args[0].IsNumber() {
 		str = s.FormatValue(args[0])
 	} else {
@@ -2481,7 +2481,7 @@ func nativeStringSub(s *State, args []Value) ([]Value, error) {
 	}
 	var str string
 	if args[0].IsString() {
-		str = args[0].AsString().Str()
+		str = s.asString(args[0]).Str()
 	} else if args[0].IsNumber() {
 		str = s.FormatValue(args[0])
 	} else {
@@ -2562,7 +2562,7 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 	}
 	var str string
 	if args[0].IsString() {
-		str = args[0].AsString().Str()
+		str = s.asString(args[0]).Str()
 	} else if args[0].IsNumber() {
 		str = s.FormatValue(args[0])
 	} else {
@@ -2587,7 +2587,7 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 	sep := ""
 	if len(args) >= 3 && !args[2].IsNil() {
 		if args[2].IsString() {
-			sep = args[2].AsString().Str()
+			sep = s.asString(args[2]).Str()
 		} else if args[2].IsNumber() {
 			sep = s.FormatValue(args[2])
 		} else {
