@@ -710,6 +710,7 @@ func (s *State) TrySetGlobal(name string, v Value) error {
 		if err != nil {
 			return err
 		}
+		defer s.pinTemps(vm.StringValue(ls))()
 	}
 	s.vm.GlobalEnv().RawSetStr(s.vm, ls, v)
 	return s.vm.ConsumeMemErr()
@@ -989,6 +990,7 @@ func (t *Table) SetString(key string, val Value) error {
 		if err != nil {
 			return err
 		}
+		defer t.state.pinTemps(vm.StringValue(ls))()
 	}
 	t.raw.RawSetStr(t.state.vm, ls, val)
 	return t.state.vm.ConsumeMemErr()

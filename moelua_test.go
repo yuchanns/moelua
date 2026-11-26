@@ -1417,6 +1417,25 @@ func TestRootOperandsAcrossAllocationPreservesMemoryLimit(t *testing.T) {
 		}
 	})
 
+	t.Run("Table.SetString_key", func(t *testing.T) {
+		s := moelua.New()
+		defer s.Close()
+		tbl := s.NewTable(0, 0)
+		if err := s.TrySetGlobal("t", tbl.Value()); err != nil {
+			t.Fatal(err)
+		}
+		s.CollectGarbage()
+		// Room for the 30,000-byte key (len+48) but not for the table's storage growth, so the
+		// insertion runs an emergency GC that must still count the new key.
+		limit := s.MemoryUsage() + 30048
+		s.SetMemoryLimit(limit)
+		err := tbl.SetString(strings.Repeat("k", 30000), moelua.Int(1))
+		s.CollectGarbage()
+		if usage := s.MemoryUsage(); usage > limit {
+			t.Fatalf("SetString err=%v but recounted MemoryUsage()=%d exceeded %d", err, usage, limit)
+		}
+	})
+
 	nameLimit := func(s *moelua.State, name string) int64 {
 		s.CollectGarbage()
 		// Room for the interned name (len+48) plus a few bytes: the following allocation must not fit.
