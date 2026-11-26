@@ -100,12 +100,8 @@ func (s *State) CloseThread(co *Thread) error {
 		co.nny--
 		co.closing = false
 		co.status = ThreadDead
-		co.nframe = 0
-		co.top = 0
-		co.stack[0] = NilValue()
+		co.clearDeadRefs()
 		co.errObj = NilValue()
-		co.yieldedNative = false
-		co.yieldNativeFn = NilValue()
 		if uerr := s.abortErr; uerr != nil {
 			if s.nCcalls == 0 {
 				s.abortErr = nil
@@ -178,6 +174,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 		fn := co.stack[0]
 		if fn.IsNil() {
 			co.status = ThreadDead
+			co.clearDeadRefs()
 			return false, []Value{StringValue(s.intern.Intern("cannot resume dead coroutine"))}, nil
 		}
 		if fn.IsNative() {
@@ -293,15 +290,19 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				return true, out, nil
 			}
 			co.status = ThreadDead
-			co.stack[0] = NilValue()
 			if err != nil {
 				if errors.Is(err, errCoroCloseSelf) || errors.Is(s.abortErr, errCoroCloseSelf) {
 					return s.finishCoroCloseSelf(co)
 				}
 				if isUncatchableErr(err) {
+					co.discardTBCAtOrAbove(0)
+					co.closeUpvals(0)
+					co.clearDeadRefs()
 					return false, nil, err
 				}
+				co.stack[0] = NilValue()
 				ev := s.runtimeErrorToValue(co, err)
+				co.clearUnusedRefs()
 				co.errObj = ev
 				return false, []Value{ev}, nil
 			}
@@ -310,10 +311,12 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 				copy(cp, res)
 				res = cp
 			}
+			co.clearDeadRefs()
 			return true, res, nil
 		}
 		if !fn.IsClosure() {
 			co.status = ThreadDead
+			co.clearDeadRefs()
 			return false, []Value{StringValue(s.intern.Intern("cannot resume non-function coroutine"))}, nil
 		}
 		cl := fn.AsClosure()
@@ -513,12 +516,12 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			co.status = ThreadDead
 			nres := co.top
 			if nres <= 0 {
-				co.stack[0] = NilValue()
+				co.clearDeadRefs()
 				return true, nil, nil
 			}
 			res := make([]Value, nres)
 			copy(res, co.stack[:nres])
-			co.stack[0] = NilValue()
+			co.clearDeadRefs()
 			return true, res, nil
 		}
 	}
@@ -541,11 +544,15 @@ runCoro:
 	if err != nil {
 		if isUncatchableErr(err) {
 			co.status = ThreadDead
+			co.discardTBCAtOrAbove(0)
+			co.closeUpvals(0)
+			co.clearDeadRefs()
 			return false, nil, err
 		}
 		// Per Lua 5.5 spec, error in coroutine does NOT automatically close TBC vars until coroutine.close().
 		ev := s.runtimeErrorToValue(co, err)
 		co.status = ThreadDead
+		co.clearUnusedRefs()
 		co.errObj = ev
 		return false, []Value{ev}, nil
 	}
@@ -554,13 +561,12 @@ runCoro:
 	co.status = ThreadDead
 	nres := co.top
 	if nres <= 0 {
-		co.stack[0] = NilValue()
+		co.clearDeadRefs()
 		return true, nil, nil
 	}
 	res := make([]Value, nres)
 	copy(res, co.stack[:nres])
-	co.stack[0] = NilValue()
-	co.top = 0
+	co.clearDeadRefs()
 	return true, res, nil
 }
 
@@ -576,11 +582,7 @@ func (s *State) finishCoroCloseSelf(co *Thread) (bool, []Value, error) {
 	co.nny--
 	co.closing = false
 	co.status = ThreadDead
-	co.nframe = 0
-	co.top = 0
-	co.stack[0] = NilValue()
-	co.yieldedNative = false
-	co.yieldNativeFn = NilValue()
+	co.clearDeadRefs()
 	if hasErr {
 		co.errObj = errVal
 		return false, []Value{errVal}, nil
@@ -696,12 +698,8 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 					errVal, _, _ = co.closeAllSync(0, errVal, true)
 					co.closing = false
 					co.status = ThreadDead
-					co.nframe = 0
-					co.top = 0
-					co.stack[0] = NilValue()
+					co.clearDeadRefs()
 					co.errObj = NilValue()
-					co.yieldedNative = false
-					co.yieldNativeFn = NilValue()
 				}
 				// Match Lua 5.5 lcorolib.c:luaB_auxwrap: prepend caller location to string error objects.
 				if errVal.IsString() {
@@ -749,12 +747,8 @@ func nativeCoroClose(s *State, args []Value) ([]Value, error) {
 		co.nny--
 		co.closing = false
 		co.status = ThreadDead
-		co.nframe = 0
-		co.top = 0
-		co.stack[0] = NilValue()
+		co.clearDeadRefs()
 		co.errObj = NilValue()
-		co.yieldedNative = false
-		co.yieldNativeFn = NilValue()
 		if s.abortErr != nil {
 			return nil, s.abortErr
 		}

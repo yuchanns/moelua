@@ -2810,7 +2810,11 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 
 	case bytecode.OP_EQ:
 		ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
-		if RawEqual(ra, rb) {
+		eq, err := s.rawEqual(ra, rb)
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if eq {
 			if true != w.K() {
 				pc++
 			} else {
@@ -2841,10 +2845,27 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		}
 		return coldContinue, pc, nil
 
+	case bytecode.OP_EQK:
+		ra, rb := regs[a], ev.consts[uint8(w>>bytecode.PosB)]
+		eq, err := s.rawEqual(ra, rb)
+		if err != nil {
+			return coldContinue, pc, err
+		}
+		if eq != w.K() {
+			pc++
+		} else {
+			pc += 1 + ev.insns.at(pc).SJ()
+		}
+		return coldContinue, pc, nil
+
 	case bytecode.OP_LT:
 		ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
 		if ra.IsString() && rb.IsString() {
-			cond := ra.AsString().S < rb.AsString().S
+			cmp, err := s.compareStrings(ra.AsString(), rb.AsString())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			cond := cmp < 0
 			if cond != w.K() {
 				pc++
 			} else {
@@ -2889,7 +2910,11 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 	case bytecode.OP_LE:
 		ra, rb := regs[a], regs[uint8(w>>bytecode.PosB)]
 		if ra.IsString() && rb.IsString() {
-			cond := ra.AsString().S <= rb.AsString().S
+			cmp, err := s.compareStrings(ra.AsString(), rb.AsString())
+			if err != nil {
+				return coldContinue, pc, err
+			}
+			cond := cmp <= 0
 			if cond != w.K() {
 				pc++
 			} else {
@@ -3668,7 +3693,11 @@ func (s *State) compareError(a, b Value) error {
 
 func (s *State) lessThan(a, b Value) (bool, error) {
 	if a.IsString() && b.IsString() {
-		return a.AsString().S < b.AsString().S, nil
+		cmp, err := s.compareStrings(a.AsString(), b.AsString())
+		if err != nil {
+			return false, err
+		}
+		return cmp < 0, nil
 	}
 	if BothInt(a, b) {
 		return a.Int() < b.Int(), nil
@@ -3700,7 +3729,11 @@ func (s *State) lessThan(a, b Value) (bool, error) {
 }
 
 func (s *State) equalValues(a, b Value) (bool, error) {
-	if RawEqual(a, b) {
+	eq, err := s.rawEqual(a, b)
+	if err != nil {
+		return false, err
+	}
+	if eq {
 		return true, nil
 	}
 	if (a.IsTable() && b.IsTable()) || (a.IsUserdata() && b.IsUserdata()) {

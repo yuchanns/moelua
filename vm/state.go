@@ -1043,8 +1043,11 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	}
 	clearTopStack := func() {
 		th.top = funcIdx
-		if entryDepth == 0 && th.openUpvals == nil && funcIdx < len(th.stack) {
-			fillNil(th.stack[funcIdx:])
+		if entryDepth == 0 && th.openUpvals == nil {
+			if funcIdx < len(th.stack) {
+				fillNil(th.stack[funcIdx:])
+			}
+			clear(th.frames)
 		}
 	}
 	err := s.runThread(th, entryDepth)

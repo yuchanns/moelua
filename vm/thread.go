@@ -474,6 +474,61 @@ func (th *Thread) IsYieldable() bool {
 	return th.nny == 0
 }
 
+// clearDeadRefs clears all stack slots, frame entries, and transient references on a
+// completed or closed coroutine so Go's GC can reclaim discarded arguments, locals,
+// and closures immediately in Tier 0 without waiting for State.CollectFull.
+// Preserves th.hook so debug.gethook(deadCo) remains faithful to Lua 5.5.1.
+func (th *Thread) clearDeadRefs() {
+	fillNil(th.stack)
+	clear(th.frames)
+	th.nframe = 0
+	th.top = 0
+	th.openUpvals = nil
+	th.tbc = nil
+	th.yieldVals = nil
+	th.yieldedNative = false
+	th.yieldNativeFn = NilValue()
+	th.lastErrNative = NilValue()
+	th.uncaughtErr = nil
+	th.syncCloseErrs = nil
+}
+
+// clearUnusedRefs clears stack slots above the live frame/TBC/upvalue watermark and
+// unused frame entries on an errored dead coroutine while keeping live frames, locals,
+// and TBC variables intact for debug.traceback(co), debug.getlocal(co, ...), and
+// deferred coroutine.close(co).
+func (th *Thread) clearUnusedRefs() {
+	if th.nframe < len(th.frames) {
+		clear(th.frames[th.nframe:])
+	}
+	liveTop := th.top
+	for i := range th.nframe {
+		cf := &th.frames[i]
+		if cf.kind == frameLua && cf.cl != nil {
+			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > liveTop {
+				liveTop = end
+			}
+		}
+	}
+	for _, idx := range th.tbc {
+		if idx+1 > liveTop {
+			liveTop = idx + 1
+		}
+	}
+	for uv := th.openUpvals; uv != nil; uv = uv.next {
+		if uv.stackIdx+1 > liveTop {
+			liveTop = uv.stackIdx + 1
+		}
+	}
+	if liveTop < len(th.stack) {
+		fillNil(th.stack[liveTop:])
+	}
+	th.yieldVals = nil
+	th.yieldedNative = false
+	th.yieldNativeFn = NilValue()
+	th.uncaughtErr = nil
+}
+
 // Status returns the current ThreadStatus of th.
 func (th *Thread) Status() ThreadStatus {
 	if th == nil {

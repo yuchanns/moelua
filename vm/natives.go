@@ -506,11 +506,15 @@ func nativeRawSet(s *State, args []Value) ([]Value, error) {
 	return []Value{args[0]}, nil
 }
 
-func nativeRawEqual(_ *State, args []Value) ([]Value, error) {
+func nativeRawEqual(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad argument to 'rawequal'")
 	}
-	return []Value{BoolValue(RawEqual(args[0], args[1]))}, nil
+	eq, err := s.rawEqual(args[0], args[1])
+	if err != nil {
+		return nil, err
+	}
+	return []Value{BoolValue(eq)}, nil
 }
 
 func nativeRawLen(_ *State, args []Value) ([]Value, error) {
@@ -939,8 +943,14 @@ func nativeMathMin(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'min' (value expected)")
 	}
+	cancelFn := s.nativeCancelFunc()
 	best := args[0]
-	for _, a := range args[1:] {
+	for i, a := range args[1:] {
+		if cancelFn != nil && ((i+1)&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
 		lt, err := s.lessThan(a, best)
 		if err != nil {
 			return nil, err
@@ -956,8 +966,14 @@ func nativeMathMax(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'max' (value expected)")
 	}
+	cancelFn := s.nativeCancelFunc()
 	best := args[0]
-	for _, a := range args[1:] {
+	for i, a := range args[1:] {
+		if cancelFn != nil && ((i+1)&1023) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
 		lt, err := s.lessThan(best, a)
 		if err != nil {
 			return nil, err

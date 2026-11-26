@@ -546,3 +546,232 @@ func TestNativeNumericCoercionCancelAndBudget(t *testing.T) {
 		}
 	})
 }
+
+// TestLongStringComparisonAndEqualityCancelAndBudget verifies that comparing or equality-checking
+// long strings sharing a large prefix polls both instruction-budget and context-cancellation
+// controls across math.min/max, table.sort, <, <=, ==, rawequal, and table lookups.
+func TestLongStringComparisonAndEqualityCancelAndBudget(t *testing.T) {
+	prefix := strings.Repeat("a", 8*1024*1024)
+	sA := prefix + "1"
+	sB := prefix + "2"
+	sA2 := strings.Clone(sA)
+
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"math_min", `return math.min(A, B)`},
+		{"math_max", `return math.max(A, B)`},
+		{"table_sort", `local t = {B, A}; table.sort(t); return t[1]`},
+		{"op_lt", `return A < B`},
+		{"op_le", `return A <= B`},
+		{"op_eq", `return A == A2`},
+		{"rawequal", `return rawequal(A, A2)`},
+		{"table_lookup_prehashed", `return T[A2]`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+"/insn_budget", func(t *testing.T) {
+			s := vm.NewState()
+			defer s.Close()
+			vA := vm.StringValue(s.Intern(sA))
+			vB := vm.StringValue(s.Intern(sB))
+			vA2 := vm.StringValue(s.Intern(sA2))
+			s.SetGlobal("A", vA)
+			s.SetGlobal("B", vB)
+			s.SetGlobal("A2", vA2)
+			// Pre-populate and pre-hash T[A] and T2[A2] outside the budget so table_lookup_prehashed
+			// specifically exercises long-string key equality comparison on hash collision/match.
+			pre, err := s.LoadChunk([]byte(`T = { [A] = 1 }; local _ = ({ [A2] = 1 })[A2]`), "=pre")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Call(pre); err != nil {
+				t.Fatal(err)
+			}
+			cl, err := s.LoadChunk([]byte(tc.src), "="+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetInstructionLimit(100)
+			if _, err := s.Call(cl); err == nil {
+				t.Fatalf("%s unexpectedly succeeded past instruction limit 100 (executed=%d)", tc.name, s.InstructionsExecuted())
+			}
+			if s.InstructionsExecuted() == 0 {
+				t.Fatalf("%s charged 0 instructions during huge string comparison", tc.name)
+			}
+		})
+		t.Run(tc.name+"/ctx_canceled", func(t *testing.T) {
+			s := vm.NewState()
+			defer s.Close()
+			vA := vm.StringValue(s.Intern(sA))
+			vB := vm.StringValue(s.Intern(sB))
+			vA2 := vm.StringValue(s.Intern(sA2))
+			s.SetGlobal("A", vA)
+			s.SetGlobal("B", vB)
+			s.SetGlobal("A2", vA2)
+			pre, err := s.LoadChunk([]byte(`T = { [A] = 1 }; local _ = ({ [A2] = 1 })[A2]`), "=pre")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Call(pre); err != nil {
+				t.Fatal(err)
+			}
+			cl, err := s.LoadChunk([]byte(tc.src), "="+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			defer cancel()
+			s.SetContext(ctx)
+			start := time.Now()
+			if _, err := s.Call(cl); err == nil {
+				t.Fatalf("%s unexpectedly succeeded with expired context deadline", tc.name)
+			}
+			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+				t.Fatalf("%s took %v despite already-expired context", tc.name, elapsed)
+			}
+		})
+	}
+
+	// Direct State.Call(math.min, A, B) matching exact host-to-native path (0 Lua bytecode ops).
+	t.Run("direct_state_call_math_min", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		mathMin := s.GetGlobal("math").AsTable().RawGetStr(s.Intern("min"))
+		vA := vm.StringValue(s.Intern(sA))
+		vB := vm.StringValue(s.Intern(sB))
+		s.SetInstructionLimit(100)
+		if _, err := s.Call(mathMin, vA, vB); err == nil {
+			t.Fatalf("direct State.Call(math.min, A, B) bypassed instruction limit 100")
+		}
+		if s.InstructionsExecuted() == 0 {
+			t.Fatalf("direct State.Call(math.min, A, B) charged 0 instructions")
+		}
+	})
+}
+
+// TestDeadCoroutineClearsStackAndFramesInTier0 verifies that completed and closed coroutines
+// immediately drop stack slot and frame references so Go's GC reclaims discarded arguments and
+// locals in Tier 0 without waiting for State.CollectFull, while errored coroutines preserve
+// debug.traceback until coroutine.close.
+func TestDeadCoroutineClearsStackAndFramesInTier0(t *testing.T) {
+	runReclaimCheck := func(t *testing.T, src string) {
+		t.Helper()
+		s := vm.NewState()
+		defer s.Close()
+
+		var wp weak.Pointer[vm.Table]
+		func() {
+			cl, err := s.LoadChunk([]byte(src), "=dead_coro")
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := s.Call(cl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wp = weak.Make(res[0].AsTable())
+			res[0] = vm.NilValue()
+		}()
+
+		reclaimed := false
+		for range 10 {
+			runtime.GC()
+			if wp.Value() == nil {
+				reclaimed = true
+				break
+			}
+		}
+		if !reclaimed {
+			t.Fatalf("discarded coroutine argument/local remained retained by dead coroutine in Tier 0")
+		}
+	}
+
+	t.Run("normal_lua_completion", func(t *testing.T) {
+		runReclaimCheck(t, `
+			CO = coroutine.create(function(x)
+				local y = { x }
+				return 1
+			end)
+			local arg = { payload = string.rep("z", 65536) }
+			local ok, r = coroutine.resume(CO, arg)
+			assert(ok and r == 1 and coroutine.status(CO) == "dead")
+			return arg
+		`)
+	})
+
+	t.Run("normal_native_completion", func(t *testing.T) {
+		runReclaimCheck(t, `
+			CO = coroutine.create(function(x) return x end)
+			-- Test native-backed coroutine directly as well.
+			CO = coroutine.create(type)
+			local arg = { payload = string.rep("z", 65536) }
+			local ok, r = coroutine.resume(CO, arg)
+			assert(ok and r == "table" and coroutine.status(CO) == "dead")
+			return arg
+		`)
+	})
+
+	t.Run("yield_then_close", func(t *testing.T) {
+		runReclaimCheck(t, `
+			CO = coroutine.create(function(x)
+				local y = x
+				coroutine.yield(1)
+				return y
+			end)
+			local arg = { payload = string.rep("z", 65536) }
+			local ok, r = coroutine.resume(CO, arg)
+			assert(ok and r == 1 and coroutine.status(CO) == "suspended")
+			local cok = coroutine.close(CO)
+			assert(cok and coroutine.status(CO) == "dead")
+			return arg
+		`)
+	})
+
+	t.Run("error_preserves_traceback_then_close_releases", func(t *testing.T) {
+		runReclaimCheck(t, `
+			CO = coroutine.create(function(x)
+				local y = x
+				error("boom")
+				return y
+			end)
+			local arg = { payload = string.rep("z", 65536) }
+			local ok = coroutine.resume(CO, arg)
+			assert(not ok and coroutine.status(CO) == "dead")
+			local tb = debug.traceback(CO)
+			assert(string.find(tb, "dead_coro", 1, true), "expected error traceback before close, got: " .. tb)
+			local cok = coroutine.close(CO)
+			assert(not cok)
+			return arg
+		`)
+	})
+
+	t.Run("self_close", func(t *testing.T) {
+		runReclaimCheck(t, `
+			CO = coroutine.create(function(x)
+				local y = x
+				coroutine.close()
+				return y
+			end)
+			local arg = { payload = string.rep("z", 65536) }
+			local ok = coroutine.resume(CO, arg)
+			assert(ok and coroutine.status(CO) == "dead")
+			return arg
+		`)
+	})
+
+	t.Run("wrap_error_auto_close", func(t *testing.T) {
+		runReclaimCheck(t, `
+			W = coroutine.wrap(function(x)
+				local y = x
+				error("wrap_boom")
+				return y
+			end)
+			local arg = { payload = string.rep("z", 65536) }
+			local ok = pcall(W, arg)
+			assert(not ok)
+			return arg
+		`)
+	})
+}

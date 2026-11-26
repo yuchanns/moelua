@@ -675,6 +675,8 @@ reloadFrame:
 				cond = false
 			} else if ra.IsUserdata() && rb.IsUserdata() && ra.ptr != rb.ptr {
 				goto cold
+			} else if ra.IsString() && rb.IsString() && !ra.AsString().Short {
+				goto cold
 			} else {
 				cond = RawEqual(ra, rb)
 			}
@@ -720,7 +722,11 @@ reloadFrame:
 			continue
 
 		case bytecode.OP_EQK:
-			cond := RawEqual(regs[a], ev.consts[uint8(w>>bytecode.PosB)])
+			ra, rb := regs[a], ev.consts[uint8(w>>bytecode.PosB)]
+			if ra.IsString() && rb.IsString() && ra.ptr != rb.ptr && !ra.AsString().Short {
+				goto cold
+			}
+			cond := RawEqual(ra, rb)
 			if cond != w.K() {
 				pc++
 			} else {

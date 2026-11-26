@@ -99,6 +99,91 @@ var tmNames = [tmCount]string{
 }
 
 const strHashCancelChunk = 4096
+const strCmpCancelChunk = 65536
+
+// compareStrings compares two Lua strings lexicographically (matching Lua's l_strcmp),
+// polling State execution controls every 64 KiB for long strings with shared prefixes.
+func (s *State) compareStrings(a, b *LuaString) (int, error) {
+	if a == b {
+		return 0, nil
+	}
+	sa, sb := a.S, b.S
+	n := min(len(sa), len(sb))
+	cancelFn := s.nativeCancelFunc()
+	if cancelFn == nil || n <= strCmpCancelChunk {
+		if sa < sb {
+			return -1, nil
+		}
+		if sa > sb {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	for off := 0; off < n; off += strCmpCancelChunk {
+		if off > 0 {
+			if err := cancelFn(); err != nil {
+				return 0, err
+			}
+		}
+		end := min(off+strCmpCancelChunk, n)
+		ca, cb := sa[off:end], sb[off:end]
+		if ca != cb {
+			if ca < cb {
+				return -1, nil
+			}
+			return 1, nil
+		}
+	}
+	if len(sa) < len(sb) {
+		return -1, nil
+	}
+	if len(sa) > len(sb) {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+// stringsEqual compares two Lua strings for equality, polling State execution controls
+// every 64 KiB when comparing distinct long strings of identical length.
+func (s *State) stringsEqual(a, b *LuaString) (bool, error) {
+	if a == b {
+		return true, nil
+	}
+	if a.Short || b.Short {
+		return false, nil
+	}
+	sa, sb := a.S, b.S
+	if len(sa) != len(sb) {
+		return false, nil
+	}
+	if ha, hb := atomic.LoadUint32(&a.Hash), atomic.LoadUint32(&b.Hash); ha != 0 && hb != 0 && ha != hb {
+		return false, nil
+	}
+	cancelFn := s.nativeCancelFunc()
+	if cancelFn == nil || len(sa) <= strCmpCancelChunk {
+		return sa == sb, nil
+	}
+	for off := 0; off < len(sa); off += strCmpCancelChunk {
+		if off > 0 {
+			if err := cancelFn(); err != nil {
+				return false, err
+			}
+		}
+		end := min(off+strCmpCancelChunk, len(sa))
+		if sa[off:end] != sb[off:end] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// rawEqual implements Lua 5.5 rawequal(a, b) with cooperative cancel polling on long strings.
+func (s *State) rawEqual(a, b Value) (bool, error) {
+	if a.IsString() && b.IsString() {
+		return s.stringsEqual(a.AsString(), b.AsString())
+	}
+	return RawEqual(a, b), nil
+}
 
 // hashString computes a fast 32-bit FNV-1a hash seeded with state seed.
 func hashString(s string, seed uint32) uint32 {
@@ -236,11 +321,57 @@ func (s *State) ensureStrKeyHash(ls *LuaString) error {
 	return err
 }
 
+// checkTableLongStrProbe cooperatively polls execution controls before table hash probes
+// compare a huge long string against distinct same-length long strings in the probe chain.
+func (s *State) checkTableLongStrProbe(t *Table, ls *LuaString) error {
+	if s == nil || t == nil || t.hash == nil || len(t.hash.nodes) == 0 || ls == nil || ls.Short || len(ls.S) <= strCmpCancelChunk || !s.hasInterruptControl() {
+		return nil
+	}
+	h := t.hash
+	mask := h.mask
+	idx := ls.hash() & mask
+	for {
+		nd := &h.nodes[idx]
+		if !nd.used {
+			return nil
+		}
+		if !nd.dead {
+			if nd.key.IsString() {
+				other := nd.key.AsString()
+				if other != ls && !other.Short && len(other.S) == len(ls.S) {
+					eq, err := s.stringsEqual(other, ls)
+					if err != nil {
+						return err
+					}
+					if eq {
+						return nil
+					}
+				}
+			}
+		} else if h.deadKeys != nil {
+			if ref, ok := h.deadKeys[int(idx)]; ok {
+				if dv, alive := deadKeyValue(ref); alive && dv.IsString() {
+					other := dv.AsString()
+					if other != ls && !other.Short && len(other.S) == len(ls.S) {
+						if _, err := s.stringsEqual(other, ls); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+		idx = (idx + 1) & mask
+	}
+}
+
 func (s *State) ensureLookupStrKeyHash(t *Table, ls *LuaString) error {
 	if t == nil || t.hash == nil || len(t.hash.nodes) == 0 {
 		return nil
 	}
-	return s.ensureStrKeyHash(ls)
+	if err := s.ensureStrKeyHash(ls); err != nil {
+		return err
+	}
+	return s.checkTableLongStrProbe(t, ls)
 }
 
 func (s *State) ensureLookupKeyHash(t *Table, key Value) error {
@@ -254,7 +385,10 @@ func (s *State) ensureWriteStrKeyHash(t *Table, ls *LuaString, valNil bool) erro
 	if valNil && (t == nil || t.hash == nil || len(t.hash.nodes) == 0) {
 		return nil
 	}
-	return s.ensureStrKeyHash(ls)
+	if err := s.ensureStrKeyHash(ls); err != nil {
+		return err
+	}
+	return s.checkTableLongStrProbe(t, ls)
 }
 
 // lookupExistingShort returns an already-interned short *LuaString if present (without allocating).
