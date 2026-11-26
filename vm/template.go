@@ -350,7 +350,9 @@ func cloneFromStdTemplate(noEnv bool) *State {
 	th := &a.mainThread
 	th.state = s
 	th.stack = a.initStack[:]
+	th.initStack = a.initStack[:]
 	th.frames = a.initFrames[:]
+	th.initFrames = a.initFrames[:]
 	th.status = ThreadOK
 	th.errObj = NilValue()
 	th.hook = NilValue()

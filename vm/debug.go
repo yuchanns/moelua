@@ -68,14 +68,18 @@ func shortSrc(source string) string {
 		}
 		return s
 	}
-	// Literal string chunk
-	nl := strings.IndexByte(source, '\n')
-	truncated := nl >= 0
-	line := source
-	if truncated {
-		line = source[:nl]
-	}
+	// Literal string chunk (only inspect up to maxLen+1 bytes so huge sources stay O(1)).
 	maxLen := bufLen - len(`[string "..."]`) - 1
+	probe := source
+	if len(probe) > maxLen+1 {
+		probe = probe[:maxLen+1]
+	}
+	nl := strings.IndexByte(probe, '\n')
+	truncated := nl >= 0 || len(source) > maxLen
+	line := probe
+	if nl >= 0 {
+		line = probe[:nl]
+	}
 	if len(line) > maxLen {
 		line = line[:maxLen]
 		truncated = true
@@ -145,14 +149,25 @@ func optThreadArg(s *State, args []Value) (*Thread, []Value) {
 }
 
 func (s *State) formatTraceback(th *Thread, msg string, hasMsg bool, level int) string {
+	tb, _ := s.formatTracebackWithCancel(th, msg, hasMsg, level, "", nil)
+	return tb
+}
+
+func (s *State) formatTracebackWithCancel(th *Thread, msg string, hasMsg bool, level int, selfEntry string, cancelFn func() error) (string, error) {
 	var sb strings.Builder
 	if hasMsg {
-		sb.WriteString(msg)
+		work := 0
+		if err := writeStringWithCancel(&sb, msg, cancelFn, &work); err != nil {
+			return "", err
+		}
 		sb.WriteByte('\n')
 	}
 	sb.WriteString("stack traceback:")
+	if selfEntry != "" {
+		sb.WriteString(selfEntry)
+	}
 	if level < 0 {
-		return sb.String()
+		return sb.String(), nil
 	}
 	var entries []string
 	// Level 0 on a suspended coroutine is [C]: in <namewhat> 'yield';
@@ -252,7 +267,7 @@ func (s *State) formatTraceback(th *Thread, msg string, hasMsg bool, level int) 
 		entries = append(entries, eb.String())
 	}
 	if level >= len(entries) {
-		return sb.String()
+		return sb.String(), nil
 	}
 	shown := entries[level:]
 	const (
@@ -273,7 +288,7 @@ func (s *State) formatTraceback(th *Thread, msg string, hasMsg bool, level int) 
 			sb.WriteString(e)
 		}
 	}
-	return sb.String()
+	return sb.String(), nil
 }
 
 func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
@@ -313,15 +328,18 @@ func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
 			return nil, err
 		}
 	}
-	tb := s.formatTraceback(th, msg, hasMsg, level)
+	selfEntry := ""
 	if includeSelf {
-		selfEntry := "\n\t[C]: in field 'traceback'"
+		selfEntry = "\n\t[C]: in field 'traceback'"
 		if th.nframe > 0 && th.frames[th.nframe-1].kind == frameLua {
 			if n, nw := funcNameFromCallerFrame(&th.frames[th.nframe-1]); nw != "" {
 				selfEntry = fmt.Sprintf("\n\t[C]: in %s '%s'", nw, n)
 			}
 		}
-		tb = strings.Replace(tb, "stack traceback:", "stack traceback:"+selfEntry, 1)
+	}
+	tb, err := s.formatTracebackWithCancel(th, msg, hasMsg, level, selfEntry, s.nativeCancelFunc())
+	if err != nil {
+		return nil, err
 	}
 	ls, err := s.TryIntern(tb)
 	if err != nil {
@@ -338,7 +356,55 @@ func nativeUpvalueCount(nf *NativeFunc) int {
 	return n
 }
 
-func fillCFrameInfo(s *State, what string, cfunc Value, cname, namewhat string, ftransfer, ntransfer int64) (*Table, error) {
+const (
+	infoFlagS uint8 = 1 << iota
+	infoFlagL
+	infoFlagN
+	infoFlagU
+	infoFlagT
+	infoFlagR
+	infoFlagF
+	infoFlagActL
+)
+
+const defaultGetInfoFlags = infoFlagF | infoFlagL | infoFlagN | infoFlagS | infoFlagR | infoFlagT | infoFlagU
+
+func parseGetInfoWhat(what string, cancelFn func() error) (uint8, error) {
+	if len(what) > 0 && what[0] == '>' {
+		return 0, fmt.Errorf("bad argument #2 to 'getinfo' (invalid option '>')")
+	}
+	var flags uint8
+	for i := 0; i < len(what); i++ {
+		if cancelFn != nil && i > 0 && (i&4095) == 0 {
+			if err := cancelFn(); err != nil {
+				return 0, err
+			}
+		}
+		switch what[i] {
+		case 'S':
+			flags |= infoFlagS
+		case 'l':
+			flags |= infoFlagL
+		case 'n':
+			flags |= infoFlagN
+		case 'u':
+			flags |= infoFlagU
+		case 't':
+			flags |= infoFlagT
+		case 'r':
+			flags |= infoFlagR
+		case 'f':
+			flags |= infoFlagF
+		case 'L':
+			flags |= infoFlagActL
+		default:
+			return 0, fmt.Errorf("bad argument #2 to 'getinfo' (invalid option)")
+		}
+	}
+	return flags, nil
+}
+
+func fillCFrameInfo(s *State, flags uint8, cfunc Value, cname, namewhat string, ftransfer, ntransfer int64) (*Table, error) {
 	info, err := s.TryNewTable(0, 10)
 	if err != nil {
 		return nil, err
@@ -351,36 +417,36 @@ func fillCFrameInfo(s *State, what string, cfunc Value, cname, namewhat string, 
 	if cfunc.IsNative() {
 		nups = int64(nativeUpvalueCount(cfunc.AsNative()))
 	}
-	if strings.ContainsRune(what, 'S') {
+	if flags&infoFlagS != 0 {
 		info.RawSetStr(s, s.intern.Intern("what"), StringValue(s.intern.Intern("C")))
 		info.RawSetStr(s, s.intern.Intern("source"), StringValue(s.intern.Intern("=[C]")))
 		info.RawSetStr(s, s.intern.Intern("short_src"), StringValue(s.intern.Intern("[C]")))
 		info.RawSetStr(s, s.intern.Intern("linedefined"), IntValue(-1))
 		info.RawSetStr(s, s.intern.Intern("lastlinedefined"), IntValue(-1))
 	}
-	if strings.ContainsRune(what, 'l') {
+	if flags&infoFlagL != 0 {
 		info.RawSetStr(s, s.intern.Intern("currentline"), IntValue(-1))
 	}
-	if strings.ContainsRune(what, 'n') {
+	if flags&infoFlagN != 0 {
 		if cname != "" {
 			info.RawSetStr(s, s.intern.Intern("name"), StringValue(s.intern.Intern(cname)))
 		}
 		info.RawSetStr(s, s.intern.Intern("namewhat"), StringValue(s.intern.Intern(namewhat)))
 	}
-	if strings.ContainsRune(what, 'u') {
+	if flags&infoFlagU != 0 {
 		info.RawSetStr(s, s.intern.Intern("nups"), IntValue(nups))
 		info.RawSetStr(s, s.intern.Intern("nparams"), IntValue(0))
 		info.RawSetStr(s, s.intern.Intern("isvararg"), TrueValue())
 	}
-	if strings.ContainsRune(what, 't') {
+	if flags&infoFlagT != 0 {
 		info.RawSetStr(s, s.intern.Intern("istailcall"), FalseValue())
 		info.RawSetStr(s, s.intern.Intern("extraargs"), IntValue(0))
 	}
-	if strings.ContainsRune(what, 'r') {
+	if flags&infoFlagR != 0 {
 		info.RawSetStr(s, s.intern.Intern("ftransfer"), IntValue(ftransfer))
 		info.RawSetStr(s, s.intern.Intern("ntransfer"), IntValue(ntransfer))
 	}
-	if strings.ContainsRune(what, 'f') {
+	if flags&infoFlagF != 0 {
 		info.RawSetStr(s, s.intern.Intern("func"), cfunc)
 	}
 	if err := s.ConsumeMemErr(); err != nil {
@@ -394,21 +460,15 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 	if len(rest) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'getinfo'")
 	}
-	what := "flnSrtu"
+	flags := defaultGetInfoFlags
 	if len(rest) >= 2 && !rest[1].IsNil() {
 		if !rest[1].IsString() {
 			return nil, fmt.Errorf("bad argument #2 to 'getinfo' (string expected)")
 		}
-		what = rest[1].AsString().S
-		if len(what) > 0 && what[0] == '>' {
-			return nil, fmt.Errorf("bad argument #2 to 'getinfo' (invalid option '>')")
-		}
-		for i := 0; i < len(what); i++ {
-			switch what[i] {
-			case 'f', 'l', 'n', 'r', 'S', 't', 'u', 'L':
-			default:
-				return nil, fmt.Errorf("bad argument #2 to 'getinfo' (invalid option)")
-			}
+		var err error
+		flags, err = parseGetInfoWhat(rest[1].AsString().S, s.nativeCancelFunc())
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -430,7 +490,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			if s.builtinDebugGetInfo != nil {
 				cfunc = NativeValue(s.builtinDebugGetInfo)
 			}
-			info, err := fillCFrameInfo(s, what, cfunc, "getinfo", "field", 0, 0)
+			info, err := fillCFrameInfo(s, flags, cfunc, "getinfo", "field", 0, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -442,7 +502,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			if s.builtinCoroYield != nil {
 				cfunc = NativeValue(s.builtinCoroYield)
 			}
-			info, err := fillCFrameInfo(s, what, cfunc, "yield", "field", 0, 0)
+			info, err := fillCFrameInfo(s, flags, cfunc, "yield", "field", 0, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -496,7 +556,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 					cfunc = s.GetGlobal("xpcall")
 				}
 			}
-			info, err := fillCFrameInfo(s, what, cfunc, cname, namewhat, int64(cf.ftransfer), int64(cf.ntransfer))
+			info, err := fillCFrameInfo(s, flags, cfunc, cname, namewhat, int64(cf.ftransfer), int64(cf.ntransfer))
 			if err != nil {
 				return nil, err
 			}
@@ -517,7 +577,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 	}
 	if fn.IsClosure() {
 		p := fn.AsClosure().bp.proto
-		if strings.ContainsRune(what, 'S') {
+		if flags&infoFlagS != 0 {
 			src := p.Source
 			if p.NoSource {
 				src = "=?"
@@ -532,7 +592,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			}
 			info.RawSetStr(s, s.intern.Intern("what"), StringValue(s.intern.Intern(w)))
 		}
-		if strings.ContainsRune(what, 'l') {
+		if flags&infoFlagL != 0 {
 			line := -1
 			if cf != nil {
 				pc := cf.pc
@@ -543,12 +603,12 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			}
 			info.RawSetStr(s, s.intern.Intern("currentline"), IntValue(int64(line)))
 		}
-		if strings.ContainsRune(what, 'u') {
+		if flags&infoFlagU != 0 {
 			info.RawSetStr(s, s.intern.Intern("nups"), IntValue(int64(len(p.Upvalues))))
 			info.RawSetStr(s, s.intern.Intern("nparams"), IntValue(int64(p.NumParams)))
 			info.RawSetStr(s, s.intern.Intern("isvararg"), BoolValue(p.IsVararg()))
 		}
-		if strings.ContainsRune(what, 't') {
+		if flags&infoFlagT != 0 {
 			tc := false
 			ea := int64(0)
 			if cf != nil {
@@ -558,7 +618,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			info.RawSetStr(s, s.intern.Intern("istailcall"), BoolValue(tc))
 			info.RawSetStr(s, s.intern.Intern("extraargs"), IntValue(ea))
 		}
-		if strings.ContainsRune(what, 'n') {
+		if flags&infoFlagN != 0 {
 			name, namewhat := "", ""
 			if cf != nil && cfIdx >= 0 {
 				name, namewhat = funcNameFromCall(th, cfIdx)
@@ -568,7 +628,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			}
 			info.RawSetStr(s, s.intern.Intern("namewhat"), StringValue(s.intern.Intern(namewhat)))
 		}
-		if strings.ContainsRune(what, 'r') {
+		if flags&infoFlagR != 0 {
 			ft, nt := int64(0), int64(0)
 			if cf != nil {
 				ft = int64(cf.ftransfer)
@@ -577,10 +637,10 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			info.RawSetStr(s, s.intern.Intern("ftransfer"), IntValue(ft))
 			info.RawSetStr(s, s.intern.Intern("ntransfer"), IntValue(nt))
 		}
-		if strings.ContainsRune(what, 'f') {
+		if flags&infoFlagF != 0 {
 			info.RawSetStr(s, s.intern.Intern("func"), fn)
 		}
-		if strings.ContainsRune(what, 'L') {
+		if flags&infoFlagActL != 0 {
 			al, err := s.TryNewTable(0, 16)
 			if err != nil {
 				return nil, err
@@ -613,17 +673,17 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		}
 	} else {
 		// Native Go function
-		if strings.ContainsRune(what, 'S') {
+		if flags&infoFlagS != 0 {
 			info.RawSetStr(s, s.intern.Intern("source"), StringValue(s.intern.Intern("=[C]")))
 			info.RawSetStr(s, s.intern.Intern("short_src"), StringValue(s.intern.Intern("[C]")))
 			info.RawSetStr(s, s.intern.Intern("linedefined"), IntValue(-1))
 			info.RawSetStr(s, s.intern.Intern("lastlinedefined"), IntValue(-1))
 			info.RawSetStr(s, s.intern.Intern("what"), StringValue(s.intern.Intern("C")))
 		}
-		if strings.ContainsRune(what, 'l') {
+		if flags&infoFlagL != 0 {
 			info.RawSetStr(s, s.intern.Intern("currentline"), IntValue(-1))
 		}
-		if strings.ContainsRune(what, 'u') {
+		if flags&infoFlagU != 0 {
 			nups := int64(0)
 			if fn.IsNative() {
 				nups = int64(nativeUpvalueCount(fn.AsNative()))
@@ -632,11 +692,11 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			info.RawSetStr(s, s.intern.Intern("nparams"), IntValue(0))
 			info.RawSetStr(s, s.intern.Intern("isvararg"), TrueValue())
 		}
-		if strings.ContainsRune(what, 't') {
+		if flags&infoFlagT != 0 {
 			info.RawSetStr(s, s.intern.Intern("istailcall"), FalseValue())
 			info.RawSetStr(s, s.intern.Intern("extraargs"), IntValue(0))
 		}
-		if strings.ContainsRune(what, 'f') {
+		if flags&infoFlagF != 0 {
 			info.RawSetStr(s, s.intern.Intern("func"), fn)
 		}
 	}
@@ -1395,7 +1455,14 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'sethook' (function expected, got %s)", s.objTypeName(rest[0]))
 	}
 	var mask uint8
+	cancelFn := s.nativeCancelFunc()
+	const allMask = HookMaskCall | HookMaskRet | HookMaskLine
 	for i := range len(maskStr) {
+		if cancelFn != nil && i > 0 && (i&4095) == 0 {
+			if err := cancelFn(); err != nil {
+				return nil, err
+			}
+		}
 		switch maskStr[i] {
 		case 'c':
 			mask |= HookMaskCall
@@ -1403,6 +1470,9 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 			mask |= HookMaskRet
 		case 'l':
 			mask |= HookMaskLine
+		}
+		if mask == allMask {
+			break
 		}
 	}
 	count := 0

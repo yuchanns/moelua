@@ -107,6 +107,14 @@ type Thread struct {
 	frames []callFrame
 	nframe int
 
+	// Optional views of stateAlloc's embedded initStack/initFrames for mainThread.
+	// Cleared only once abandoned AND no active native args / frames can still borrow them.
+	initStack           []Value
+	initFrames          []callFrame
+	nativeArgsDepth     int
+	initStackAbandoned  bool
+	initFramesAbandoned bool
+
 	openUpvals []*Upvalue // ascending stack indices of open upvalues owned by this thread
 	tbc        []int      // ascending stack indices of active <close> variables
 
@@ -200,10 +208,18 @@ func (th *Thread) ensureFrameCap(need, limit int) error {
 			return err
 		}
 	}
+	old := th.frames
 	nf := make([]callFrame, newCap)
-	copy(nf, th.frames)
-	clear(th.frames)
+	copy(nf, old)
 	th.frames = nf
+	if th.initFrames != nil && len(old) > 0 && unsafe.SliceData(old) == unsafe.SliceData(th.initFrames) {
+		if th.nframe == 0 {
+			clear(th.initFrames)
+			th.initFrames = nil
+		} else {
+			th.initFramesAbandoned = true
+		}
+	}
 	return nil
 }
 
@@ -233,13 +249,38 @@ func (th *Thread) ensureStack(need int) error {
 			return err
 		}
 	}
+	old := th.stack
 	ns := make([]Value, newSize)
-	copy(ns, th.stack)
-	fillNil(ns[len(th.stack):])
-	clear(th.stack)
+	copy(ns, old)
+	fillNil(ns[len(old):])
 	th.stack = ns
 	th.stackGen++
+	if th.initStack != nil && len(old) > 0 && unsafe.SliceData(old) == unsafe.SliceData(th.initStack) {
+		if th.nativeArgsDepth == 0 {
+			clear(th.initStack)
+			th.initStack = nil
+		} else {
+			th.initStackAbandoned = true
+		}
+	}
 	return nil
+}
+
+func (th *Thread) clearAbandonedInitStack() {
+	if th.initStackAbandoned && th.initStack != nil && th.nativeArgsDepth == 0 {
+		clear(th.initStack)
+		th.initStack = nil
+		th.initStackAbandoned = false
+	}
+}
+
+func (th *Thread) clearAbandonedInitStorage() {
+	th.clearAbandonedInitStack()
+	if th.initFramesAbandoned && th.initFrames != nil && th.nframe == 0 {
+		clear(th.initFrames)
+		th.initFrames = nil
+		th.initFramesAbandoned = false
+	}
 }
 
 // window returns a *[256]Value view rooted at th.stack[base].

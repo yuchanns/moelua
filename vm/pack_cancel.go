@@ -58,24 +58,6 @@ const (
 	vpkNop
 )
 
-func indexByteWithCancel(src string, c byte, cancelFn func() error) (int, error) {
-	if cancelFn == nil || len(src) <= strCloneCancelChunk {
-		return strings.IndexByte(src, c), nil
-	}
-	for off := 0; off < len(src); off += strCloneCancelChunk {
-		if off > 0 {
-			if err := cancelFn(); err != nil {
-				return -1, err
-			}
-		}
-		end := min(off+strCloneCancelChunk, len(src))
-		if idx := strings.IndexByte(src[off:end], c); idx >= 0 {
-			return off + idx, nil
-		}
-	}
-	return -1, nil
-}
-
 func writeZeroPadWithCancel(sb *strings.Builder, pad uint64, cancelFn func() error, work *int) error {
 	for pad > 0 {
 		rem := uint64(strCloneCancelChunk - *work)

@@ -596,7 +596,15 @@ func nativeStringPackSize(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	sz, err := luastdlib.PackSizeWithCancel(fmtStr, s.nativeCancelFunc())
+	cancelFn := s.nativeCancelFunc()
+	if cancelFn != nil {
+		if nul, cerr := indexByteWithCancel(fmtStr, 0, cancelFn); cerr != nil {
+			return nil, cerr
+		} else if nul >= 0 {
+			fmtStr = fmtStr[:nul]
+		}
+	}
+	sz, err := luastdlib.PackSizeWithCancel(fmtStr, cancelFn)
 	if err != nil {
 		if isUncatchableErr(err) {
 			return nil, err
@@ -611,7 +619,10 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	hasStrSpec := strings.IndexByte(fmtStr, 's') >= 0
+	hasStrSpec, err := containsByteWithCancel(fmtStr, 's', s.nativeCancelFunc())
+	if err != nil {
+		return nil, err
+	}
 	fargs := make([]luastdlib.FormatArg, len(args)-1)
 	for i, a := range args[1:] {
 		var lazyToStr func() (string, error)

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
-	"strings"
 	"unsafe"
 	"weak"
 )
@@ -348,10 +347,21 @@ func (s *State) weakModeOf(t *Table) (weakK, weakV bool) {
 		return false, false
 	}
 	ms := mv.AsString().S
-	if nul := strings.IndexByte(ms, 0); nul >= 0 {
+	cancelFn := s.nativeCancelFunc()
+	if nul, err := indexByteWithCancel(ms, 0, cancelFn); err != nil {
+		return false, false
+	} else if nul >= 0 {
 		ms = ms[:nul]
 	}
-	return strings.ContainsRune(ms, 'k'), strings.ContainsRune(ms, 'v')
+	wk, err := containsByteWithCancel(ms, 'k', cancelFn)
+	if err != nil {
+		return false, false
+	}
+	wv, err := containsByteWithCancel(ms, 'v', cancelFn)
+	if err != nil {
+		return false, false
+	}
+	return wk, wv
 }
 
 // isCollectableWeak reports whether v can be cleared from a weak table.

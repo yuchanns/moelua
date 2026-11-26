@@ -836,6 +836,7 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 				fillNil(th.stack[base:])
 			}
 			clear(th.frames)
+			th.clearAbandonedInitStorage()
 		} else {
 			if base < len(th.stack) {
 				end := max(th.top, setupEnd)
@@ -1047,7 +1048,12 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 				}
 			}
 		} else if th.hookMask == 0 || th.inHook || th.suppressHook {
+			th.nativeArgsDepth++
 			res, err = nf.callMulti(s, th.stack[base+1:base+1+len(args)])
+			th.nativeArgsDepth--
+			if th.nativeArgsDepth == 0 && th.initStackAbandoned {
+				th.clearAbandonedInitStack()
+			}
 		} else {
 			res, _, err = s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
 		}
@@ -1130,6 +1136,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 				fillNil(th.stack[funcIdx:])
 			}
 			clear(th.frames)
+			th.clearAbandonedInitStorage()
 		}
 	}
 	err := s.runThread(th, entryDepth)

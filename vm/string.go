@@ -103,6 +103,29 @@ const strHashCancelChunk = 4096
 const strCmpCancelChunk = 65536
 const strCloneCancelChunk = 65536
 
+func indexByteWithCancel(src string, c byte, cancelFn func() error) (int, error) {
+	if cancelFn == nil || len(src) <= strCloneCancelChunk {
+		return strings.IndexByte(src, c), nil
+	}
+	for off := 0; off < len(src); off += strCloneCancelChunk {
+		if off > 0 {
+			if err := cancelFn(); err != nil {
+				return -1, err
+			}
+		}
+		end := min(off+strCloneCancelChunk, len(src))
+		if idx := strings.IndexByte(src[off:end], c); idx >= 0 {
+			return off + idx, nil
+		}
+	}
+	return -1, nil
+}
+
+func containsByteWithCancel(src string, c byte, cancelFn func() error) (bool, error) {
+	idx, err := indexByteWithCancel(src, c, cancelFn)
+	return idx >= 0, err
+}
+
 // writeStringWithCancel appends src to sb in bounded 64 KiB chunks while polling cancelFn
 // (zero overhead when cancelFn == nil, and zero extra charge on short strings below 64 KiB).
 func writeStringWithCancel(sb *strings.Builder, src string, cancelFn func() error, work *int) error {

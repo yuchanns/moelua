@@ -342,9 +342,14 @@ func (s *State) undumpBytes(data []byte) (*bytecode.Proto, error) {
 }
 
 func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv, stripFileHeader bool) (Value, error) {
+	cancelFn := s.nativeCancelFunc()
 	isBin := len(src) > 0 && src[0] == 0x1b
 	if isBin {
-		if !strings.ContainsRune(mode, 'b') {
+		allowBin, cerr := containsByteWithCancel(mode, 'b', cancelFn)
+		if cerr != nil {
+			return NilValue(), cerr
+		}
+		if !allowBin {
 			return NilValue(), fmt.Errorf("attempt to load a binary chunk (mode is '%s')", mode)
 		}
 		p, err := s.undumpBytes(unsafe.Slice(unsafe.StringData(src), len(src)))
@@ -360,7 +365,11 @@ func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv, 
 		}
 		return ClosureValue(cl), nil
 	}
-	if !strings.ContainsRune(mode, 't') {
+	allowText, cerr := containsByteWithCancel(mode, 't', cancelFn)
+	if cerr != nil {
+		return NilValue(), cerr
+	}
+	if !allowText {
 		return NilValue(), fmt.Errorf("attempt to load a text chunk (mode is '%s')", mode)
 	}
 	if s.compilerFn == nil {
@@ -377,7 +386,7 @@ func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv, 
 				return s.checkMem(n)
 			}))
 		}
-		if cancelFn := s.nativeCancelFunc(); cancelFn != nil {
+		if cancelFn != nil {
 			opts = append(opts, compiler.WithCancel(cancelFn))
 		}
 		p, err = compiler.Compile(chunkName, src, opts...)
@@ -400,7 +409,11 @@ func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv, 
 func (s *State) loadChunkBytes(data []byte, chunkName, mode string, env Value, hasEnv bool) (Value, error) {
 	isBin := len(data) > 0 && data[0] == 0x1b
 	if isBin {
-		if !strings.ContainsRune(mode, 'b') {
+		allowBin, cerr := containsByteWithCancel(mode, 'b', s.nativeCancelFunc())
+		if cerr != nil {
+			return NilValue(), cerr
+		}
+		if !allowBin {
 			return NilValue(), fmt.Errorf("attempt to load a binary chunk (mode is '%s')", mode)
 		}
 		p, err := s.undumpBytes(data)
@@ -511,7 +524,11 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 	}
 	cancelFn := s.nativeCancelFunc()
 	if isBin {
-		if !strings.ContainsRune(mode, 'b') {
+		allowBin, cerr := containsByteWithCancel(mode, 'b', cancelFn)
+		if cerr != nil {
+			return NilValue(), cerr
+		}
+		if !allowBin {
 			return NilValue(), fmt.Errorf("attempt to load a binary chunk (mode is '%s')", mode)
 		}
 		p, uerr := bytecode.UndumpReaderWithControls(br, checkMem, cancelFn)
@@ -529,7 +546,11 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 		}
 		return ClosureValue(cl), nil
 	}
-	if !strings.ContainsRune(mode, 't') {
+	allowText, cerr := containsByteWithCancel(mode, 't', cancelFn)
+	if cerr != nil {
+		return NilValue(), cerr
+	}
+	if !allowText {
 		return NilValue(), fmt.Errorf("attempt to load a text chunk (mode is '%s')", mode)
 	}
 	if s.compilerFn == nil {
@@ -646,7 +667,11 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 		}
 		mode = FormatValue(args[2])
 		// Lua 5.5 rejects fixed-buffer mode 'B' from Lua scripts (lbaselib.c:342-349).
-		if strings.ContainsRune(mode, 'B') {
+		hasB, cerr := containsByteWithCancel(mode, 'B', s.nativeCancelFunc())
+		if cerr != nil {
+			return nil, cerr
+		}
+		if hasB {
 			return nil, fmt.Errorf("bad argument #3 to 'load' (invalid mode)")
 		}
 	}
@@ -807,7 +832,11 @@ func nativeLoadFile(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #2 to 'loadfile' (string expected, got %s)", s.objTypeName(args[1]))
 		}
 		mode = FormatValue(args[1])
-		if strings.ContainsRune(mode, 'B') {
+		hasB, cerr := containsByteWithCancel(mode, 'B', s.nativeCancelFunc())
+		if cerr != nil {
+			return nil, cerr
+		}
+		if hasB {
 			return nil, fmt.Errorf("bad argument #2 to 'loadfile' (invalid mode)")
 		}
 	}
@@ -3299,7 +3328,11 @@ func (s *State) checkedReplaceSize(src, oldStr, newStr string) (int64, error) {
 // enforcing memLimit and cooperative cancellation without materializing quadratic expansions.
 func (s *State) forEachSearchCandidate(path, name string, cancelFn func() error, fn func(cand string) (bool, error)) error {
 	var steps int64
-	if !strings.ContainsRune(name, ';') {
+	hasSemi, err := containsByteWithCancel(name, ';', cancelFn)
+	if err != nil {
+		return err
+	}
+	if !hasSemi {
 		for tmpl := range strings.SplitSeq(path, ";") {
 			steps++
 			if cancelFn != nil && (steps&1023) == 0 {

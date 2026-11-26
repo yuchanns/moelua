@@ -1836,3 +1836,114 @@ print("io_closed_ok")
 		}
 	}
 }
+
+// TestNativeArgsSurviveStackGrowth verifies that growing th.stack off initStack during a
+// native call (such as 350-element table.sort or a stack-growing comparator) never clobbers
+// active native argument slices, while abandoned initStack storage is still cleared afterwards.
+func TestNativeArgsSurviveStackGrowth(t *testing.T) {
+	src := `
+local t = {}
+for i = 1, 350 do
+	t[i] = string.format("%04d", 351 - i)
+end
+table.sort(t)
+assert(#t == 350 and t[1] == "0001" and t[350] == "0350")
+
+local function grow(n)
+	if n == 0 then return 0 end
+	return grow(n - 1) + 1
+end
+local t2 = {}
+for i = 1, 40 do t2[i] = 41 - i end
+local grew = false
+table.sort(t2, function(a, b)
+	if not grew then
+		grew = true
+		grow(150)
+	end
+	return a < b
+end)
+assert(t2[1] == 1 and t2[40] == 40)
+print("sort_stack_growth_ok")
+`
+	got := runMoeLua(t, src)
+	if got != "sort_stack_growth_ok\n" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+	if hasCLua55(t) {
+		if want := runCLua55(t, src); got != want {
+			t.Fatalf("mismatch vs C Lua 5.5.1:\nwant:\n%s\ngot:\n%s", want, got)
+		}
+	}
+}
+
+// TestDebugAndOptionStringScansCancelAndBudget verifies that unbounded string scans in
+// debug.sethook, debug.getinfo, debug.traceback, load, string.packsize, and string.format
+// cooperatively poll execution controls (instruction budget and context deadline).
+func TestDebugAndOptionStringScansCancelAndBudget(t *testing.T) {
+	bigMask := strings.Repeat("x", 8*1024*1024)
+	bigWhat := strings.Repeat("S", 8*1024*1024)
+
+	t.Run("direct_state_call_debug_sethook", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		setHook := s.GetGlobal("debug").AsTable().RawGetStr(s.Intern("sethook"))
+		noop := s.GetGlobal("tostring")
+		maskVal := vm.StringValue(s.Intern(bigMask))
+
+		s.SetInstructionLimit(100)
+		if _, err := s.Call(setHook, noop, maskVal); err == nil {
+			t.Fatalf("direct State.Call(debug.sethook, fn, bigMask) bypassed instruction limit 100")
+		}
+		if s.InstructionsExecuted() == 0 {
+			t.Fatalf("direct State.Call(debug.sethook) charged 0 instructions")
+		}
+
+		s2 := vm.NewState()
+		defer s2.Close()
+		setHook2 := s2.GetGlobal("debug").AsTable().RawGetStr(s2.Intern("sethook"))
+		noop2 := s2.GetGlobal("tostring")
+		maskVal2 := vm.StringValue(s2.Intern(bigMask))
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		s2.SetContext(ctx)
+		start := time.Now()
+		if _, err := s2.Call(setHook2, noop2, maskVal2); err == nil {
+			t.Fatalf("direct State.Call(debug.sethook) bypassed expired context deadline")
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("direct State.Call(debug.sethook) took %v despite expired context", elapsed)
+		}
+	})
+
+	t.Run("debug_getinfo_traceback_load_packsize_format", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			src  string
+		}{
+			{"debug_sethook", `debug.sethook(tostring, BIG_MASK)`},
+			{"debug_getinfo", `return debug.getinfo(tostring, BIG_WHAT)`},
+			{"debug_traceback", `return debug.traceback(BIG_MASK)`},
+			{"load_mode", `return load("return 1", "=x", BIG_MASK)`},
+			{"string_packsize", `return string.packsize(BIG_SPACES)`},
+			{"string_format", `return string.format(BIG_MASK)`},
+		} {
+			s := vm.NewState()
+			defer s.Close()
+			s.SetGlobal("BIG_MASK", vm.StringValue(s.Intern(bigMask)))
+			s.SetGlobal("BIG_WHAT", vm.StringValue(s.Intern(bigWhat)))
+			s.SetGlobal("BIG_SPACES", vm.StringValue(s.Intern(strings.Repeat(" ", 8*1024*1024))))
+			cl, err := s.LoadChunk([]byte(tc.src), "="+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetInstructionLimit(100)
+			if _, err := s.Call(cl); err == nil {
+				t.Fatalf("%s bypassed instruction limit 100", tc.name)
+			}
+			if s.InstructionsExecuted() == 0 {
+				t.Fatalf("%s charged 0 instructions", tc.name)
+			}
+		}
+	})
+}
