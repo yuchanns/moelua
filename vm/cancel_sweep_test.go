@@ -413,3 +413,104 @@ func TestLua55SemanticParityRegressions(t *testing.T) {
 	// Ensure temp dir check doesn't leave stray files.
 	_ = os.Remove(nonExist)
 }
+
+// TestBulkFileWriteCancelAndBudget verifies PR #4 Round 37 P1:
+// both buffered and unbuffered file:write poll context deadlines and instruction budgets
+// in bounded chunks without blocking or bypassing execution limits.
+func TestBulkFileWriteCancelAndBudget(t *testing.T) {
+	for _, bufMode := range []string{"full", "no"} {
+		t.Run("expired_ctx_"+bufMode, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "out.bin")
+			s := NewState()
+			defer s.Close()
+			s.SetGlobal("OUT_PATH", StringValue(s.Intern(path)))
+			s.SetGlobal("BUF_MODE", StringValue(s.Intern(bufMode)))
+			setup, err := s.LoadChunk([]byte(`
+				F = assert(io.open(OUT_PATH, "wb"))
+				F:setvbuf(BUF_MODE)
+				BIG = string.rep("x", 2 * 1024 * 1024)
+			`), "=write_setup")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Call(setup); err != nil {
+				t.Fatal(err)
+			}
+			writeFn, err := s.LoadChunk([]byte(`return F:write(BIG)`), "=write_run")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+			defer cancel()
+			time.Sleep(5 * time.Millisecond)
+			s.SetContext(ctx)
+			if _, err := s.Call(writeFn); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("bufMode=%s: expected context.DeadlineExceeded, got %v", bufMode, err)
+			}
+		})
+
+		t.Run("insn_limit_"+bufMode, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "out.bin")
+			s := NewState()
+			defer s.Close()
+			s.SetGlobal("OUT_PATH", StringValue(s.Intern(path)))
+			s.SetGlobal("BUF_MODE", StringValue(s.Intern(bufMode)))
+			setup, err := s.LoadChunk([]byte(`
+				F = assert(io.open(OUT_PATH, "wb"))
+				F:setvbuf(BUF_MODE)
+				BIG = string.rep("x", 2 * 1024 * 1024)
+			`), "=write_setup")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Call(setup); err != nil {
+				t.Fatal(err)
+			}
+			smallFn, err := s.LoadChunk([]byte(`return F:write("hello")`), "=write_small")
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetInstructionLimit(100)
+			if _, err := s.Call(smallFn); err != nil {
+				t.Fatalf("bufMode=%s: small write failed under 100-insn budget: %v", bufMode, err)
+			}
+
+			bigFn, err := s.LoadChunk([]byte(`return F:write(BIG)`), "=write_big")
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetInstructionLimit(100)
+			if _, err := s.Call(bigFn); !errors.Is(err, ErrInstructionLimit) {
+				t.Fatalf("bufMode=%s: expected ErrInstructionLimit on 2 MiB write, got %v", bufMode, err)
+			}
+		})
+	}
+}
+
+// TestTryNewUserdataInitializesUValuesToNil verifies PR #4 Round 37 P2:
+// TryNewUserdata(data, nUValues) initializes every user value slot to Lua nil
+// across both default (intnil) and moeluafloatnil build modes.
+func TestTryNewUserdataInitializesUValuesToNil(t *testing.T) {
+	s := NewState()
+	defer s.Close()
+	u, err := s.TryNewUserdata(nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetGlobal("UD", u)
+	cl, err := s.LoadChunk([]byte(`
+		local v1, ok1 = debug.getuservalue(UD, 1)
+		local v2, ok2 = debug.getuservalue(UD, 2)
+		assert(ok1 == true and v1 == nil and type(v1) == "nil", "slot 1: " .. tostring(v1) .. " " .. type(v1))
+		assert(ok2 == true and v2 == nil and type(v2) == "nil", "slot 2: " .. tostring(v2) .. " " .. type(v2))
+		local v3, ok3 = debug.getuservalue(UD, 3)
+		assert(v3 == nil and ok3 == nil)
+		return "ok"
+	`), "=ud_uvalues")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(cl); err != nil {
+		t.Fatal(err)
+	}
+}
