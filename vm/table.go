@@ -56,8 +56,6 @@ func makeDeadKeyRef(key Value) (any, bool) {
 		return weak.Make(key.AsUserdata()), true
 	case key.IsThread():
 		return weak.Make(key.AsThread()), true
-	case key.IsString() && !key.AsString().Short:
-		return weak.Make(key.AsString()), true
 	default:
 		return nil, false
 	}
@@ -84,10 +82,6 @@ func deadKeyValue(ref any) (Value, bool) {
 	case weak.Pointer[Thread]:
 		if p := wp.Value(); p != nil {
 			return ThreadValue(p), true
-		}
-	case weak.Pointer[LuaString]:
-		if p := wp.Value(); p != nil {
-			return StringValue(p), true
 		}
 	}
 	return NilValue(), false
@@ -471,7 +465,7 @@ func (t *Table) hashFindStrSlot(k *LuaString) (int, bool) {
 			if nd.key.ptr == kv.ptr {
 				return int(idx), true
 			}
-			if !k.Short && nd.key.IsString() && nd.key.AsString().S == k.S {
+			if !k.IsShort() && nd.key.IsString() && nd.key.AsString().Len == k.Len && nd.key.AsString().Str() == k.Str() {
 				return int(idx), true
 			}
 		}
@@ -618,7 +612,7 @@ func (t *Table) appendSlot(val Value) {
 // RawGetStr looks up a LuaString key (fast path for GETFIELD/SELF/GETTABUP).
 func (t *Table) RawGetStr(k *LuaString) Value {
 	if OptimizeEnabled && t.shape != nil {
-		if k.Short {
+		if k.IsShort() {
 			if idx := t.shape.Lookup(k); idx >= 0 {
 				return t.slots[idx]
 			}
@@ -651,11 +645,11 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 			}
 		}
 	}
-	if t.tmFlags != 0 && k.Short {
+	if t.tmFlags != 0 && k.IsShort() {
 		t.tmFlags = 0
 	}
 	if OptimizeEnabled && t.shape != nil {
-		if k.Short {
+		if k.IsShort() {
 			if idx := t.shape.Lookup(k); idx >= 0 {
 				// Assigning nil keeps slot & shape intact (next/pairs stability!).
 				t.slots[idx] = val
@@ -1343,7 +1337,7 @@ func (t *Table) Next(key Value) (Value, Value, error) {
 				found = true
 			}
 		}
-		if !found && OptimizeEnabled && t.shape != nil && key.IsString() && key.AsString().Short {
+		if !found && OptimizeEnabled && t.shape != nil && key.IsString() && key.AsString().IsShort() {
 			if slot := t.shape.Lookup(key.AsString()); slot >= 0 {
 				startPhase = 1
 				startIdx = int(slot) + 1

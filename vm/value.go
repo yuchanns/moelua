@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"unsafe"
 
 	"github.com/yuchanns/moelua/internal/luastdlib"
@@ -219,7 +220,7 @@ func (v Value) CoerceFloat() (float64, bool) {
 		return float64(v.Int()), true
 	}
 	if v.IsString() {
-		if i, f, isInt, ok := luastdlib.StrToNum(v.AsString().S); ok {
+		if i, f, isInt, ok := luastdlib.StrToNum(v.AsString().Str()); ok {
 			if isInt {
 				return float64(i), true
 			}
@@ -238,7 +239,7 @@ func (v Value) CoerceInt() (int64, bool) {
 		return FloatToIntExact(v.Float())
 	}
 	if v.IsString() {
-		if i, f, isInt, ok := luastdlib.StrToNum(v.AsString().S); ok {
+		if i, f, isInt, ok := luastdlib.StrToNum(v.AsString().Str()); ok {
 			if isInt {
 				return i, true
 			}
@@ -321,10 +322,10 @@ func RawEqual(a, b Value) bool {
 	// Two long strings with different pointers may still have equal contents.
 	if a.IsString() && b.IsString() {
 		sa, sb := a.AsString(), b.AsString()
-		if sa.Short && sb.Short {
+		if sa.IsShort() && sb.IsShort() {
 			return false // short strings are interned per State
 		}
-		return sa.S == sb.S
+		return sa.Len == sb.Len && sa.Str() == sb.Str()
 	}
 	return false
 }
@@ -531,7 +532,7 @@ func FormatValue(v Value) string {
 	case v.IsFloat():
 		return FormatFloat(v.Float())
 	case v.IsString():
-		return v.AsString().S
+		return strings.Clone(v.AsString().Str())
 	case v.IsTable():
 		return fmt.Sprintf("table: %p", v.AsTable())
 	case v.IsClosure():

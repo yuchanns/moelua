@@ -466,7 +466,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #2 to 'getinfo' (string expected)")
 		}
 		var err error
-		flags, err = parseGetInfoWhat(rest[1].AsString().S, s.nativeCancelFunc())
+		flags, err = parseGetInfoWhat(rest[1].AsString().Str(), s.nativeCancelFunc())
 		if err != nil {
 			return nil, err
 		}

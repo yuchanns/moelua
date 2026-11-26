@@ -552,7 +552,7 @@ func TestPhase2FrozenTemplateIsolationAndParallelRace(t *testing.T) {
 					s.Close()
 					return
 				}
-				if len(res) != 2 || res[0].Int() != 30 || res[1].AsString().S != "HELLO" {
+				if len(res) != 2 || res[0].Int() != 30 || res[1].AsString().Str() != "HELLO" {
 					errs <- fmt.Errorf("g=%d unexpected res: %v", id, res)
 					s.Close()
 					return

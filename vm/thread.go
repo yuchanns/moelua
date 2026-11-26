@@ -102,10 +102,12 @@ type callFrame struct {
 type Thread struct {
 	state *State
 
-	stack  []Value
-	top    int
-	frames []callFrame
-	nframe int
+	stack      []Value
+	top        int
+	highStack  int // high-water mark of written stack slots since last top-level clear
+	frames     []callFrame
+	nframe     int
+	highFrames int // high-water mark of written frame slots since last top-level clear
 
 	// Optional views of stateAlloc's embedded initStack/initFrames for mainThread.
 	// Cleared only once abandoned AND no active native args / frames can still borrow them.
@@ -186,7 +188,20 @@ func newThread(s *State, stackCap int) *Thread {
 	return th
 }
 
+func (th *Thread) noteStack(end int) {
+	if end > th.highStack {
+		th.highStack = end
+	}
+}
+
+func (th *Thread) noteFrame(nf int) {
+	if nf > th.highFrames {
+		th.highFrames = nf
+	}
+}
+
 func (th *Thread) ensureFrameCap(need, limit int) error {
+	th.noteFrame(need)
 	if need <= len(th.frames) {
 		return nil
 	}
@@ -255,6 +270,7 @@ func (th *Thread) ensureStack(need int) error {
 	copy(ns, old)
 	fillNil(ns[len(old):])
 	th.stack = ns
+	th.highStack = len(ns)
 	th.stackGen++
 	if th.initStack != nil && len(old) > 0 && unsafe.SliceData(old) == unsafe.SliceData(th.initStack) {
 		if th.nativeArgsDepth == 0 {
@@ -575,6 +591,8 @@ func (th *Thread) pushLuaFrame(cl *Closure, funcIdx, nargs, nresults int) error 
 	}
 	th.nextFrameFinalizer = false
 	th.nframe++
+	th.noteFrame(th.nframe)
+	th.noteStack(max(th.top, base+int(p.MaxStackSize)))
 	return nil
 }
 
@@ -589,6 +607,7 @@ func (th *Thread) placeResults(dst int, res []Value, nresults int) error {
 		}
 		copy(th.stack[dst:dst+len(res)], res)
 		th.top = dst + len(res)
+		th.noteStack(th.top)
 		return nil
 	}
 	n := min(len(res), nresults)
@@ -604,6 +623,7 @@ func (th *Thread) placeResults(dst int, res []Value, nresults int) error {
 		fillNil(th.stack[dst+n : dst+nresults])
 	}
 	th.top = dst + nresults
+	th.noteStack(th.top)
 	return nil
 }
 
@@ -621,6 +641,8 @@ func (th *Thread) clearDeadRefs() {
 	clear(th.frames)
 	th.nframe = 0
 	th.top = 0
+	th.highStack = 0
+	th.highFrames = 0
 	clear(th.openUpvals)
 	th.openUpvals = nil
 	th.tbc = nil
@@ -660,6 +682,8 @@ func (th *Thread) clearUnusedRefs() {
 	if liveTop < len(th.stack) {
 		fillNil(th.stack[liveTop:])
 	}
+	th.highStack = liveTop
+	th.highFrames = th.nframe
 	th.detachOpenUpvals()
 	th.yieldVals = nil
 	th.yieldedNative = false

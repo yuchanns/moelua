@@ -18,16 +18,16 @@ type Shape struct {
 	// Fast lookup for >8 properties (lazily populated).
 	index map[*LuaString]int32
 
-	// Transitions: inline small list for <= 4 children, weak map beyond that so unused shapes/keys can be reclaimed.
+	// Transitions: inline small list for <= 4 children, weak map beyond that so unused shapes can be reclaimed.
 	transSmall   [4]shapeTrans
 	nTrans       uint8
 	frozen       bool // true for read-only shapes from frozen stdlib template (transitions go to shapeRegistry.frozenTrans)
-	transMap     map[weak.Pointer[LuaString]]weak.Pointer[Shape]
+	transMap     map[uint64]weak.Pointer[Shape]
 	transInserts uint32
 }
 
 type shapeTrans struct {
-	key   weak.Pointer[LuaString]
+	keyID uint64
 	child weak.Pointer[Shape]
 }
 
@@ -64,7 +64,7 @@ func (sh *Shape) Keys() []*LuaString {
 
 type weakFrozenTransKey struct {
 	shape weak.Pointer[Shape]
-	key   weak.Pointer[LuaString]
+	keyID uint64
 }
 
 type shapeRegistry struct {
@@ -104,7 +104,7 @@ func newShapeRegistry() shapeRegistry {
 
 func pruneShapeTransMap(sh *Shape) {
 	for k, v := range sh.transMap {
-		if k.Value() == nil || v.Value() == nil {
+		if v.Value() == nil {
 			delete(sh.transMap, k)
 		}
 	}
@@ -123,7 +123,7 @@ func (sr *shapeRegistry) Prune() {
 		}
 	}
 	for k, v := range sr.frozenTrans {
-		if k.shape.Value() == nil || k.key.Value() == nil || v.Value() == nil {
+		if k.shape.Value() == nil || v.Value() == nil {
 			delete(sr.frozenTrans, k)
 		}
 	}
@@ -185,9 +185,9 @@ func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString, r1, r2 Va
 	if sh.length >= maxShapeProps {
 		return nil, nil
 	}
-	wk := weak.Make(k)
+	kid := k.ID
 	if sh.frozen {
-		fk := weakFrozenTransKey{shape: weak.Make(sh), key: wk}
+		fk := weakFrozenTransKey{shape: weak.Make(sh), keyID: kid}
 		if sr.frozenTrans != nil {
 			if wp, ok := sr.frozenTrans[fk]; ok {
 				if child := wp.Value(); child != nil {
@@ -229,17 +229,17 @@ func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString, r1, r2 Va
 	freeSmall := -1
 	for i := range int(sh.nTrans) {
 		st := sh.transSmall[i]
-		if st.key == wk {
+		if st.keyID == kid {
 			if child := st.child.Value(); child != nil {
 				return child, nil
 			}
 			freeSmall = i
-		} else if freeSmall < 0 && (st.key.Value() == nil || st.child.Value() == nil) {
+		} else if freeSmall < 0 && st.child.Value() == nil {
 			freeSmall = i
 		}
 	}
 	if sh.transMap != nil {
-		if wp, ok := sh.transMap[wk]; ok {
+		if wp, ok := sh.transMap[kid]; ok {
 			if child := wp.Value(); child != nil {
 				return child, nil
 			}
@@ -278,15 +278,15 @@ func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString, r1, r2 Va
 		child.index = idx
 	}
 	if freeSmall >= 0 {
-		sh.transSmall[freeSmall] = shapeTrans{key: wk, child: weak.Make(child)}
+		sh.transSmall[freeSmall] = shapeTrans{keyID: kid, child: weak.Make(child)}
 	} else if sh.nTrans < 4 {
-		sh.transSmall[sh.nTrans] = shapeTrans{key: wk, child: weak.Make(child)}
+		sh.transSmall[sh.nTrans] = shapeTrans{keyID: kid, child: weak.Make(child)}
 		sh.nTrans++
 	} else {
 		if sh.transMap == nil {
-			sh.transMap = make(map[weak.Pointer[LuaString]]weak.Pointer[Shape], 8)
+			sh.transMap = make(map[uint64]weak.Pointer[Shape], 8)
 		}
-		sh.transMap[wk] = weak.Make(child)
+		sh.transMap[kid] = weak.Make(child)
 		sh.transInserts++
 		if sh.transInserts&255 == 0 {
 			pruneShapeTransMap(sh)
@@ -377,9 +377,9 @@ const (
 type icWeakKind uint8
 
 const (
-	icWeakNone    icWeakKind = iota // immediate value stored directly in val (nil/bool/num/lightUD)
+	icWeakNone    icWeakKind = iota // immediate value or Arena LuaString stored directly in val (swept by sweepInlineCaches)
 	icWeakClosure                   // fast weak.Pointer[Closure] stored in weakCl (OOP method calls)
-	icWeakAny                       // weak.Pointer[Table|LuaString|Userdata|Thread|NativeFunc] stored in weakVal
+	icWeakAny                       // weak.Pointer[Table|Userdata|Thread|NativeFunc] stored in weakVal
 )
 
 func encodeICProtoVal(v Value) (val Value, weakCl weak.Pointer[Closure], weakVal any, wk icWeakKind) {
@@ -389,7 +389,10 @@ func encodeICProtoVal(v Value) (val Value, weakCl weak.Pointer[Closure], weakVal
 	case v.IsTable():
 		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsTable()), icWeakAny
 	case v.IsString():
-		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsString()), icWeakAny
+		// Arena strings live inside noscan slab pages and are swept explicitly by
+		// tr.sweepInlineCaches() BEFORE s.intern.Sweep() frees unmarked string slots;
+		// never wrap slab interior pointers in weak.Pointer (which would pin the 64 KiB page).
+		return v, weak.Pointer[Closure]{}, nil, icWeakNone
 	case v.IsUserdata():
 		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsUserdata()), icWeakAny
 	case v.IsThread():
@@ -407,10 +410,6 @@ func loadWeakICVal(w any) (Value, bool) {
 	case weak.Pointer[Table]:
 		if t := wp.Value(); t != nil {
 			return TableValue(t), true
-		}
-	case weak.Pointer[LuaString]:
-		if ls := wp.Value(); ls != nil {
-			return StringValue(ls), true
 		}
 	case weak.Pointer[Userdata]:
 		if u := wp.Value(); u != nil {

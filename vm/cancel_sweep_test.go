@@ -406,7 +406,7 @@ func TestLua55SemanticParityRegressions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parity regressions failed: %v", err)
 	}
-	if len(res) != 1 || res[0].AsString().S != "ok" {
+	if len(res) != 1 || res[0].AsString().Str() != "ok" {
 		t.Fatalf("unexpected res: %v", res)
 	}
 
@@ -622,7 +622,7 @@ func TestCloseAllSyncRootsCallingCoroutine(t *testing.T) {
 	if err != nil || yielded {
 		t.Fatalf("Resume failed: yielded=%v out=%v err=%v", yielded, out, err)
 	}
-	if len(out) != 1 || !out[0].IsString() || out[0].AsString().S != "still-alive" {
+	if len(out) != 1 || !out[0].IsString() || out[0].AsString().Str() != "still-alive" {
 		t.Fatalf("unexpected coroutine result: %v", out)
 	}
 }
@@ -639,6 +639,8 @@ func TestNumericConcatRespectsMemLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clRef := s.Ref(cl)
+	defer s.Unref(clRef)
 	s.SetMemoryLimit(1 << 30)
 	s.CollectFull()
 	limit := s.MemoryUsage() + 100

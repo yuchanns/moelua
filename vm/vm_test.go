@@ -398,12 +398,15 @@ func TestNativeResultRootedAcrossStackGrowthEmergencyGC(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			callerRef := s.Ref(caller)
 			s.SetMemoryLimit(64 << 20)
 			s.CollectFull()
 			baseMem = s.MemoryUsage()
 			s.SetMemoryLimit(baseMem + 96*1024)
-			if _, err := s.Call(caller); err != nil {
-				t.Fatalf("Lua call failed: %v", err)
+			_, callErr := s.Call(caller)
+			s.Unref(callerRef)
+			if callErr != nil {
+				t.Fatalf("Lua call failed: %v", callErr)
 			}
 		}
 	}
@@ -1032,6 +1035,8 @@ func TestDebugGetInfoRootsInfoTableAcrossActivelinesMemLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	callerRef := s.Ref(caller)
+	defer s.Unref(callerRef)
 
 	s.SetMemoryLimit(64 << 20)
 	s.CollectFull()
@@ -2076,7 +2081,7 @@ func TestNativeReturningArgsAfterStackGrowthPreservesResults(t *testing.T) {
 			t.Fatalf("expected 2 results, got %d", len(res))
 		}
 		got, ok := res[0].ToInt()
-		if !ok || got != 42 || !res[1].IsString() || res[1].AsString().S != "ok" {
+		if !ok || got != 42 || !res[1].IsString() || res[1].AsString().Str() != "ok" {
 			t.Fatalf("aliased native results corrupted: got (%v, %v)", res[0], res[1])
 		}
 	})
@@ -2096,7 +2101,7 @@ func TestNativeReturningArgsAfterStackGrowthPreservesResults(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, ok := res[0].ToInt()
-		if len(res) != 2 || !ok || got != 42 || !res[1].IsString() || res[1].AsString().S != "ok" {
+		if len(res) != 2 || !ok || got != 42 || !res[1].IsString() || res[1].AsString().Str() != "ok" {
 			t.Fatalf("hooked aliased native results corrupted: got %v", res)
 		}
 	})
@@ -2656,6 +2661,8 @@ func TestXPCallBypassesMessageHandlerOnAllocationError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clRef := s.Ref(cl)
+	defer s.Unref(clRef)
 	s.SetMemoryLimit(64 << 20)
 	s.CollectFull()
 	base := s.MemoryUsage()

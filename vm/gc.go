@@ -170,23 +170,35 @@ func (s *State) gcDebtThreshold() int64 {
 	return threshold
 }
 
-// gcNeedsCheck reports whether gcCheckDebt would trigger a Tier-1 collection or drain finalizers.
+// gcNeedsCheck reports whether gcCheckDebt would trigger a Tier-1 collection,
+// drain finalizers, or sweep accumulated per-State Arena allocations.
 func (s *State) gcNeedsCheck() bool {
-	if !s.gc.tier1 || !s.gc.running || s.gc.inGCTM {
+	if !s.gc.running || s.gc.inGCTM {
 		return false
 	}
-	return s.gc.debt >= s.gcDebtThreshold() || len(s.gc.toBeFnz) > 0
+	if s.gc.tier1 && (s.gc.debt >= s.gcDebtThreshold() || len(s.gc.toBeFnz) > 0) {
+		return true
+	}
+	return s.arenaNeedsSweep()
 }
 
-// gcCheckDebt triggers an automatic Tier 1 GC cycle (or drains pending finalizers)
-// when accumulated allocation debt reaches the pause threshold.
+func (s *State) arenaNeedsSweep() bool {
+	a := s.intern.arena
+	if a == nil || s.arenaSweepThresh <= 0 {
+		return false
+	}
+	return a.AllocBytes() >= s.arenaSweepThresh
+}
+
+// gcCheckDebt triggers an automatic GC cycle (or drains pending finalizers / sweeps
+// accumulated Arena allocations) when accumulated debt reaches the threshold.
 // liveTop matches PUC-Rio lvm.c's checkGC(L, ra+1): only stack[0..liveTop) is live
 // so dead temporaries above R[a] are collected.
 func (s *State) gcCheckDebt(liveTop int) {
-	if !s.gc.tier1 || !s.gc.running || s.gc.inGCTM {
+	if !s.gc.running || s.gc.inGCTM {
 		return
 	}
-	if s.gc.debt >= s.gcDebtThreshold() {
+	if (s.gc.tier1 && s.gc.debt >= s.gcDebtThreshold()) || s.arenaNeedsSweep() {
 		s.gc.debt = 0
 		if s.cur != nil && liveTop > 0 {
 			savedTop := s.cur.top
@@ -200,7 +212,7 @@ func (s *State) gcCheckDebt(liveTop int) {
 		s.CollectFull()
 		return
 	}
-	if len(s.gc.toBeFnz) > 0 {
+	if s.gc.tier1 && len(s.gc.toBeFnz) > 0 {
 		s.drainFinalizers()
 	}
 }
@@ -348,7 +360,7 @@ func (s *State) weakModeOf(t *Table) (weakK, weakV bool) {
 	if !mv.IsString() {
 		return false, false
 	}
-	ms := mv.AsString().S
+	ms := mv.AsString().Str()
 	cancelFn := s.nativeCancelFunc()
 	if nul, err := indexByteWithCancel(ms, 0, cancelFn); err != nil {
 		return false, false
@@ -397,28 +409,26 @@ func gcObjPtr(v Value) (unsafe.Pointer, bool) {
 }
 
 type gcTracer struct {
-	s                *State
-	epoch            uint64
-	preserveFrames   bool // true when triggered mid-opcode (e.g. checkMem) where s.cur.top may be stale
-	countStrings     bool // true when s.memLimit > 0 so live strings are counted accurately in liveBytes
-	trackDeadStrings bool // true when deleted hash keys exist so unreachable dead string keys can be released
-	cancelFn         func() error
-	cancelSteps      int64
-	aborted          bool
-	seenStrings      map[*LuaString]struct{}
-	seenProtos       map[*boundProto]struct{}
-	seenShapes       map[*Shape]struct{}
-	seenShapeIDs     map[uint64]struct{}
-	gray             []Value
-	hashedTables     []*Table // all marked tables with t.hash != nil (for dead hash-key clearing)
-	weakVals         []*Table // __mode="v"
-	ephemerons       []*Table // __mode="k"
-	allWeaks         []*Table // __mode="kv"
-	ephemDeps        map[unsafe.Pointer][]Value
-	ephemReady       []Value
-	ephemScanned     int
-	liveOpenUpvals   []*Upvalue
-	liveBytes        int64
+	s              *State
+	epoch          uint64
+	preserveFrames bool // true when triggered mid-opcode (e.g. checkMem) where s.cur.top may be stale
+	countStrings   bool // true when s.memLimit > 0 so live strings are counted accurately in liveBytes
+	cancelFn       func() error
+	cancelSteps    int64
+	aborted        bool
+	seenProtos     map[*boundProto]struct{}
+	seenShapes     map[*Shape]struct{}
+	seenShapeIDs   map[uint64]struct{}
+	gray           []Value
+	hashedTables   []*Table // all marked tables with t.hash != nil (for dead hash-key clearing)
+	weakVals       []*Table // __mode="v"
+	ephemerons     []*Table // __mode="k"
+	allWeaks       []*Table // __mode="kv"
+	ephemDeps      map[unsafe.Pointer][]Value
+	ephemReady     []Value
+	ephemScanned   int
+	liveOpenUpvals []*Upvalue
+	liveBytes      int64
 }
 
 func (tr *gcTracer) tickCancel() bool {
@@ -467,7 +477,7 @@ func (tr *gcTracer) markShape(sh *Shape) {
 			continue
 		}
 		tr.liveBytes += shapeNodeBytes(cur)
-		if (tr.countStrings || tr.trackDeadStrings) && cur.key != nil {
+		if cur.key != nil {
 			tr.mark(StringValue(cur.key))
 		}
 	}
@@ -485,11 +495,9 @@ func (tr *gcTracer) markBoundProto(bp *boundProto) {
 	}
 	tr.seenProtos[bp] = struct{}{}
 	tr.liveBytes += protoOwnBytes(bp.proto, len(bp.ic) > 0)
-	if tr.countStrings || tr.trackDeadStrings {
-		for _, ls := range bp.strConsts {
-			if ls != nil {
-				tr.mark(StringValue(ls))
-			}
+	for _, ls := range bp.strConsts {
+		if ls != nil {
+			tr.mark(StringValue(ls))
 		}
 	}
 	for _, sub := range bp.sub {
@@ -565,16 +573,11 @@ func (tr *gcTracer) isMarked(v Value) bool {
 
 func (tr *gcTracer) mark(v Value) {
 	if v.IsString() {
-		if tr.countStrings || tr.trackDeadStrings {
-			ls := v.AsString()
-			if _, ok := tr.seenStrings[ls]; !ok {
-				if tr.seenStrings == nil {
-					tr.seenStrings = make(map[*LuaString]struct{}, 64)
-				}
-				tr.seenStrings[ls] = struct{}{}
-				if tr.countStrings {
-					tr.liveBytes += 48 + int64(len(ls.S))
-				}
+		ls := v.AsString()
+		if !ls.IsFixed() && !ls.hdr.IsBlack() {
+			ls.hdr.SetBlack()
+			if tr.countStrings {
+				tr.liveBytes += 48 + int64(ls.Len)
 			}
 		}
 		return
@@ -1037,9 +1040,6 @@ func (tr *gcTracer) clearByKeys(tables []*Table) {
 }
 
 func (tr *gcTracer) accountWeakStrings() {
-	if !tr.countStrings && !tr.trackDeadStrings {
-		return
-	}
 	markTableStrings := func(tables []*Table) {
 		for _, t := range tables {
 			if t.arrKind == arrGeneric && t.arrLen > 0 {
@@ -1106,11 +1106,10 @@ func (tr *gcTracer) clearDeadHashKeys() bool {
 				continue
 			}
 			if nd.key.IsString() {
-				if tr.countStrings || tr.trackDeadStrings {
-					if _, live := tr.seenStrings[nd.key.AsString()]; !live {
-						nd.key = NilValue()
-						continue
-					}
+				ls := nd.key.AsString()
+				if !ls.IsFixed() && !ls.hdr.IsBlack() {
+					nd.key = NilValue()
+					continue
 				}
 				anyDead = true
 			} else if isCollectableWeak(nd.key) {
@@ -1131,15 +1130,7 @@ func (tr *gcTracer) clearDeadHashKeys() bool {
 					delete(t.hash.deadKeys, slot)
 					continue
 				}
-				if v.IsString() {
-					if tr.countStrings || tr.trackDeadStrings {
-						if _, live := tr.seenStrings[v.AsString()]; !live {
-							delete(t.hash.deadKeys, slot)
-							continue
-						}
-					}
-					anyDead = true
-				} else if isCollectableWeak(v) {
+				if isCollectableWeak(v) {
 					if !tr.isMarked(v) {
 						delete(t.hash.deadKeys, slot)
 						continue
@@ -1157,11 +1148,8 @@ func (tr *gcTracer) clearDeadHashKeys() bool {
 
 func (tr *gcTracer) icValAlive(v Value) bool {
 	if v.IsString() {
-		if tr.countStrings || tr.trackDeadStrings {
-			_, live := tr.seenStrings[v.AsString()]
-			return live
-		}
-		return true
+		ls := v.AsString()
+		return ls.IsFixed() || ls.hdr.IsBlack()
 	}
 	if isCollectableWeak(v) {
 		return tr.isMarked(v)
@@ -1378,8 +1366,15 @@ func (s *State) recountLiveBytes() {
 	tr.propagateAll()
 	tr.convergeEphemerons()
 	tr.accountWeakStrings()
+	s.intern.ClearMarks()
 	s.gc.allocBytes = tr.liveBytes
 	s.gc.lastLiveBytes = tr.liveBytes
+}
+
+func (s *State) updateArenaSweepThresh() {
+	if a := s.intern.arena; a != nil {
+		s.arenaSweepThresh = max(defaultArenaSweepThresh, a.AllocBytes()*2)
+	}
 }
 
 func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
@@ -1387,8 +1382,13 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		return // non-reentrant inside __gc (gc.lua:698-705), except emergency GC under memLimit
 	}
 	countStr := s.memLimit > 0
-	trackDeadStr := s.gc.hasDeadHashKeys
 	cancelFn := s.nativeCancelFunc()
+	sweptStrings := false
+	defer func() {
+		if !sweptStrings {
+			s.intern.ClearMarks()
+		}
+	}()
 	if emergency || (!s.gc.tier1 && len(s.gc.finalizable) == 0 && len(s.gc.weakFiles) == 0) {
 		// Tier 0 (with no open finalizable handles) or emergency allocation-time recount:
 		// nil-fill dead stack/frame slack and recompute exact live VM bytes without running
@@ -1417,12 +1417,11 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 			s.gc.epoch = 1
 		}
 		tr := &gcTracer{
-			s:                s,
-			epoch:            s.gc.epoch,
-			preserveFrames:   preserveFrames,
-			countStrings:     countStr,
-			trackDeadStrings: trackDeadStr,
-			cancelFn:         cancelFn,
+			s:              s,
+			epoch:          s.gc.epoch,
+			preserveFrames: preserveFrames,
+			countStrings:   countStr,
+			cancelFn:       cancelFn,
 		}
 		tr.markRoots()
 		if tr.aborted {
@@ -1519,7 +1518,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 			}
 		}
 		s.sweepCoallocTables(tr.epoch)
-		s.intern.Prune()
+		s.intern.Sweep(emergency)
+		sweptStrings = true
+		s.updateArenaSweepThresh()
 		s.shapes.Prune()
 		s.gc.allocBytes = tr.liveBytes
 		s.gc.lastLiveBytes = tr.liveBytes
@@ -1531,12 +1532,11 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		s.gc.epoch = 1
 	}
 	tr := &gcTracer{
-		s:                s,
-		epoch:            s.gc.epoch,
-		preserveFrames:   preserveFrames,
-		countStrings:     countStr,
-		trackDeadStrings: trackDeadStr,
-		cancelFn:         cancelFn,
+		s:              s,
+		epoch:          s.gc.epoch,
+		preserveFrames: preserveFrames,
+		countStrings:   countStr,
+		cancelFn:       cancelFn,
 	}
 
 	// Mark all VM roots.
@@ -1696,7 +1696,9 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	}
 
 	s.sweepCoallocTables(tr.epoch)
-	s.intern.Prune()
+	s.intern.Sweep(emergency)
+	sweptStrings = true
+	s.updateArenaSweepThresh()
 	s.shapes.Prune()
 	s.gc.allocBytes = tr.liveBytes
 	s.gc.lastLiveBytes = tr.liveBytes
@@ -1741,7 +1743,7 @@ func (s *State) runFinalizerObj(th *Thread, obj Value) bool {
 		var le *LuaError
 		if errors.As(err, &le) {
 			if le.Val.IsString() {
-				if werr := s.emitWarningParts("error in __gc (", le.Val.AsString().S, ")"); werr != nil {
+				if werr := s.emitWarningParts("error in __gc (", le.Val.AsString().Str(), ")"); werr != nil {
 					s.abortErr = werr
 					return false
 				}
@@ -1854,6 +1856,13 @@ func (s *State) Close() {
 	s.closeOpenFiles()
 	if !s.gc.inGCTM {
 		s.gc.pinnedRefs = nil
+		if s.goRefs != nil {
+			s.goRefs.ClearAll()
+		}
+		if a := s.intern.arena; a != nil {
+			s.intern.Close()
+			a.Close()
+		}
 	}
 }
 
@@ -1885,7 +1894,7 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 		if !args[0].IsString() {
 			return nil, fmt.Errorf("bad argument #1 to 'collectgarbage' (string expected, got %s)", s.objTypeName(args[0]))
 		}
-		opt = args[0].AsString().S
+		opt = args[0].AsString().Str()
 	}
 	switch opt {
 	case "collect":
@@ -1971,9 +1980,9 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 			}
 			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (string expected, got %s)", got)
 		}
-		idx, ok := gcParamNames[args[1].AsString().S]
+		idx, ok := gcParamNames[args[1].AsString().Str()]
 		if !ok {
-			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (invalid option '%s')", args[1].AsString().S)
+			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (invalid option '%s')", args[1].AsString().Str())
 		}
 		nv := int64(-1)
 		if len(args) >= 3 && !args[2].IsNil() {

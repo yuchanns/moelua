@@ -37,7 +37,7 @@ func checkStringArg(args []Value, idx int, fnName string) (string, error) {
 	}
 	v := args[idx]
 	if v.IsString() {
-		return v.AsString().S, nil
+		return v.AsString().Str(), nil
 	}
 	if v.IsNumber() {
 		return FormatValue(v), nil
@@ -231,7 +231,7 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 			return nil, ierr
 		}
 		strVal = StringValue(ls)
-		str = ls.S
+		str = ls.Str()
 		if s.memLimit > 0 {
 			pinIDs = append(pinIDs, s.Ref(strVal))
 		}
@@ -245,7 +245,7 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 			return nil, ierr
 		}
 		patVal = StringValue(ls)
-		pat = ls.S
+		pat = ls.Str()
 		if s.memLimit > 0 {
 			pinIDs = append(pinIDs, s.Ref(patVal))
 		}
@@ -408,7 +408,7 @@ func nativeStringPack(s *State, args []Value) ([]Value, error) {
 		case a.IsFloat():
 			pargs[i] = luastdlib.PackFloatVal(a.Float())
 		case a.IsString():
-			pargs[i] = luastdlib.PackStringVal(a.AsString().S)
+			pargs[i] = luastdlib.PackStringVal(a.AsString().Str())
 		default:
 			// Preserve an invalid PackKind so PackWithLimits rejects unsupported values iff consumed,
 			// without rejecting unused trailing arguments.
@@ -650,7 +650,7 @@ func nativeStringFormatStdlib(s *State, args []Value) ([]Value, error) {
 			fa.ToString = lazyToStr
 			fargs[i] = fa
 		case a.IsString():
-			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgString, Str: a.AsString().S, Ptr: uintptr(a.ptr), ToString: lazyToStr}
+			fargs[i] = luastdlib.FormatArg{Kind: luastdlib.ArgString, Str: a.AsString().Str(), Ptr: uintptr(a.ptr), ToString: lazyToStr}
 		default:
 			// Defer __tostring / __name evaluation until a %s conversion actually consumes this argument.
 			// Use logical pointer identity for encoded light userdata (debug.upvalueid tokens / NULL lightud).

@@ -454,6 +454,8 @@ func TestPackAndVarargHashAccounting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clRef := s.Ref(cl)
+	defer s.Unref(clRef)
 	s.SetMemoryLimit(64 * 1024 * 1024)
 	s.CollectFull()
 	if _, err := s.Call(cl); err != nil {

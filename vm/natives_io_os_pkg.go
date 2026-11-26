@@ -232,7 +232,7 @@ func nativeWarn(s *State, args []Value) ([]Value, error) {
 		}
 	}
 	if len(args) == 1 && args[0].IsString() {
-		first := args[0].AsString().S
+		first := args[0].AsString().Str()
 		if strings.HasPrefix(first, "@") {
 			switch first {
 			case "@on":
@@ -254,7 +254,7 @@ func nativeWarn(s *State, args []Value) ([]Value, error) {
 	for _, a := range args {
 		var str string
 		if a.IsString() {
-			str = a.AsString().S
+			str = a.AsString().Str()
 		} else {
 			str = FormatValue(a)
 		}
@@ -1186,7 +1186,7 @@ func nativeIOOpen(s *State, args []Value) ([]Value, error) {
 	if !isValidIOMode(mode) {
 		return nil, fmt.Errorf("bad argument #2 to 'open' (invalid mode)")
 	}
-	lf, err := openFileWithMode(args[0].AsString().S, mode)
+	lf, err := openFileWithMode(args[0].AsString().Str(), mode)
 	if err != nil {
 		return ioFail(s, err), nil
 	}
@@ -1564,7 +1564,7 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 	if lf.w != nil {
 		oldSz = int64(lf.w.Size())
 	}
-	mode := args[1].AsString().S
+	mode := args[1].AsString().Str()
 	switch mode {
 	case "no":
 		lf.bufMode = bufModeNo
@@ -2390,7 +2390,7 @@ func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) ([]Val
 			}
 			if len(res) >= 2 && res[0].IsNil() && res[1].IsString() {
 				// Propagate I/O error from f:lines() iterator (files.lua:386)!
-				return nil, fmt.Errorf("%s", res[1].AsString().S)
+				return nil, fmt.Errorf("%s", res[1].AsString().Str())
 			}
 			if len(res) == 0 || res[0].IsNil() {
 				if curAutoClose && !lf.closed && !lf.isStd {
@@ -3150,7 +3150,7 @@ func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
 	)
 	if args[0].IsString() {
 		key = args[0].AsString()
-		name = key.S
+		name = key.Str()
 	} else {
 		name = FormatValue(args[0])
 		key, err = s.TryIntern(name)
@@ -3255,7 +3255,7 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	)
 	if args[0].IsString() {
 		key = args[0].AsString()
-		name = key.S
+		name = key.Str()
 	} else {
 		name = FormatValue(args[0])
 		key, err = s.TryIntern(name)
@@ -3712,7 +3712,7 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 	name := FormatValue(args[0])
 	pathStr := defaultLuaPath
 	if pv := s.pkgTbl.RawGetStr(s.intern.Intern("path")); pv.IsString() {
-		pathStr = pv.AsString().S
+		pathStr = pv.AsString().Str()
 	}
 	cancelFn := s.nativeCancelFunc()
 	if _, err := s.checkedReplaceSize(name, ".", "/"); err != nil {
