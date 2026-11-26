@@ -4,12 +4,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
 	"sync/atomic"
-	"unicode"
 
 	"github.com/yuchanns/moelua/vm"
 )
@@ -133,6 +133,7 @@ func armInterruptHandler(s *vm.State) func() {
 	signal.Notify(sigCh, os.Interrupt)
 	s.SetInterruptFlag(&intrFlag)
 	go func() {
+		gotFirst := false
 		for {
 			select {
 			case <-done:
@@ -143,16 +144,14 @@ func armInterruptHandler(s *vm.State) func() {
 				if s.InChildExec() {
 					continue
 				}
-				// Match lua.c:laction: restore default SIGINT disposition on the first signal
-				// so a second SIGINT terminates the process even if Lua caught the first via pcall.
-				signal.Reset(os.Interrupt)
-				intrFlag.Store(true)
-				select {
-				case <-sigCh:
+				// Match lua.c:laction: first SIGINT interrupts Lua; second SIGINT terminates
+				// immediately (even if Lua caught the first via pcall, or if POSIX '&'
+				// started this process with SIGINT=SIG_IGN where signal.Reset would restore SIG_IGN).
+				if gotFirst {
 					os.Exit(130)
-				default:
 				}
-				return
+				gotFirst = true
+				intrFlag.Store(true)
 			}
 		}
 	}()
@@ -164,35 +163,28 @@ func armInterruptHandler(s *vm.State) func() {
 	}
 }
 
-const cliRunnerSrc = `
-local _xpcall, _getmt, _rawget, _tb, _type, _tostring = xpcall, debug.getmetatable, rawget, debug.traceback, type, tostring
-local function invokeToString(tm, err)
-	local r = tm(err)
-	return r
-end
-local function msgh(err)
-	local t = _type(err)
-	if t == "string" or t == "number" then
-		return _tb(_tostring(err), 2)
-	end
-	local mt = _getmt(err)
-	local tm = _type(mt) == "table" and _rawget(mt, "__tostring") or nil
-	if tm ~= nil then
-		local r = invokeToString(tm, err)
-		if _type(r) == "string" then
-			return r
-		end
-	end
-	return _tb("(error object is a " .. t .. " value)", 2)
-end
-return function(fn, ...)
-	return _xpcall(fn, msgh, ...)
-end
-`
+func lMessage(progName, msg string) {
+	if progName != "" {
+		fmt.Fprintf(os.Stderr, "%s: %s\n", progName, msg)
+	} else {
+		fmt.Fprintf(os.Stderr, "%s\n", msg)
+	}
+}
+
+func luaToStringErr(err error) string {
+	var le *vm.LuaError
+	if errors.As(err, &le) {
+		if le.Val.IsString() || le.Val.IsNumber() {
+			return vm.FormatValue(le.Val)
+		}
+		return "(null)"
+	}
+	return err.Error()
+}
 
 type cliState struct {
-	s      *vm.State
-	runner vm.Value
+	s    *vm.State
+	msgh vm.Value
 }
 
 func newCLIState(noEnv bool) *cliState {
@@ -202,50 +194,70 @@ func newCLIState(noEnv bool) *cliState {
 	} else {
 		s = vm.NewState()
 	}
-	fn, err := s.LoadChunk([]byte(cliRunnerSrc), "=(cli)")
-	if err != nil {
-		panic(err)
+	// Match luaL_newstate (lauxlib.c:1201): warnings start ON so LUA_INIT warnings are emitted;
+	// runArgs turns them off after handleLuaInit unless -W is passed.
+	s.SetWarnings(true)
+	// Match lua.c:754: stand-alone interpreter switches GC to generational mode at startup.
+	s.SetGCGenerational()
+
+	// Native message handler matching lua.c:142-154 (msghandler) without pushing a Lua wrapper frame.
+	var msghNF *vm.NativeFunc
+	msghNF = &vm.NativeFunc{
+		Name: "msghandler",
+		Fn: func(s *vm.State, args []vm.Value) ([]vm.Value, error) {
+			errVal := vm.NilValue()
+			if len(args) > 0 {
+				errVal = args[0]
+			}
+			var msg string
+			if errVal.IsString() || errVal.IsNumber() {
+				msg = vm.FormatValue(errVal)
+			} else {
+				if mt := s.GetMetatableOf(errVal); mt != nil {
+					tm := mt.RawGetStr(s.Intern("__tostring"))
+					if !tm.IsNil() {
+						r, err := s.Call(tm, errVal)
+						if err != nil {
+							return nil, err
+						}
+						if len(r) > 0 && r[0].IsString() {
+							return []vm.Value{r[0]}, nil
+						}
+					}
+				}
+				msg = fmt.Sprintf("(error object is a %s value)", errVal.TypeName())
+			}
+			tb := s.TracebackFromNative(msg, msghNF)
+			return []vm.Value{vm.StringValue(s.Intern(tb))}, nil
+		},
 	}
-	res, err := s.Call(fn)
-	if err != nil || len(res) == 0 {
-		panic(fmt.Sprintf("cli runner init failed: %v", err))
-	}
-	return &cliState{s: s, runner: res[0]}
+	return &cliState{s: s, msgh: vm.NativeValue(msghNF)}
 }
 
 func (c *cliState) doCall(progName string, fn vm.Value, args ...vm.Value) ([]vm.Value, bool) {
 	disarm := armInterruptHandler(c.s)
 	defer disarm()
-	callArgs := make([]vm.Value, 0, 1+len(args))
-	callArgs = append(callArgs, fn)
-	callArgs = append(callArgs, args...)
-	res, err := c.s.Call(c.runner, callArgs...)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(err))
+	res, errVal, ok, abortErr := c.s.CallProtected(fn, c.msgh, args...)
+	if abortErr != nil {
+		lMessage(progName, c.s.FormatError(abortErr))
 		return nil, false
 	}
-	if len(res) > 0 && res[0].IsFalsy() {
-		errMsg := ""
-		if len(res) > 1 {
-			if res[1].IsString() {
-				errMsg = res[1].AsString().S
-			} else {
-				errMsg = vm.FormatValue(res[1])
-			}
+	if !ok {
+		msg := "(error message not a string)"
+		if errVal.IsString() || errVal.IsNumber() {
+			msg = vm.FormatValue(errVal)
 		}
-		fmt.Fprintf(os.Stderr, "%s: %s\n", progName, errMsg)
+		lMessage(progName, msg)
 		return nil, false
 	}
-	if len(res) > 1 {
-		return res[1:], true
-	}
-	return nil, true
+	return res, true
 }
 
 func (c *cliState) doChunkString(progName, chunkName, src string) bool {
-	fn, err := c.s.LoadChunk([]byte(src), chunkName)
+	// Match lua.c:215 (dostring): luaL_loadbufferx(..., "t") with no BOM/# stripping and text-only mode.
+	fn, err := c.s.LoadTextChunk([]byte(src), chunkName)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(err))
+		lMessage(progName, c.s.FormatError(err))
 		return false
 	}
 	_, ok := c.doCall(progName, fn)
@@ -260,34 +272,51 @@ func (c *cliState) doChunkFile(progName, path string, literalFile, passArgs bool
 	} else {
 		f, oerr := os.Open(path)
 		if oerr != nil {
-			fmt.Fprintf(os.Stderr, "%s: cannot open %s\n", progName, oerr.Error())
+			reason := oerr.Error()
+			var pe *os.PathError
+			if errors.As(oerr, &pe) {
+				reason = pe.Err.Error()
+			}
+			lMessage(progName, fmt.Sprintf("cannot open %s: %s", path, reason))
+			return false
+		}
+		if info, serr := f.Stat(); serr == nil && info.IsDir() {
+			_ = f.Close()
+			lMessage(progName, fmt.Sprintf("cannot read %s", path))
 			return false
 		}
 		fn, err = c.s.LoadChunkReader(f, "@"+path)
 		_ = f.Close()
+		if err != nil {
+			var pe *os.PathError
+			if errors.As(err, &pe) {
+				lMessage(progName, fmt.Sprintf("cannot read %s: %s", path, pe.Err.Error()))
+				return false
+			}
+		}
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(err))
+		lMessage(progName, c.s.FormatError(err))
 		return false
 	}
 	var args []vm.Value
 	if passArgs {
 		argVal, gerr := c.s.GetGlobalMM("arg")
 		if gerr != nil {
-			fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(gerr))
+			lMessage(progName, c.s.FormatError(gerr))
 			return false
 		}
 		if !argVal.IsTable() {
-			fmt.Fprintf(os.Stderr, "%s: 'arg' is not a table\n", progName)
+			lMessage(progName, "'arg' is not a table")
 			return false
 		}
 		n, lerr := c.s.TableLen(argVal)
 		if lerr != nil {
-			fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(lerr))
+			lMessage(progName, c.s.FormatError(lerr))
 			return false
 		}
 		if n > 1_000_000 {
-			fmt.Fprintf(os.Stderr, "%s: too many arguments to script\n", progName)
+			lMessage(progName, "too many arguments to script")
 			return false
 		}
 		if n > 0 {
@@ -314,7 +343,7 @@ func (c *cliState) doLibrary(progName, spec string) bool {
 	}
 	reqFn, gerr := c.s.GetGlobalMM("require")
 	if gerr != nil {
-		fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(gerr))
+		lMessage(progName, c.s.FormatError(gerr))
 		return false
 	}
 	res, ok := c.doCall(progName, reqFn, vm.StringValue(c.s.Intern(modName)))
@@ -326,7 +355,7 @@ func (c *cliState) doLibrary(progName, spec string) bool {
 		val = res[0]
 	}
 	if serr := c.s.SetGlobalMM(globName, val); serr != nil {
-		fmt.Fprintf(os.Stderr, "%s: %s\n", progName, c.s.FormatError(serr))
+		lMessage(progName, c.s.FormatError(serr))
 		return false
 	}
 	return true
@@ -396,15 +425,9 @@ func getPrompt(s *vm.State, firstLine bool) string {
 	if err != nil || v.IsNil() {
 		return dflt
 	}
-	if v.IsString() {
-		return v.AsString().S
-	}
-	tsFn, err := s.GetGlobalMM("tostring")
-	if err == nil && tsFn.IsFunction() {
-		res, err := s.Call(tsFn, v)
-		if err == nil && len(res) > 0 && res[0].IsString() {
-			return res[0].AsString().S
-		}
+	// Match lua.c:558: use luaL_tolstring (ToStringValue) directly without consulting _G.tostring.
+	if p, serr := s.ToStringValue(v); serr == nil {
+		return p
 	}
 	return dflt
 }
@@ -416,23 +439,26 @@ func isIncompleteError(err error) bool {
 	return strings.HasSuffix(err.Error(), "near <eof>")
 }
 
+// hasLeadingLocalKeyword matches lua.c:621-630 (checklocal): skip space/tab, match "local"
+// followed by space, tab, or end-of-line.
 func hasLeadingLocalKeyword(line string) bool {
-	trimmed := strings.TrimLeftFunc(line, unicode.IsSpace)
+	trimmed := strings.TrimLeft(line, " \t")
 	if !strings.HasPrefix(trimmed, "local") {
 		return false
 	}
 	if len(trimmed) == len("local") {
 		return true
 	}
-	r := rune(trimmed[len("local")])
-	return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_')
+	next := trimmed[len("local")]
+	return next == ' ' || next == '\t'
 }
 
-func (c *cliState) doREPL(progName string, noEnv bool) {
+func (c *cliState) doREPL(noEnv bool) {
 	s := c.s
 	if !noEnv {
 		if rl, ok := os.LookupEnv("LUA_READLINELIB"); ok && rl != "" {
-			fmt.Fprintf(os.Stderr, "%s: warning: unable to load readline library '%s'\n", progName, rl)
+			// Match lua.c:531-533: emitted via lua_warning (visible only when warnings are on).
+			s.EmitWarning(fmt.Sprintf("unable to load readline library '%s'", rl))
 		}
 	}
 	for {
@@ -444,16 +470,16 @@ func (c *cliState) doREPL(progName string, noEnv bool) {
 		}
 		line = strings.TrimRight(line, "\r\n")
 
-		// Try "return <line>" first for interactive expression printing.
-		fn, lerr := s.LoadChunk([]byte("return "+line), "=stdin")
+		// Match lua.c:611-612 (addreturn): try "return <line>;" in text-only mode first.
+		fn, lerr := s.LoadTextChunk([]byte("return "+line+";"), "=stdin")
 		if lerr != nil {
 			// Fall back to statement mode with multi-line continuation on <eof>.
 			buf := line
 			if hasLeadingLocalKeyword(line) {
-				fmt.Fprintf(os.Stderr, "%s: warning: local variable in interactive mode is not kept across chunks\n", progName)
+				fmt.Fprintln(os.Stderr, "warning: locals do not survive across lines in interactive mode")
 			}
 			for {
-				fn, lerr = s.LoadChunk([]byte(buf), "=stdin")
+				fn, lerr = s.LoadTextChunk([]byte(buf), "=stdin")
 				if lerr == nil || !isIncompleteError(lerr) {
 					break
 				}
@@ -466,10 +492,11 @@ func (c *cliState) doREPL(progName string, noEnv bool) {
 			}
 		}
 		if lerr != nil {
-			fmt.Fprintf(os.Stderr, "%s: %s\n", progName, s.FormatError(lerr))
+			// Match lua.c:701: progname = NULL inside doREPL (no progname prefix on REPL errors).
+			lMessage("", s.FormatError(lerr))
 			continue
 		}
-		res, ok := c.doCall(progName, fn)
+		res, ok := c.doCall("", fn)
 		if !ok {
 			continue
 		}
@@ -486,11 +513,11 @@ func (c *cliState) doREPL(progName string, noEnv bool) {
 				}()
 				printFn, gerr := s.GetGlobalMM("print")
 				if gerr != nil {
-					fmt.Fprintf(os.Stderr, "%s: error calling 'print' (%s)\n", progName, s.FormatError(gerr))
+					lMessage("", fmt.Sprintf("error calling 'print' (%s)", luaToStringErr(gerr)))
 					return
 				}
 				if _, perr := s.Call(printFn, res...); perr != nil {
-					fmt.Fprintf(os.Stderr, "%s: error calling 'print' (%s)\n", progName, s.FormatError(perr))
+					lMessage("", fmt.Sprintf("error calling 'print' (%s)", luaToStringErr(perr)))
 				}
 			}()
 		}
@@ -544,16 +571,14 @@ func main() {
 	}
 
 	if flags.hasI {
-		c.doREPL(progName, flags.hasNoE)
+		c.doREPL(flags.hasNoE)
 	} else if flags.script == 0 && !flags.hasE && !flags.hasV {
 		if isStdinTerminal() {
 			fmt.Fprintln(os.Stdout, luaReleaseBanner)
-			c.doREPL(progName, flags.hasNoE)
+			c.doREPL(flags.hasNoE)
 		} else {
-			if !c.doChunkFile(progName, "-", false, false) {
-				s.Close()
-				os.Exit(1)
-			}
+			// Match lua.c:770: piped stdin with no script reports errors but exits 0.
+			_ = c.doChunkFile(progName, "-", false, false)
 		}
 	}
 

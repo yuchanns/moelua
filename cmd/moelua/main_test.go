@@ -526,3 +526,181 @@ func TestCLIRejectsOptionAsSeparatedArgument(t *testing.T) {
 		t.Errorf("concatenated -e-- should be accepted: err=%v out=%q", err, out)
 	}
 }
+
+// TestCLILua55ParityAuditRegressions verifies all 13 Track 1 CLI parity fixes against lua.c.
+func TestCLILua55ParityAuditRegressions(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "moelua")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build cmd/moelua failed: %v\n%s", err, out)
+	}
+
+	run := func(stdin string, env []string, args ...string) (string, string, error) {
+		cmd := exec.Command(bin, args...)
+		if len(env) > 0 {
+			cmd.Env = append(os.Environ(), env...)
+		}
+		if stdin != "" {
+			cmd.Stdin = strings.NewReader(stdin)
+		}
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		return stdout.String(), stderr.String(), err
+	}
+
+	// 1 & 2. -e uses text-only luaL_loadbufferx(..., "t") with NO '#' stripping and rejects binary chunks.
+	t.Run("dash_e_text_only_no_shebang_strip", func(t *testing.T) {
+		_, stderr, err := run("", nil, "-E", "-e", "#x")
+		if err == nil || !strings.Contains(stderr, "unexpected symbol near '#'") {
+			t.Fatalf("expected syntax error near '#' for -e '#x', err=%v stderr=%q", err, stderr)
+		}
+		_, stderr2, err2 := run("", nil, "-E", "-e", "\x1bLua")
+		if err2 == nil || !strings.Contains(stderr2, "attempt to load a binary chunk (mode is 't')") {
+			t.Fatalf("expected binary chunk rejection for -e, err=%v stderr=%q", err2, stderr2)
+		}
+	})
+
+	// 3. Piped stdin with no script ignores dofile status (prints error, exits 0).
+	t.Run("piped_stdin_error_exits_zero", func(t *testing.T) {
+		_, stderr, err := run("error('boom')\n", nil)
+		if err != nil {
+			t.Fatalf("expected exit 0 on piped stdin error (lua.c:770), got err=%v stderr=%q", err, stderr)
+		}
+		if !strings.Contains(stderr, "stdin:1: boom") || !strings.Contains(stderr, "[C]: in ?") {
+			t.Fatalf("expected error + clean traceback on stderr, got %q", stderr)
+		}
+	})
+
+	// 4. Warnings start ON during LUA_INIT (lauxlib.c:1201) and turn off in runArgs.
+	t.Run("warnings_on_during_lua_init", func(t *testing.T) {
+		out, stderr, err := run("", []string{"LUA_INIT_5_5=warn('init_w')"}, "-e", "warn('arg_w'); print('ok')")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%q", err, stderr)
+		}
+		if strings.TrimSpace(out) != "ok" {
+			t.Fatalf("unexpected stdout: %q", out)
+		}
+		if !strings.Contains(stderr, "Lua warning: init_w") {
+			t.Fatalf("expected LUA_INIT warning to print, got stderr=%q", stderr)
+		}
+		if strings.Contains(stderr, "arg_w") {
+			t.Fatalf("expected -e warning to be suppressed without -W, got stderr=%q", stderr)
+		}
+	})
+
+	// 5 & 6. REPL errors and print errors have NO progname prefix; non-string print error shows (null).
+	t.Run("repl_no_progname_prefix_and_print_error", func(t *testing.T) {
+		in := "error('repl_err')\nprint = function() error({}) end\n1\n"
+		_, stderr, err := run(in, nil, "-E", "-i")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%q", err, stderr)
+		}
+		if strings.Contains(stderr, bin+":") {
+			t.Fatalf("REPL stderr must not contain progname prefix: %q", stderr)
+		}
+		if !strings.Contains(stderr, "stdin:1: repl_err") {
+			t.Fatalf("missing REPL runtime error: %q", stderr)
+		}
+		if !strings.Contains(stderr, "error calling 'print' ((null))") {
+			t.Fatalf("expected \"error calling 'print' ((null))\", got %q", stderr)
+		}
+	})
+
+	// 7. REPL addreturn uses "return <line>;" so "1;" fails expression mode and falls back to statement mode.
+	t.Run("repl_addreturn_trailing_semicolon", func(t *testing.T) {
+		out, stderr, err := run("1;\n", nil, "-E", "-i")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%q", err, stderr)
+		}
+		if !strings.Contains(stderr, "unexpected symbol near '1'") {
+			t.Fatalf("expected syntax error for REPL '1;', got stdout=%q stderr=%q", out, stderr)
+		}
+	})
+
+	// 8. REPL checklocal exact wording, no prefix, and does not trigger on "local(".
+	t.Run("repl_checklocal_parity", func(t *testing.T) {
+		_, stderr, err := run("local x = 1\nlocal(\n", nil, "-E", "-i")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%q", err, stderr)
+		}
+		want := "warning: locals do not survive across lines in interactive mode"
+		if strings.Count(stderr, want) != 1 {
+			t.Fatalf("expected checklocal warning exactly once (not for local(), no prefix), got stderr=%q", stderr)
+		}
+	})
+
+	// 9. REPL prompt uses luaL_tolstring (works even if global tostring = nil).
+	t.Run("repl_prompt_ignores_global_tostring", func(t *testing.T) {
+		out, stderr, err := run("tostring = nil; _PROMPT = 7\n1+1\n", nil, "-E", "-i")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%q", err, stderr)
+		}
+		if !strings.Contains(out, "7") || !strings.Contains(out, "2") {
+			t.Fatalf("expected prompt '7' and result '2', got stdout=%q stderr=%q", out, stderr)
+		}
+	})
+
+	// 10 & 11. Nonexistent file omits doubled "open ", directory prints "cannot read <dir>".
+	t.Run("file_open_and_directory_error_messages", func(t *testing.T) {
+		dir := t.TempDir()
+		missing := filepath.Join(dir, "nonexist.lua")
+		_, stderr, err := run("", nil, "-E", missing)
+		if err == nil {
+			t.Fatalf("expected error opening missing file")
+		}
+		if strings.Contains(stderr, "cannot open open ") || !strings.Contains(stderr, "cannot open "+missing+":") {
+			t.Fatalf("unexpected missing file stderr: %q", stderr)
+		}
+		_, stderrDir, errDir := run("", nil, "-E", dir)
+		if errDir == nil {
+			t.Fatalf("expected error running directory")
+		}
+		wantDir := "cannot read " + dir
+		if !strings.Contains(stderrDir, wantDir) {
+			t.Fatalf("expected %q in stderr, got %q", wantDir, stderrDir)
+		}
+	})
+
+	// 12. LUA_READLINELIB warning goes through lua_warning (suppressed without -W, shown with -W).
+	t.Run("readline_warning_respects_dash_W", func(t *testing.T) {
+		_, stderrOff, err := run("", []string{"LUA_READLINELIB=nonexist_rl.so"}, "-i")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%q", err, stderrOff)
+		}
+		if strings.Contains(stderrOff, "readline") {
+			t.Fatalf("expected LUA_READLINELIB warning suppressed without -W, got %q", stderrOff)
+		}
+		_, stderrOn, err := run("", []string{"LUA_READLINELIB=nonexist_rl.so"}, "-W", "-i")
+		if err != nil {
+			t.Fatalf("err=%v stderr=%q", err, stderrOn)
+		}
+		if !strings.Contains(stderrOn, "Lua warning: unable to load readline library 'nonexist_rl.so'") {
+			t.Fatalf("expected Lua warning for LUA_READLINELIB with -W, got %q", stderrOn)
+		}
+	})
+
+	// 13. CLI starts in generational GC mode and tracebacks end in "[C]: in ?" with no (cli)/xpcall frame.
+	t.Run("gc_generational_and_clean_traceback", func(t *testing.T) {
+		out, stderr, err := run("", nil, "-E", "-e", `print(collectgarbage("generational"))`)
+		if err != nil {
+			t.Fatalf("err=%v stderr=%q", err, stderr)
+		}
+		if strings.TrimSpace(out) != "generational" {
+			t.Fatalf("expected CLI to start in generational GC mode, got %q", out)
+		}
+		_, stderrTB, errTB := run("", nil, "-E", "-e", `error("boom")`)
+		if errTB == nil {
+			t.Fatalf("expected error exit")
+		}
+		if strings.Contains(stderrTB, "(cli)") || strings.Contains(stderrTB, "xpcall") {
+			t.Fatalf("traceback must not contain internal (cli)/xpcall frames:\n%s", stderrTB)
+		}
+		if !strings.Contains(stderrTB, "[C]: in global 'error'") || !strings.Contains(stderrTB, "[C]: in ?") {
+			t.Fatalf("expected [C]: in global 'error' and [C]: in ? in traceback:\n%s", stderrTB)
+		}
+	})
+}

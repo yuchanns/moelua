@@ -223,6 +223,7 @@ func (s *State) AddSearcher(name string, fn GoFunc) {
 	if err != nil {
 		return
 	}
+	defer s.pinTemps(v)()
 	s.vm.AddSearcher(v.AsNative())
 	_ = s.vm.ConsumeMemErr()
 }
@@ -248,6 +249,8 @@ func (s *State) Preload(name string, loader GoFunc) error {
 		if err != nil {
 			return err
 		}
+		// Root the newly created loader across PreloadTable().RawSetStr (emergency GC recount).
+		defer s.pinTemps(v)()
 	} else {
 		var ok bool
 		ls, ok = s.vm.LookupString(name)
@@ -425,6 +428,7 @@ func (s *State) NewUserdataWithMeta(data any, mt *Table) (Value, error) {
 		return vm.NilValue(), err
 	}
 	if mt != nil {
+		defer s.pinTemps(u)()
 		s.vm.SetMetatableOf(u, mt.raw)
 		if err := s.vm.ConsumeMemErr(); err != nil {
 			return vm.NilValue(), err
@@ -460,6 +464,9 @@ func (s *State) SetMetatable(v Value, mt *Table) error {
 			return fmt.Errorf("moelua: metatable belongs to another State")
 		}
 		rawMT = mt.raw
+		defer s.pinTemps(v, vm.TableValue(rawMT))()
+	} else {
+		defer s.pinTemps(v)()
 	}
 	s.vm.SetMetatableOf(v, rawMT)
 	return s.vm.ConsumeMemErr()
@@ -482,13 +489,19 @@ func (s *State) TryNewMetatable(name string) (*Table, bool, error) {
 	if existing := reg.RawGetStr(key); existing.IsTable() {
 		return &Table{state: s, raw: existing.AsTable()}, false, nil
 	}
-	// Root the interned name across the metatable allocation (emergency GC recount).
+	// Root the interned name across the metatable allocation and insertions (emergency GC recount).
 	defer s.pinTemps(vm.StringValue(key))()
 	mt, err := s.vm.TryNewTable(0, 4)
 	if err != nil {
 		return nil, false, err
 	}
-	mt.RawSetStr(s.vm, s.vm.Intern("__name"), vm.StringValue(key))
+	defer s.pinTemps(vm.TableValue(mt))()
+	nameKey, err := s.vm.TryIntern("__name")
+	if err != nil {
+		return nil, false, err
+	}
+	defer s.pinTemps(vm.StringValue(nameKey))()
+	mt.RawSetStr(s.vm, nameKey, vm.StringValue(key))
 	if err := s.vm.ConsumeMemErr(); err != nil {
 		return nil, false, err
 	}
