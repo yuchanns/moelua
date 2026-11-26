@@ -290,7 +290,10 @@ func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
 	level := 1
 	explicitLevel := false
 	if len(rest) >= 2 && !rest[1].IsNil() {
-		lv, ok := rest[1].CoerceInt()
+		lv, ok, err := s.coerceInt(rest[1])
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			return nil, fmt.Errorf("bad argument to 'traceback' (number expected)")
 		}
@@ -410,8 +413,13 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 	cfIdx := -1
 	if rest[0].IsFunction() {
 		fn = rest[0]
-	} else if lv, ok := rest[0].CoerceInt(); ok {
-		lvl := int(lv)
+	} else {
+		lv, ok, err := s.coerceInt(rest[0])
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			lvl := int(lv)
 		if th == s.cur && lvl == 0 {
 			// Level 0 is debug.getinfo itself (C/Go function).
 			cfunc := NilValue()
@@ -490,8 +498,9 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			}
 			return []Value{TableValue(info)}, nil
 		}
-	} else {
-		return nil, fmt.Errorf("bad argument #1 to 'getinfo' (function or level expected)")
+		} else {
+			return nil, fmt.Errorf("bad argument #1 to 'getinfo' (function or level expected)")
+		}
 	}
 
 	info, err := s.TryNewTable(0, 12)
@@ -934,7 +943,10 @@ func nativeDebugGetLocal(s *State, args []Value) ([]Value, error) {
 	if len(rest) < 2 {
 		return nil, fmt.Errorf("bad arguments to 'getlocal'")
 	}
-	idx, ok := rest[1].CoerceInt()
+	idx, ok, err := s.coerceInt(rest[1])
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("bad argument to 'getlocal' (number expected)")
 	}
@@ -951,7 +963,10 @@ func nativeDebugGetLocal(s *State, args []Value) ([]Value, error) {
 	if rest[0].IsNative() {
 		return []Value{NilValue()}, nil
 	}
-	lv, ok := rest[0].CoerceInt()
+	lv, ok, err := s.coerceInt(rest[0])
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'getlocal' (function or level expected)")
 	}
@@ -1011,8 +1026,14 @@ func nativeDebugSetLocal(s *State, args []Value) ([]Value, error) {
 	if len(rest) < 3 {
 		return nil, fmt.Errorf("bad arguments to 'setlocal'")
 	}
-	lv, ok1 := rest[0].CoerceInt()
-	idx, ok2 := rest[1].CoerceInt()
+	lv, ok1, err := s.coerceInt(rest[0])
+	if err != nil {
+		return nil, err
+	}
+	idx, ok2, err := s.coerceInt(rest[1])
+	if err != nil {
+		return nil, err
+	}
 	if !ok1 || !ok2 {
 		return nil, fmt.Errorf("bad arguments to 'setlocal'")
 	}
@@ -1067,7 +1088,10 @@ func nativeDebugGetUpvalue(s *State, args []Value) ([]Value, error) {
 		}
 		return nil, fmt.Errorf("bad argument #2 to 'getupvalue' (number expected, got no value)")
 	}
-	idx, ok := args[1].CoerceInt()
+	idx, ok, err := s.coerceInt(args[1])
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("bad argument #2 to 'getupvalue' (number expected, got %s)", s.objTypeName(args[1]))
 	}
@@ -1104,7 +1128,10 @@ func nativeDebugSetUpvalue(s *State, args []Value) ([]Value, error) {
 	if len(args) < 3 {
 		return nil, fmt.Errorf("bad argument #3 to 'setupvalue' (value expected)")
 	}
-	idx, ok := args[1].CoerceInt()
+	idx, ok, err := s.coerceInt(args[1])
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("bad argument #2 to 'setupvalue' (number expected, got %s)", s.objTypeName(args[1]))
 	}
@@ -1142,7 +1169,10 @@ func nativeDebugUpvalueID(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad arguments to 'upvalueid'")
 	}
-	idx, ok := args[1].CoerceInt()
+	idx, ok, err := s.coerceInt(args[1])
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("bad argument #2 to 'upvalueid'")
 	}
@@ -1193,7 +1223,10 @@ func nativeDebugUpvalueJoin(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad argument #2 to 'upvaluejoin' (number expected, got no value)")
 	}
-	n1, ok1 := args[1].CoerceInt()
+	n1, ok1, err := s.coerceInt(args[1])
+	if err != nil {
+		return nil, err
+	}
 	if !ok1 {
 		return nil, fmt.Errorf("bad argument #2 to 'upvaluejoin' (number expected, got %s)", s.objTypeName(args[1]))
 	}
@@ -1210,7 +1243,10 @@ func nativeDebugUpvalueJoin(s *State, args []Value) ([]Value, error) {
 	if len(args) < 4 {
 		return nil, fmt.Errorf("bad argument #4 to 'upvaluejoin' (number expected, got no value)")
 	}
-	n2, ok2 := args[3].CoerceInt()
+	n2, ok2, err := s.coerceInt(args[3])
+	if err != nil {
+		return nil, err
+	}
 	if !ok2 {
 		return nil, fmt.Errorf("bad argument #4 to 'upvaluejoin' (number expected, got %s)", s.objTypeName(args[3]))
 	}
@@ -1272,10 +1308,14 @@ func nativeDebugGetRegistry(s *State, _ []Value) ([]Value, error) {
 func nativeDebugGetUserValue(s *State, args []Value) ([]Value, error) {
 	n := int64(1)
 	if len(args) >= 2 && !args[1].IsNil() {
-		var ok bool
-		n, ok = args[1].CoerceInt()
+		var ok, nonInt bool
+		var err error
+		n, ok, nonInt, err = s.coerceIntKind(args[1])
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
-			if args[1].IsFloat() {
+			if nonInt {
 				return nil, fmt.Errorf("bad argument #2 to 'getuservalue' (number has no integer representation)")
 			}
 			return nil, fmt.Errorf("bad argument #2 to 'getuservalue' (number expected, got %s)", s.objTypeName(args[1]))
@@ -1302,7 +1342,11 @@ func nativeDebugSetUserValue(s *State, args []Value) ([]Value, error) {
 	u := args[0].AsUserdata()
 	n := int64(1)
 	if len(args) >= 3 && !args[2].IsNil() {
-		n, _ = args[2].CoerceInt()
+		var err error
+		n, _, err = s.coerceInt(args[2])
+		if err != nil {
+			return nil, err
+		}
 	}
 	if n < 1 || int(n) > len(u.UValues) {
 		return []Value{NilValue()}, nil
@@ -1344,7 +1388,10 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 	}
 	count := 0
 	if len(rest) >= 3 && !rest[2].IsNil() {
-		c, ok := rest[2].CoerceInt()
+		c, ok, err := s.coerceInt(rest[2])
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			return nil, fmt.Errorf("bad argument #3 to 'sethook' (number expected, got %s)", s.objTypeName(rest[2]))
 		}

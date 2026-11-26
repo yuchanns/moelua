@@ -541,3 +541,240 @@ func parseHexFloatWithCancel(s string, neg bool, cancelFn func() error) (float64
 	}
 	return math.Float64frombits(signBit | sig), true, nil
 }
+
+// coerceFloat converts an int, float, or numeric string Value to float64 (matching lua_tonumberx),
+// polling execution controls when parsing long numeral strings.
+func (s *State) coerceFloat(v Value) (float64, bool, error) {
+	if v.IsFloat() {
+		return v.Float(), true, nil
+	}
+	if v.IsInt() {
+		return float64(v.Int()), true, nil
+	}
+	if v.IsString() {
+		iv, fv, isInt, ok, err := s.strToNum(v.AsString().S)
+		if err != nil {
+			return 0, false, err
+		}
+		if !ok {
+			return 0, false, nil
+		}
+		if isInt {
+			return float64(iv), true, nil
+		}
+		return fv, true, nil
+	}
+	return 0, false, nil
+}
+
+// coerceInt converts an int, exact-integer float, or numeric string Value to int64
+// (matching lua_tointegerx), polling execution controls when parsing long numeral strings.
+func (s *State) coerceInt(v Value) (int64, bool, error) {
+	if v.IsInt() {
+		return v.Int(), true, nil
+	}
+	if v.IsFloat() {
+		i, ok := FloatToIntExact(v.Float())
+		return i, ok, nil
+	}
+	if v.IsString() {
+		iv, fv, isInt, ok, err := s.strToNum(v.AsString().S)
+		if err != nil {
+			return 0, false, err
+		}
+		if !ok {
+			return 0, false, nil
+		}
+		if isInt {
+			return iv, true, nil
+		}
+		i, ok := FloatToIntExact(fv)
+		return i, ok, nil
+	}
+	return 0, false, nil
+}
+
+// coerceIntKind is like coerceInt, also reporting whether v was a numeric value/string
+// without an exact integer representation.
+func (s *State) coerceIntKind(v Value) (val int64, ok bool, nonIntNum bool, err error) {
+	if v.IsInt() {
+		return v.Int(), true, false, nil
+	}
+	if v.IsFloat() {
+		i, iok := FloatToIntExact(v.Float())
+		return i, iok, !iok, nil
+	}
+	if v.IsString() {
+		iv, fv, isInt, nok, serr := s.strToNum(v.AsString().S)
+		if serr != nil {
+			return 0, false, false, serr
+		}
+		if !nok {
+			return 0, false, false, nil
+		}
+		if isInt {
+			return iv, true, false, nil
+		}
+		i, iok := FloatToIntExact(fv)
+		return i, iok, !iok, nil
+	}
+	return 0, false, false, nil
+}
+
+// preCoerceFormatArgs pre-parses any long string argument consumed by a numeric string.format
+// specifier using s.strToNum so execution controls are polled instead of running uncancellable
+// luastdlib.StrToNum on huge strings. Zero cost unless execution controls are active and a
+// string argument exceeds numeralCancelChunk.
+func (s *State) preCoerceFormatArgs(fmtStr string, fargs []luastdlib.FormatArg) error {
+	cancelFn := s.nativeCancelFunc()
+	if cancelFn == nil {
+		return nil
+	}
+	hasLongStr := false
+	for i := range fargs {
+		if fargs[i].Kind == luastdlib.ArgString && len(fargs[i].Str) > numeralCancelChunk {
+			hasLongStr = true
+			break
+		}
+	}
+	if !hasLongStr {
+		return nil
+	}
+	argIdx := 0
+	for i := 0; i < len(fmtStr); i++ {
+		if i > 0 && (i&(numeralCancelChunk-1)) == 0 {
+			if err := cancelFn(); err != nil {
+				return err
+			}
+		}
+		if fmtStr[i] != '%' {
+			continue
+		}
+		i++
+		if i >= len(fmtStr) {
+			return nil
+		}
+		if fmtStr[i] == '%' {
+			continue
+		}
+		start := i
+		for i < len(fmtStr) && i-start < 32 {
+			c := fmtStr[i]
+			if c == '-' || c == '+' || c == '#' || c == '0' || c == ' ' || (c >= '1' && c <= '9') || c == '.' {
+				i++
+				continue
+			}
+			break
+		}
+		if i >= len(fmtStr) {
+			return nil
+		}
+		spec := fmtStr[i]
+		if argIdx >= len(fargs) {
+			return nil
+		}
+		idx := argIdx
+		argIdx++
+		switch spec {
+		case 'd', 'i', 'o', 'u', 'x', 'X', 'c', 'a', 'A', 'e', 'E', 'f', 'g', 'G':
+			if fargs[idx].Kind == luastdlib.ArgString && len(fargs[idx].Str) > numeralCancelChunk {
+				iv, fv, isInt, ok, err := s.strToNum(fargs[idx].Str)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					fargs[idx].Str = "?"
+				} else if isInt {
+					fargs[idx] = luastdlib.IntArg(iv)
+				} else {
+					fargs[idx] = luastdlib.FloatArg(fv)
+				}
+			}
+		case 'q', 'p', 's':
+			// Non-numeric specifiers preserve original string/ToString semantics.
+		default:
+			// Stop before unknown specifiers so FormatWithControls reports the first syntax error.
+			return nil
+		}
+	}
+	return nil
+}
+
+// preCoercePackArgs pre-parses any long string argument consumed by a numeric string.pack
+// option using s.strToNum so execution controls are polled on huge numeric strings.
+func (s *State) preCoercePackArgs(fmtStr string, pargs []luastdlib.PackValue) error {
+	cancelFn := s.nativeCancelFunc()
+	if cancelFn == nil {
+		return nil
+	}
+	hasLongStr := false
+	for i := range pargs {
+		if pargs[i].Kind == luastdlib.PackString && len(pargs[i].Str) > numeralCancelChunk {
+			hasLongStr = true
+			break
+		}
+	}
+	if !hasLongStr {
+		return nil
+	}
+	skipDigits := func(pos int) int {
+		for pos < len(fmtStr) && fmtStr[pos] >= '0' && fmtStr[pos] <= '9' {
+			pos++
+		}
+		return pos
+	}
+	argIdx := 0
+	for i := 0; i < len(fmtStr); {
+		if i > 0 && (i&(numeralCancelChunk-1)) == 0 {
+			if err := cancelFn(); err != nil {
+				return err
+			}
+		}
+		opt := fmtStr[i]
+		i++
+		switch opt {
+		case ' ', '<', '>', '=', 'x':
+		case '!':
+			i = skipDigits(i)
+		case 'X':
+			if i >= len(fmtStr) {
+				return nil
+			}
+			al := fmtStr[i]
+			i++
+			if al == 'i' || al == 'I' || al == 's' {
+				i = skipDigits(i)
+			}
+		case 'b', 'B', 'h', 'H', 'l', 'L', 'j', 'J', 'T', 'f', 'd', 'n', 'i', 'I':
+			if opt == 'i' || opt == 'I' {
+				i = skipDigits(i)
+			}
+			if argIdx >= len(pargs) {
+				return nil
+			}
+			idx := argIdx
+			argIdx++
+			if pargs[idx].Kind == luastdlib.PackString && len(pargs[idx].Str) > numeralCancelChunk {
+				iv, fv, isInt, ok, err := s.strToNum(pargs[idx].Str)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					pargs[idx] = luastdlib.PackStringVal("?")
+				} else if isInt {
+					pargs[idx] = luastdlib.PackIntVal(iv)
+				} else {
+					pargs[idx] = luastdlib.PackFloatVal(fv)
+				}
+			}
+		case 'c', 's':
+			i = skipDigits(i)
+			argIdx++
+		case 'z':
+			argIdx++
+		default:
+			return nil
+		}
+	}
+	return nil
+}

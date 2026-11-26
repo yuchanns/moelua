@@ -2,11 +2,14 @@ package vm_test
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 	"weak"
 
 	"github.com/yuchanns/moelua/bytecode"
@@ -451,4 +454,95 @@ print(b)
 			t.Fatalf("mismatch vs C Lua 5.5.1:\nwant:\n%s\ngot:\n%s", cWant, got)
 		}
 	}
+}
+
+// TestNativeNumericCoercionCancelAndBudget verifies that native numeric argument coercion
+// (math.*, string.sub/format/pack, table.create, utf8.offset, debug.*, os.*, collectgarbage)
+// polls both instruction-budget and context-cancellation controls on huge numeral strings.
+func TestNativeNumericCoercionCancelAndBudget(t *testing.T) {
+	bigZeros := strings.Repeat("0", 4*1024*1024)
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"math_sqrt", `return math.sqrt(BIG)`},
+		{"math_floor", `return math.floor(BIG)`},
+		{"math_ldexp", `return math.ldexp(1, BIG)`},
+		{"string_sub", `return string.sub("abcdef", BIG)`},
+		{"string_format_d", `return string.format("%d", BIG)`},
+		{"string_format_f", `return string.format("%f", BIG)`},
+		{"string_pack_i", `return string.pack("i", BIG)`},
+		{"string_pack_d", `return string.pack("d", BIG)`},
+		{"utf8_offset", `return utf8.offset("abcdef", BIG)`},
+		{"table_create", `return table.create(BIG)`},
+		{"debug_getuservalue", `return debug.getuservalue(nil, BIG)`},
+		{"os_date", `return os.date("%Y", BIG)`},
+		{"collectgarbage_step", `return collectgarbage("step", BIG)`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+"/insn_budget", func(t *testing.T) {
+			s := vm.NewState()
+			defer s.Close()
+			s.SetGlobal("BIG", vm.StringValue(s.Intern(bigZeros)))
+			cl, err := s.LoadChunk([]byte(tc.src), "="+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.SetInstructionLimit(100)
+			if _, err := s.Call(cl); err == nil {
+				t.Fatalf("%s unexpectedly succeeded past instruction budget 100 (executed=%d)", tc.name, s.InstructionsExecuted())
+			}
+			if s.InstructionsExecuted() == 0 {
+				t.Fatalf("%s charged 0 instructions during huge numeral coercion", tc.name)
+			}
+		})
+		t.Run(tc.name+"/ctx_canceled", func(t *testing.T) {
+			s := vm.NewState()
+			defer s.Close()
+			s.SetGlobal("BIG", vm.StringValue(s.Intern(bigZeros)))
+			cl, err := s.LoadChunk([]byte(tc.src), "="+tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			defer cancel()
+			s.SetContext(ctx)
+			start := time.Now()
+			if _, err := s.Call(cl); err == nil {
+				t.Fatalf("%s unexpectedly succeeded with expired context deadline", tc.name)
+			}
+			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+				t.Fatalf("%s took %v despite already-expired context", tc.name, elapsed)
+			}
+		})
+	}
+
+	// Direct State.Call into math.sqrt (zero Lua bytecode instructions executed) matching exact
+	// host-to-native invocation path under both instruction limit and expired context deadline.
+	t.Run("direct_state_call_math_sqrt", func(t *testing.T) {
+		s := vm.NewState()
+		defer s.Close()
+		mathSqrt := s.GetGlobal("math").AsTable().RawGetStr(s.Intern("sqrt"))
+		bigVal := vm.StringValue(s.Intern(bigZeros))
+
+		s.SetInstructionLimit(100)
+		if _, err := s.Call(mathSqrt, bigVal); err == nil {
+			t.Fatalf("direct State.Call(math.sqrt, bigZeros) bypassed instruction limit 100")
+		}
+		if s.InstructionsExecuted() == 0 {
+			t.Fatalf("direct State.Call(math.sqrt, bigZeros) charged 0 instructions")
+		}
+
+		s2 := vm.NewState()
+		defer s2.Close()
+		mathSqrt2 := s2.GetGlobal("math").AsTable().RawGetStr(s2.Intern("sqrt"))
+		bigVal2 := vm.StringValue(s2.Intern(bigZeros))
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		s2.SetContext(ctx)
+		if _, err := s2.Call(mathSqrt2, bigVal2); err == nil {
+			t.Fatalf("direct State.Call(math.sqrt, bigZeros) bypassed expired context deadline")
+		}
+	})
 }

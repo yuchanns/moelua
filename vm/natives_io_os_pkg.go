@@ -1469,7 +1469,11 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 	}
 	sz := int64(4096)
 	if len(args) >= 3 && !args[2].IsNil() {
-		if v, ok := args[2].CoerceInt(); ok && v > 0 {
+		v, ok, err := s.coerceInt(args[2])
+		if err != nil {
+			return nil, err
+		}
+		if ok && v > 0 {
 			sz = v
 		}
 	}
@@ -1572,7 +1576,11 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 	}
 	if len(args) >= 3 && !args[2].IsNil() {
 		var ok bool
-		offset, ok = args[2].CoerceInt()
+		var err error
+		offset, ok, err = s.coerceInt(args[2])
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			return nil, fmt.Errorf("bad argument #%d to 'seek' (number expected)", s.methodArgNum(3))
 		}
@@ -2411,7 +2419,10 @@ func nativeOSTime(s *State, args []Value) ([]Value, error) {
 			}
 			return def, nil
 		}
-		iv, ok := v.CoerceInt()
+		iv, ok, err := s.coerceInt(v)
+		if err != nil {
+			return 0, err
+		}
 		if !ok {
 			return 0, fmt.Errorf("field '%s' is not an integer", name)
 		}
@@ -2555,16 +2566,15 @@ func checkTimeArg(s *State, args []Value, idx int, fnName string) (int64, error)
 		return 0, fmt.Errorf("bad argument #%d to '%s' (number expected, got no value)", idx+1, fnName)
 	}
 	a := args[idx]
-	if i, ok := a.CoerceInt(); ok {
+	i, ok, nonInt, err := s.coerceIntKind(a)
+	if err != nil {
+		return 0, err
+	}
+	if ok {
 		return i, nil
 	}
-	if a.IsNumber() {
+	if nonInt {
 		return 0, fmt.Errorf("bad argument #%d to '%s' (number has no integer representation)", idx+1, fnName)
-	}
-	if a.IsString() {
-		if _, ok := luastdlib.StrToFloat(a.AsString().S); ok {
-			return 0, fmt.Errorf("bad argument #%d to '%s' (number has no integer representation)", idx+1, fnName)
-		}
 	}
 	return 0, fmt.Errorf("bad argument #%d to '%s' (number expected, got %s)", idx+1, fnName, s.objTypeName(a))
 }
@@ -2597,9 +2607,12 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 	}
 	tm := time.Now()
 	if len(args) >= 2 && !args[1].IsNil() {
-		sec, ok := args[1].CoerceInt()
+		sec, ok, nonInt, err := s.coerceIntKind(args[1])
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
-			if args[1].IsFloat() {
+			if nonInt {
 				return nil, fmt.Errorf("bad argument #2 to 'date' (number has no integer representation)")
 			}
 			return nil, fmt.Errorf("bad argument #2 to 'date' (number expected, got %s)", s.objTypeName(args[1]))
@@ -2945,17 +2958,18 @@ func nativeOSExit(s *State, args []Value) ([]Value, error) {
 			if a.IsFalse() {
 				code = 1
 			}
-		} else if i, ok := a.CoerceInt(); ok {
-			code = int(i)
-		} else if a.IsNumber() {
-			return nil, fmt.Errorf("bad argument #1 to 'os.exit' (number has no integer representation)")
 		} else {
-			if a.IsString() {
-				if _, ok := luastdlib.StrToFloat(a.AsString().S); ok {
-					return nil, fmt.Errorf("bad argument #1 to 'os.exit' (number has no integer representation)")
-				}
+			i, ok, nonInt, err := s.coerceIntKind(a)
+			if err != nil {
+				return nil, err
 			}
-			return nil, fmt.Errorf("bad argument #1 to 'os.exit' (number expected, got %s)", s.objTypeName(a))
+			if ok {
+				code = int(i)
+			} else if nonInt {
+				return nil, fmt.Errorf("bad argument #1 to 'os.exit' (number has no integer representation)")
+			} else {
+				return nil, fmt.Errorf("bad argument #1 to 'os.exit' (number expected, got %s)", s.objTypeName(a))
+			}
 		}
 	}
 	s.flushOpenFiles()

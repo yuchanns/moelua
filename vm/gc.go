@@ -1813,8 +1813,12 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 		return []Value{FloatValue(kb)}, nil
 	case "step":
 		if len(args) >= 2 && !args[1].IsNil() {
-			if _, ok := args[1].CoerceInt(); !ok {
-				if args[1].IsFloat() {
+			_, ok, nonInt, err := s.coerceIntKind(args[1])
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				if nonInt {
 					return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (number has no integer representation)")
 				}
 				return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (number expected, got %s)", s.objTypeName(args[1]))
@@ -1869,10 +1873,14 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 		}
 		nv := int64(-1)
 		if len(args) >= 3 && !args[2].IsNil() {
-			var ok bool
-			nv, ok = args[2].CoerceInt()
+			var ok, nonInt bool
+			var err error
+			nv, ok, nonInt, err = s.coerceIntKind(args[2])
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
-				if args[2].IsFloat() {
+				if nonInt {
 					return nil, fmt.Errorf("bad argument #3 to 'collectgarbage' (number has no integer representation)")
 				}
 				return nil, fmt.Errorf("bad argument #3 to 'collectgarbage' (number expected, got %s)", s.objTypeName(args[2]))
