@@ -235,9 +235,9 @@ func (s *State) toStringValue(v Value) (string, error) {
 	if mt := s.getMetatableOf(v); mt != nil {
 		if nm := mt.RawGetStr(s.intern.Intern("__name")); nm.IsString() {
 			if v.IsLightUD() {
-				return s.joinStringsWithCancel(nm.AsString().S, ": ", v.formatLightUDAddr())
+				return s.joinStringsWithCancel(nm.AsString().Str(), ": ", v.formatLightUDAddr())
 			}
-			return s.joinStringsWithCancel(nm.AsString().S, ": ", fmt.Sprintf("%p", v.ptr))
+			return s.joinStringsWithCancel(nm.AsString().Str(), ": ", fmt.Sprintf("%p", v.ptr))
 		}
 	}
 	return FormatValue(v), nil
@@ -306,7 +306,7 @@ func nativeError(s *State, args []Value) ([]Value, error) {
 	}
 	if level > 0 && args[0].IsString() {
 		if where := s.errorWhere(level); where != "" {
-			msg := args[0].AsString().S
+			msg := args[0].AsString().Str()
 			joined, err := s.joinStringsWithCancel(where, msg)
 			if err != nil {
 				return nil, err
@@ -392,7 +392,7 @@ func nativeToNumber(s *State, args []Value) ([]Value, error) {
 		if !v.IsString() {
 			return []Value{NilValue()}, nil
 		}
-		iv, fv, isInt, ok, err := s.strToNum(v.AsString().S)
+		iv, fv, isInt, ok, err := s.strToNum(v.AsString().Str())
 		if err != nil {
 			return nil, err
 		}
@@ -421,7 +421,7 @@ func nativeToNumber(s *State, args []Value) ([]Value, error) {
 	if base < 2 || base > 36 {
 		return nil, fmt.Errorf("bad argument #2 to 'tonumber' (base out of range)")
 	}
-	iv, ok, err := s.strToIntBase(v.AsString().S, int(base))
+	iv, ok, err := s.strToIntBase(v.AsString().Str(), int(base))
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +435,7 @@ func nativeSelect(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'select'")
 	}
-	if args[0].IsString() && strings.HasPrefix(args[0].AsString().S, "#") {
+	if args[0].IsString() && strings.HasPrefix(args[0].AsString().Str(), "#") {
 		return []Value{IntValue(int64(len(args) - 1))}, nil
 	}
 	idx, ok, err := s.coerceInt(args[0])
@@ -515,7 +515,7 @@ func nativeRawLen(_ *State, args []Value) ([]Value, error) {
 		return []Value{IntValue(args[0].AsTable().Len())}, nil
 	}
 	if args[0].IsString() {
-		return []Value{IntValue(int64(len(args[0].AsString().S)))}, nil
+		return []Value{IntValue(int64(len(args[0].AsString().Str())))}, nil
 	}
 	return nil, fmt.Errorf("bad argument #1 to 'rawlen' (table or string expected)")
 }
@@ -986,7 +986,7 @@ func nativeMathToInteger(s *State, args []Value) ([]Value, error) {
 		return []Value{IntValue(i)}, nil
 	}
 	if args[0].IsString() {
-		iv, fv, isInt, ok, err := s.strToNum(args[0].AsString().S)
+		iv, fv, isInt, ok, err := s.strToNum(args[0].AsString().Str())
 		if err != nil {
 			return nil, err
 		}
@@ -1243,7 +1243,7 @@ func (s *State) checkTab(v Value, what int, argNum int, globalName string) error
 
 func (s *State) tableLen(v Value) (int64, error) {
 	if v.IsString() {
-		return int64(len(v.AsString().S)), nil
+		return int64(len(v.AsString().Str())), nil
 	}
 	if v.IsTable() {
 		t := v.AsTable()
@@ -2309,7 +2309,7 @@ func nativeStringByte(s *State, args []Value) ([]Value, error) {
 	}
 	var str string
 	if args[0].IsString() {
-		str = args[0].AsString().S
+		str = args[0].AsString().Str()
 	} else if args[0].IsNumber() {
 		str = FormatValue(args[0])
 	} else {
@@ -2481,7 +2481,7 @@ func nativeStringSub(s *State, args []Value) ([]Value, error) {
 	}
 	var str string
 	if args[0].IsString() {
-		str = args[0].AsString().S
+		str = args[0].AsString().Str()
 	} else if args[0].IsNumber() {
 		str = FormatValue(args[0])
 	} else {
@@ -2562,7 +2562,7 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 	}
 	var str string
 	if args[0].IsString() {
-		str = args[0].AsString().S
+		str = args[0].AsString().Str()
 	} else if args[0].IsNumber() {
 		str = FormatValue(args[0])
 	} else {
@@ -2587,7 +2587,7 @@ func nativeStringRep(s *State, args []Value) ([]Value, error) {
 	sep := ""
 	if len(args) >= 3 && !args[2].IsNil() {
 		if args[2].IsString() {
-			sep = args[2].AsString().S
+			sep = args[2].AsString().Str()
 		} else if args[2].IsNumber() {
 			sep = FormatValue(args[2])
 		} else {

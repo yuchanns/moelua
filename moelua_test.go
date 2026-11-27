@@ -55,7 +55,7 @@ func TestPublicAPIQuickstart(t *testing.T) {
 	if out.String() != "hello\t50\n" {
 		t.Fatalf("unexpected output: %q", out.String())
 	}
-	if len(res) != 2 || res[0].Int() != 123 || res[1].AsString().S != "done" {
+	if len(res) != 2 || res[0].Int() != 123 || res[1].AsString().Str() != "done" {
 		t.Fatalf("unexpected results: %v", res)
 	}
 }
@@ -85,7 +85,7 @@ func TestPublicAPIPinHandleGCAnchoring(t *testing.T) {
 	if _, err := s.DoString(`assert(weak[1] ~= nil and weak[1].tag == "anchored" and not finalized)`); err != nil {
 		t.Fatalf("pinned value should survive GC: %v", err)
 	}
-	if h.Value().AsTable().RawGetStr(s.Raw().Intern("tag")).AsString().S != "anchored" {
+	if h.Value().AsTable().RawGetStr(s.Raw().Intern("tag")).AsString().Str() != "anchored" {
 		t.Fatalf("handle value mismatch")
 	}
 
@@ -202,7 +202,7 @@ func TestPublicAPIMemoryLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(res) != 1 || res[0].AsString().S != "still-alive" {
+	if len(res) != 1 || res[0].AsString().Str() != "still-alive" {
 		t.Fatalf("unexpected res: %v", res)
 	}
 }
@@ -453,7 +453,7 @@ func TestPublicAPIFSModuleLoaderAndCustomSearcher(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DoString failed: %v", err)
 	}
-	if len(res) != 1 || res[0].AsString().S != "ok" {
+	if len(res) != 1 || res[0].AsString().Str() != "ok" {
 		t.Fatalf("unexpected res: %v", res)
 	}
 }
@@ -576,7 +576,7 @@ func TestMetatablesAndTypedUserdata(t *testing.T) {
 	if got := s.GetMetatableByName("moelua.Counter"); got == nil || got.Raw() != mt.Raw() {
 		t.Fatalf("GetMetatableByName mismatch")
 	}
-	if name := mt.GetString("__name"); !name.IsString() || name.AsString().S != "moelua.Counter" {
+	if name := mt.GetString("__name"); !name.IsString() || name.AsString().Str() != "moelua.Counter" {
 		t.Fatalf("expected __name='moelua.Counter', got %v", name)
 	}
 
@@ -762,7 +762,7 @@ func TestGoDrivenCoroutines(t *testing.T) {
 	}
 
 	r1, yielded, err := th.Resume(moelua.Int(4))
-	if err != nil || !yielded || len(r1) != 2 || r1[0].AsString().S != "step1" || r1[1].Int() != 5 {
+	if err != nil || !yielded || len(r1) != 2 || r1[0].AsString().Str() != "step1" || r1[1].Int() != 5 {
 		t.Fatalf("Resume 1: res=%v yielded=%v err=%v", r1, yielded, err)
 	}
 	if th.Status() != moelua.ThreadSuspended || th.StatusString() != "suspended" {
@@ -770,12 +770,12 @@ func TestGoDrivenCoroutines(t *testing.T) {
 	}
 
 	r2, yielded, err := th.Resume(moelua.Int(7))
-	if err != nil || !yielded || len(r2) != 2 || r2[0].AsString().S != "step2" || r2[1].Int() != 70 {
+	if err != nil || !yielded || len(r2) != 2 || r2[0].AsString().Str() != "step2" || r2[1].Int() != 70 {
 		t.Fatalf("Resume 2: res=%v yielded=%v err=%v", r2, yielded, err)
 	}
 
 	r3, yielded, err := th.Resume(moelua.Int(100))
-	if err != nil || yielded || len(r3) != 2 || r3[0].AsString().S != "done" || r3[1].Int() != 105 {
+	if err != nil || yielded || len(r3) != 2 || r3[0].AsString().Str() != "done" || r3[1].Int() != 105 {
 		t.Fatalf("Resume 3: res=%v yielded=%v err=%v", r3, yielded, err)
 	}
 	if th.Status() != moelua.ThreadDead || th.StatusString() != "dead" {
@@ -1520,4 +1520,31 @@ func TestRootOperandsAcrossAllocationPreservesMemoryLimit(t *testing.T) {
 			t.Fatalf("NewUserdataWithMeta succeeded but recounted MemoryUsage()=%d exceeded %d", usage, l)
 		}
 	})
+}
+
+func TestCall1AndToStringClonesAcrossClose(t *testing.T) {
+	s := moelua.New()
+	res, err := s.DoString(`return function(a, b) return "sum=" .. tostring(a + b) end`)
+	if err != nil || len(res) != 1 {
+		t.Fatalf("DoString failed: %v %v", res, err)
+	}
+	v, err := s.Call1(res[0], moelua.Int(19), moelua.Int(23))
+	if err != nil {
+		t.Fatalf("Call1 failed: %v", err)
+	}
+	got, ok := s.ToString(v)
+	if !ok || got != "sum=42" {
+		t.Fatalf("ToString = (%q, %v), want (\"sum=42\", true)", got, ok)
+	}
+	if _, ok := s.ToString(moelua.Int(7)); ok {
+		t.Fatalf("ToString on non-string must return false")
+	}
+	// Close the State and overwrite Go heap; the cloned Go string must stay intact.
+	s.Close()
+	if got != "sum=42" {
+		t.Fatalf("cloned string corrupted after Close: %q", got)
+	}
+	if _, err := s.Call1(res[0]); !errors.Is(err, moelua.ErrStateClosed) {
+		t.Fatalf("Call1 on closed State = %v, want ErrStateClosed", err)
+	}
 }

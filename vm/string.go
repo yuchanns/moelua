@@ -5,10 +5,19 @@ import (
 	"io"
 	"strings"
 	"sync/atomic"
-	"weak"
+	"unsafe"
+
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
 const maxShortStringLen = 40
+
+const (
+	gcKindShortStr uint8 = 1
+	gcKindLongStr  uint8 = 2
+
+	strFlagFixed uint8 = 1 << 0 // frozen process-wide stdlib string (immutable, never swept)
+)
 
 // globalStrSeed is initialized once per process from crypto/random maphash.MakeSeed()
 // so both short and lazy long strings resist HashDoS while remaining cross-State shareable.
@@ -25,14 +34,57 @@ func initGlobalStrSeed() uint32 {
 	return s
 }
 
-// LuaString represents a Lua 5.5 string.
-// Short strings (len <= 40) are interned per State so pointer equality == string equality
-// and hash/ID lookups never touch string bytes.
+// LuaString is a noscan Lua 5.5 string stored contiguously inside an Arena slab page
+// or dedicated large span: 32-byte header followed immediately by Len inline payload bytes.
+// ptrdata(LuaString) == 0 so Go's GC never scans Lua strings.
+// Short strings (Len <= 40) are interned per State via intrusive HNext chains so pointer
+// equality == string equality and hash/ID lookups never touch string bytes.
 type LuaString struct {
-	S     string
-	Hash  uint32
-	ID    uint32
-	Short bool
+	hdr   arena.GCHeader // 8B: Next (allGC list), Kind (short/long), Mark, Class, Flags
+	ID    uint64         // 8B: monotonically unique per-State short-string ID (0 for long strings)
+	Hash  uint32         // 4B: FNV-1a hash (eager for short strings, lazy for long strings)
+	Len   uint32         // 4B: exact byte length
+	HNext arena.ObjRef   // 4B: intrusive hash bucket chain in stringInterner.buckets (short only)
+	_     uint32         // 4B: pad to 32 bytes for 8-byte payload alignment
+}
+
+const luaStringHeaderSize = int(unsafe.Sizeof(LuaString{}))
+
+const (
+	_ = uint(32 - unsafe.Sizeof(LuaString{}))
+	_ = uint(unsafe.Sizeof(LuaString{}) - 32)
+)
+
+// Str returns a zero-copy string view of ls's inline Arena payload bytes.
+// Valid while ls remains live in its owning State's Arena; host callers retaining
+// a Go string beyond Lua GC or State.Close must copy via strings.Clone.
+func (ls *LuaString) Str() string {
+	if ls == nil || ls.Len == 0 {
+		return ""
+	}
+	return unsafe.String((*byte)(unsafe.Add(unsafe.Pointer(ls), luaStringHeaderSize)), ls.Len)
+}
+
+// IsShort reports whether ls is an interned short string (Len <= 40).
+func (ls *LuaString) IsShort() bool {
+	return ls != nil && ls.hdr.Kind == gcKindShortStr
+}
+
+// IsFixed reports whether ls belongs to the immutable process-wide frozen stdlib arena.
+func (ls *LuaString) IsFixed() bool {
+	return ls != nil && ls.hdr.Flags&strFlagFixed != 0
+}
+
+// newTransientLongString wraps str in a standalone noscan byte buffer for non-mutating
+// read-only table lookups (State.LookupString) without touching State.arena.
+func newTransientLongString(str string) *LuaString {
+	buf := make([]byte, luaStringHeaderSize+len(str))
+	ls := (*LuaString)(unsafe.Pointer(unsafe.SliceData(buf)))
+	ls.hdr.Kind = gcKindLongStr
+	ls.hdr.Flags = strFlagFixed
+	ls.Len = uint32(len(str))
+	copy(buf[luaStringHeaderSize:], str)
+	return ls
 }
 
 // Metamethod tag indices matching PUC-Rio Lua 5.5.1 ltm.h.
@@ -324,7 +376,7 @@ func (s *State) compareStrings(a, b *LuaString) (int, error) {
 	if a == b {
 		return 0, nil
 	}
-	sa, sb := a.S, b.S
+	sa, sb := a.Str(), b.Str()
 	n := min(len(sa), len(sb))
 	cancelFn := s.nativeCancelFunc()
 	if cancelFn == nil || n <= strCmpCancelChunk {
@@ -366,16 +418,16 @@ func (s *State) stringsEqual(a, b *LuaString) (bool, error) {
 	if a == b {
 		return true, nil
 	}
-	if a.Short || b.Short {
+	if a.IsShort() || b.IsShort() {
 		return false, nil
 	}
-	sa, sb := a.S, b.S
-	if len(sa) != len(sb) {
+	if a.Len != b.Len {
 		return false, nil
 	}
 	if ha, hb := atomic.LoadUint32(&a.Hash), atomic.LoadUint32(&b.Hash); ha != 0 && hb != 0 && ha != hb {
 		return false, nil
 	}
+	sa, sb := a.Str(), b.Str()
 	cancelFn := s.nativeCancelFunc()
 	if cancelFn == nil || len(sa) <= strCmpCancelChunk {
 		return sa == sb, nil
@@ -437,88 +489,210 @@ func hashStringWithCancel(s string, seed uint32, cancelFn func() error) (uint32,
 	return h, nil
 }
 
+const (
+	minStrBuckets = 32
+)
+
 type stringInterner struct {
-	seed      uint32
-	nextID    uint32
-	shortAdds int
-	frozen    map[string]*LuaString              // read-only shared stdlib short strings (never mutated after template init)
-	short     map[uint32][]weak.Pointer[LuaString] // hash-bucketed weak interner so unreachable short strings are reclaimed
-	tms       [tmCount]*LuaString
+	seed   uint32
+	nextID uint64
+
+	// Immutable process-wide frozen stdlib short strings (shared read-only across States).
+	frozenArena   *arena.Arena
+	frozenBuckets []arena.ObjRef
+	frozenMask    uint32
+
+	// Per-State noscan Arena and PUC-Rio lstring.c open-chain short-string table.
+	arena   *arena.Arena   // bound to State.arena (lazily created on first dynamic string)
+	buckets []arena.ObjRef // noscan []uint32; power-of-2 length
+	nuse    int32          // count of live dynamic short strings in buckets
+	allGC   arena.ObjRef   // intrusive list (hdr.Next) of ALL dynamic strings (short + long)
+
+	tms [tmCount]*LuaString
 }
 
-func newStringInterner(_ uint32) stringInterner {
+var fixedErrMsgs = [...]string{
+	"not enough memory",
+	"C stack overflow",
+	"<no error object>",
+}
+
+func newStringInterner(a *arena.Arena) stringInterner {
 	si := stringInterner{
 		seed:   globalStrSeed,
 		nextID: 1,
-		short:  make(map[uint32][]weak.Pointer[LuaString], 160),
+		arena:  a,
 	}
 	for i := range tmCount {
 		si.tms[i] = si.Intern(tmNames[i])
 	}
+	for _, msg := range fixedErrMsgs {
+		si.Intern(msg)
+	}
 	return si
 }
 
-// SnapshotFrozen returns a strong map of all currently live short strings (used once when freezing stdTemplate).
-func (si *stringInterner) SnapshotFrozen() map[string]*LuaString {
-	out := make(map[string]*LuaString, len(si.short))
-	for _, bucket := range si.short {
-		for _, wp := range bucket {
-			if ls := wp.Value(); ls != nil {
-				out[ls.S] = ls
-			}
-		}
+func (si *stringInterner) ensureArena() *arena.Arena {
+	if si.arena == nil {
+		si.arena = arena.New()
 	}
-	return out
+	return si.arena
 }
 
-// Prune removes collected weak entries and empty hash buckets from the per-State interner.
-func (si *stringInterner) Prune() int {
-	si.shortAdds = 0
-	if len(si.short) == 0 {
+func (si *stringInterner) resizeBuckets(newSize int) {
+	if newSize < minStrBuckets {
+		newSize = minStrBuckets
+	}
+	nb := make([]arena.ObjRef, newSize)
+	mask := uint32(newSize - 1)
+	a := si.arena
+	for _, head := range si.buckets {
+		for ref := head; ref != arena.NullRef; {
+			ls := arena.As[LuaString](a, ref)
+			next := ls.HNext
+			idx := ls.Hash & mask
+			ls.HNext = nb[idx]
+			nb[idx] = ref
+			ref = next
+		}
+	}
+	si.buckets = nb
+}
+
+// FreezeBootstrap marks all strings currently allocated in si.arena as immutable fixed
+// stdlib strings and returns the frozen arena + read-only bucket table for stdTemplate.
+func (si *stringInterner) FreezeBootstrap() (*arena.Arena, []arena.ObjRef, uint32) {
+	if si.arena == nil {
+		return nil, nil, 0
+	}
+	for ref := si.allGC; ref != arena.NullRef; {
+		ls := arena.As[LuaString](si.arena, ref)
+		ls.hdr.Flags |= strFlagFixed
+		ref = ls.hdr.Next
+	}
+	if len(si.buckets) == 0 {
+		si.buckets = make([]arena.ObjRef, minStrBuckets)
+	}
+	// Size frozen table cleanly for low load factor (<= 0.5) so stdlib lookups stay O(1).
+	want := minStrBuckets
+	for want < int(si.nuse)*2 {
+		want <<= 1
+	}
+	if want > len(si.buckets) {
+		si.resizeBuckets(want)
+	}
+	return si.arena, si.buckets, uint32(len(si.buckets) - 1)
+}
+
+// ClearMarks resets the GC mark bit of every dynamic Arena string back to MarkWhite0
+// without freeing any strings (used after recountLiveBytes or aborted GC traces).
+func (si *stringInterner) ClearMarks() {
+	if si.arena == nil || si.allGC == arena.NullRef {
+		return
+	}
+	a := si.arena
+	for ref := si.allGC; ref != arena.NullRef; {
+		ls := arena.As[LuaString](a, ref)
+		ls.hdr.SetWhite(arena.MarkWhite0)
+		ref = ls.hdr.Next
+	}
+}
+
+func (si *stringInterner) unlinkBucket(target arena.ObjRef, hash uint32) {
+	if len(si.buckets) == 0 {
+		return
+	}
+	idx := hash & uint32(len(si.buckets)-1)
+	a := si.arena
+	var prev arena.ObjRef
+	for cur := si.buckets[idx]; cur != arena.NullRef; {
+		ls := arena.As[LuaString](a, cur)
+		if cur == target {
+			if prev == arena.NullRef {
+				si.buckets[idx] = ls.HNext
+			} else {
+				arena.As[LuaString](a, prev).HNext = ls.HNext
+			}
+			ls.HNext = arena.NullRef
+			si.nuse--
+			return
+		}
+		prev = cur
+		cur = ls.HNext
+	}
+}
+
+// Sweep frees every unmarked dynamic Arena string (short and long), unlinks swept short
+// strings from the intern bucket table, resets survivors to MarkWhite0, and shrinks
+// oversized bucket tables when not in emergency mode (matching lgc.c:checkSizes).
+func (si *stringInterner) Sweep(emergency bool) int {
+	if si.arena == nil || si.allGC == arena.NullRef {
 		return 0
 	}
-	live := 0
-	for h, bucket := range si.short {
-		kept := bucket[:0]
-		for _, wp := range bucket {
-			if wp.Value() != nil {
-				kept = append(kept, wp)
-			}
+	a := si.arena
+	var prev arena.ObjRef
+	for cur := si.allGC; cur != arena.NullRef; {
+		ls := arena.As[LuaString](a, cur)
+		next := ls.hdr.Next
+		if ls.hdr.IsBlack() {
+			ls.hdr.SetWhite(arena.MarkWhite0)
+			prev = cur
+			cur = next
+			continue
 		}
-		if len(kept) == 0 {
-			delete(si.short, h)
+		if ls.IsShort() {
+			si.unlinkBucket(cur, ls.Hash)
+		}
+		if prev == arena.NullRef {
+			si.allGC = next
 		} else {
-			clear(bucket[len(kept):])
-			si.short[h] = kept
-			live += len(kept)
+			arena.As[LuaString](a, prev).hdr.Next = next
 		}
+		a.Free(cur)
+		cur = next
 	}
-	return live
+	if !emergency && len(si.buckets) > minStrBuckets && int(si.nuse) < len(si.buckets)/4 {
+		si.resizeBuckets(len(si.buckets) / 2)
+	}
+	return int(si.nuse)
+}
+
+// LiveDynamicShort returns the number of live dynamic short strings in this State.
+func (si *stringInterner) LiveDynamicShort() int {
+	return int(si.nuse)
+}
+
+// Close releases all per-State dynamic string table metadata (State.Close frees the Arena).
+func (si *stringInterner) Close() {
+	si.buckets = nil
+	si.nuse = 0
+	si.allGC = arena.NullRef
+	si.arena = nil
 }
 
 // hash returns the cached hash, computing it lazily for long strings (len > 40)
 // using the process-global randomized seed. Short strings have immutable precomputed
-// hashes; long strings use atomic load/store so shared compiled protos never race.
+// hashes; long strings use atomic load/store so concurrent reads never race.
 func (ls *LuaString) hash() uint32 {
-	if ls.Short {
+	if ls.IsShort() {
 		return ls.Hash
 	}
 	if h := atomic.LoadUint32(&ls.Hash); h != 0 {
 		return h
 	}
-	h := hashString(ls.S, globalStrSeed)
+	h := hashString(ls.Str(), globalStrSeed)
 	atomic.StoreUint32(&ls.Hash, h)
 	return h
 }
 
 func (ls *LuaString) hashWithCancel(cancelFn func() error) (uint32, error) {
-	if ls.Short {
+	if ls.IsShort() {
 		return ls.Hash, nil
 	}
 	if h := atomic.LoadUint32(&ls.Hash); h != 0 {
 		return h, nil
 	}
-	h, err := hashStringWithCancel(ls.S, globalStrSeed, cancelFn)
+	h, err := hashStringWithCancel(ls.Str(), globalStrSeed, cancelFn)
 	if err != nil {
 		return 0, err
 	}
@@ -527,7 +701,7 @@ func (ls *LuaString) hashWithCancel(cancelFn func() error) (uint32, error) {
 }
 
 func (s *State) ensureStrKeyHash(ls *LuaString) error {
-	if s == nil || ls == nil || ls.Short || len(ls.S) <= strHashCancelChunk || atomic.LoadUint32(&ls.Hash) != 0 {
+	if s == nil || ls == nil || ls.IsShort() || int(ls.Len) <= strHashCancelChunk || atomic.LoadUint32(&ls.Hash) != 0 {
 		return nil
 	}
 	cancelFn := s.nativeCancelFunc()
@@ -541,7 +715,7 @@ func (s *State) ensureStrKeyHash(ls *LuaString) error {
 // checkTableLongStrProbe cooperatively polls execution controls before table hash probes
 // compare a huge long string against distinct same-length long strings in the probe chain.
 func (s *State) checkTableLongStrProbe(t *Table, ls *LuaString) error {
-	if s == nil || t == nil || t.hash == nil || len(t.hash.nodes) == 0 || ls == nil || ls.Short || len(ls.S) <= strCmpCancelChunk || !s.hasInterruptControl() {
+	if s == nil || t == nil || t.hash == nil || len(t.hash.nodes) == 0 || ls == nil || ls.IsShort() || int(ls.Len) <= strCmpCancelChunk || !s.hasInterruptControl() {
 		return nil
 	}
 	h := t.hash
@@ -552,28 +726,15 @@ func (s *State) checkTableLongStrProbe(t *Table, ls *LuaString) error {
 		if !nd.used {
 			return nil
 		}
-		if !nd.dead {
-			if nd.key.IsString() {
-				other := nd.key.AsString()
-				if other != ls && !other.Short && len(other.S) == len(ls.S) {
-					eq, err := s.stringsEqual(other, ls)
-					if err != nil {
-						return err
-					}
-					if eq {
-						return nil
-					}
+		if nd.key.IsString() {
+			other := nd.key.AsString()
+			if other != ls && !other.IsShort() && other.Len == ls.Len {
+				eq, err := s.stringsEqual(other, ls)
+				if err != nil {
+					return err
 				}
-			}
-		} else if h.deadKeys != nil {
-			if ref, ok := h.deadKeys[int(idx)]; ok {
-				if dv, alive := deadKeyValue(ref); alive && dv.IsString() {
-					other := dv.AsString()
-					if other != ls && !other.Short && len(other.S) == len(ls.S) {
-						if _, err := s.stringsEqual(other, ls); err != nil {
-							return err
-						}
-					}
+				if eq && !nd.dead {
+					return nil
 				}
 			}
 		}
@@ -613,87 +774,94 @@ func (si *stringInterner) lookupExistingShort(s string) (*LuaString, bool) {
 	if len(s) > maxShortStringLen {
 		return nil, false
 	}
-	if si.frozen != nil {
-		if ls, ok := si.frozen[s]; ok {
-			return ls, true
-		}
-	}
-	if si.short != nil {
-		h := hashString(s, si.seed)
-		for _, wp := range si.short[h] {
-			if ls := wp.Value(); ls != nil && ls.S == s {
+	h := hashString(s, si.seed)
+	if si.frozenArena != nil {
+		for ref := si.frozenBuckets[h&si.frozenMask]; ref != arena.NullRef; {
+			ls := arena.As[LuaString](si.frozenArena, ref)
+			if ls.Hash == h && ls.Len == uint32(len(s)) && ls.Str() == s {
 				return ls, true
 			}
+			ref = ls.HNext
+		}
+	}
+	if len(si.buckets) > 0 && si.arena != nil {
+		mask := uint32(len(si.buckets) - 1)
+		for ref := si.buckets[h&mask]; ref != arena.NullRef; {
+			ls := arena.As[LuaString](si.arena, ref)
+			if ls.Hash == h && ls.Len == uint32(len(s)) && ls.Str() == s {
+				return ls, true
+			}
+			ref = ls.HNext
 		}
 	}
 	return nil, false
 }
 
 // Intern returns a canonical *LuaString for short strings (<= 40 bytes) or allocates a long string
-// with lazy hashing (matching PUC-Rio Lua 5.5).
+// with lazy hashing inside the per-State noscan Arena (matching PUC-Rio Lua 5.5).
 func (si *stringInterner) Intern(s string) *LuaString {
 	if len(s) <= maxShortStringLen {
-		if si.frozen != nil {
-			if ls, ok := si.frozen[s]; ok {
-				return ls
-			}
-		}
 		h := hashString(s, si.seed)
-		if si.short != nil {
-			if bucket := si.short[h]; len(bucket) > 0 {
-				var found *LuaString
-				dead := false
-				for _, wp := range bucket {
-					ls := wp.Value()
-					if ls == nil {
-						dead = true
-						continue
-					}
-					if ls.S == s {
-						found = ls
-						if !dead {
-							return ls
-						}
-					}
+		if si.frozenArena != nil {
+			for ref := si.frozenBuckets[h&si.frozenMask]; ref != arena.NullRef; {
+				ls := arena.As[LuaString](si.frozenArena, ref)
+				if ls.Hash == h && ls.Len == uint32(len(s)) && ls.Str() == s {
+					return ls
 				}
-				if dead {
-					kept := bucket[:0]
-					for _, wp := range bucket {
-						if wp.Value() != nil {
-							kept = append(kept, wp)
-						}
-					}
-					clear(bucket[len(kept):])
-					if len(kept) == 0 {
-						delete(si.short, h)
-					} else {
-						si.short[h] = kept
-					}
-				}
-				if found != nil {
-					return found
-				}
+				ref = ls.HNext
 			}
-		} else {
-			si.short = make(map[uint32][]weak.Pointer[LuaString], 32)
 		}
-		ls := &LuaString{
-			S:     strings.Clone(s),
-			Hash:  h,
-			ID:    si.nextID,
-			Short: true,
+		if len(si.buckets) > 0 && si.arena != nil {
+			mask := uint32(len(si.buckets) - 1)
+			for ref := si.buckets[h&mask]; ref != arena.NullRef; {
+				ls := arena.As[LuaString](si.arena, ref)
+				if ls.Hash == h && ls.Len == uint32(len(s)) && ls.Str() == s {
+					return ls
+				}
+				ref = ls.HNext
+			}
 		}
+		a := si.ensureArena()
+		total := luaStringHeaderSize + len(s)
+		ref, err := a.AllocGC(total, gcKindShortStr, arena.MarkWhite0)
+		if err != nil {
+			panic(err)
+		}
+		ls := arena.As[LuaString](a, ref)
+		ls.ID = si.nextID
 		si.nextID++
-		si.short[h] = append(si.short[h], weak.Make(ls))
-		si.shortAdds++
-		if si.shortAdds >= 1024 && len(si.short) > 64 {
-			si.Prune()
+		ls.Hash = h
+		ls.Len = uint32(len(s))
+		if len(s) > 0 {
+			copy(a.Bytes(ref, total)[luaStringHeaderSize:], s)
 		}
+		ls.hdr.Next = si.allGC
+		si.allGC = ref
+		if len(si.buckets) == 0 {
+			si.buckets = make([]arena.ObjRef, minStrBuckets)
+		} else if int(si.nuse) >= len(si.buckets) {
+			si.resizeBuckets(len(si.buckets) * 2)
+		}
+		idx := h & uint32(len(si.buckets)-1)
+		ls.HNext = si.buckets[idx]
+		si.buckets[idx] = ref
+		si.nuse++
 		return ls
 	}
-	return &LuaString{
-		S:     s,
-		Hash:  0, // lazily hashed on first table-key lookup
-		Short: false,
+	a := si.ensureArena()
+	total := luaStringHeaderSize + len(s)
+	ref, err := a.AllocGC(total, gcKindLongStr, arena.MarkWhite0)
+	if err != nil {
+		// Fall back to transient fixed buffer only if Arena hard single-alloc limit hit
+		// outside TryIntern (normal callers enforce memLimit via checkMem before Intern).
+		return newTransientLongString(s)
 	}
+	ls := arena.As[LuaString](a, ref)
+	ls.Len = uint32(len(s))
+	if len(s) > 0 {
+		copy(a.Bytes(ref, total)[luaStringHeaderSize:], s)
+	}
+	ls.hdr.Next = si.allGC
+	si.allGC = ref
+	return ls
 }

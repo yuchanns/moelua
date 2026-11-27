@@ -552,7 +552,7 @@ func (s *State) coerceFloat(v Value) (float64, bool, error) {
 		return float64(v.Int()), true, nil
 	}
 	if v.IsString() {
-		iv, fv, isInt, ok, err := s.strToNum(v.AsString().S)
+		iv, fv, isInt, ok, err := s.strToNum(v.AsString().Str())
 		if err != nil {
 			return 0, false, err
 		}
@@ -578,7 +578,7 @@ func (s *State) coerceInt(v Value) (int64, bool, error) {
 		return i, ok, nil
 	}
 	if v.IsString() {
-		iv, fv, isInt, ok, err := s.strToNum(v.AsString().S)
+		iv, fv, isInt, ok, err := s.strToNum(v.AsString().Str())
 		if err != nil {
 			return 0, false, err
 		}
@@ -605,7 +605,7 @@ func (s *State) coerceIntKind(v Value) (val int64, ok bool, nonIntNum bool, err 
 		return i, iok, !iok, nil
 	}
 	if v.IsString() {
-		iv, fv, isInt, nok, serr := s.strToNum(v.AsString().S)
+		iv, fv, isInt, nok, serr := s.strToNum(v.AsString().Str())
 		if serr != nil {
 			return 0, false, false, serr
 		}

@@ -48,6 +48,27 @@ func BenchmarkGoCallLua(b *testing.B) {
 	}
 }
 
+func BenchmarkGoCallLua1(b *testing.B) {
+	proto := compileChunk(b, `return function(a, b) return a * 3 + b end`)
+	s := vm.NewState()
+	cl, err := s.Load(proto)
+	if err != nil {
+		b.Fatal(err)
+	}
+	fn, err := s.Call1(vm.ClosureValue(cl))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		out, err := s.Call1(fn, vm.IntValue(int64(i)), vm.IntValue(7))
+		if err != nil || out.Int() != int64(i)*3+7 {
+			b.Fatalf("unexpected: %v %v", out, err)
+		}
+	}
+}
+
 func BenchmarkLuaCallGoHost1M(b *testing.B) {
 	proto := compileChunk(b, `
 local host_add = host_add

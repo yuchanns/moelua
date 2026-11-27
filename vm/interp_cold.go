@@ -521,7 +521,7 @@ func (s *State) completeFinishOp(th *Thread, cf *callFrame, entryDepth int) (boo
 			return false, err
 		}
 		th.nframe--
-		if s.gc.tier1 {
+		if s.gcNeedsCheck() {
 			s.gcCheckDebt(th.top)
 			if s.abortErr != nil {
 				return false, s.abortErr
@@ -679,6 +679,12 @@ func (s *State) pushMetamethodFrame(th *Thread, ev *frameEnv, tm Value, args []V
 			cf.pc += 1 + cf.cl.bp.proto.Code[cf.pc].SJ()
 		}
 	}
+	if s.gcNeedsCheck() {
+		s.gcCheckDebt(th.top)
+		if s.abortErr != nil {
+			return false, s.abortErr
+		}
+	}
 	return false, nil
 }
 
@@ -697,7 +703,7 @@ func (s *State) getTabUpSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 		}
 		if OptimizeEnabled {
 			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
-			if t.shape != nil && key.Short {
+			if t.shape != nil && key.IsShort() {
 				if slot := t.shape.Lookup(key); slot >= 0 {
 					v := t.slots[slot]
 					if !v.IsNil() || t.meta == nil {
@@ -736,7 +742,7 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 	key := ev.bp.strConsts[c]
 	if rb.IsTable() {
 		t := rb.AsTable()
-		if OptimizeEnabled && t.shape != nil && key.Short {
+		if OptimizeEnabled && t.shape != nil && key.IsShort() {
 			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
 			if ic.polyLookup(t.shape.id) {
 				if ic.kind == icOwnSlot {
@@ -868,7 +874,7 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 	key := ev.bp.strConsts[b]
 	if ra.IsTable() {
 		t := ra.AsTable()
-		if OptimizeEnabled && t.shape != nil && key.Short {
+		if OptimizeEnabled && t.shape != nil && key.IsShort() {
 			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
 			if !t.isProto() && ic.polyLookup(t.shape.id) {
 				if ic.kind == icOwnSlot {
@@ -1205,6 +1211,8 @@ func (s *State) finishGet(obj, key Value) (Value, error) {
 
 //go:noinline
 func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, nargs, nresults int) (bool, error) {
+	th.highStack = len(th.stack)
+	th.highFrames = len(th.frames)
 	funcIdx := ev.base + a
 	fn := th.stack[funcIdx]
 
@@ -1323,7 +1331,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 							th.top = end
 						}
 					}
-					if s.gc.tier1 {
+					if s.gcNeedsCheck() {
 						s.gcCheckDebt(liveTop)
 						if s.abortErr != nil {
 							return false, s.abortErr
@@ -1391,7 +1399,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 						th.top = end
 					}
 				}
-				if s.gc.tier1 {
+				if s.gcNeedsCheck() {
 					s.gcCheckDebt(liveTop)
 					if s.abortErr != nil {
 						return false, s.abortErr
@@ -1474,7 +1482,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					th.top = end
 				}
 			}
-			if s.gc.tier1 {
+			if s.gcNeedsCheck() {
 				s.gcCheckDebt(liveTop)
 				if s.abortErr != nil {
 					return false, s.abortErr
@@ -1571,7 +1579,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			if end := ev.base + int(ev.bp.proto.MaxStackSize); th.top < end {
 				th.top = end
 			}
-			if s.gc.tier1 {
+			if s.gcNeedsCheck() {
 				s.gcCheckDebt(funcIdx + 1)
 				if s.abortErr != nil {
 					return false, s.abortErr
@@ -1589,7 +1597,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				th.top = end
 			}
 		}
-		if s.gc.tier1 {
+		if s.gcNeedsCheck() {
 			s.gcCheckDebt(liveTop)
 			if s.abortErr != nil {
 				return false, s.abortErr
@@ -1650,7 +1658,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 					th.top = end
 				}
 			}
-			if s.gc.tier1 {
+			if s.gcNeedsCheck() {
 				s.gcCheckDebt(liveTop)
 				if s.abortErr != nil {
 					return false, s.abortErr
@@ -2044,6 +2052,12 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 					}
 					return false, uncaught(ferr)
 				}
+				if s.gcNeedsCheck() {
+					s.gcCheckDebt(th.top)
+					if s.abortErr != nil {
+						return false, s.abortErr
+					}
+				}
 				return false, nil
 			}
 		}
@@ -2101,6 +2115,12 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 				return true, nil
 			}
 			return false, uncaught(ferr)
+		}
+		if s.gcNeedsCheck() {
+			s.gcCheckDebt(th.top)
+			if s.abortErr != nil {
+				return false, s.abortErr
+			}
 		}
 		return false, nil
 	}
@@ -2168,6 +2188,16 @@ func (s *State) tforCallSlow(th *Thread, ev *frameEnv, a uint8, c int) (bool, er
 		}
 		if err := th.placeResults(fnIdx, res, c); err != nil {
 			return s.catchSlow(th, ev, false, err)
+		}
+		liveTop := max(th.top, fnIdx+c)
+		if end := ev.base + int(ev.bp.maxStack); th.top < end {
+			th.top = end
+		}
+		if s.gcNeedsCheck() {
+			s.gcCheckDebt(liveTop)
+			if s.abortErr != nil {
+				return false, s.abortErr
+			}
 		}
 		return false, nil
 	}
@@ -2365,7 +2395,7 @@ func (s *State) strToNumForLoop(v Value) (Value, error) {
 	if !v.IsString() {
 		return v, nil
 	}
-	iv, fv, isInt, ok, err := s.strToNum(v.AsString().S)
+	iv, fv, isInt, ok, err := s.strToNum(v.AsString().Str())
 	if err != nil {
 		return NilValue(), err
 	}
@@ -2487,6 +2517,8 @@ func (s *State) forPrepSlow(regs *[256]Value, a uint8) (bool, error) {
 
 //go:noinline
 func (s *State) coldOp(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruction, regs *[256]Value, entryDepth int) (coldAction, int, error) {
+	th.highStack = len(th.stack)
+	th.highFrames = len(th.frames)
 	act, newPC, err := s.coldOpImpl(th, ev, ipc, w, regs, entryDepth)
 	if err == nil && s.abortErr != nil {
 		err = s.abortErr
@@ -3377,6 +3409,12 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 					if perr := th.placeResults(srcStart, out, 4); perr != nil {
 						return coldContinue, pc, perr
 					}
+					if s.gcNeedsCheck() {
+						s.gcCheckDebt(th.top)
+						if s.abortErr != nil {
+							return coldContinue, pc, s.abortErr
+						}
+					}
 					return coldContinue, pc, nil
 				}
 				nres := th.frames[ev.ci].nresults
@@ -3384,6 +3422,12 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 					return coldContinue, pc, perr
 				}
 				th.nframe--
+				if s.gcNeedsCheck() {
+					s.gcCheckDebt(th.top)
+					if s.abortErr != nil {
+						return coldContinue, pc, s.abortErr
+					}
+				}
 				if th.nframe <= entryDepth {
 					return coldReturn, 0, nil
 				}
@@ -3517,7 +3561,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			return coldContinue, pc, err
 		}
 		th.nframe--
-		if s.gc.tier1 {
+		if s.gcNeedsCheck() {
 			s.gcCheckDebt(th.top)
 			if s.abortErr != nil {
 				return coldContinue, pc, s.abortErr
@@ -3845,7 +3889,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			} else {
 				regs[a] = NilValue()
 			}
-		} else if rc.IsString() && rc.AsString().S == "n" {
+		} else if rc.IsString() && rc.AsString().Str() == "n" {
 			regs[a] = IntValue(int64(cf.nextraargs))
 		} else {
 			regs[a] = NilValue()
@@ -3856,7 +3900,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		if !regs[a].IsNil() {
 			bx := w.Bx()
 			if bx > 0 && bx-1 < len(ev.bp.strConsts) && ev.bp.strConsts[bx-1] != nil {
-				return coldContinue, pc, fmt.Errorf("global '%s' already defined", ev.bp.strConsts[bx-1].S)
+				return coldContinue, pc, fmt.Errorf("global '%s' already defined", ev.bp.strConsts[bx-1].Str())
 			}
 			return coldContinue, pc, fmt.Errorf("global '?' already defined")
 		}
@@ -3885,7 +3929,7 @@ func (s *State) objTypeName(v Value) string {
 	}
 	if mt := s.getMetatableOf(v); mt != nil {
 		if nm := mt.RawGetStr(s.intern.Intern("__name")); nm.IsString() {
-			return nm.AsString().S
+			return nm.AsString().Str()
 		}
 	}
 	return v.TypeName()
@@ -3997,7 +4041,7 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 	for i := 0; i < n; i++ {
 		v := th.stack[start+i]
 		if v.IsString() {
-			totalLen += len(v.AsString().S)
+			totalLen += len(v.AsString().Str())
 		} else if v.IsNumber() {
 			ns := FormatValue(v)
 			totalLen += len(ns)
@@ -4031,7 +4075,7 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 			v := th.stack[start+i]
 			var part string
 			if v.IsString() {
-				part = v.AsString().S
+				part = v.AsString().Str()
 			} else {
 				part = numStrs[ni]
 				ni++
@@ -4044,8 +4088,16 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 		th.stack[start] = StringValue(s.intern.Intern(out))
 		if s.gc.tier1 {
 			s.gcRecordAlloc(int64(48+len(out)), start+1)
-		} else if s.memLimit > 0 {
-			s.gc.allocBytes += int64(48 + len(out))
+		} else {
+			if s.memLimit > 0 {
+				s.gc.allocBytes += int64(48 + len(out))
+			}
+			if s.arenaNeedsSweep() {
+				s.gcCheckDebt(start + 1)
+				if s.abortErr != nil {
+					return false, s.abortErr
+				}
+			}
 		}
 		return false, nil
 	}
@@ -4085,7 +4137,7 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 				}
 			}
 			th.stack[cur-1] = StringValue(s.intern.Intern(joined))
-			if s.gc.tier1 {
+			if s.gcNeedsCheck() {
 				s.gcCheckDebt(cur)
 				if s.abortErr != nil {
 					return false, s.abortErr
@@ -4194,6 +4246,12 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 			th.stack[cur-1] = res[0]
 		} else {
 			th.stack[cur-1] = NilValue()
+		}
+		if s.gcNeedsCheck() {
+			s.gcCheckDebt(cur)
+			if s.abortErr != nil {
+				return false, s.abortErr
+			}
 		}
 		cur--
 	}

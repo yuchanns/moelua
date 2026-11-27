@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
 // Frozen Stdlib Template (Phase 2):
@@ -59,9 +61,11 @@ type tmplTableDesc struct {
 }
 
 type stdTemplate struct {
-	short     map[string]*LuaString
-	tms       [tmCount]*LuaString
-	nextStrID uint32
+	strArena      *arena.Arena
+	frozenBuckets []arena.ObjRef
+	frozenMask    uint32
+	tms           [tmCount]*LuaString
+	nextStrID     uint64
 
 	nextShapeID uint64
 
@@ -178,10 +182,13 @@ func buildStdTemplate() *stdTemplate {
 		panic("moelua: stdlib table count exceeds maxStdTables")
 	}
 
+	strArena, frozenBuckets, frozenMask := b.intern.FreezeBootstrap()
 	tmpl := &stdTemplate{
-		short:             b.intern.SnapshotFrozen(),
-		tms:               b.intern.tms,
-		nextStrID:         b.intern.nextID,
+		strArena:              strArena,
+		frozenBuckets:         frozenBuckets,
+		frozenMask:            frozenMask,
+		tms:                   b.intern.tms,
+		nextStrID:             b.intern.nextID,
 		nextShapeID:       b.shapes.nextID,
 		builtinNext:           b.builtinNext,
 		builtinIPairsIter:     b.builtinIPairsIter,
@@ -316,11 +323,14 @@ func cloneFromStdTemplate(noEnv bool) *State {
 
 	s := &a.state
 	s.intern = stringInterner{
-		seed:   globalStrSeed,
-		nextID: tmpl.nextStrID,
-		frozen: tmpl.short,
-		tms:    tmpl.tms,
+		seed:          globalStrSeed,
+		nextID:        tmpl.nextStrID,
+		frozenArena:   tmpl.strArena,
+		frozenBuckets: tmpl.frozenBuckets,
+		frozenMask:    tmpl.frozenMask,
+		tms:           tmpl.tms,
 	}
+	s.arenaSweepThresh = defaultArenaSweepThresh
 	s.shapes.init(tmpl.nextShapeID)
 	s.out = os.Stdout
 	s.errOut = os.Stderr

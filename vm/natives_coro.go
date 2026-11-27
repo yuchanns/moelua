@@ -822,7 +822,7 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 				// Match Lua 5.5 lcorolib.c:luaB_auxwrap: prepend caller location to string error objects.
 				if errVal.IsString() {
 					if where := s.errorWhere(1); where != "" {
-						if ls, ierr := s.TryIntern(where + errVal.AsString().S); ierr == nil {
+						if ls, ierr := s.TryIntern(where + errVal.AsString().Str()); ierr == nil {
 							errVal = StringValue(ls)
 						} else {
 							return nil, ierr

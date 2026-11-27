@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"strings"
 
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/compiler"
@@ -794,12 +795,30 @@ func (s *State) LoadReader(chunkName string, r io.Reader) (Value, error) {
 	return s.vm.LoadChunkReader(r, chunkName)
 }
 
+// ToString returns a safe Go string copy of a Lua string Value, or ("", false) if v is not a string
+// or s is closed. Copying guarantees the returned Go string remains valid after Lua GC or State.Close.
+func (s *State) ToString(v Value) (string, bool) {
+	if !s.ready() || !v.IsString() {
+		return "", false
+	}
+	return strings.Clone(v.AsString().Str()), true
+}
+
 // Call invokes a Lua function, GoFunc, or callable table/userdata with args.
 func (s *State) Call(fn Value, args ...Value) ([]Value, error) {
 	if !s.ready() {
 		return nil, ErrStateClosed
 	}
 	return s.vm.Call(fn, args...)
+}
+
+// Call1 invokes fn(args...) and returns its first result (or Nil if none) with zero
+// return-slice allocation on the hot Lua closure path.
+func (s *State) Call1(fn Value, args ...Value) (Value, error) {
+	if !s.ready() {
+		return vm.NilValue(), ErrStateClosed
+	}
+	return s.vm.Call1(fn, args...)
 }
 
 // DoString compiles and executes a Lua 5.5.1 source snippet.

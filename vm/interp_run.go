@@ -136,7 +136,7 @@ reloadFrame:
 						regs[a] = v
 						continue
 					}
-				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.IsShort() {
 					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
@@ -162,7 +162,7 @@ reloadFrame:
 						regs[a] = v
 						continue
 					}
-				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.IsShort() {
 					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
@@ -225,7 +225,7 @@ reloadFrame:
 						regs[a] = v
 						continue
 					}
-				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.Short {
+				} else if k := ev.bp.strConsts[uint8(w>>bytecode.PosC)]; k.IsShort() {
 					if v := t.RawGetStr(k); !v.IsNil() || t.meta == nil {
 						regs[a] = v
 						continue
@@ -610,7 +610,7 @@ reloadFrame:
 					continue
 				}
 			} else if rb.IsString() {
-				regs[a].SetInt(int64(len(rb.AsString().S)))
+				regs[a].SetInt(int64(rb.AsString().Len))
 				continue
 			}
 			goto cold
@@ -633,7 +633,7 @@ reloadFrame:
 				cond = false
 			} else if ra.IsUserdata() && rb.IsUserdata() && ra.ptr != rb.ptr {
 				goto cold
-			} else if ra.IsString() && rb.IsString() && !ra.AsString().Short {
+			} else if ra.IsString() && rb.IsString() && !ra.AsString().IsShort() {
 				goto cold
 			} else {
 				cond = RawEqual(ra, rb)
@@ -681,7 +681,7 @@ reloadFrame:
 
 		case bytecode.OP_EQK:
 			ra, rb := regs[a], ev.consts[uint8(w>>bytecode.PosB)]
-			if ra.IsString() && rb.IsString() && ra.ptr != rb.ptr && !ra.AsString().Short {
+			if ra.IsString() && rb.IsString() && ra.ptr != rb.ptr && !ra.AsString().IsShort() {
 				goto cold
 			}
 			cond := RawEqual(ra, rb)
@@ -830,6 +830,12 @@ reloadFrame:
 						nf.pc = 0
 						nf.nresults = c - 1
 						th.nframe = newCI + 1
+						if newCI+1 > th.highFrames {
+							th.highFrames = newCI + 1
+						}
+						if frameEnd := newBase + int(bp.maxStack); frameEnd > th.highStack {
+							th.highStack = frameEnd
+						}
 						ev.ci = newCI
 						ev.cl = callee
 						if bp != ev.bp {
@@ -1089,7 +1095,7 @@ func execIntrinsic1(intr uint8, regs *[256]Value, a uint8, nargs int) bool {
 			k := regs[a+2]
 			if t.hash != nil && k.IsString() {
 				ls := k.AsString()
-				if !ls.Short && len(ls.S) > strHashCancelChunk && atomic.LoadUint32(&ls.Hash) == 0 {
+				if !ls.IsShort() && int(ls.Len) > strHashCancelChunk && atomic.LoadUint32(&ls.Hash) == 0 {
 					return false
 				}
 			}
@@ -1102,12 +1108,12 @@ func execIntrinsic1(intr uint8, regs *[256]Value, a uint8, nargs int) bool {
 			return true
 		}
 		if arg0.IsString() {
-			regs[a].SetInt(int64(len(arg0.AsString().S)))
+			regs[a].SetInt(int64(arg0.AsString().Len))
 			return true
 		}
 	case intrStringLen:
 		if arg0.IsString() {
-			regs[a].SetInt(int64(len(arg0.AsString().S)))
+			regs[a].SetInt(int64(arg0.AsString().Len))
 			return true
 		}
 	}
