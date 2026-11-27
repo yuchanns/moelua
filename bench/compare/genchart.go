@@ -577,6 +577,8 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 		yStep = 25.0
 	} else if maxMs <= 250 {
 		yStep = 50.0
+	} else if maxMs > 1200 {
+		yStep = 400.0
 	} else if maxMs > 600 {
 		yStep = 200.0
 	}

@@ -346,7 +346,7 @@ func main() {
 	workerMode := flag.String("worker-mode", "idle", "worker mode: idle or active-scale")
 	jsonOut := flag.String("json", "", "optional path to write structured JSON results")
 	count := flag.Int("n", 256, "primary VM count for summary table")
-	scaleFlag := flag.String("scale", "32,128,256,512", "comma-separated active VM counts for scaling curve")
+	scaleFlag := flag.String("scale", "64,256,512,1000", "comma-separated active VM counts for scaling curve")
 	flag.Parse()
 
 	scaleCounts, err := parseScaleList(*scaleFlag)
