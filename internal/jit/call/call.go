@@ -10,8 +10,12 @@
 //     RBP, RSP, and XMM15 (zero).
 package call
 
-// Call invokes JIT-compiled machine code at entry, passing ctx as its sole pointer-sized
+import "unsafe"
+
+// Call invokes JIT-compiled machine code at entry, passing ctx as its sole pointer
 // argument and returning the uint64 exit code produced by the compiled code.
+// Taking unsafe.Pointer with //go:noescape keeps ctx stack-allocated while ensuring
+// Go's compiler tracks mutations through ctx and updates its address across stack growth.
 //
 //go:noescape
-func Call(entry uintptr, ctx uintptr) uint64
+func Call(entry uintptr, ctx unsafe.Pointer) uint64

@@ -59,7 +59,7 @@ func TestCallNativeCode(t *testing.T) {
 	defer reg.Free()
 
 	var val uint64 = 100
-	got := Call(reg.Addr(), uintptr(unsafe.Pointer(&val)))
+	got := Call(reg.Addr(), unsafe.Pointer(&val))
 	if val != 113 {
 		t.Fatalf("mutated ctx val = %d, want 113", val)
 	}
