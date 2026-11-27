@@ -363,10 +363,31 @@ func TestCompactSnapshotAndCloneSnapshot(t *testing.T) {
 		t.Fatalf("mutating compacted clone corrupted template src")
 	}
 
-	// Freeing every object on a compacted page must release that page cleanly without stashing flatSlab in sparePage.
+	// Freeing one sub-page of a shared flat slab reduces ActivePages, while BackingBytes
+	// continues to account for the full shared flat slab until its final surviving sub-page is freed.
 	clone.Free(r16)
-	if clone.ActivePages() != 3 || clone.BackingBytes() != afterBacking+2048-16 {
-		t.Fatalf("freeing compacted 16B page accounting mismatch: pages=%d backing=%d",
+	if clone.ActivePages() != 3 || clone.BackingBytes() != afterBacking+2048 {
+		t.Fatalf("after freeing 1 of 3 shared sub-pages: pages=%d backing=%d want (3, %d)",
+			clone.ActivePages(), clone.BackingBytes(), afterBacking+2048)
+	}
+
+	// Free the remaining objects on the other two shared sub-pages -> shared flat slab bytes are now released,
+	// leaving only the standalone 2 KiB runtime page holding fresh64.
+	clone.Free(r64a)
+	clone.Free(reused)
+	clone.Free(r64b)
+	if clone.ActivePages() != 2 || clone.BackingBytes() != afterBacking+2048 {
+		t.Fatalf("after freeing 2 of 3 shared sub-pages: pages=%d backing=%d want (2, %d)",
+			clone.ActivePages(), clone.BackingBytes(), afterBacking+2048)
+	}
+	clone.Free(r512)
+	if clone.ActivePages() != 1 || clone.BackingBytes() != 2048 {
+		t.Fatalf("after releasing final shared sub-page: pages=%d backing=%d want (1, 2048)",
+			clone.ActivePages(), clone.BackingBytes())
+	}
+	clone.Free(fresh64)
+	if clone.ActivePages() != 0 || clone.BackingBytes() != 0 {
+		t.Fatalf("after freeing all pages: pages=%d backing=%d want (0, 0)",
 			clone.ActivePages(), clone.BackingBytes())
 	}
 }

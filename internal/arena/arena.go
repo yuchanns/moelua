@@ -150,7 +150,9 @@ type Arena struct {
 	freeLargeIDs []uint32
 
 	allocBytes       int64 // exact live bytes currently allocated across slabs and large spans
-	backingSlabBytes int64 // exact bytes currently backed by active slab pages
+	backingSlabBytes int64 // exact bytes currently backed by standalone active slab pages
+	sharedSlabBytes  int64 // exact bytes of the shared compacted/cloned flat slab while >= 1 sub-page lives
+	sharedSlabPages  int   // number of active pages currently referencing the shared flat slab
 	limit            int64 // optional hard byte limit (<= 0 disables limit)
 	liveObjects      int64 // exact count of live allocations
 	activePages      int   // number of non-nil slab pages
@@ -191,9 +193,9 @@ func (a *Arena) ActivePages() int { return a.activePages }
 func (a *Arena) ActiveLargeSpans() int { return a.activeLarge }
 
 // BackingBytes returns the total []byte memory currently backed by Go for this Arena
-// (active slab pages + cached spare page + active large spans).
+// (standalone active slab pages + retained shared flat slab + cached spare page + active large spans).
 func (a *Arena) BackingBytes() int64 {
-	total := a.backingSlabBytes
+	total := a.backingSlabBytes + a.sharedSlabBytes
 	if a.sparePage != nil {
 		total += int64(len(a.sparePage))
 	}
@@ -477,9 +479,16 @@ func (a *Arena) Free(ref ObjRef) {
 		*meta = pageMeta{}
 		a.freePageIDs = append(a.freePageIDs, pid)
 		a.activePages--
-		a.backingSlabBytes -= int64(len(buf))
-		if a.sparePage == nil && !shared && len(buf) == PageSize {
-			a.sparePage = buf
+		if shared {
+			a.sharedSlabPages--
+			if a.sharedSlabPages == 0 {
+				a.sharedSlabBytes = 0
+			}
+		} else {
+			a.backingSlabBytes -= int64(len(buf))
+			if a.sparePage == nil && len(buf) == PageSize {
+				a.sparePage = buf
+			}
 		}
 		return
 	}
@@ -706,6 +715,8 @@ func (a *Arena) Close() {
 	a.freeLargeIDs = nil
 	a.allocBytes = 0
 	a.backingSlabBytes = 0
+	a.sharedSlabBytes = 0
+	a.sharedSlabPages = 0
 	a.liveObjects = 0
 	a.activePages = 0
 	a.activeLarge = 0
@@ -727,6 +738,7 @@ func (a *Arena) CompactSnapshot() {
 	}
 	var totalBytes int
 	var totalBitWords int
+	var packedPages int
 	for pid := 1; pid < len(a.pages); pid++ {
 		meta := &a.pageMeta[pid]
 		if !meta.active || a.pages[pid] == nil {
@@ -736,8 +748,12 @@ func (a *Arena) CompactSnapshot() {
 		totalBytes += usedBytes
 		slots := int(meta.bumpOff / classWords[meta.class])
 		totalBitWords += (slots + 63) >> 6
+		packedPages++
 	}
 	if totalBytes == 0 {
+		a.backingSlabBytes = 0
+		a.sharedSlabBytes = 0
+		a.sharedSlabPages = 0
 		return
 	}
 	flatSlab := make([]byte, totalBytes)
@@ -748,6 +764,7 @@ func (a *Arena) CompactSnapshot() {
 	if totalBitWords > 0 {
 		flatBits = make([]uint64, totalBitWords)
 	}
+	shared := packedPages > 1
 	byteOff := 0
 	bitOff := 0
 	for pid := 1; pid < len(a.pages); pid++ {
@@ -773,12 +790,20 @@ func (a *Arena) CompactSnapshot() {
 		a.pagePtrs[pid] = unsafe.Pointer(unsafe.SliceData(sub))
 		meta.liveBits = subBits
 		meta.capWords = meta.bumpOff
-		meta.sharedSlab = true
+		meta.sharedSlab = shared
 		if meta.freeHead == NullRef {
 			a.unlinkAvail(uint32(pid))
 		}
 	}
-	a.backingSlabBytes = int64(totalBytes)
+	if shared {
+		a.backingSlabBytes = 0
+		a.sharedSlabBytes = int64(totalBytes)
+		a.sharedSlabPages = packedPages
+	} else {
+		a.backingSlabBytes = int64(totalBytes)
+		a.sharedSlabBytes = 0
+		a.sharedSlabPages = 0
+	}
 }
 
 // CloneSnapshot produces a completely independent deep copy of this Arena by copying
@@ -817,9 +842,11 @@ func (a *Arena) CloneSnapshot() *Arena {
 
 	var totalSlabBytes int
 	var totalBitWords int
+	var packedPages int
 	for pid := 1; pid < len(a.pages); pid++ {
 		if src := a.pages[pid]; src != nil {
 			totalSlabBytes += len(src)
+			packedPages++
 		}
 		if srcBits := a.pageMeta[pid].liveBits; len(srcBits) > 0 {
 			totalBitWords += len(srcBits)
@@ -836,6 +863,7 @@ func (a *Arena) CloneSnapshot() *Arena {
 	if totalBitWords > 0 {
 		flatBits = make([]uint64, totalBitWords)
 	}
+	shared := packedPages > 1
 	byteOff := 0
 	bitOff := 0
 	for pid := 1; pid < len(a.pages); pid++ {
@@ -846,7 +874,7 @@ func (a *Arena) CloneSnapshot() *Arena {
 			byteOff += n
 			cp.pages[pid] = dst
 			cp.pagePtrs[pid] = unsafe.Pointer(unsafe.SliceData(dst))
-			cp.pageMeta[pid].sharedSlab = (totalSlabBytes != n)
+			cp.pageMeta[pid].sharedSlab = shared
 		}
 		if srcBits := a.pageMeta[pid].liveBits; len(srcBits) > 0 {
 			nb := len(srcBits)
@@ -856,7 +884,12 @@ func (a *Arena) CloneSnapshot() *Arena {
 			cp.pageMeta[pid].liveBits = dstBits
 		}
 	}
-	cp.backingSlabBytes = int64(totalSlabBytes)
+	if shared {
+		cp.sharedSlabBytes = int64(totalSlabBytes)
+		cp.sharedSlabPages = packedPages
+	} else {
+		cp.backingSlabBytes = int64(totalSlabBytes)
+	}
 
 	for idx := 1; idx < len(a.largeSpans); idx++ {
 		if src := a.largeSpans[idx]; src != nil {
