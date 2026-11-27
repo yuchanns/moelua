@@ -91,7 +91,7 @@ jobs:
           dispatch = os.environ["DISPATCH_SHA"]
           want = "Release " + os.environ["RELEASE_TAG"]
           out = subprocess.check_output(
-              ["git", "log", "--first-parent", "--format=%H\x00%P\x00%s", f"{dispatch}..HEAD"],
+              ["git", "log", "--first-parent", "--format=%H%x00%P%x00%s", f"{dispatch}..HEAD"],
               text=True,
           )
           for line in out.splitlines():
