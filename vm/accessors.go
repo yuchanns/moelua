@@ -6,9 +6,8 @@ import (
 	"github.com/yuchanns/moelua/internal/arena"
 )
 
-// Accessor layer backing the interpreter, debug, and stdlib call sites (Step 5c:
-// noscan Value, Arena String/Closure/Upvalue/Native/Userdata/Proto + GoRefs, and
-// arena.Collector with thin Arena stubs bridging Table & Thread until Step 5d).
+// Accessor layer backing the interpreter, debug, and stdlib call sites over
+// per-State noscan Arena storage (all methods are small and inlineable).
 
 // --- State root & GC pacing accessors ---
 
@@ -38,17 +37,9 @@ func (s *State) setStringMeta(mt *Table) {
 	s.typeMetaRefs[4] = mt.self
 }
 
-func (s *State) newSmallRecordTable() *Table {
-	t := &Table{shape: s.shapes.root}
-	t.slots = t.inlineSlots[:0]
-	s.allocTableStub(t)
-	s.addTableMem(t, 80)
-	return t
-}
-
 func (s *State) gcNeedsStep() bool { return s.collector.NeedsStep() }
 
-func (s *State) recordNewTableAlloc(_ int64, _ int)          {}
+func (s *State) recordNewTableAlloc(_ int64, _ int)      {}
 func (s *State) noteShapeMetaKeyWrite(_ *Table, _ *LuaString) {}
 
 func (s *State) checkPreallocMem(delta int64) error {
@@ -68,6 +59,7 @@ func (s *State) checkPreallocMemWithRoots(delta int64, r1, r2, r3 Value) error {
 func (s *State) tableCreateCheckBytes(nseq, nrec int64) int64 {
 	checkBytes := tablePreallocBytes(nseq, nrec)
 	if OptimizeEnabled && nseq > 0 {
+		// Enforce requested sequence capacity (16B/elem worst case) up front (matching lua_createtable).
 		checkBytes += nseq * 8
 	}
 	return checkBytes
@@ -88,22 +80,21 @@ func (s *State) coroWrapPreallocBytes() int64 {
 // --- Arena GC write barriers ---
 
 func (s *State) barrierTableVal(t *Table, val Value) {
-	if val.IsGCObject() && t.self != arena.NullRef && s.arena.Header(t.self).IsBlack() {
+	if val.IsGCObject() && t.hdr.IsBlack() {
 		s.collector.BarrierBack(t.self)
 	}
 }
 
 func (s *State) barrierBackTable(t *Table) {
-	if t.self != arena.NullRef && s.arena.Header(t.self).IsBlack() {
+	if t.hdr.IsBlack() {
 		s.collector.BarrierBack(t.self)
 	}
 }
 
 // --- Thread storage & lifecycle accessors ---
 
-func (th *Thread) framesLen() int       { return th.framesCap }
-func (th *Thread) stackSize() int       { return th.stackLen }
-func (th *Thread) openUpvalsCount() int { return int(th.openUpvalsLen) }
+func (th *Thread) framesLen() int { return th.framesCap }
+func (th *Thread) stackSize() int { return th.stackLen }
 
 func (th *Thread) popTBCAtOrAbove(a *arena.Arena, level int) (int, bool) {
 	if th.tbcLen <= 0 {
@@ -161,7 +152,10 @@ func (s *State) setFrameClosure(cf *callFrame, cl *Closure) {
 }
 
 func (s *State) frameVarargTab(cf *callFrame) *Table {
-	return s.tableByRef(cf.varargTabRef)
+	if cf.varargTabRef == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Table](s.arena, cf.varargTabRef)
 }
 
 func (s *State) setFrameVarargTab(cf *callFrame, t *Table) {
@@ -316,61 +310,66 @@ func (s *State) userdataUValGet(u *Userdata, idx int) Value {
 
 // --- Table, Shape & IC accessors ---
 
-func (t *Table) hasMeta() bool                         { return t.meta != nil }
-func (t *Table) hasHash() bool                         { return t.hash != nil }
-func (t *Table) shapePtr(_ *arena.Arena) *Shape        { return t.shape }
-func (t *Table) setShape(_ *State, sh *Shape)          { t.shape = sh }
-func (t *Table) slotAt(_ *arena.Arena, slot int) Value { return t.slots[slot] }
-func (t *Table) slotPtr(_ *arena.Arena, slot int) *Value {
-	return &t.slots[slot]
-}
-func (t *Table) appendSlotFor(s *State, val Value) bool {
-	oldCap := cap(t.slots)
-	t.appendSlot(val)
-	if cap(t.slots) > oldCap {
-		s.addTableMem(t, int64(cap(t.slots)-oldCap)*16)
+func (t *Table) hasMeta() bool { return t.metaRef != arena.NullRef }
+func (t *Table) hasHash() bool { return t.hashRef != arena.NullRef }
+
+func (t *Table) shapePtr(a *arena.Arena) *Shape {
+	if t.shapeRef == arena.NullRef {
+		return nil
 	}
-	return true
+	return arena.AsSmall[Shape](a, t.shapeRef)
 }
 
-func (sh *Shape) lookupKey(_ *State, k *LuaString) int32 { return sh.Lookup(k) }
-func (sh *Shape) hasMeta() bool                          { return sh.meta != nil }
+func (t *Table) setShape(_ *State, sh *Shape) {
+	if sh == nil {
+		t.shapeRef = arena.NullRef
+		return
+	}
+	t.shapeRef = sh.self
+}
+
+func (t *Table) appendSlotFor(s *State, val Value) bool { return t.appendSlot(s, val) }
+
+func (sh *Shape) lookupKey(s *State, k *LuaString) int32 { return sh.Lookup(s, k) }
+func (sh *Shape) hasMeta() bool                          { return sh.metaRef != arena.NullRef }
 
 func (s *State) tableHashValAt(t *Table, slot int) Value {
-	return t.hash.nodes[slot].val
+	h := arena.AsSmall[tableHash](s.arena, t.hashRef)
+	return h.nodesSlice(s.arena)[slot].val
 }
 
 func (ic *ICEntry) differsFromShape(sh *Shape) bool {
-	return ic.shapeID != 0 && ic.shapeID != sh.id
+	return ic.shapeRef != arena.NullRef && ic.shapeRef != sh.self
 }
 
-func (ic *ICEntry) polyLookupFor(_ *State, sh *Shape) bool {
-	return ic.polyLookup(sh.id)
+func (ic *ICEntry) polyLookupFor(s *State, sh *Shape) bool {
+	return ic.polyLookup(s.arena, sh.self)
 }
 
-func (ic *ICEntry) polySavePrimaryFor(_ *State) {
-	ic.polySavePrimary()
+func (ic *ICEntry) polySavePrimaryFor(s *State) {
+	ic.polySavePrimary(s)
 }
 
 func (ic *ICEntry) setOwnSlotFor(sh *Shape, slot int32, noMeta, protoAbsent bool, epoch uint64) {
-	ic.setOwnSlot(sh.id, slot, noMeta, protoAbsent, epoch)
+	ic.setOwnSlot(sh.self, slot, noMeta, protoAbsent, epoch)
 }
 
-func (ic *ICEntry) setEnvSlotFor(_ *State, t *Table, slot int32, noMeta bool) {
-	ic.setEnvSlot(t, t.hash.dictGen, slot, noMeta)
+func (ic *ICEntry) setEnvSlotFor(s *State, t *Table, slot int32, noMeta bool) {
+	h := arena.AsSmall[tableHash](s.arena, t.hashRef)
+	ic.setEnvSlot(s.arena, t.self, h.dictGen, slot, noMeta)
 }
 
 func (ic *ICEntry) setProtoValFor(sh *Shape, v Value, epoch uint64, noMeta bool) {
-	ic.setProtoVal(sh.id, v, epoch, noMeta)
+	ic.setProtoVal(sh.self, v, epoch, noMeta)
 }
 
 func (ic *ICEntry) setAddSlotFor(oldSh, nextSh *Shape, slot int32, epoch uint64, noMeta bool) {
-	ic.setAddSlot(oldSh.id, nextSh, slot, epoch, noMeta)
+	ic.setAddSlot(oldSh.self, nextSh.self, slot, epoch, noMeta)
 }
 
 func (ic *ICEntry) tryPolyGetField(s *State, t *Table) (Value, bool) {
 	if ic.kind == icOwnSlot {
-		v := t.slots[ic.slot]
+		v := t.slotAt(s.arena, int(ic.slot))
 		if !v.IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
 			return v, true
 		}
@@ -382,18 +381,23 @@ func (ic *ICEntry) tryPolyGetField(s *State, t *Table) (Value, bool) {
 
 func (ic *ICEntry) tryPolySetField(s *State, t *Table, val Value) bool {
 	if ic.kind == icOwnSlot {
-		if !t.slots[ic.slot].IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
-			t.slots[ic.slot] = val
-			s.barrierTableVal(t, val)
+		sp := t.slotPtr(s.arena, int(ic.slot))
+		if !sp.IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
+			*sp = val
+			if val.IsGCObject() && t.hdr.IsBlack() {
+				s.collector.BarrierBack(t.self)
+			}
 			return true
 		}
 	} else if ic.kind == icAddSlot && !val.IsNil() && (ic.noMeta || s.protoEpoch == ic.epoch) {
 		slot := int(ic.slot)
-		if ts := ic.targetShape.Value(); ts != nil && slot < cap(t.slots) {
-			t.slots = t.slots[:slot+1]
-			t.slots[slot] = val
-			t.shape = ts
-			s.barrierBackTable(t)
+		if ic.targetShapeRef != arena.NullRef && slot < int(t.slotsCap) {
+			t.slotsLen = uint8(slot + 1)
+			*t.slotPtr(s.arena, slot) = val
+			t.shapeRef = ic.targetShapeRef
+			if t.hdr.IsBlack() {
+				s.collector.BarrierBack(t.self)
+			}
 			return true
 		}
 	}
@@ -401,16 +405,18 @@ func (ic *ICEntry) tryPolySetField(s *State, t *Table, val Value) bool {
 }
 
 func (s *State) transitionShapeFor(oldSh *Shape, key *LuaString, tblVal, val Value) (*Shape, error) {
-	return s.shapes.Transition(s, oldSh, key, tblVal, val)
+	return s.shapes.Transition(s, oldSh.self, key, tblVal, val)
 }
 
 func (s *State) checkShapeSlotMem(t *Table, next *Shape, key *LuaString, val Value) error {
-	if s.memLimit > 0 && len(t.slots) == cap(t.slots) {
-		prevPinned := s.pinnedShape
-		s.pinnedShape = next
-		err := s.checkMemWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(key), val)
-		s.pinnedShape = prevPinned
-		return err
+	if s.memLimit > 0 && t.slotsLen == t.slotsCap {
+		if delta := t.slotsGrowthDelta(s); delta > 0 {
+			prevPinned := s.pinnedShapeRef
+			s.pinnedShapeRef = next.self
+			err := s.checkMemWithRoots(delta, TableValue(t), StringValue(key), val)
+			s.pinnedShapeRef = prevPinned
+			return err
+		}
 	}
 	return nil
 }

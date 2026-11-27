@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"unsafe"
-	"weak"
 
 	"github.com/yuchanns/moelua/internal/arena"
 )
@@ -75,11 +74,34 @@ func (s *State) gcMarkLeaf(c *arena.Collector, ref arena.ObjRef) bool {
 func (s *State) gcAuxBytes(a *arena.Arena, ref arena.ObjRef) int64 {
 	switch a.Header(ref).Kind {
 	case gcKindTable:
-		t := s.tableByRef(ref)
-		if t == nil {
-			return 0
+		t := arena.AsSmall[Table](a, ref)
+		var total int64
+		if t.arrRef != arena.NullRef {
+			total += int64(a.SlotSize(t.arrRef))
+		} else if t.arrHint > 0 {
+			total += int64(t.arrHint) * 8
 		}
-		return t.memBytes
+		if t.slotsRef != arena.NullRef {
+			total += int64(a.SlotSize(t.slotsRef))
+		}
+		if t.hashRef != arena.NullRef {
+			total += int64(a.SlotSize(t.hashRef))
+			h := arena.AsSmall[tableHash](a, t.hashRef)
+			if h.nodesRef != arena.NullRef {
+				total += int64(a.SlotSize(h.nodesRef))
+			}
+		}
+		return total
+	case gcKindShape:
+		sh := arena.AsSmall[Shape](a, ref)
+		var total int64
+		if sh.transRef != arena.NullRef {
+			total += int64(a.SlotSize(sh.transRef))
+		}
+		if sh.indexRef != arena.NullRef {
+			total += int64(a.SlotSize(sh.indexRef))
+		}
+		return total
 	case gcKindClosure:
 		cl := arena.AsSmall[Closure](a, ref)
 		if cl.upvalsRef != arena.NullRef {
@@ -137,6 +159,15 @@ func (s *State) gcAuxBytes(a *arena.Arena, ref arena.ObjRef) int64 {
 		if ap.subRef != arena.NullRef {
 			total += int64(a.SlotSize(ap.subRef))
 		}
+		if ap.icRef != arena.NullRef {
+			total += int64(a.SlotSize(ap.icRef))
+			ics := arena.SliceFast[ICEntry](a, ap.icRef, 0, int(ap.nIC))
+			for i := range ics {
+				if ics[i].polyRef != arena.NullRef {
+					total += int64(a.SlotSize(ics[i].polyRef))
+				}
+			}
+		}
 		if int(ap.protoIdx) > 0 && int(ap.protoIdx) < len(s.protos) {
 			if bp := s.protos[ap.protoIdx]; bp != nil {
 				total += bp.goBytes
@@ -145,17 +176,6 @@ func (s *State) gcAuxBytes(a *arena.Arena, ref arena.ObjRef) int64 {
 		return total
 	default:
 		return 0
-	}
-}
-
-func (s *State) markShape(c *arena.Collector, sh *Shape) {
-	for cur := sh; cur != nil; cur = cur.parent {
-		if cur.meta != nil && cur.meta.self != arena.NullRef {
-			c.MarkObject(cur.meta.self)
-		}
-		if cur.key != nil && cur.key.hdr.Flags&strFlagFixed == 0 && cur.key.self != arena.NullRef {
-			c.MarkObject(cur.key.self)
-		}
 	}
 }
 
@@ -177,8 +197,11 @@ func (s *State) gcMarkRoots(c *arena.Collector) {
 			c.MarkObject(ref)
 		}
 	}
-	if s.pinnedShape != nil {
-		s.markShape(c, s.pinnedShape)
+	if s.shapes.rootRef != arena.NullRef {
+		c.MarkObject(s.shapes.rootRef)
+	}
+	if s.pinnedShapeRef != arena.NullRef {
+		c.MarkObject(s.pinnedShapeRef)
 	}
 	s.markValue(c, s.stdinInput)
 	s.markValue(c, s.defaultInput)
@@ -220,10 +243,11 @@ func (s *State) isClearedWeak(c *arena.Collector, v Value) bool {
 }
 
 func (s *State) weakModeOf(t *Table) (weakK, weakV bool) {
-	if t.meta == nil {
+	if t.metaRef == arena.NullRef {
 		return false, false
 	}
-	mv := t.meta.RawGetStr(s, s.intern.tms[TMMode])
+	mt := arena.AsSmall[Table](s.arena, t.metaRef)
+	mv := mt.RawGetStr(s, s.intern.tms[TMMode])
 	if !mv.IsString() {
 		return false, false
 	}
@@ -249,11 +273,17 @@ func (s *State) gcTraverse(c *arena.Collector, ref arena.ObjRef) int64 {
 	a := s.arena
 	switch a.Header(ref).Kind {
 	case gcKindTable:
-		t := s.tableByRef(ref)
-		if t == nil {
-			return 1
+		return s.gcTraverseTable(c, arena.AsSmall[Table](a, ref))
+	case gcKindShape:
+		sh := arena.AsSmall[Shape](a, ref)
+		if sh.parentRef != arena.NullRef {
+			c.MarkObject(sh.parentRef)
 		}
-		return s.gcTraverseTable(c, t)
+		if sh.metaRef != arena.NullRef {
+			c.MarkObject(sh.metaRef)
+		}
+		s.markValue(c, sh.keyVal)
+		return 1
 	case gcKindClosure:
 		cl := arena.AsSmall[Closure](a, ref)
 		if cl.protoRef != arena.NullRef {
@@ -318,18 +348,19 @@ func (s *State) gcTraverse(c *arena.Collector, ref arena.ObjRef) int64 {
 }
 
 func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
-	if t.shape != nil {
-		s.markShape(c, t.shape)
+	a := s.arena
+	if t.shapeRef != arena.NullRef {
+		c.MarkObject(t.shapeRef)
 	}
-	if t.meta != nil && t.meta.self != arena.NullRef {
-		c.MarkObject(t.meta.self)
+	if t.metaRef != arena.NullRef {
+		c.MarkObject(t.metaRef)
 	}
 	var work int64 = 1
 	weakK, weakV := s.weakModeOf(t)
 	checkCancel := s.hasInterruptControl()
 	if !weakK && !weakV {
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
-			arr := t.arrValSlice(nil)
+			arr := t.arrValSlice(a)
 			for i, v := range arr {
 				if checkCancel && (i&4095) == 4095 {
 					if err := s.gcCancelCheck(); err != nil {
@@ -341,14 +372,14 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 			}
 			work += int64(len(arr))
 		}
-		if len(t.slots) > 0 {
-			for _, v := range t.slots {
+		if slots := t.slotsSlice(a); len(slots) > 0 {
+			for _, v := range slots {
 				s.markValue(c, v)
 			}
-			work += int64(len(t.slots))
+			work += int64(len(slots))
 		}
-		if t.hash != nil {
-			nodes := t.hash.nodes
+		if t.hashRef != arena.NullRef {
+			nodes := arena.AsSmall[tableHash](a, t.hashRef).nodesSlice(a)
 			for i := range nodes {
 				if checkCancel && (i&4095) == 4095 {
 					if err := s.gcCancelCheck(); err != nil {
@@ -357,7 +388,7 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 					}
 				}
 				nd := &nodes[i]
-				if nd.used && !nd.dead && !nd.val.IsNil() {
+				if nd.state == nodeLive && !nd.val.IsNil() {
 					s.markValue(c, nd.key)
 					s.markValue(c, nd.val)
 				}
@@ -367,8 +398,9 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 		return work
 	}
 	if weakK && weakV {
+		// All-weak table: mark non-weak values/keys (e.g. strings, non-collectable natives).
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
-			for i, v := range t.arrValSlice(nil) {
+			for i, v := range t.arrValSlice(a) {
 				if checkCancel && (i&4095) == 4095 {
 					if err := s.gcCancelCheck(); err != nil {
 						c.SetCancelErr(err)
@@ -380,13 +412,13 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 				}
 			}
 		}
-		for _, v := range t.slots {
+		for _, v := range t.slotsSlice(a) {
 			if !v.IsNil() && !s.isWeakCollectable(v) {
 				s.markValue(c, v)
 			}
 		}
-		if t.hash != nil {
-			nodes := t.hash.nodes
+		if t.hashRef != arena.NullRef {
+			nodes := arena.AsSmall[tableHash](a, t.hashRef).nodesSlice(a)
 			for i := range nodes {
 				if checkCancel && (i&4095) == 4095 {
 					if err := s.gcCancelCheck(); err != nil {
@@ -395,7 +427,7 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 					}
 				}
 				nd := &nodes[i]
-				if nd.used && !nd.dead && !nd.val.IsNil() {
+				if nd.state == nodeLive && !nd.val.IsNil() {
 					if !s.isWeakCollectable(nd.key) {
 						s.markValue(c, nd.key)
 					}
@@ -412,7 +444,7 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 	if weakV {
 		hasClears := false
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
-			arr := t.arrValSlice(nil)
+			arr := t.arrValSlice(a)
 			for i, v := range arr {
 				if checkCancel && (i&4095) == 4095 {
 					if err := s.gcCancelCheck(); err != nil {
@@ -430,8 +462,8 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 			}
 			work += int64(len(arr))
 		}
-		if len(t.slots) > 0 {
-			for _, v := range t.slots {
+		if slots := t.slotsSlice(a); len(slots) > 0 {
+			for _, v := range slots {
 				if !v.IsNil() {
 					if !s.isWeakCollectable(v) {
 						s.markValue(c, v)
@@ -440,10 +472,10 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 					}
 				}
 			}
-			work += int64(len(t.slots))
+			work += int64(len(slots))
 		}
-		if t.hash != nil {
-			nodes := t.hash.nodes
+		if t.hashRef != arena.NullRef {
+			nodes := arena.AsSmall[tableHash](a, t.hashRef).nodesSlice(a)
 			for i := range nodes {
 				if checkCancel && (i&4095) == 4095 {
 					if err := s.gcCancelCheck(); err != nil {
@@ -452,7 +484,7 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 					}
 				}
 				nd := &nodes[i]
-				if nd.used && !nd.dead && !nd.val.IsNil() {
+				if nd.state == nodeLive && !nd.val.IsNil() {
 					s.markValue(c, nd.key)
 					if !s.isWeakCollectable(nd.val) {
 						s.markValue(c, nd.val)
@@ -468,7 +500,7 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 	}
 	// Ephemeron table (__mode = "k"): array & shape slots have non-weak int/string keys -> strong values!
 	if t.arrKind == arrGeneric && t.arrLen > 0 {
-		arr := t.arrValSlice(nil)
+		arr := t.arrValSlice(a)
 		for i, v := range arr {
 			if checkCancel && (i&4095) == 4095 {
 				if err := s.gcCancelCheck(); err != nil {
@@ -480,29 +512,27 @@ func (s *State) gcTraverseTable(c *arena.Collector, t *Table) int64 {
 		}
 		work += int64(len(arr))
 	}
-	if len(t.slots) > 0 {
-		for _, v := range t.slots {
+	if slots := t.slotsSlice(a); len(slots) > 0 {
+		for _, v := range slots {
 			s.markValue(c, v)
 		}
-		work += int64(len(t.slots))
+		work += int64(len(slots))
 	}
 	s.gcTraverseEphemeron(c, t.self, 0)
-	if t.hash != nil {
-		work += int64(len(t.hash.nodes))
+	if t.hashRef != arena.NullRef {
+		work += int64(arena.AsSmall[tableHash](a, t.hashRef).mask) + 1
 	}
 	return work
 }
 
 func (s *State) gcTraverseEphemeron(c *arena.Collector, ref arena.ObjRef, dir int) bool {
-	t := s.tableByRef(ref)
-	if t == nil {
-		return false
-	}
+	a := s.arena
+	t := arena.AsSmall[Table](a, ref)
 	hasWW := false
 	hasClears := false
 	marked := false
-	if t.hash != nil {
-		nodes := t.hash.nodes
+	if t.hashRef != arena.NullRef {
+		nodes := arena.AsSmall[tableHash](a, t.hashRef).nodesSlice(a)
 		n := len(nodes)
 		for step := range n {
 			i := step
@@ -510,7 +540,7 @@ func (s *State) gcTraverseEphemeron(c *arena.Collector, ref arena.ObjRef, dir in
 				i = n - 1 - step
 			}
 			nd := &nodes[i]
-			if !nd.used || nd.dead || nd.val.IsNil() {
+			if nd.state != nodeLive || nd.val.IsNil() {
 				continue
 			}
 			if s.isClearedWeak(c, nd.key) {
@@ -533,13 +563,11 @@ func (s *State) gcTraverseEphemeron(c *arena.Collector, ref arena.ObjRef, dir in
 }
 
 func (s *State) gcClearByValues(c *arena.Collector, ref arena.ObjRef) {
-	t := s.tableByRef(ref)
-	if t == nil {
-		return
-	}
+	a := s.arena
+	t := arena.AsSmall[Table](a, ref)
 	cleared := false
 	if t.arrKind == arrGeneric && t.arrLen > 0 {
-		arr := t.arrValSlice(nil)
+		arr := t.arrValSlice(a)
 		for i := range arr {
 			if !arr[i].IsNil() && s.isClearedWeak(c, arr[i]) {
 				arr[i] = NilValue()
@@ -547,23 +575,23 @@ func (s *State) gcClearByValues(c *arena.Collector, ref arena.ObjRef) {
 			}
 		}
 	}
-	if len(t.slots) > 0 {
-		for i := range t.slots {
-			if !t.slots[i].IsNil() && s.isClearedWeak(c, t.slots[i]) {
-				t.slots[i] = NilValue()
+	if slots := t.slotsSlice(a); len(slots) > 0 {
+		for i := range slots {
+			if !slots[i].IsNil() && s.isClearedWeak(c, slots[i]) {
+				slots[i] = NilValue()
 				cleared = true
 			}
 		}
 	}
-	if t.hash != nil {
-		h := t.hash
-		nodes := h.nodes
+	if t.hashRef != arena.NullRef {
+		h := arena.AsSmall[tableHash](a, t.hashRef)
+		nodes := h.nodesSlice(a)
 		for i := range nodes {
 			nd := &nodes[i]
-			if nd.used && !nd.dead && !nd.val.IsNil() && s.isClearedWeak(c, nd.val) {
-				h.markDead(i)
+			if nd.state == nodeLive && !nd.val.IsNil() && s.isClearedWeak(c, nd.val) {
+				h.markDead(a, i)
 				if nd.key.IsGCObject() {
-					t.flags |= tblFlagHasDeadKeys
+					t.hdr.Flags |= tblFlagHasDeadKeys
 					s.hasDeadHashKeys = true
 				}
 				cleared = true
@@ -576,19 +604,20 @@ func (s *State) gcClearByValues(c *arena.Collector, ref arena.ObjRef) {
 }
 
 func (s *State) gcClearByKeys(c *arena.Collector, ref arena.ObjRef) {
-	t := s.tableByRef(ref)
-	if t == nil || t.hash == nil {
+	a := s.arena
+	t := arena.AsSmall[Table](a, ref)
+	if t.hashRef == arena.NullRef {
 		return
 	}
-	h := t.hash
-	nodes := h.nodes
+	h := arena.AsSmall[tableHash](a, t.hashRef)
+	nodes := h.nodesSlice(a)
 	cleared := false
 	for i := range nodes {
 		nd := &nodes[i]
-		if nd.used && !nd.dead && !nd.val.IsNil() && s.isClearedWeak(c, nd.key) {
+		if nd.state == nodeLive && !nd.val.IsNil() && s.isClearedWeak(c, nd.key) {
 			nd.key = deadKeyValue()
 			nd.val = NilValue()
-			nd.dead = true
+			nd.state = nodeDead
 			h.live--
 			h.dictGen++
 			cleared = true
@@ -738,6 +767,9 @@ func (s *State) gcTraverseThread(c *arena.Collector, th *Thread) int64 {
 	return int64(1 + th.nframe + lim)
 }
 
+// gcRemarkUpvals runs during atomic() right after grayAgain propagation (lgc.c:remarkupvals):
+// marks the captured stack values of any open upvalue reachable from a live closure,
+// even if the upvalue's owning coroutine thread itself is unreachable.
 func (s *State) gcRemarkUpvals(c *arena.Collector) {
 	a := s.arena
 	for _, thRef := range s.twups {
@@ -754,6 +786,9 @@ func (s *State) gcRemarkUpvals(c *arena.Collector) {
 	}
 }
 
+// gcPreSweep runs at the end of atomic() after resurrection and weak clearing and right
+// before flipping currentWhite and sweeping. Every surviving object is non-White and every
+// soon-to-be-freed object is White.
 func (s *State) gcPreSweep(c *arena.Collector) {
 	a := s.arena
 
@@ -779,6 +814,7 @@ func (s *State) gcPreSweep(c *arena.Collector) {
 			th.hdr.Flags &^= thFlagInTwups
 			continue
 		}
+		// Live thread: unlink dead open upvalues before sweep frees them.
 		ups := th.openUpvalsSlice(a)
 		k := 0
 		for _, uvRef := range ups {
@@ -797,36 +833,10 @@ func (s *State) gcPreSweep(c *arena.Collector) {
 	}
 	s.twups = s.twups[:keptTwups]
 
-	// 2. Prune dead weak shape caches and recount live Go-heap Shape memory.
-	s.shapes.Prune()
-	if s.shapeMemBytes > 0 {
-		var seenShapes map[*Shape]struct{}
-		var liveShapeBytes int64
-		countShape := func(sh *Shape) {
-			for cur := sh; cur != nil && cur != s.shapes.root && cur.id > s.shapes.frozenMaxID; cur = cur.parent {
-				if seenShapes == nil {
-					seenShapes = make(map[*Shape]struct{}, 32)
-				}
-				if _, ok := seenShapes[cur]; ok {
-					break
-				}
-				seenShapes[cur] = struct{}{}
-				liveShapeBytes += shapeNodeBytes(cur)
-			}
-		}
-		for i := 1; i < len(s.tables); i++ {
-			t := s.tables[i]
-			if t != nil && t.shape != nil && t.self != arena.NullRef && !c.IsWhite(t.self) {
-				countShape(t.shape)
-			}
-		}
-		if s.pinnedShape != nil {
-			countShape(s.pinnedShape)
-		}
-		s.shapeMemBytes = liveShapeBytes
-	}
+	// 2. Prune dead weak shape transitions and metatable shape caches.
+	s.shapes.pruneDead(a, c)
 
-	// 3. Sweep inline caches on all surviving ArenaProtos so no IC entry outlives a White value/table.
+	// 3. Sweep inline caches on all surviving ArenaProtos so no IC entry outlives a White shape/table/val.
 	s.gcSweepInlineCaches(c)
 
 	// 4. Sweep dead collectable tombstoned hash keys (replacing dead keys with deadKeyValue)
@@ -837,19 +847,17 @@ func (s *State) gcPreSweep(c *arena.Collector) {
 		if c.IsWhite(tRef) {
 			continue
 		}
-		t := s.tableByRef(tRef)
-		if t == nil || t.hash == nil {
-			if t != nil {
-				t.flags &^= tblFlagTrackedHash | tblFlagHasDeadKeys
-			}
+		t := arena.AsSmall[Table](a, tRef)
+		if t.hashRef == arena.NullRef {
+			t.hdr.Flags &^= tblFlagTrackedHash | tblFlagHasDeadKeys
 			continue
 		}
-		if s.hasDeadHashKeys && t.flags&tblFlagHasDeadKeys != 0 {
+		if s.hasDeadHashKeys && t.hdr.Flags&tblFlagHasDeadKeys != 0 {
 			tableHasDead := false
-			nodes := t.hash.nodes
+			nodes := arena.AsSmall[tableHash](a, t.hashRef).nodesSlice(a)
 			for i := range nodes {
 				nd := &nodes[i]
-				if nd.used && nd.dead && nd.key.IsGCObject() {
+				if nd.state == nodeDead && nd.key.IsGCObject() {
 					if c.IsWhite(nd.key.Ref()) {
 						nd.key = deadKeyValue()
 					} else {
@@ -858,7 +866,7 @@ func (s *State) gcPreSweep(c *arena.Collector) {
 				}
 			}
 			if !tableHasDead {
-				t.flags &^= tblFlagHasDeadKeys
+				t.hdr.Flags &^= tblFlagHasDeadKeys
 			} else {
 				anyDead = true
 			}
@@ -882,8 +890,11 @@ func (s *State) icPrimaryAlive(c *arena.Collector, ic *ICEntry) bool {
 	case icEmpty:
 		return false
 	case icEnvSlot:
-		h := ic.holder.Value()
-		if h == nil || h.self == arena.NullRef || c.IsWhite(h.self) || h.hash == nil || h.hash.dictGen != ic.epoch {
+		if ic.holderRef == arena.NullRef || c.IsWhite(ic.holderRef) {
+			return false
+		}
+		h := arena.AsSmall[Table](s.arena, ic.holderRef)
+		if h.hashRef == arena.NullRef || arena.AsSmall[tableHash](s.arena, h.hashRef).dictGen != ic.epoch {
 			return false
 		}
 		return true
@@ -891,17 +902,18 @@ func (s *State) icPrimaryAlive(c *arena.Collector, ic *ICEntry) bool {
 		if !ic.noMeta && ic.epoch != s.protoEpoch {
 			return false
 		}
-		return s.icValAlive(c, ic.val)
+		return ic.shapeRef != arena.NullRef && !c.IsWhite(ic.shapeRef) && s.icValAlive(c, ic.val)
 	case icAddSlot:
 		if !ic.noMeta && ic.epoch != s.protoEpoch {
 			return false
 		}
-		return ic.targetShape.Value() != nil
+		return ic.shapeRef != arena.NullRef && !c.IsWhite(ic.shapeRef) &&
+			ic.targetShapeRef != arena.NullRef && !c.IsWhite(ic.targetShapeRef)
 	case icOwnSlot:
 		if !ic.noMeta && ic.epoch != s.protoEpoch {
 			return false
 		}
-		return true
+		return ic.shapeRef != arena.NullRef && !c.IsWhite(ic.shapeRef)
 	default:
 		return false
 	}
@@ -915,23 +927,25 @@ func (s *State) icPolyAlive(c *arena.Collector, pe *polyEntry) bool {
 		if !pe.noMeta && pe.epoch != s.protoEpoch {
 			return false
 		}
-		return s.icValAlive(c, pe.val)
+		return pe.shapeRef != arena.NullRef && !c.IsWhite(pe.shapeRef) && s.icValAlive(c, pe.val)
 	case icAddSlot:
 		if !pe.noMeta && pe.epoch != s.protoEpoch {
 			return false
 		}
-		return pe.targetShape.Value() != nil
+		return pe.shapeRef != arena.NullRef && !c.IsWhite(pe.shapeRef) &&
+			pe.targetShapeRef != arena.NullRef && !c.IsWhite(pe.targetShapeRef)
 	case icOwnSlot:
 		if !pe.noMeta && pe.epoch != s.protoEpoch {
 			return false
 		}
-		return true
+		return pe.shapeRef != arena.NullRef && !c.IsWhite(pe.shapeRef)
 	default:
 		return false
 	}
 }
 
 func (s *State) gcSweepInlineCaches(c *arena.Collector) {
+	a := s.arena
 	for idx := 1; idx < len(s.protos); idx++ {
 		bp := s.protos[idx]
 		if bp == nil || c.IsWhite(bp.arenaRef) {
@@ -940,42 +954,46 @@ func (s *State) gcSweepInlineCaches(c *arena.Collector) {
 		ics := bp.ic
 		for i := range ics {
 			ic := &ics[i]
-			if ic.kind == icEmpty && ic.poly == nil {
+			if ic.kind == icEmpty && ic.polyRef == arena.NullRef {
 				continue
 			}
-			if ic.poly != nil {
+			if ic.polyRef != arena.NullRef {
+				poly := arena.SliceFast[polyEntry](a, ic.polyRef, 0, 4)
 				kept := 0
 				for j := range int(ic.polyCount) {
-					pe := &ic.poly[j]
+					pe := &poly[j]
 					if s.icPolyAlive(c, pe) {
 						if kept != j {
-							ic.poly[kept] = *pe
+							poly[kept] = *pe
 						}
 						kept++
 					}
 				}
 				for j := kept; j < int(ic.polyCount); j++ {
-					ic.poly[j] = polyEntry{}
+					poly[j] = polyEntry{}
 				}
 				ic.polyCount = uint8(kept)
 				if kept == 0 {
-					ic.poly = nil
+					a.Free(ic.polyRef)
+					ic.polyRef = arena.NullRef
 				}
 			}
 			if !s.icPrimaryAlive(c, ic) {
-				if ic.poly != nil && ic.polyCount > 0 {
-					pe := ic.poly[0]
+				if ic.polyRef != arena.NullRef && ic.polyCount > 0 {
+					poly := arena.SliceFast[polyEntry](a, ic.polyRef, 0, 4)
+					pe := poly[0]
 					for j := 1; j < int(ic.polyCount); j++ {
-						ic.poly[j-1] = ic.poly[j]
+						poly[j-1] = poly[j]
 					}
-					ic.poly[ic.polyCount-1] = polyEntry{}
+					poly[ic.polyCount-1] = polyEntry{}
 					ic.polyCount--
 					if ic.polyCount == 0 {
-						ic.poly = nil
+						a.Free(ic.polyRef)
+						ic.polyRef = arena.NullRef
 					}
-					ic.shapeID = pe.shapeID
-					ic.targetShape = pe.targetShape
-					ic.holder = weak.Pointer[Table]{}
+					ic.shapeRef = pe.shapeRef
+					ic.targetShapeRef = pe.targetShapeRef
+					ic.holderRef = arena.NullRef
 					ic.val = pe.val
 					ic.epoch = pe.epoch
 					ic.slot = pe.slot
@@ -999,15 +1017,29 @@ func (s *State) gcFreeObject(a *arena.Arena, ref arena.ObjRef) {
 	case gcKindLongStr:
 		a.Free(ref)
 	case gcKindTable:
-		stub := arena.AsSmall[tableStub](a, ref)
-		if int(stub.idx) > 0 && int(stub.idx) < len(s.tables) {
-			if t := s.tables[stub.idx]; t != nil {
-				s.subExtraMem(t.memBytes)
-				t.memBytes = 0
-				t.self = arena.NullRef
-				s.tables[stub.idx] = nil
-				s.freeTableIDs = append(s.freeTableIDs, stub.idx)
+		t := arena.AsSmall[Table](a, ref)
+		t.consumeArrHint(s)
+		if t.arrRef != arena.NullRef {
+			a.Free(t.arrRef)
+		}
+		if t.slotsRef != arena.NullRef {
+			a.Free(t.slotsRef)
+		}
+		if t.hashRef != arena.NullRef {
+			h := arena.AsSmall[tableHash](a, t.hashRef)
+			if h.nodesRef != arena.NullRef {
+				a.Free(h.nodesRef)
 			}
+			a.Free(t.hashRef)
+		}
+		a.Free(ref)
+	case gcKindShape:
+		sh := arena.AsSmall[Shape](a, ref)
+		if sh.transRef != arena.NullRef {
+			a.Free(sh.transRef)
+		}
+		if sh.indexRef != arena.NullRef {
+			a.Free(sh.indexRef)
 		}
 		a.Free(ref)
 	case gcKindClosure:
@@ -1086,6 +1118,15 @@ func (s *State) gcFreeObject(a *arena.Arena, ref arena.ObjRef) {
 		a.Free(ref)
 	case gcKindProto:
 		ap := arena.AsSmall[ArenaProto](a, ref)
+		if ap.icRef != arena.NullRef {
+			ics := arena.SliceFast[ICEntry](a, ap.icRef, 0, int(ap.nIC))
+			for i := range ics {
+				if ics[i].polyRef != arena.NullRef {
+					a.Free(ics[i].polyRef)
+				}
+			}
+			a.Free(ap.icRef)
+		}
 		if ap.constsRef != arena.NullRef {
 			a.Free(ap.constsRef)
 		}
@@ -1117,10 +1158,7 @@ func (s *State) gcRunFinalizer(_ *arena.Collector, ref arena.ObjRef) {
 	)
 	switch s.arena.Header(ref).Kind {
 	case gcKindTable:
-		t := s.tableByRef(ref)
-		if t == nil {
-			return
-		}
+		t := arena.AsSmall[Table](s.arena, ref)
 		obj = TableValue(t)
 		mt = t.Metatable(s)
 	case gcKindUserdata:
@@ -1232,7 +1270,7 @@ func (s *State) registerWeakCandidate(t, mt *Table) {
 		return
 	}
 	if !mt.RawGetStr(s, s.intern.tms[TMMode]).IsNil() {
-		t.flags |= tblFlagGCWeakCand
+		t.hdr.Flags |= tblFlagGCWeakCand
 	}
 }
 
@@ -1308,8 +1346,6 @@ func (s *State) Close() {
 		s.deferredStackFrees = nil
 		s.protos = nil
 		s.freeProtoIDs = nil
-		s.tables = nil
-		s.freeTableIDs = nil
 		if s.goRefs != nil {
 			s.goRefs.ClearAll()
 		}

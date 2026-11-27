@@ -1,7 +1,9 @@
 package vm
 
 import (
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -9,11 +11,16 @@ import (
 	"github.com/yuchanns/moelua/internal/arena"
 )
 
-// Frozen Stdlib String Arena Template (Step 5c):
+// Zero-Relocation Arena Stdlib Snapshot (Phase 4):
 //
-// All stdlib short strings live in one process-wide immutable strArena (tagFrozenString),
-// shared read-only across every State. Full zero-relocation Arena.CloneSnapshot() for
-// stdlib Tables, Shapes, and mainThread lands in Step 5d once those structs move to Arena.
+// Builds the complete Lua 5.5.1 standard library ONCE via newBootstrapState():
+//   - All stdlib short strings live in an immutable process-wide strArena (tagFrozenString,
+//     shared read-only across every State, never cloned and never swept).
+//   - All stdlib Tables, Shapes, mainThread, stack, frames, and 3 std file Userdatas live
+//     inside template.arena with ObjRef links exclusively (ptrdata == 0).
+//
+// NewState() calls template.arena.CloneSnapshot() to copy the active noscan []byte pages
+// verbatim with ZERO pointer relocation, then binds 3 fresh GoRefs handles for stdin/stdout/stderr.
 
 const (
 	initFastStackCap = 320 // >= stackSlack (264) + 56 initial registers
@@ -21,11 +28,33 @@ const (
 )
 
 type stdTemplate struct {
+	// Immutable process-wide frozen stdlib short strings.
 	strArena      *arena.Arena
 	frozenBuckets []arena.ObjRef
 	frozenMask    uint32
 	tms           [tmCount]*LuaString
 	nextStrID     uint64
+
+	// Read-only Arena snapshot containing all stdlib Tables, Shapes, mainThread, and std file UDs.
+	arena  *arena.Arena
+	gcSnap arena.CollectorSnapshot
+
+	// Snapshot metadata copied into each cloned State (all ObjRefs remain identical!).
+	mainThreadRef arena.ObjRef
+	registryRef   arena.ObjRef
+	stringMetaRef arena.ObjRef
+	fileMetaRef   arena.ObjRef
+	pkgRef        arena.ObjRef
+	stdinRef      arena.ObjRef
+	stdoutRef     arena.ObjRef
+	stderrRef     arena.ObjRef
+
+	nextShapeID   uint64
+	shapesRootRef arena.ObjRef
+	metaRoots     map[arena.ObjRef]arena.ObjRef
+	metaTrans     map[metaTransKey]arena.ObjRef
+	transShapes   []arena.ObjRef
+	hashedTables  []arena.ObjRef
 
 	builtinNext           *NativeFunc
 	builtinIPairsIter     *NativeFunc
@@ -51,13 +80,49 @@ func getStdTemplate() *stdTemplate {
 
 func buildStdTemplate() *stdTemplate {
 	b := newBootstrapState()
+
+	stdinRef := b.defaultInput.Ref()
+	stdoutRef := b.defaultOutput.Ref()
+	var stderrRef arena.ObjRef
+	if env := b.GlobalEnv(); env != nil {
+		if ioVal := env.RawGetStr(b, b.intern.Intern("io")); ioVal.IsTable() {
+			if se := b.asTable(ioVal).RawGetStr(b, b.intern.Intern("stderr")); se.IsUserdata() {
+				stderrRef = se.Ref()
+			}
+		}
+	}
+
+	// Clear GoRefs handles in the template's 3 std file Userdatas (each clone binds its own).
+	arena.AsSmall[Userdata](b.arena, stdinRef).dataRef = arena.NullGoHandle
+	arena.AsSmall[Userdata](b.arena, stdoutRef).dataRef = arena.NullGoHandle
+	arena.AsSmall[Userdata](b.arena, stderrRef).dataRef = arena.NullGoHandle
+
+	// Freeze all bootstrap strings into the process-wide read-only string arena.
 	strArena, frozenBuckets, frozenMask := b.intern.FreezeBootstrap()
-	tmpl := &stdTemplate{
+	b.arena.ReleaseSpare()
+
+	return &stdTemplate{
 		strArena:              strArena,
 		frozenBuckets:         frozenBuckets,
 		frozenMask:            frozenMask,
 		tms:                   b.intern.tms,
 		nextStrID:             b.intern.nextID,
+		arena:                 b.arena,
+		gcSnap:                b.collector.Snapshot(),
+		mainThreadRef:         b.mainThreadRef,
+		registryRef:           b.registryRef,
+		stringMetaRef:         b.stringMetaRef,
+		fileMetaRef:           b.fileMetaRef,
+		pkgRef:                b.pkgRef,
+		stdinRef:              stdinRef,
+		stdoutRef:             stdoutRef,
+		stderrRef:             stderrRef,
+		nextShapeID:           b.shapes.nextID,
+		shapesRootRef:         b.shapes.rootRef,
+		metaRoots:             maps.Clone(b.shapes.metaRoots),
+		metaTrans:             maps.Clone(b.shapes.metaTrans),
+		transShapes:           slices.Clone(b.shapes.transShapes),
+		hashedTables:          slices.Clone(b.hashedTables),
 		builtinNext:           b.builtinNext,
 		builtinIPairsIter:     b.builtinIPairsIter,
 		builtinDebugGetInfo:   b.builtinDebugGetInfo,
@@ -67,16 +132,22 @@ func buildStdTemplate() *stdTemplate {
 		builtinDebugSetHook:   b.builtinDebugSetHook,
 		builtinCoroYield:      b.builtinCoroYield,
 	}
-	b.Close()
-	return tmpl
 }
 
 func cloneFromStdTemplate(noEnv bool) *State {
 	tmpl := getStdTemplate()
-	a := arena.New()
+	a := tmpl.arena.CloneSnapshot()
+	goRefs := arena.NewGoRefs()
+
 	s := &State{
-		arena:  a,
-		goRefs: arena.NewGoRefs(),
+		arena:         a,
+		goRefs:        goRefs,
+		mainThreadRef: tmpl.mainThreadRef,
+		curRef:        tmpl.mainThreadRef,
+		registryRef:   tmpl.registryRef,
+		stringMetaRef: tmpl.stringMetaRef,
+		fileMetaRef:   tmpl.fileMetaRef,
+		pkgRef:        tmpl.pkgRef,
 		intern: stringInterner{
 			seed:          globalStrSeed,
 			nextID:        tmpl.nextStrID,
@@ -85,44 +156,44 @@ func cloneFromStdTemplate(noEnv bool) *State {
 			frozenMask:    tmpl.frozenMask,
 			tms:           tmpl.tms,
 		},
-		shapes:           newShapeRegistry(),
-		protos:           []*boundProto{nil},
-		tables:           []*Table{nil},
-		nextRefID:        1,
-		out:              os.Stdout,
-		errOut:           os.Stderr,
-		startTime:        time.Now(),
-		compilerFn:       defaultCompileFunc,
-		compilerReaderFn: defaultCompileReaderFunc,
+		shapes: shapeRegistry{
+			nextID:      tmpl.nextShapeID,
+			rootRef:     tmpl.shapesRootRef,
+			metaRoots:   maps.Clone(tmpl.metaRoots),
+			metaTrans:   maps.Clone(tmpl.metaTrans),
+			transShapes: slices.Clone(tmpl.transShapes),
+		},
+		hashedTables:          slices.Clone(tmpl.hashedTables),
+		nextRefID:             1,
+		out:                   os.Stdout,
+		errOut:                os.Stderr,
+		startTime:             time.Now(),
+		compilerFn:            defaultCompileFunc,
+		compilerReaderFn:      defaultCompileReaderFunc,
+		builtinNext:           tmpl.builtinNext,
+		builtinIPairsIter:     tmpl.builtinIPairsIter,
+		builtinDebugGetInfo:   tmpl.builtinDebugGetInfo,
+		builtinDebugTraceback: tmpl.builtinDebugTraceback,
+		builtinDebugGetLocal:  tmpl.builtinDebugGetLocal,
+		builtinDebugSetLocal:  tmpl.builtinDebugSetLocal,
+		builtinDebugSetHook:   tmpl.builtinDebugSetHook,
+		builtinCoroYield:      tmpl.builtinCoroYield,
 	}
+	s.typeMetaRefs[4] = s.stringMetaRef
 	s.initCollector()
+	s.collector.RestoreSnapshot(tmpl.gcSnap)
 	s.seedRNG(makeRandomSeed(s), 0)
 
-	th, err := s.newThread(initFastStackCap, initFastFrameCap)
-	if err != nil {
-		panic(err)
-	}
-	th.nny = 1 // main thread is never yieldable (L->nny = 1)
-	s.mainThreadRef = th.self
-	s.curRef = th.self
+	// Bind 3 fresh GoRefs handles for stdin, stdout, stderr into the cloned std file Userdatas.
+	arena.AsSmall[Userdata](a, tmpl.stdinRef).dataRef = goRefs.Alloc(&luaFile{f: os.Stdin, isStd: true})
+	arena.AsSmall[Userdata](a, tmpl.stdoutRef).dataRef = goRefs.Alloc(&luaFile{f: os.Stdout, isStd: true})
+	arena.AsSmall[Userdata](a, tmpl.stderrRef).dataRef = goRefs.Alloc(&luaFile{f: os.Stderr, isStd: true})
 
-	env := s.NewDictTable(64)
-	reg := s.NewDictTable(16)
-	s.registryRef = reg.self
-	reg.RawSetInt(s, ridxRef, FalseValue())
-	reg.RawSetInt(s, ridxGlobals, TableValue(env))
-	reg.RawSetInt(s, ridxMainThread, ThreadValue(th))
-	s.initStdlib()
-	s.builtinNext = tmpl.builtinNext
-	s.builtinIPairsIter = tmpl.builtinIPairsIter
-	s.builtinDebugGetInfo = tmpl.builtinDebugGetInfo
-	s.builtinDebugTraceback = tmpl.builtinDebugTraceback
-	s.builtinDebugGetLocal = tmpl.builtinDebugGetLocal
-	s.builtinDebugSetLocal = tmpl.builtinDebugSetLocal
-	s.builtinDebugSetHook = tmpl.builtinDebugSetHook
-	s.builtinCoroYield = tmpl.builtinCoroYield
-	s.shapes.frozenMaxID = s.shapes.nextID
-	s.shapeMemBytes = 0
+	stdinVal := userdataRefValue(tmpl.stdinRef)
+	stdoutVal := userdataRefValue(tmpl.stdoutRef)
+	s.stdinInput = stdinVal
+	s.defaultInput = stdinVal
+	s.defaultOutput = stdoutVal
 
 	if !noEnv {
 		s.applyPackageEnv()

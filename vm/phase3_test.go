@@ -235,10 +235,10 @@ func TestCoroutineStackShrinkWithOpenUpvalues(t *testing.T) {
 	getter := res[1]
 	setter := res[2]
 
-	if co.openUpvalsCount() == 0 {
+	if co.openUpvalsRef == arena.NullRef {
 		t.Fatalf("expected coroutine to have open upvalues before GC shrink")
 	}
-	beforeLen := co.stackSize()
+	beforeLen := co.stackLen
 	if beforeLen <= 2048 {
 		t.Fatalf("expected grown stack > 2048 before GC, got %d", beforeLen)
 	}
@@ -249,7 +249,7 @@ func TestCoroutineStackShrinkWithOpenUpvalues(t *testing.T) {
 	s.SetGlobal("_setter", setter)
 	s.CollectFull()
 
-	afterLen := co.stackSize()
+	afterLen := co.stackLen
 	if afterLen >= beforeLen/2 {
 		t.Fatalf("expected coroutine stack with open upvalues to shrink significantly: before=%d after=%d", beforeLen, afterLen)
 	}
@@ -945,39 +945,34 @@ func TestCodexReviewRound4VMRegressions(t *testing.T) {
 		}
 	})
 
-	// 4. Ordinary shape transitions do not strongly root transient shapes.
+	// 4. Ordinary shape transitions do not strongly root transient shapes across Arena GC.
 	t.Run("weak_shape_transitions_reclaimed", func(t *testing.T) {
 		s := NewState()
 		defer s.Close()
 		parent := s.NewTable(0, 2)
 		parent.RawSetStr(s, s.intern.Intern("base"), IntValue(1))
 		s.SetGlobal("parent_keep", TableValue(parent))
-		var rootChild, nestedChild weak.Pointer[Shape]
-		func() {
-			for i := range 20 {
-				tmp := s.NewTable(0, 2)
-				k := s.intern.Intern(fmt.Sprintf("transient_root_%d", i))
-				tmp.RawSetStr(s, k, IntValue(int64(i)))
-				if i == 0 {
-					rootChild = weak.Make(tmp.shape)
-				}
-				tmp2 := s.NewTable(0, 2)
-				tmp2.RawSetStr(s, s.intern.Intern("base"), IntValue(1))
-				k2 := s.intern.Intern(fmt.Sprintf("transient_nested_%d", i))
-				tmp2.RawSetStr(s, k2, IntValue(int64(i)))
-				if i == 0 {
-					nestedChild = weak.Make(tmp2.shape)
-				}
+		var rootChildRef, nestedChildRef arena.ObjRef
+		for i := range 20 {
+			tmp := s.NewTable(0, 2)
+			k := s.intern.Intern(fmt.Sprintf("transient_root_%d", i))
+			tmp.RawSetStr(s, k, IntValue(int64(i)))
+			if i == 0 {
+				rootChildRef = tmp.shapeRef
 			}
-		}()
-		s.CollectFull()
-		for range 10 {
-			runtime.GC()
+			tmp2 := s.NewTable(0, 2)
+			tmp2.RawSetStr(s, s.intern.Intern("base"), IntValue(1))
+			k2 := s.intern.Intern(fmt.Sprintf("transient_nested_%d", i))
+			tmp2.RawSetStr(s, k2, IntValue(int64(i)))
+			if i == 0 {
+				nestedChildRef = tmp2.shapeRef
+			}
 		}
-		if rootChild.Value() != nil {
+		s.CollectFull()
+		if s.arena.IsLive(rootChildRef) {
 			t.Fatalf("root shape retained transient child shape")
 		}
-		if nestedChild.Value() != nil {
+		if s.arena.IsLive(nestedChildRef) {
 			t.Fatalf("non-root shape retained transient child shape")
 		}
 	})
