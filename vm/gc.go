@@ -200,12 +200,12 @@ func (s *State) gcCheckDebt(liveTop int) {
 	}
 	if (s.gc.tier1 && s.gc.debt >= s.gcDebtThreshold()) || s.arenaNeedsSweep() {
 		s.gc.debt = 0
-		if s.cur != nil && liveTop > 0 {
-			savedTop := s.cur.top
-			s.cur.top = liveTop
+		if s.curThread != nil && liveTop > 0 {
+			savedTop := s.curThread.top
+			s.curThread.top = liveTop
 			s.CollectFull()
-			if savedTop > s.cur.top {
-				s.cur.top = savedTop
+			if savedTop > s.curThread.top {
+				s.curThread.top = savedTop
 			}
 			return
 		}
@@ -507,8 +507,8 @@ func (tr *gcTracer) markBoundProto(bp *boundProto) {
 
 func (tr *gcTracer) markRoots() {
 	s := tr.s
-	if s.registry != nil {
-		tr.mark(TableValue(s.registry))
+	if s.registryTbl != nil {
+		tr.mark(TableValue(s.registryTbl))
 	}
 	if s.pkgTbl != nil {
 		tr.mark(TableValue(s.pkgTbl))
@@ -518,8 +518,8 @@ func (tr *gcTracer) markRoots() {
 			tr.mark(TableValue(mt))
 		}
 	}
-	if s.fileMeta != nil {
-		tr.mark(TableValue(s.fileMeta))
+	if s.fileMetaTbl != nil {
+		tr.mark(TableValue(s.fileMetaTbl))
 	}
 	if !s.stdinInput.IsNil() {
 		tr.mark(s.stdinInput)
@@ -530,9 +530,9 @@ func (tr *gcTracer) markRoots() {
 	if !s.defaultOutput.IsNil() {
 		tr.mark(s.defaultOutput)
 	}
-	tr.mark(ThreadValue(s.mainThread))
-	if s.cur != nil && s.cur != s.mainThread {
-		tr.mark(ThreadValue(s.cur))
+	tr.mark(ThreadValue(s.mainThreadPtr))
+	if s.curThread != nil && s.curThread != s.mainThreadPtr {
+		tr.mark(ThreadValue(s.curThread))
 	}
 	for _, v := range s.gc.pinnedRefs {
 		if tr.cancelFn != nil && tr.tickCancel() {
@@ -793,7 +793,7 @@ func (tr *gcTracer) traverseThread(th *Thread) {
 	}
 	// Shrink oversized stacks on non-running coroutines (including coroutines with open upvalues,
 	// since Upvalue tracks stackIdx rather than raw slice pointers) & release finished dead stacks.
-	if th != tr.s.cur && th != tr.s.mainThread {
+	if th != tr.s.curThread && th != tr.s.mainThreadPtr {
 		if th.status == ThreadDead && th.nframe == 0 && th.top == 0 && len(th.openUpvals) == 0 && len(th.tbc) == 0 {
 			if len(th.stack) > 8 {
 				th.stack = []Value{NilValue()}
@@ -837,7 +837,7 @@ func (tr *gcTracer) traverseTable(t *Table) {
 	if !weakK && !weakV {
 		// Strong table: mark all keys and values.
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
-			for _, v := range t.arrValSlice() {
+			for _, v := range t.arrValSlice(nil) {
 				if tr.cancelFn != nil && tr.tickCancel() {
 					return
 				}
@@ -890,7 +890,7 @@ func (tr *gcTracer) traverseTable(t *Table) {
 	tr.ephemerons = append(tr.ephemerons, t)
 	// Dense array & shape slots have non-collectable keys (int / string) -> always strong!
 	if t.arrKind == arrGeneric && t.arrLen > 0 {
-		for _, v := range t.arrValSlice() {
+		for _, v := range t.arrValSlice(nil) {
 			if tr.cancelFn != nil && tr.tickCancel() {
 				return
 			}
@@ -977,7 +977,7 @@ func (tr *gcTracer) clearByValues(tables []*Table) {
 	}()
 	for _, t := range tables {
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
-			arr := t.arrValSlice()
+			arr := t.arrValSlice(nil)
 			for i := range arr {
 				if tr.cancelFn != nil && tr.tickCancel() {
 					return
@@ -1046,7 +1046,7 @@ func (tr *gcTracer) accountWeakStrings() {
 	markTableStrings := func(tables []*Table) {
 		for _, t := range tables {
 			if t.arrKind == arrGeneric && t.arrLen > 0 {
-				for _, v := range t.arrValSlice() {
+				for _, v := range t.arrValSlice(nil) {
 					if tr.cancelFn != nil && tr.tickCancel() {
 						return
 					}
@@ -1396,22 +1396,22 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 		// Tier 0 (with no open finalizable handles) or emergency allocation-time recount:
 		// nil-fill dead stack/frame slack and recompute exact live VM bytes without running
 		// __gc finalizers mid-operation!
-		if s.cur != nil {
-			if s.cur.nframe < len(s.cur.frames) {
-				clear(s.cur.frames[s.cur.nframe:])
+		if s.curThread != nil {
+			if s.curThread.nframe < len(s.curThread.frames) {
+				clear(s.curThread.frames[s.curThread.nframe:])
 			}
-			if s.cur.top < len(s.cur.stack) {
-				lim := s.cur.top
-				for i := range s.cur.nframe {
-					cf := &s.cur.frames[i]
+			if s.curThread.top < len(s.curThread.stack) {
+				lim := s.curThread.top
+				for i := range s.curThread.nframe {
+					cf := &s.curThread.frames[i]
 					if cf.cl != nil {
 						if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > lim {
 							lim = end
 						}
 					}
 				}
-				if lim < len(s.cur.stack) {
-					fillNil(s.cur.stack[lim:])
+				if lim < len(s.curThread.stack) {
+					fillNil(s.curThread.stack[lim:])
 				}
 			}
 		}
@@ -1770,7 +1770,7 @@ func (s *State) drainFinalizers() {
 	s.gc.inGCTM = true
 	// Suppress debug hooks (without clearing hookMask so debug.gethook/sethook still work)
 	// and forbid coroutine.yield while running __gc (lgc.c:GCTM: L->allowhook = 0).
-	th := s.cur
+	th := s.curThread
 	savedSuppress := false
 	if th != nil {
 		savedSuppress = th.suppressHook
@@ -1803,11 +1803,11 @@ func (s *State) drainFinalizers() {
 func (s *State) Close() {
 	if !s.gc.closing {
 		// Close any active <close> TBC variables on mainThread first (e.g. os.exit(true, true)).
-		if s.mainThread != nil {
-			s.mainThread.nframe = 0
-			s.mainThread.nny++
-			_, _, _ = s.mainThread.closeAllSync(0, NilValue(), false)
-			s.mainThread.nny--
+		if s.mainThreadPtr != nil {
+			s.mainThreadPtr.nframe = 0
+			s.mainThreadPtr.nny++
+			_, _, _ = s.mainThreadPtr.closeAllSync(s, 0, NilValue(), false)
+			s.mainThreadPtr.nny--
 		}
 		s.gc.closing = true
 		// Merge all remaining finalizable objects and file handles into toBeFnz in strict LIFO order.
@@ -1870,7 +1870,7 @@ func (s *State) Close() {
 }
 
 func (s *State) drainFinalizersQueued() {
-	th := s.cur
+	th := s.curThread
 	for len(s.gc.toBeFnz) > 0 {
 		obj := s.gc.toBeFnz[0]
 		s.gc.toBeFnz[0] = Value{}

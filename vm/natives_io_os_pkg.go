@@ -379,8 +379,10 @@ func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv, 
 		if err != nil {
 			return NilValue(), err
 		}
-		if hasEnv && len(cl.upvals) > 0 {
-			cl.upvals[0] = &Upvalue{closed: env}
+		if hasEnv {
+			if err := s.setChunkEnv(cl, env); err != nil {
+				return NilValue(), err
+			}
 		}
 		return ClosureValue(cl), nil
 	}
@@ -419,8 +421,10 @@ func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv, 
 	if err != nil {
 		return NilValue(), err
 	}
-	if hasEnv && len(cl.upvals) > 0 {
-		cl.upvals[0] = &Upvalue{closed: env}
+	if hasEnv {
+		if err := s.setChunkEnv(cl, env); err != nil {
+			return NilValue(), err
+		}
 	}
 	return ClosureValue(cl), nil
 }
@@ -443,8 +447,10 @@ func (s *State) loadChunkBytes(data []byte, chunkName, mode string, env Value, h
 		if err != nil {
 			return NilValue(), err
 		}
-		if hasEnv && len(cl.upvals) > 0 {
-			cl.upvals[0] = &Upvalue{closed: env}
+		if hasEnv {
+			if err := s.setChunkEnv(cl, env); err != nil {
+				return NilValue(), err
+			}
 		}
 		return ClosureValue(cl), nil
 	}
@@ -524,7 +530,7 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 	isBin := len(b0) == 1 && b0[0] == 0x1b
 	var streamTempBytes int64
 	defer func() {
-		s.gc.tempBytes -= streamTempBytes
+		s.addTempBytes(-streamTempBytes)
 	}()
 	var checkMem func(int64) error
 	if s.memLimit > 0 {
@@ -537,7 +543,7 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 				return merr
 			}
 			streamTempBytes = n
-			s.gc.tempBytes += delta
+			s.addTempBytes(delta)
 			return nil
 		}
 	}
@@ -554,14 +560,16 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 		if uerr != nil {
 			return NilValue(), uerr
 		}
-		s.gc.tempBytes -= streamTempBytes
+		s.addTempBytes(-streamTempBytes)
 		streamTempBytes = 0
 		cl, lerr := s.Load(p)
 		if lerr != nil {
 			return NilValue(), lerr
 		}
-		if hasEnv && len(cl.upvals) > 0 {
-			cl.upvals[0] = &Upvalue{closed: env}
+		if hasEnv {
+			if err := s.setChunkEnv(cl, env); err != nil {
+				return NilValue(), err
+			}
 		}
 		return ClosureValue(cl), nil
 	}
@@ -599,14 +607,16 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 			return NilValue(), err
 		}
 	}
-	s.gc.tempBytes -= streamTempBytes
+	s.addTempBytes(-streamTempBytes)
 	streamTempBytes = 0
 	cl, lerr := s.Load(p)
 	if lerr != nil {
 		return NilValue(), lerr
 	}
-	if hasEnv && len(cl.upvals) > 0 {
-		cl.upvals[0] = &Upvalue{closed: env}
+	if hasEnv {
+		if err := s.setChunkEnv(cl, env); err != nil {
+			return NilValue(), err
+		}
 	}
 	return ClosureValue(cl), nil
 }
@@ -616,7 +626,7 @@ func (s *State) readBoundedStream(r io.Reader) ([]byte, error) {
 	var readBytes int64
 	var reads int64
 	defer func() {
-		s.gc.tempBytes -= readBytes
+		s.addTempBytes(-readBytes)
 	}()
 	cancelFn := s.nativeCancelFunc()
 	var tmp [4096]byte
@@ -633,7 +643,7 @@ func (s *State) readBoundedStream(r io.Reader) ([]byte, error) {
 			prevStride := readBytes / 4096
 			buf.Write(tmp[:n])
 			readBytes += int64(n)
-			s.gc.tempBytes += int64(n)
+			s.addTempBytes(int64(n))
 			if cancelFn != nil && (readBytes/4096 > prevStride || (reads&63) == 0) {
 				if cerr := cancelFn(); cerr != nil {
 					return nil, cerr
@@ -749,7 +759,7 @@ func (s *State) CompileString(name, src string) (*bytecode.Proto, error) {
 	}
 	var compileTempBytes int64
 	defer func() {
-		s.gc.tempBytes -= compileTempBytes
+		s.addTempBytes(-compileTempBytes)
 	}()
 	var opts []compiler.Option
 	if s.memLimit > 0 {
@@ -762,7 +772,7 @@ func (s *State) CompileString(name, src string) (*bytecode.Proto, error) {
 				return merr
 			}
 			compileTempBytes = n
-			s.gc.tempBytes += delta
+			s.addTempBytes(delta)
 			return nil
 		}))
 	}
@@ -783,7 +793,7 @@ func (s *State) CompileReader(name string, r io.Reader) (*bytecode.Proto, error)
 	}
 	var compileTempBytes int64
 	defer func() {
-		s.gc.tempBytes -= compileTempBytes
+		s.addTempBytes(-compileTempBytes)
 	}()
 	var opts []compiler.Option
 	if s.memLimit > 0 {
@@ -796,7 +806,7 @@ func (s *State) CompileReader(name string, r io.Reader) (*bytecode.Proto, error)
 				return merr
 			}
 			compileTempBytes = n
-			s.gc.tempBytes += delta
+			s.addTempBytes(delta)
 			return nil
 		}))
 	}
@@ -946,7 +956,7 @@ func (s *State) initIOLib() {
 	s.registerFunc(fileMT, "__tostring", intrNone, nativeFileToString)
 	s.registerFunc(fileMT, "__close", intrNone, nativeFileGCClose)
 	s.registerFunc(fileMT, "__gc", intrNone, nativeFileGCClose)
-	s.fileMeta = fileMT
+	s.setFileMeta(fileMT)
 	fileMT.markProto(s)
 
 	stdinUD := s.newFileUD(&luaFile{f: os.Stdin, isStd: true})
@@ -975,7 +985,7 @@ func (s *State) initIOLib() {
 }
 
 func (s *State) newFileUD(lf *luaFile) Value {
-	u := &Userdata{Data: lf, Meta: s.fileMeta}
+	u := &Userdata{Data: lf, Meta: s.fileMeta()}
 	v := UserdataValue(u)
 	if !lf.isStd {
 		fi := &fileInner{f: lf.f, w: lf.w, cmd: lf.cmd}
@@ -1621,13 +1631,15 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 }
 
 func (s *State) methodArgNum(n int) int {
-	if s.cur != nil && s.cur.nframe > 0 {
-		idx := s.cur.nframe - 1
-		if s.cur.frames[idx].kind == frameNative && idx > 0 {
+	cur := s.cur()
+	if cur != nil && cur.nframe > 0 {
+		frames := cur.framesSlice(s.arena)
+		idx := cur.nframe - 1
+		if frames[idx].kind == frameNative && idx > 0 {
 			idx--
 		}
-		if s.cur.frames[idx].kind == frameLua {
-			if _, nw := funcNameFromCallerFrame(&s.cur.frames[idx]); nw == "method" {
+		if frames[idx].kind == frameLua {
+			if _, nw := s.funcNameFromCallerFrame(&frames[idx]); nw == "method" {
 				return n - 1
 			}
 		}
@@ -1721,7 +1733,7 @@ func (s *State) ReadAllStdin() ([]byte, error) {
 		var buf bytes.Buffer
 		var readBytes int64
 		defer func() {
-			s.gc.tempBytes -= readBytes
+			s.addTempBytes(-readBytes)
 		}()
 		var tmp [4096]byte
 		for {
@@ -1732,7 +1744,7 @@ func (s *State) ReadAllStdin() ([]byte, error) {
 				}
 				buf.Write(tmp[:n])
 				readBytes += int64(n)
-				s.gc.tempBytes += int64(n)
+				s.addTempBytes(int64(n))
 			}
 			if err == io.EOF {
 				return buf.Bytes(), nil
@@ -1930,7 +1942,7 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		var out bytes.Buffer
 		var readBytes int64
 		defer func() {
-			s.gc.tempBytes -= readBytes
+			s.addTempBytes(-readBytes)
 		}()
 		var chunk [32768]byte
 		rem := n
@@ -1949,7 +1961,7 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 				}
 				out.Write(chunk[:got])
 				readBytes += int64(got)
-				s.gc.tempBytes += int64(got)
+				s.addTempBytes(int64(got))
 				rem -= int64(got)
 			}
 			if err != nil {
@@ -2229,24 +2241,25 @@ func nativeFileRead(s *State, args []Value) ([]Value, error) {
 	}
 	// Root accumulated results on the active thread stack across subsequent readOneItem calls
 	// so emergency GC triggered while reading later formats still accounts for earlier strings.
-	th := s.cur
+	th := s.cur()
 	savedTop := th.top
 	baseTop := savedTop
+	frames := th.framesSlice(s.arena)
 	for fi := range th.nframe {
-		cf := &th.frames[fi]
-		if cf.cl != nil {
-			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+		cf := &frames[fi]
+		if cl := s.frameClosure(cf); cl != nil {
+			if end := cf.base + int(s.boundProtoOf(cl).proto.MaxStackSize); end > baseTop {
 				baseTop = end
 			}
 		}
 	}
-	if err := th.ensureStack(baseTop + len(fmts) + 2); err != nil {
+	if err := th.ensureStack(s, baseTop+len(fmts)+2); err != nil {
 		return nil, err
 	}
 	written := 0
 	defer func() {
 		if written > 0 {
-			fillNil(th.stack[baseTop : baseTop+written])
+			fillNil(th.stackSlice(s.arena)[baseTop : baseTop+written])
 		}
 		th.top = savedTop
 	}()
@@ -2264,7 +2277,7 @@ func nativeFileRead(s *State, args []Value) ([]Value, error) {
 			}
 			return nil, err
 		}
-		th.stack[baseTop+written] = v
+		th.stackSlice(s.arena)[baseTop+written] = v
 		written++
 		th.top = baseTop + written
 		if !ok {
@@ -2272,7 +2285,7 @@ func nativeFileRead(s *State, args []Value) ([]Value, error) {
 		}
 	}
 	out := make([]Value, written)
-	copy(out, th.stack[baseTop:baseTop+written])
+	copy(out, th.stackSlice(s.arena)[baseTop:baseTop+written])
 	return out, nil
 }
 
@@ -3106,8 +3119,9 @@ func (s *State) initPackageLib() {
 
 	s.pkgTbl = pkg
 	s.SetGlobal("package", TableValue(pkg))
-	s.registry.RawSetStr(s, s.intern.Intern("_LOADED"), TableValue(loaded))
-	s.registry.RawSetStr(s, s.intern.Intern("_PRELOAD"), TableValue(preload))
+	reg := s.registry()
+	reg.RawSetStr(s, s.intern.Intern("_LOADED"), TableValue(loaded))
+	reg.RawSetStr(s, s.intern.Intern("_PRELOAD"), TableValue(preload))
 
 	s.registerFunc(s.GlobalEnv(), "require", intrNone, nativeRequire)
 }
@@ -3115,7 +3129,7 @@ func (s *State) initPackageLib() {
 func (s *State) pkgField(name string) (Value, error) {
 	key := s.intern.Intern(name)
 	v := s.pkgTbl.RawGetStr(s, key)
-	if v.IsNil() && s.pkgTbl.meta != nil {
+	if v.IsNil() && s.pkgTbl.hasMeta() {
 		return s.finishGet(TableValue(s.pkgTbl), StringValue(key))
 	}
 	return v, nil
@@ -3123,9 +3137,10 @@ func (s *State) pkgField(name string) (Value, error) {
 
 func (s *State) registryField(name string) (Value, error) {
 	key := s.intern.Intern(name)
-	v := s.registry.RawGetStr(s, key)
-	if v.IsNil() && s.registry.meta != nil {
-		return s.finishGet(TableValue(s.registry), StringValue(key))
+	reg := s.registry()
+	v := reg.RawGetStr(s, key)
+	if v.IsNil() && reg.hasMeta() {
+		return s.finishGet(TableValue(reg), StringValue(key))
 	}
 	return v, nil
 }
@@ -3274,13 +3289,14 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	}
 	// Root _LOADED (and later searchers / loader / extra / result) on the active thread
 	// stack across all Lua callbacks so GC cannot prematurely finalize them while require runs.
-	th := s.cur
+	th := s.cur()
 	savedTop := th.top
 	baseTop := savedTop
+	frames := th.framesSlice(s.arena)
 	for fi := range th.nframe {
-		cf := &th.frames[fi]
-		if cf.cl != nil {
-			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > baseTop {
+		cf := &frames[fi]
+		if cl := s.frameClosure(cf); cl != nil {
+			if end := cf.base + int(s.boundProtoOf(cl).proto.MaxStackSize); end > baseTop {
 				baseTop = end
 			}
 		}
@@ -3288,14 +3304,16 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	if err := s.ensureStackWithRoots(th, baseTop+5, loadedVal, []Value{StringValue(key)}); err != nil {
 		return nil, err
 	}
-	th.stack[baseTop] = loadedVal
-	th.stack[baseTop+1] = NilValue()
-	th.stack[baseTop+2] = NilValue()
+	stack := th.stackSlice(s.arena)
+	stack[baseTop] = loadedVal
+	stack[baseTop+1] = NilValue()
+	stack[baseTop+2] = NilValue()
 	th.top = baseTop + 3
 	defer func() {
-		th.stack[baseTop] = NilValue()
-		th.stack[baseTop+1] = NilValue()
-		th.stack[baseTop+2] = NilValue()
+		st := th.stackSlice(s.arena)
+		st[baseTop] = NilValue()
+		st[baseTop+1] = NilValue()
+		st[baseTop+2] = NilValue()
 		th.top = savedTop
 	}()
 	existing, err := s.tableGetStrAny(loadedVal, key)
@@ -3313,7 +3331,7 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("'package.searchers' must be a table")
 	}
 	st := s.asTable(sv)
-	th.stack[baseTop+1] = sv
+	th.stackSlice(s.arena)[baseTop+1] = sv
 	cancelFn := s.nativeCancelFunc()
 	var errs strings.Builder
 	errWork := 0
@@ -3378,14 +3396,14 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 			}
 		}
 	}
-	th.stack[baseTop+1] = loader
-	th.stack[baseTop+2] = extra
+	th.stackSlice(s.arena)[baseTop+1] = loader
+	th.stackSlice(s.arena)[baseTop+2] = extra
 	res, err := s.Call(loader, StringValue(key), extra)
 	if err != nil {
 		return nil, err
 	}
 	if len(res) > 0 && !res[0].IsNil() {
-		th.stack[baseTop+1] = res[0]
+		th.stackSlice(s.arena)[baseTop+1] = res[0]
 		if err := s.tableSetStr(loadedVal, key, res[0]); err != nil {
 			return nil, err
 		}

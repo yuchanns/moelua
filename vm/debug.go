@@ -16,7 +16,6 @@ func getFuncLine(p *bytecode.Proto, pc int) int {
 	if p == nil || len(p.LineInfo) == 0 || pc < 0 || pc >= len(p.LineInfo) {
 		return -1
 	}
-	// Find latest AbsLineInfo with abs.PC <= pc.
 	basePC := 0
 	baseLine := p.LineDefined
 	if len(p.AbsLineInfo) > 0 && pc >= int(p.AbsLineInfo[0].PC) {
@@ -68,7 +67,6 @@ func shortSrc(source string) string {
 		}
 		return s
 	}
-	// Literal string chunk (only inspect up to maxLen+1 bytes so huge sources stay O(1)).
 	maxLen := bufLen - len(`[string "..."]`) - 1
 	probe := source
 	if len(probe) > maxLen+1 {
@@ -92,22 +90,10 @@ func shortSrc(source string) string {
 
 func (s *State) initDebugLib() {
 	dbg := s.NewTable(0, 16)
-	s.registerFunc(dbg, "getinfo", intrNone, nativeDebugGetInfo)
-	if v := dbg.RawGetStr(s, s.intern.Intern("getinfo")); v.IsNative() {
-		s.builtinDebugGetInfo = s.asNative(v)
-	}
-	s.registerFunc(dbg, "traceback", intrNone, nativeDebugTraceback)
-	if v := dbg.RawGetStr(s, s.intern.Intern("traceback")); v.IsNative() {
-		s.builtinDebugTraceback = s.asNative(v)
-	}
-	s.registerFunc(dbg, "getlocal", intrNone, nativeDebugGetLocal)
-	if v := dbg.RawGetStr(s, s.intern.Intern("getlocal")); v.IsNative() {
-		s.builtinDebugGetLocal = s.asNative(v)
-	}
-	s.registerFunc(dbg, "setlocal", intrNone, nativeDebugSetLocal)
-	if v := dbg.RawGetStr(s, s.intern.Intern("setlocal")); v.IsNative() {
-		s.builtinDebugSetLocal = s.asNative(v)
-	}
+	s.builtinDebugGetInfo = s.registerFunc(dbg, "getinfo", intrNone, nativeDebugGetInfo)
+	s.builtinDebugTraceback = s.registerFunc(dbg, "traceback", intrNone, nativeDebugTraceback)
+	s.builtinDebugGetLocal = s.registerFunc(dbg, "getlocal", intrNone, nativeDebugGetLocal)
+	s.builtinDebugSetLocal = s.registerFunc(dbg, "setlocal", intrNone, nativeDebugSetLocal)
 	s.registerFunc(dbg, "getupvalue", intrNone, nativeDebugGetUpvalue)
 	s.registerFunc(dbg, "setupvalue", intrNone, nativeDebugSetUpvalue)
 	s.registerFunc(dbg, "upvalueid", intrNone, nativeDebugUpvalueID)
@@ -117,10 +103,7 @@ func (s *State) initDebugLib() {
 	s.registerFunc(dbg, "getregistry", intrNone, nativeDebugGetRegistry)
 	s.registerFunc(dbg, "getuservalue", intrNone, nativeDebugGetUserValue)
 	s.registerFunc(dbg, "setuservalue", intrNone, nativeDebugSetUserValue)
-	s.registerFunc(dbg, "sethook", intrNone, nativeDebugSetHook)
-	if v := dbg.RawGetStr(s, s.intern.Intern("sethook")); v.IsNative() {
-		s.builtinDebugSetHook = s.asNative(v)
-	}
+	s.builtinDebugSetHook = s.registerFunc(dbg, "sethook", intrNone, nativeDebugSetHook)
 	s.registerFunc(dbg, "gethook", intrNone, nativeDebugGetHook)
 	s.registerFunc(dbg, "debug", intrNone, nativeDebugDebug)
 	s.SetGlobal("debug", TableValue(dbg))
@@ -129,23 +112,23 @@ func (s *State) initDebugLib() {
 	hookKey := s.NewDictTable(4)
 	hkMeta := s.NewTable(0, 1)
 	hkMeta.RawSetStr(s, s.intern.tms[TMMode], StringValue(s.intern.Intern("k")))
-	hookKey.meta = hkMeta
-	s.registry.RawSetStr(s, s.intern.Intern("_HOOKKEY"), TableValue(hookKey))
+	s.SetMetatable(hookKey, hkMeta)
+	s.registry().RawSetStr(s, s.intern.Intern("_HOOKKEY"), TableValue(hookKey))
 }
 
-func topFrameIsNative(th *Thread, fn *NativeFunc) bool {
-	if fn == nil || th.nframe <= 0 {
+func (s *State) topFrameIsNative(th *Thread, fn *NativeFunc) bool {
+	if fn == nil || th == nil || th.nframe <= 0 {
 		return false
 	}
-	top := &th.frames[th.nframe-1]
-	return top.kind == frameNative && top.nativeFn.IsNative() && (*NativeFunc)(top.nativeFn.ptr) == fn
+	top := &th.framesSlice(s.arena)[th.nframe-1]
+	return top.kind == frameNative && top.nativeFn.IsNative() && s.asNative(top.nativeFn) == fn
 }
 
 func optThreadArg(s *State, args []Value) (*Thread, []Value) {
 	if len(args) > 0 && args[0].IsThread() {
 		return s.asThread(args[0]), args[1:]
 	}
-	return s.cur, args
+	return s.cur(), args
 }
 
 func (s *State) formatTraceback(th *Thread, msg string, hasMsg bool, level int) string {
@@ -169,22 +152,21 @@ func (s *State) formatTracebackWithCancel(th *Thread, msg string, hasMsg bool, l
 	if level < 0 {
 		return sb.String(), nil
 	}
+	frames := th.framesSlice(s.arena)
 	var entries []string
-	// Level 0 on a suspended coroutine is [C]: in <namewhat> 'yield';
-	// Level 0 on a dead errored coroutine that died in a native call (e.g. error()) is that native.
-	if th != s.cur {
+	if th != s.cur() {
 		if th.status == ThreadSuspended {
 			name, namewhat := "yield", "field"
-			if th.nframe > 0 && th.frames[th.nframe-1].kind == frameLua {
-				if n, nw := funcNameFromCallerFrame(&th.frames[th.nframe-1]); nw != "" {
+			if th.nframe > 0 && frames[th.nframe-1].kind == frameLua {
+				if n, nw := s.funcNameFromCallerFrame(&frames[th.nframe-1]); nw != "" {
 					name, namewhat = n, nw
 				}
 			}
 			entries = append(entries, fmt.Sprintf("\n\t[C]: in %s '%s'", namewhat, name))
 		} else if th.status == ThreadDead && !th.errObj.IsNil() && th.lastErrNative.IsNative() {
 			name, namewhat := s.asNative(th.lastErrNative).Name, "function"
-			if th.nframe > 0 && th.frames[th.nframe-1].kind == frameLua {
-				if n, nw := funcNameFromCallerFrame(&th.frames[th.nframe-1]); nw != "" {
+			if th.nframe > 0 && frames[th.nframe-1].kind == frameLua {
+				if n, nw := s.funcNameFromCallerFrame(&frames[th.nframe-1]); nw != "" {
 					name, namewhat = n, nw
 				}
 			}
@@ -192,13 +174,13 @@ func (s *State) formatTracebackWithCancel(th *Thread, msg string, hasMsg bool, l
 		}
 	}
 	for i := th.nframe - 1; i >= 0; i-- {
-		cf := &th.frames[i]
+		cf := &frames[i]
 		if cf.kind != frameLua {
 			if cf.topProtected {
 				entries = append(entries, "\n\t[C]: in ?")
 				continue
 			}
-			if name, namewhat := funcNameFromCall(th, i); namewhat != "" {
+			if name, namewhat := s.funcNameFromCall(th, i); namewhat != "" {
 				if namewhat == "metamethod" {
 					entries = append(entries, fmt.Sprintf("\n\t[C]: in metamethod '%s'", name))
 				} else if namewhat == "hook" {
@@ -225,10 +207,10 @@ func (s *State) formatTracebackWithCancel(th *Thread, msg string, hasMsg bool, l
 			}
 			continue
 		}
-		if cf.cl == nil {
+		if s.frameClosure(cf) == nil {
 			continue
 		}
-		p := cf.cl.bp.proto
+		p := s.boundProtoOf(s.frameClosure(cf)).proto
 		pc := cf.pc
 		if !cf.atCurrentPC && pc > 0 {
 			pc--
@@ -248,7 +230,7 @@ func (s *State) formatTracebackWithCancel(th *Thread, msg string, hasMsg bool, l
 		}
 		if p.LineDefined == 0 {
 			eb.WriteString(" in main chunk")
-		} else if name, namewhat := funcNameFromCall(th, i); namewhat != "" {
+		} else if name, namewhat := s.funcNameFromCall(th, i); namewhat != "" {
 			if namewhat == "metamethod" {
 				eb.WriteString(fmt.Sprintf(" in metamethod '%s'", name))
 			} else if namewhat == "hook" {
@@ -297,7 +279,7 @@ func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
 	hasMsg := false
 	if len(rest) >= 1 && !rest[0].IsNil() {
 		if !rest[0].IsString() && !rest[0].IsNumber() {
-			return []Value{rest[0]}, nil // non-string error object returned verbatim per Lua spec!
+			return []Value{rest[0]}, nil
 		}
 		msg = s.FormatValue(rest[0])
 		hasMsg = true
@@ -315,12 +297,12 @@ func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
 		level = int(lv)
 		explicitLevel = true
 	}
-	if th != s.cur && !explicitLevel {
+	if th != s.cur() && !explicitLevel {
 		level = 0
 	}
-	hasNativeTop := topFrameIsNative(th, s.builtinDebugTraceback)
-	includeSelf := th == s.cur && level == 0 && !hasNativeTop
-	if th == s.cur && level > 0 && !hasNativeTop {
+	hasNativeTop := s.topFrameIsNative(th, s.builtinDebugTraceback)
+	includeSelf := th == s.cur() && level == 0 && !hasNativeTop
+	if th == s.cur() && level > 0 && !hasNativeTop {
 		level--
 	}
 	if hasMsg && s.memLimit > 0 {
@@ -331,8 +313,9 @@ func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
 	selfEntry := ""
 	if includeSelf {
 		selfEntry = "\n\t[C]: in field 'traceback'"
-		if th.nframe > 0 && th.frames[th.nframe-1].kind == frameLua {
-			if n, nw := funcNameFromCallerFrame(&th.frames[th.nframe-1]); nw != "" {
+		frames := th.framesSlice(s.arena)
+		if th.nframe > 0 && frames[th.nframe-1].kind == frameLua {
+			if n, nw := s.funcNameFromCallerFrame(&frames[th.nframe-1]); nw != "" {
 				selfEntry = fmt.Sprintf("\n\t[C]: in %s '%s'", nw, n)
 			}
 		}
@@ -348,12 +331,8 @@ func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
 	return []Value{StringValue(ls)}, nil
 }
 
-func nativeUpvalueCount(nf *NativeFunc) int {
-	n := len(nf.upvals)
-	if int(nf.NumUpvals) > n {
-		n = int(nf.NumUpvals)
-	}
-	return n
+func (s *State) nativeUpvalueCountVal(fn Value) int {
+	return s.nativeUpvalCount(fn)
 }
 
 const (
@@ -413,10 +392,7 @@ func fillCFrameInfo(s *State, flags uint8, cfunc Value, cname, namewhat string, 
 		ref := s.Ref(TableValue(info))
 		defer s.Unref(ref)
 	}
-	nups := int64(0)
-	if cfunc.IsNative() {
-		nups = int64(nativeUpvalueCount(s.asNative(cfunc)))
-	}
+	nups := int64(s.nativeUpvalueCountVal(cfunc))
 	if flags&infoFlagS != 0 {
 		info.RawSetStr(s, s.intern.Intern("what"), StringValue(s.intern.Intern("C")))
 		info.RawSetStr(s, s.intern.Intern("source"), StringValue(s.intern.Intern("=[C]")))
@@ -484,84 +460,82 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		}
 		if ok {
 			lvl := int(lv)
-		if th == s.cur && lvl == 0 {
-			// Level 0 is debug.getinfo itself (C/Go function).
-			cfunc := NilValue()
-			if s.builtinDebugGetInfo != nil {
-				cfunc = s.NativeValue(s.builtinDebugGetInfo)
-			}
-			info, err := fillCFrameInfo(s, flags, cfunc, "getinfo", "field", 0, 0)
-			if err != nil {
-				return nil, err
-			}
-			return []Value{TableValue(info)}, nil
-		}
-		// Level 0 on a suspended coroutine is coroutine.yield (C frame).
-		if th != s.cur && th.status == ThreadSuspended && lvl == 0 {
-			cfunc := NilValue()
-			if s.builtinCoroYield != nil {
-				cfunc = s.NativeValue(s.builtinCoroYield)
-			}
-			info, err := fillCFrameInfo(s, flags, cfunc, "yield", "field", 0, 0)
-			if err != nil {
-				return nil, err
-			}
-			return []Value{TableValue(info)}, nil
-		}
-		// Walk frames (1-based on current thread unless frameNative for getinfo itself is already on top;
-		// also 1-based on suspended coroutine because level 0 is coroutine.yield).
-		target := lvl
-		if (th == s.cur && !topFrameIsNative(th, s.builtinDebugGetInfo)) ||
-			(th != s.cur && th.status == ThreadSuspended) {
-			target = lvl - 1
-		}
-		if target < 0 {
-			return []Value{NilValue()}, nil
-		}
-		seen := 0
-		for i := th.nframe - 1; i >= 0; i-- {
-			if seen == target {
-				cf = &th.frames[i]
-				cfIdx = i
-				if cf.kind == frameLua {
-					fn = ClosureValue(cf.cl)
+			if th == s.cur() && lvl == 0 {
+				cfunc := NilValue()
+				if s.builtinDebugGetInfo != nil {
+					cfunc = s.NativeValue(s.builtinDebugGetInfo)
 				}
-				break
-			}
-			seen++
-		}
-		if cf == nil {
-			return []Value{NilValue()}, nil
-		}
-		if cf.kind != frameLua {
-			// framePCall / frameXPCall / frameNative C boundary frame!
-			cfunc := cf.nativeFn
-			cname, namewhat := "", ""
-			if !cf.topProtected && cfIdx > 0 && th.frames[cfIdx-1].kind == frameLua {
-				cname, namewhat = funcNameFromCall(th, cfIdx)
-			}
-			if cname == "" && !cf.topProtected {
-				if cf.kind == framePCall {
-					cname = "pcall"
-					namewhat = "global"
-				} else if cf.kind == frameXPCall {
-					cname = "xpcall"
-					namewhat = "global"
+				info, err := fillCFrameInfo(s, flags, cfunc, "getinfo", "field", 0, 0)
+				if err != nil {
+					return nil, err
 				}
+				return []Value{TableValue(info)}, nil
 			}
-			if cfunc.IsNil() {
-				if cf.kind == framePCall {
-					cfunc = s.GetGlobal("pcall")
-				} else if cf.kind == frameXPCall {
-					cfunc = s.GetGlobal("xpcall")
+			if th != s.cur() && th.status == ThreadSuspended && lvl == 0 {
+				cfunc := NilValue()
+				if s.builtinCoroYield != nil {
+					cfunc = s.NativeValue(s.builtinCoroYield)
 				}
+				info, err := fillCFrameInfo(s, flags, cfunc, "yield", "field", 0, 0)
+				if err != nil {
+					return nil, err
+				}
+				return []Value{TableValue(info)}, nil
 			}
-			info, err := fillCFrameInfo(s, flags, cfunc, cname, namewhat, int64(cf.ftransfer), int64(cf.ntransfer))
-			if err != nil {
-				return nil, err
+			target := lvl
+			if (th == s.cur() && !s.topFrameIsNative(th, s.builtinDebugGetInfo)) ||
+				(th != s.cur() && th.status == ThreadSuspended) {
+				target = lvl - 1
 			}
-			return []Value{TableValue(info)}, nil
-		}
+			if target < 0 {
+				return []Value{NilValue()}, nil
+			}
+			frames := th.framesSlice(s.arena)
+			seen := 0
+			for i := th.nframe - 1; i >= 0; i-- {
+				if seen == target {
+					cf = &frames[i]
+					cfIdx = i
+					if cf.kind == frameLua {
+						if cl := s.frameClosure(cf); cl != nil {
+							fn = ClosureValue(cl)
+						}
+					}
+					break
+				}
+				seen++
+			}
+			if cf == nil {
+				return []Value{NilValue()}, nil
+			}
+			if cf.kind != frameLua {
+				cfunc := cf.nativeFn
+				cname, namewhat := "", ""
+				if !cf.topProtected && cfIdx > 0 && frames[cfIdx-1].kind == frameLua {
+					cname, namewhat = s.funcNameFromCall(th, cfIdx)
+				}
+				if cname == "" && !cf.topProtected {
+					if cf.kind == framePCall {
+						cname = "pcall"
+						namewhat = "global"
+					} else if cf.kind == frameXPCall {
+						cname = "xpcall"
+						namewhat = "global"
+					}
+				}
+				if cfunc.IsNil() {
+					if cf.kind == framePCall {
+						cfunc = s.GetGlobal("pcall")
+					} else if cf.kind == frameXPCall {
+						cfunc = s.GetGlobal("xpcall")
+					}
+				}
+				info, err := fillCFrameInfo(s, flags, cfunc, cname, namewhat, int64(cf.ftransfer), int64(cf.ntransfer))
+				if err != nil {
+					return nil, err
+				}
+				return []Value{TableValue(info)}, nil
+			}
 		} else {
 			return nil, fmt.Errorf("bad argument #1 to 'getinfo' (function or level expected)")
 		}
@@ -576,7 +550,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		defer s.Unref(infoRef)
 	}
 	if fn.IsClosure() {
-		p := s.asClosure(fn).bp.proto
+		p := s.boundProtoOf(s.asClosure(fn)).proto
 		if flags&infoFlagS != 0 {
 			src := p.Source
 			if p.NoSource {
@@ -621,7 +595,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 		if flags&infoFlagN != 0 {
 			name, namewhat := "", ""
 			if cf != nil && cfIdx >= 0 {
-				name, namewhat = funcNameFromCall(th, cfIdx)
+				name, namewhat = s.funcNameFromCall(th, cfIdx)
 			}
 			if name != "" {
 				info.RawSetStr(s, s.intern.Intern("name"), StringValue(s.intern.Intern(name)))
@@ -645,8 +619,6 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			if err != nil {
 				return nil, err
 			}
-			// Link activelines onto the rooted info table before populating it so both info
-			// and al remain rooted across any emergency GC triggered while growing al.
 			info.RawSetStr(s, s.intern.Intern("activelines"), TableValue(al))
 			if err := s.ConsumeMemErr(); err != nil {
 				return nil, err
@@ -672,7 +644,6 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			}
 		}
 	} else {
-		// Native Go function
 		if flags&infoFlagS != 0 {
 			info.RawSetStr(s, s.intern.Intern("source"), StringValue(s.intern.Intern("=[C]")))
 			info.RawSetStr(s, s.intern.Intern("short_src"), StringValue(s.intern.Intern("[C]")))
@@ -684,10 +655,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			info.RawSetStr(s, s.intern.Intern("currentline"), IntValue(-1))
 		}
 		if flags&infoFlagU != 0 {
-			nups := int64(0)
-			if fn.IsNative() {
-				nups = int64(nativeUpvalueCount(s.asNative(fn)))
-			}
+			nups := int64(s.nativeUpvalueCountVal(fn))
 			info.RawSetStr(s, s.intern.Intern("nups"), IntValue(nups))
 			info.RawSetStr(s, s.intern.Intern("nparams"), IntValue(0))
 			info.RawSetStr(s, s.intern.Intern("isvararg"), TrueValue())
@@ -735,12 +703,10 @@ func opSetsA(op bytecode.OpCode) bool {
 	}
 }
 
-// findObjectName mirrors Lua 5.5 ldebug.c:getobjname to deduce (name, namewhat) for register reg at pc.
 func findObjectName(p *bytecode.Proto, reg, lastpc int) (string, string) {
 	if name, ok := findLocalName(p, reg+1, lastpc); ok {
 		return name, "local"
 	}
-	// Scan backwards for the last instruction that wrote to reg.
 	setpc := -1
 	jmptarget := 0
 	for pc := 0; pc < lastpc; pc++ {
@@ -774,7 +740,7 @@ func findObjectName(p *bytecode.Proto, reg, lastpc int) (string, string) {
 		}
 		if sets {
 			if pc < jmptarget {
-				setpc = -1 // ambiguous origin across control-flow branch (ldebug.c:findsetreg)
+				setpc = -1
 			} else {
 				setpc = pc
 			}
@@ -816,7 +782,6 @@ func findObjectName(p *bytecode.Proto, reg, lastpc int) (string, string) {
 		} else if w.Op() == bytecode.OP_GETI {
 			return "integer index", "field"
 		} else if w.Op() == bytecode.OP_GETTABLE {
-			// When constant index > 255, Lua 5.5 emits OP_LOADK/OP_LOADKX + OP_GETTABLE (errors.lua:327-331).
 			kReg := int(w.C())
 			for pc := setpc - 1; pc >= 0; pc-- {
 				kw := p.Code[pc]
@@ -849,7 +814,6 @@ func findObjectName(p *bytecode.Proto, reg, lastpc int) (string, string) {
 		}
 	case bytecode.OP_GETVARG:
 		kReg := int(w.C())
-		// Look backwards for OP_LOADK loading the constant field name into kReg.
 		for pc := setpc - 1; pc >= 0; pc-- {
 			kw := p.Code[pc]
 			if kw.Op() == bytecode.OP_LOADK && int(kw.A()) == kReg {
@@ -885,12 +849,15 @@ func findObjectName(p *bytecode.Proto, reg, lastpc int) (string, string) {
 	return "", ""
 }
 
-// funcNameFromCallerFrame inspects a Lua caller frame's active call instruction to deduce (name, namewhat).
-func funcNameFromCallerFrame(caller *callFrame) (string, string) {
-	if caller == nil || caller.kind != frameLua || caller.cl == nil {
+func (s *State) funcNameFromCallerFrame(caller *callFrame) (string, string) {
+	if caller == nil || caller.kind != frameLua {
 		return "", ""
 	}
-	p := caller.cl.bp.proto
+	cl := s.frameClosure(caller)
+	if cl == nil {
+		return "", ""
+	}
+	p := s.boundProtoOf(cl).proto
 	pc := caller.pc - 1
 	if pc < 0 || pc >= len(p.Code) {
 		return "", ""
@@ -930,62 +897,40 @@ func funcNameFromCallerFrame(caller *callFrame) (string, string) {
 	return "", ""
 }
 
-// funcNameFromCall inspects the caller frame of th.frames[cfIdx] to deduce (name, namewhat).
-func funcNameFromCall(th *Thread, cfIdx int) (string, string) {
+func (s *State) funcNameFromCall(th *Thread, cfIdx int) (string, string) {
 	if cfIdx < 0 || cfIdx >= th.nframe {
 		return "", ""
 	}
-	if th.frames[cfIdx].isHook {
+	frames := th.framesSlice(s.arena)
+	if frames[cfIdx].isHook {
 		return "?", "hook"
 	}
-	if th.frames[cfIdx].isFinalizer {
+	if frames[cfIdx].isFinalizer {
 		return "__gc", "metamethod"
 	}
-	if cfIdx == 0 || th.frames[cfIdx].isTailCall {
+	if cfIdx == 0 || frames[cfIdx].isTailCall {
 		return "", ""
 	}
-	// Only inspect immediate Lua caller frame (matching ldebug.c:funcnamefromcall;
-	// callbacks invoked from C frames like table.sort/pcall/gsub have no caller name).
 	callerIdx := cfIdx - 1
-	if callerIdx < 0 || th.frames[callerIdx].kind != frameLua {
+	if callerIdx < 0 || frames[callerIdx].kind != frameLua {
 		return "", ""
 	}
-	return funcNameFromCallerFrame(&th.frames[callerIdx])
-}
-
-func findLuaFrame(s *State, th *Thread, level int) *callFrame {
-	target := level
-	if th == s.cur || th.status == ThreadSuspended {
-		target = level - 1
-	}
-	if target < 0 {
-		return nil
-	}
-	seen := 0
-	for i := th.nframe - 1; i >= 0; i-- {
-		if th.frames[i].kind != frameLua {
-			continue
-		}
-		if seen == target {
-			return &th.frames[i]
-		}
-		seen++
-	}
-	return nil
+	return s.funcNameFromCallerFrame(&frames[callerIdx])
 }
 
 func frameLocalLimit(s *State, th *Thread, cfIdx int) int {
-	cf := &th.frames[cfIdx]
-	limit := int(cf.cl.bp.proto.MaxStackSize)
+	frames := th.framesSlice(s.arena)
+	cf := &frames[cfIdx]
+	limit := int(s.boundProtoOf(s.frameClosure(cf)).maxStack)
 	if cfIdx+1 < th.nframe {
-		if nextLim := th.frames[cfIdx+1].funcIdx - cf.base; nextLim >= 0 && nextLim < limit {
+		if nextLim := frames[cfIdx+1].funcIdx - cf.base; nextLim >= 0 && nextLim < limit {
 			limit = nextLim
 		}
-	} else if th != s.cur && th.status == ThreadSuspended {
+	} else if th != s.cur() && th.status == ThreadSuspended {
 		if yLim := th.yieldDst - cf.base; yLim >= 0 && yLim < limit {
 			limit = yLim
 		}
-	} else if th == s.cur {
+	} else if th == s.cur() {
 		if curLim := th.top - cf.base; curLim >= 0 && curLim < limit {
 			limit = curLim
 		}
@@ -1000,8 +945,8 @@ func frameLocalLimit(s *State, th *Thread, cfIdx int) int {
 
 func resolveFrameIndex(s *State, th *Thread, lv int, self *NativeFunc) int {
 	target := lv
-	if (th == s.cur && !topFrameIsNative(th, self)) ||
-		(th != s.cur && th.status == ThreadSuspended) {
+	if (th == s.cur() && !s.topFrameIsNative(th, self)) ||
+		(th != s.cur() && th.status == ThreadSuspended) {
 		target--
 	}
 	if target < 0 {
@@ -1030,7 +975,7 @@ func nativeDebugGetLocal(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument to 'getlocal' (number expected)")
 	}
 	if rest[0].IsClosure() {
-		p := s.asClosure(rest[0]).bp.proto
+		p := s.boundProtoOf(s.asClosure(rest[0])).proto
 		if idx < 1 || int(idx) > int(p.NumParams) {
 			return []Value{NilValue()}, nil
 		}
@@ -1049,7 +994,7 @@ func nativeDebugGetLocal(s *State, args []Value) ([]Value, error) {
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'getlocal' (function or level expected)")
 	}
-	if lv == 0 && th == s.cur {
+	if lv == 0 && th == s.cur() {
 		if idx < 1 || int(idx) > len(args) {
 			return []Value{NilValue()}, nil
 		}
@@ -1059,27 +1004,26 @@ func nativeDebugGetLocal(s *State, args []Value) ([]Value, error) {
 	if cfIdx < 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'getlocal' (level out of range)")
 	}
-	cf := &th.frames[cfIdx]
+	cf := &th.framesSlice(s.arena)[cfIdx]
+	stack := th.stackSlice(s.arena)
 	if cf.kind != frameLua {
 		maxSlot := int(cf.ntransfer)
 		if end := int(cf.ftransfer) + int(cf.ntransfer) - 1; end > maxSlot {
 			maxSlot = end
 		}
-		if idx < 1 || int(idx) > maxSlot || cf.base+int(idx)-1 >= len(th.stack) {
+		if idx < 1 || int(idx) > maxSlot || cf.base+int(idx)-1 >= len(stack) {
 			return []Value{NilValue()}, nil
 		}
-		return []Value{StringValue(s.intern.Intern("(C temporary)")), th.stack[cf.base+int(idx)-1]}, nil
+		return []Value{StringValue(s.intern.Intern("(C temporary)")), stack[cf.base+int(idx)-1]}, nil
 	}
-	p := cf.cl.bp.proto
+	p := s.boundProtoOf(s.frameClosure(cf)).proto
 	if idx < 0 {
-		// Negative index accesses hidden varargs only (matching PUC-Rio ldebug.c:findvararg: PF_VAHID).
-		// Guard against -math.MinInt64 overflow.
 		if p.Flag&bytecode.PFVarargHidden == 0 || idx == math.MinInt64 {
 			return []Value{NilValue()}, nil
 		}
 		vi := -idx
 		if vi >= 1 && vi <= int64(cf.nextraargs) {
-			return []Value{StringValue(s.intern.Intern("(vararg)")), th.stack[cf.base-cf.nextraargs+int(vi)-1]}, nil
+			return []Value{StringValue(s.intern.Intern("(vararg)")), stack[cf.base-cf.nextraargs+int(vi)-1]}, nil
 		}
 		return []Value{NilValue()}, nil
 	}
@@ -1095,9 +1039,9 @@ func nativeDebugGetLocal(s *State, args []Value) ([]Value, error) {
 		return []Value{NilValue()}, nil
 	}
 	if name, ok := findLocalName(p, int(idx), pc); ok {
-		return []Value{StringValue(s.intern.Intern(name)), th.localSlotValue(cf.base + int(idx) - 1)}, nil
+		return []Value{StringValue(s.intern.Intern(name)), th.localSlotValue(s, cf.base+int(idx)-1)}, nil
 	}
-	return []Value{StringValue(s.intern.Intern("(temporary)")), th.localSlotValue(cf.base + int(idx) - 1)}, nil
+	return []Value{StringValue(s.intern.Intern("(temporary)")), th.localSlotValue(s, cf.base+int(idx)-1)}, nil
 }
 
 func nativeDebugSetLocal(s *State, args []Value) ([]Value, error) {
@@ -1120,27 +1064,27 @@ func nativeDebugSetLocal(s *State, args []Value) ([]Value, error) {
 	if cfIdx < 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'setlocal' (level out of range)")
 	}
-	cf := &th.frames[cfIdx]
+	cf := &th.framesSlice(s.arena)[cfIdx]
+	stack := th.stackSlice(s.arena)
 	if cf.kind != frameLua {
 		maxSlot := int64(cf.ntransfer)
 		if end := int64(cf.ftransfer) + int64(cf.ntransfer) - 1; end > maxSlot {
 			maxSlot = end
 		}
-		if idx < 1 || idx > maxSlot || cf.base+int(idx)-1 >= len(th.stack) {
+		if idx < 1 || idx > maxSlot || cf.base+int(idx)-1 >= len(stack) {
 			return []Value{NilValue()}, nil
 		}
-		th.stack[cf.base+int(idx)-1] = rest[2]
+		stack[cf.base+int(idx)-1] = rest[2]
 		return []Value{StringValue(s.intern.Intern("(C temporary)"))}, nil
 	}
-	p := cf.cl.bp.proto
+	p := s.boundProtoOf(s.frameClosure(cf)).proto
 	if idx < 0 {
-		// Negative index accesses hidden varargs only (matching PUC-Rio ldebug.c:findvararg: PF_VAHID).
 		if p.Flag&bytecode.PFVarargHidden == 0 || idx == math.MinInt64 {
 			return []Value{NilValue()}, nil
 		}
 		vi := -idx
 		if vi >= 1 && vi <= int64(cf.nextraargs) {
-			th.stack[cf.base-cf.nextraargs+int(vi)-1] = rest[2]
+			stack[cf.base-cf.nextraargs+int(vi)-1] = rest[2]
 			return []Value{StringValue(s.intern.Intern("(vararg)"))}, nil
 		}
 		return []Value{NilValue()}, nil
@@ -1149,7 +1093,7 @@ func nativeDebugSetLocal(s *State, args []Value) ([]Value, error) {
 	if idx < 1 || idx > int64(limit) {
 		return []Value{NilValue()}, nil
 	}
-	th.setLocalSlotValue(cf.base+int(idx)-1, rest[2])
+	th.setLocalSlotValue(s, cf.base+int(idx)-1, rest[2])
 	pc := cf.pc
 	if !cf.atCurrentPC && pc > 0 {
 		pc--
@@ -1162,9 +1106,6 @@ func nativeDebugSetLocal(s *State, args []Value) ([]Value, error) {
 
 func nativeDebugGetUpvalue(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
-		if len(args) == 0 {
-			return nil, fmt.Errorf("bad argument #2 to 'getupvalue' (number expected, got no value)")
-		}
 		return nil, fmt.Errorf("bad argument #2 to 'getupvalue' (number expected, got no value)")
 	}
 	idx, ok, err := s.coerceInt(args[1])
@@ -1178,29 +1119,27 @@ func nativeDebugGetUpvalue(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'getupvalue' (function expected, got %s)", s.objTypeName(args[0]))
 	}
 	if args[0].IsNative() {
-		nf := s.asNative(args[0])
-		n := nativeUpvalueCount(nf)
+		n := s.nativeUpvalueCountVal(args[0])
 		if idx >= 1 && int(idx) <= n {
-			val := NilValue()
-			if int(idx)-1 < len(nf.upvals) {
-				val = nf.upvals[idx-1]
-			}
+			val, _ := s.nativeUpvalGet(args[0], int(idx)-1)
 			return []Value{StringValue(s.intern.Intern("")), val}, nil
 		}
 		return nil, nil
 	}
 	cl := s.asClosure(args[0])
-	if idx < 1 || int(idx) > len(cl.upvals) {
+	if idx < 1 || int(idx) > s.closureUpvalCount(cl) {
 		return nil, nil
 	}
+	p := s.boundProtoOf(cl).proto
 	name := ""
-	if int(idx)-1 < len(cl.bp.proto.Upvalues) {
-		name = cl.bp.proto.Upvalues[idx-1].Name
+	if int(idx)-1 < len(p.Upvalues) {
+		name = p.Upvalues[idx-1].Name
 	}
 	if name == "" {
 		name = "(no name)"
 	}
-	return []Value{StringValue(s.intern.Intern(name)), cl.upvals[idx-1].Get(s)}, nil
+	uv := s.closureUpval(cl, int(idx)-1)
+	return []Value{StringValue(s.intern.Intern(name)), uv.Get(s)}, nil
 }
 
 func nativeDebugSetUpvalue(s *State, args []Value) ([]Value, error) {
@@ -1218,25 +1157,24 @@ func nativeDebugSetUpvalue(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'setupvalue' (function expected, got %s)", s.objTypeName(args[0]))
 	}
 	if args[0].IsNative() {
-		nf := s.asNative(args[0])
-		n := nativeUpvalueCount(nf)
+		n := s.nativeUpvalueCountVal(args[0])
 		if idx >= 1 && int(idx) <= n {
-			if int(idx)-1 < len(nf.upvals) {
-				nf.upvals[idx-1] = args[2]
-			}
+			s.nativeUpvalSet(args[0], int(idx)-1, args[2])
 			return []Value{StringValue(s.intern.Intern(""))}, nil
 		}
 		return nil, nil
 	}
 	cl := s.asClosure(args[0])
-	if idx < 1 || int(idx) > len(cl.upvals) {
+	if idx < 1 || int(idx) > s.closureUpvalCount(cl) {
 		return nil, nil
 	}
-	cl.upvals[idx-1].Set(s, args[2])
-	s.protoEpoch++ // invalidate any upvalue-dependent IC
+	uv := s.closureUpval(cl, int(idx)-1)
+	uv.Set(s, args[2])
+	s.protoEpoch++
+	p := s.boundProtoOf(cl).proto
 	name := ""
-	if int(idx)-1 < len(cl.bp.proto.Upvalues) {
-		name = cl.bp.proto.Upvalues[idx-1].Name
+	if int(idx)-1 < len(p.Upvalues) {
+		name = p.Upvalues[idx-1].Name
 	}
 	if name == "" {
 		name = "(no name)"
@@ -1256,46 +1194,20 @@ func nativeDebugUpvalueID(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #2 to 'upvalueid'")
 	}
 	if args[0].IsNative() {
-		nf := s.asNative(args[0])
-		n := nativeUpvalueCount(nf)
+		n := s.nativeUpvalueCountVal(args[0])
 		if idx < 1 || int(idx) > n {
 			return []Value{NilValue()}, nil
 		}
-		i := int(idx) - 1
-		if nf.Collectable {
-			if len(nf.upvalIDs) < n {
-				grown := make([]uint64, n)
-				copy(grown, nf.upvalIDs)
-				nf.upvalIDs = grown
-			}
-			if nf.upvalIDs[i] == 0 {
-				nf.upvalIDs[i] = globalUpvalTokenID.Add(1)
-			}
-			return []Value{LightUDTokenValue(nf.upvalIDs[i])}, nil
-		}
-		if s.immUpvalTokens == nil {
-			s.immUpvalTokens = make(map[*NativeFunc][]uint64)
-		}
-		ids := s.immUpvalTokens[nf]
-		if len(ids) < n {
-			grown := make([]uint64, n)
-			copy(grown, ids)
-			ids = grown
-			s.immUpvalTokens[nf] = ids
-		}
-		if ids[i] == 0 {
-			ids[i] = globalUpvalTokenID.Add(1)
-		}
-		return []Value{LightUDTokenValue(ids[i])}, nil
+		return []Value{LightUDTokenValue(s.nativeUpvalID(args[0], int(idx)-1))}, nil
 	}
 	if !args[0].IsClosure() {
 		return []Value{NilValue()}, nil
 	}
 	cl := s.asClosure(args[0])
-	if idx < 1 || int(idx) > len(cl.upvals) {
+	if idx < 1 || int(idx) > s.closureUpvalCount(cl) {
 		return []Value{NilValue()}, nil
 	}
-	return []Value{LightUDTokenValue(cl.upvals[idx-1].tokenID())}, nil
+	return []Value{LightUDTokenValue(s.closureUpval(cl, int(idx)-1).tokenID())}, nil
 }
 
 func nativeDebugUpvalueJoin(s *State, args []Value) ([]Value, error) {
@@ -1313,10 +1225,10 @@ func nativeDebugUpvalueJoin(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #1 to 'upvaluejoin' (function expected, got %s)", s.objTypeName(args[0]))
 	}
 	if !args[0].IsClosure() {
-		if n1 < 1 || int(n1) > nativeUpvalueCount(s.asNative(args[0])) {
+		if n1 < 1 || int(n1) > s.nativeUpvalueCountVal(args[0]) {
 			return nil, fmt.Errorf("bad argument #2 to 'upvaluejoin' (invalid upvalue index)")
 		}
-	} else if n1 < 1 || int(n1) > len(s.asClosure(args[0]).upvals) {
+	} else if n1 < 1 || int(n1) > s.closureUpvalCount(s.asClosure(args[0])) {
 		return nil, fmt.Errorf("bad argument #2 to 'upvaluejoin' (invalid upvalue index)")
 	}
 	if len(args) < 4 {
@@ -1333,10 +1245,10 @@ func nativeDebugUpvalueJoin(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #3 to 'upvaluejoin' (function expected, got %s)", s.objTypeName(args[2]))
 	}
 	if !args[2].IsClosure() {
-		if n2 < 1 || int(n2) > nativeUpvalueCount(s.asNative(args[2])) {
+		if n2 < 1 || int(n2) > s.nativeUpvalueCountVal(args[2]) {
 			return nil, fmt.Errorf("bad argument #4 to 'upvaluejoin' (invalid upvalue index)")
 		}
-	} else if n2 < 1 || int(n2) > len(s.asClosure(args[2]).upvals) {
+	} else if n2 < 1 || int(n2) > s.closureUpvalCount(s.asClosure(args[2])) {
 		return nil, fmt.Errorf("bad argument #4 to 'upvaluejoin' (invalid upvalue index)")
 	}
 	if !args[0].IsClosure() {
@@ -1346,7 +1258,7 @@ func nativeDebugUpvalueJoin(s *State, args []Value) ([]Value, error) {
 		return nil, fmt.Errorf("bad argument #3 to 'upvaluejoin' (Lua function expected)")
 	}
 	c1, c2 := s.asClosure(args[0]), s.asClosure(args[2])
-	c1.upvals[n1-1] = c2.upvals[n2-1]
+	s.setClosureUpval(c1, int(n1-1), s.closureUpval(c2, int(n2-1)))
 	s.protoEpoch++
 	return nil, nil
 }
@@ -1381,7 +1293,7 @@ func nativeDebugSetMetatable(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeDebugGetRegistry(s *State, _ []Value) ([]Value, error) {
-	return []Value{TableValue(s.registry)}, nil
+	return []Value{TableValue(s.registry())}, nil
 }
 
 func nativeDebugGetUserValue(s *State, args []Value) ([]Value, error) {
@@ -1404,10 +1316,10 @@ func nativeDebugGetUserValue(s *State, args []Value) ([]Value, error) {
 		return []Value{NilValue()}, nil
 	}
 	u := s.asUserdata(args[0])
-	if n < 1 || int(n) > len(u.UValues) {
+	if n < 1 || int(n) > s.userdataUValCount(u) {
 		return []Value{NilValue()}, nil
 	}
-	return []Value{u.UValues[n-1], TrueValue()}, nil
+	return []Value{s.userdataUValGet(u, int(n)-1), TrueValue()}, nil
 }
 
 func nativeDebugSetUserValue(s *State, args []Value) ([]Value, error) {
@@ -1427,10 +1339,10 @@ func nativeDebugSetUserValue(s *State, args []Value) ([]Value, error) {
 			return nil, err
 		}
 	}
-	if n < 1 || int(n) > len(u.UValues) {
+	if n < 1 || int(n) > s.userdataUValCount(u) {
 		return []Value{NilValue()}, nil
 	}
-	u.UValues[n-1] = args[1]
+	s.SetUserdataUValue(u, int(n)-1, args[1])
 	return []Value{args[0]}, nil
 }
 
@@ -1501,11 +1413,11 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 	th.baseHookCount = count
 	th.hookCount = count
 	idx := th.nframe - 1
-	if th == s.cur && topFrameIsNative(th, s.builtinDebugSetHook) {
+	if th == s.cur() && s.topFrameIsNative(th, s.builtinDebugSetHook) {
 		idx--
 	}
 	if idx >= 0 {
-		cf := &th.frames[idx]
+		cf := &th.framesSlice(s.arena)[idx]
 		if cf.kind == frameLua && cf.pc > 0 {
 			cf.dirty = true
 			cf.oldPC = cf.pc - 1

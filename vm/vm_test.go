@@ -2963,3 +2963,105 @@ func TestTableArgErrorGlobalAndCallSiteNames(t *testing.T) {
 	t.Run("unhooked", func(t *testing.T) { run(t, false) })
 	t.Run("hooked", func(t *testing.T) { run(t, true) })
 }
+
+func TestOPClosureStoresBeforeFinalizerGrowsStack(t *testing.T) {
+	s := vm.NewState()
+	defer s.Close()
+
+	cl, err := s.LoadChunk([]byte(`
+		local function grow(n)
+			if n <= 0 then return 0 end
+			local a, b, c, d, e, f, g, h = 1, 2, 3, 4, 5, 6, 7, 8
+			return grow(n - 1) + a - a + b - b + c - c + d - d + e - e + f - f + g - g + h - h
+		end
+		local finRan = 0
+		for i = 1, 32 do
+			setmetatable({}, {
+				__gc = function()
+					finRan = finRan + 1
+					grow(180) -- forces active thread stack reallocation during GC
+				end
+			})
+		end
+		-- Arm GC threshold to fire frequently while allocating closures in OP_CLOSURE.
+		collectgarbage("param", "pause", 100)
+		collectgarbage("param", "stepsize", 1)
+		local sum = 0
+		for i = 1, 2000 do
+			local x = i
+			local f = function() return x end
+			sum = sum + f()
+		end
+		return sum, finRan
+	`), "=closure_gc_stack_grow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Call(cl)
+	if err != nil {
+		t.Fatalf("OP_CLOSURE with stack-growing __gc failed: %v", err)
+	}
+	wantSum := int64(2000 * 2001 / 2)
+	gotSum, ok1 := res[0].ToInt()
+	gotFin, ok2 := res[1].ToInt()
+	if len(res) != 2 || !ok1 || !ok2 || gotSum != wantSum || gotFin == 0 {
+		t.Fatalf("got sum=%v finRan=%v, want sum=%d finRan>0", res[0], res[1], wantSum)
+	}
+}
+
+func TestConcatAndStringOpsAccountMemoryOnce(t *testing.T) {
+	s := vm.NewState()
+	defer s.Close()
+	s.SetMemoryLimit(64 * 1024 * 1024)
+
+	cl, err := s.LoadChunk([]byte(`
+		collectgarbage("stop")
+		local a = string.rep("a", 50)
+		local b = string.rep("b", 50)
+		return function()
+			return a .. b
+		end, function()
+			return string.reverse(a)
+		end, function()
+			return string.upper(a)
+		end
+	`), "=concat_single_account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fns, err := s.Call(cl)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := s.MemoryUsage()
+	res, err := s.Call(fns[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := s.MemoryUsage()
+	delta := after - before
+	if len(res) != 1 || len(s.AsString(res[0]).Str()) != 100 {
+		t.Fatalf("unexpected concat result: %v", res)
+	}
+	// 100-byte string header + payload should be accounted once (~148B-176B), never double-counted (~296B+).
+	if delta > 220 {
+		t.Fatalf("concat double-accounted string memory: before=%d after=%d delta=%d", before, after, delta)
+	}
+
+	beforeRev := s.MemoryUsage()
+	if _, err := s.Call(fns[1]); err != nil {
+		t.Fatal(err)
+	}
+	if deltaRev := s.MemoryUsage() - beforeRev; deltaRev > 160 {
+		t.Fatalf("string.reverse double-accounted string memory: delta=%d", deltaRev)
+	}
+
+	beforeUp := s.MemoryUsage()
+	if _, err := s.Call(fns[2]); err != nil {
+		t.Fatal(err)
+	}
+	if deltaUp := s.MemoryUsage() - beforeUp; deltaUp > 160 {
+		t.Fatalf("string.upper double-accounted string memory: delta=%d", deltaUp)
+	}
+}

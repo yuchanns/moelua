@@ -5,6 +5,8 @@ import (
 	"math"
 	"unsafe"
 	"weak"
+
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
 type arrKind uint8
@@ -138,10 +140,10 @@ const (
 
 func (t *Table) isProto() bool { return t.flags&tblFlagIsProto != 0 }
 
-func (t *Table) arrIntSlice() []int64     { return unsafe.Slice((*int64)(t.arrPtr), t.arrLen) }
-func (t *Table) arrFloatSlice() []float64 { return unsafe.Slice((*float64)(t.arrPtr), t.arrLen) }
-func (t *Table) arrBoolSlice() []bool     { return unsafe.Slice((*bool)(t.arrPtr), t.arrLen) }
-func (t *Table) arrValSlice() []Value     { return unsafe.Slice((*Value)(t.arrPtr), t.arrLen) }
+func (t *Table) arrIntSlice(_ *arena.Arena) []int64     { return unsafe.Slice((*int64)(t.arrPtr), t.arrLen) }
+func (t *Table) arrFloatSlice(_ *arena.Arena) []float64 { return unsafe.Slice((*float64)(t.arrPtr), t.arrLen) }
+func (t *Table) arrBoolSlice(_ *arena.Arena) []bool     { return unsafe.Slice((*bool)(t.arrPtr), t.arrLen) }
+func (t *Table) arrValSlice(_ *arena.Arena) []Value     { return unsafe.Slice((*Value)(t.arrPtr), t.arrLen) }
 
 func (t *Table) setArrInt(vs []int64) {
 	t.arrPtr = unsafe.Pointer(unsafe.SliceData(vs))
@@ -448,7 +450,7 @@ func (t *Table) hashFindSlot(key Value) (int, bool) {
 	}
 }
 
-func (t *Table) hashFindStrSlot(k *LuaString) (int, bool) {
+func (t *Table) hashFindStrSlot(_ *State, k *LuaString) (int, bool) {
 	h := t.hash
 	if h == nil || len(h.nodes) == 0 {
 		return -1, false
@@ -620,7 +622,7 @@ func (t *Table) RawGetStr(_ *State, k *LuaString) Value {
 		}
 		return NilValue()
 	}
-	if slot, ok := t.hashFindStrSlot(k); ok {
+	if slot, ok := t.hashFindStrSlot(nil, k); ok {
 		return t.hash.nodes[slot].val
 	}
 	return NilValue()
@@ -633,7 +635,7 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 	}
 	if k == s.intern.tms[TMGC] || k == s.intern.tms[TMMode] {
 		s.activateTier1()
-		if k == s.intern.tms[TMGC] && t == s.fileMeta {
+		if k == s.intern.tms[TMGC] && t == s.fileMetaTbl {
 			s.promoteFileFinalizers()
 		}
 	}
@@ -704,16 +706,16 @@ func (t *Table) RawGetInt(_ *State, i int64) Value {
 			if OptimizeEnabled {
 				switch t.arrKind {
 				case arrInt:
-					return IntValue(t.arrIntSlice()[idx])
+					return IntValue(t.arrIntSlice(nil)[idx])
 				case arrFloat:
-					return FloatValue(t.arrFloatSlice()[idx])
+					return FloatValue(t.arrFloatSlice(nil)[idx])
 				case arrBool:
-					return BoolValue(t.arrBoolSlice()[idx])
+					return BoolValue(t.arrBoolSlice(nil)[idx])
 				case arrGeneric:
-					return t.arrValSlice()[idx]
+					return t.arrValSlice(nil)[idx]
 				}
 			} else {
-				return t.arrValSlice()[idx]
+				return t.arrValSlice(nil)[idx]
 			}
 		}
 	}
@@ -747,21 +749,21 @@ func (t *Table) promoteArrToGeneric(s *State, val Value) bool {
 	case arrEmpty:
 		t.arrKind = arrGeneric
 	case arrInt:
-		src := t.arrIntSlice()
+		src := t.arrIntSlice(nil)
 		g := make([]Value, len(src), t.arrCap)
 		for i, v := range src {
 			g[i] = IntValue(v)
 		}
 		t.setArrVal(g)
 	case arrFloat:
-		src := t.arrFloatSlice()
+		src := t.arrFloatSlice(nil)
 		g := make([]Value, len(src), t.arrCap)
 		for i, v := range src {
 			g[i] = FloatValue(v)
 		}
 		t.setArrVal(g)
 	case arrBool:
-		src := t.arrBoolSlice()
+		src := t.arrBoolSlice(nil)
 		g := make([]Value, len(src), t.arrCap)
 		for i, v := range src {
 			g[i] = BoolValue(v)
@@ -813,7 +815,7 @@ func (t *Table) migrateHashIntRange(oldLen, newLen int, skipIdx int64) {
 	if t.hash == nil || t.hash.live == 0 {
 		return
 	}
-	arr := t.arrValSlice()
+	arr := t.arrValSlice(nil)
 	for k := oldLen + 1; k <= newLen; k++ {
 		if slot, ok := t.hashFindSlot(IntValue(int64(k))); ok {
 			h := t.hash
@@ -929,14 +931,14 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				n := int64(t.arrLen)
 				if idx < n {
 					if val.IsInt() {
-						t.arrIntSlice()[idx] = val.Int()
+						t.arrIntSlice(nil)[idx] = val.Int()
 						return
 					}
 					// Promote on nil (including last element) or type change so next(t, k) never invalidates keys.
 					if !t.promoteArrToGeneric(s, val) {
 						return
 					}
-					t.arrValSlice()[idx] = val
+					t.arrValSlice(nil)[idx] = val
 					return
 				}
 				if idx == n && val.IsInt() {
@@ -949,12 +951,12 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 							}
 						}
 						grown := make([]int64, n+1, nc)
-						copy(grown, t.arrIntSlice())
+						copy(grown, t.arrIntSlice(nil))
 						grown[idx] = val.Int()
 						t.setArrInt(grown)
 					} else {
 						t.arrLen = uint32(n + 1)
-						t.arrIntSlice()[idx] = val.Int()
+						t.arrIntSlice(nil)[idx] = val.Int()
 					}
 					t.hashDeleteInt(i)
 					return
@@ -970,13 +972,13 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				n := int64(t.arrLen)
 				if idx < n {
 					if val.IsFloat() {
-						t.arrFloatSlice()[idx] = val.Float()
+						t.arrFloatSlice(nil)[idx] = val.Float()
 						return
 					}
 					if !t.promoteArrToGeneric(s, val) {
 						return
 					}
-					t.arrValSlice()[idx] = val
+					t.arrValSlice(nil)[idx] = val
 					return
 				}
 				if idx == n && val.IsFloat() {
@@ -989,12 +991,12 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 							}
 						}
 						grown := make([]float64, n+1, nc)
-						copy(grown, t.arrFloatSlice())
+						copy(grown, t.arrFloatSlice(nil))
 						grown[idx] = val.Float()
 						t.setArrFloat(grown)
 					} else {
 						t.arrLen = uint32(n + 1)
-						t.arrFloatSlice()[idx] = val.Float()
+						t.arrFloatSlice(nil)[idx] = val.Float()
 					}
 					t.hashDeleteInt(i)
 					return
@@ -1010,13 +1012,13 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				n := int64(t.arrLen)
 				if idx < n {
 					if val.IsBool() {
-						t.arrBoolSlice()[idx] = val.IsTrue()
+						t.arrBoolSlice(nil)[idx] = val.IsTrue()
 						return
 					}
 					if !t.promoteArrToGeneric(s, val) {
 						return
 					}
-					t.arrValSlice()[idx] = val
+					t.arrValSlice(nil)[idx] = val
 					return
 				}
 				if idx == n && val.IsBool() {
@@ -1029,12 +1031,12 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 							}
 						}
 						grown := make([]bool, n+1, nc)
-						copy(grown, t.arrBoolSlice())
+						copy(grown, t.arrBoolSlice(nil))
 						grown[idx] = val.IsTrue()
 						t.setArrBool(grown)
 					} else {
 						t.arrLen = uint32(n + 1)
-						t.arrBoolSlice()[idx] = val.IsTrue()
+						t.arrBoolSlice(nil)[idx] = val.IsTrue()
 					}
 					t.hashDeleteInt(i)
 					return
@@ -1049,7 +1051,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 			case arrGeneric:
 				n := int64(t.arrLen)
 				if idx < n {
-					t.arrValSlice()[idx] = val
+					t.arrValSlice(nil)[idx] = val
 					return
 				}
 				if !val.IsNil() && (idx == n || (idx < max(n*2, 16) && idx < 1<<24)) {
@@ -1082,7 +1084,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 		idx := i - 1
 		n := int64(t.arrLen)
 		if idx < n {
-			t.arrValSlice()[idx] = val
+			t.arrValSlice(nil)[idx] = val
 			return
 		}
 		if !val.IsNil() && (idx == n || (idx < max(n*2, 16) && idx < 1<<24)) {
@@ -1109,7 +1111,7 @@ func (t *Table) setArrGeneric(idx int64, val Value) {
 	if newLen > int(t.arrCap) {
 		grown := make([]Value, newLen, nextCap(int(t.arrCap), newLen))
 		if oldLen > 0 {
-			old := t.arrValSlice()
+			old := t.arrValSlice(nil)
 			copy(grown, old)
 			clear(old)
 		}
@@ -1117,7 +1119,7 @@ func (t *Table) setArrGeneric(idx int64, val Value) {
 	} else {
 		t.arrLen = uint32(newLen)
 	}
-	arr := t.arrValSlice()
+	arr := t.arrValSlice(nil)
 	if newLen > oldLen+1 {
 		fillNil(arr[oldLen : newLen-1])
 	}
@@ -1235,7 +1237,7 @@ func (t *Table) Len(s *State) int64 {
 	}
 	n := int(t.arrLen)
 	if n > 0 {
-		arr := t.arrValSlice()
+		arr := t.arrValSlice(nil)
 		if arr[n-1].IsNil() {
 			// Binary search for a border inside generic array.
 			lo, hi := 0, n
@@ -1394,16 +1396,16 @@ func (t *Table) arrAt(idx int) Value {
 	if OptimizeEnabled {
 		switch t.arrKind {
 		case arrInt:
-			return IntValue(t.arrIntSlice()[idx])
+			return IntValue(t.arrIntSlice(nil)[idx])
 		case arrFloat:
-			return FloatValue(t.arrFloatSlice()[idx])
+			return FloatValue(t.arrFloatSlice(nil)[idx])
 		case arrBool:
-			return BoolValue(t.arrBoolSlice()[idx])
+			return BoolValue(t.arrBoolSlice(nil)[idx])
 		case arrGeneric:
-			return t.arrValSlice()[idx]
+			return t.arrValSlice(nil)[idx]
 		default:
 			return NilValue()
 		}
 	}
-	return t.arrValSlice()[idx]
+	return t.arrValSlice(nil)[idx]
 }

@@ -141,9 +141,9 @@ func buildStdTemplate() *stdTemplate {
 		return idx
 	}
 
-	addTable(b.registry)
-	addTable(b.stringMeta)
-	addTable(b.fileMeta)
+	addTable(b.registryTbl)
+	addTable(b.stringMetaTbl)
+	addTable(b.fileMetaTbl)
 	addTable(b.pkgTbl)
 
 	for i := 0; i < len(tableList); i++ {
@@ -157,7 +157,7 @@ func buildStdTemplate() *stdTemplate {
 			}
 		}
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
-			for _, v := range t.arrValSlice() {
+			for _, v := range t.arrValSlice(nil) {
 				if v.IsTable() {
 					addTable(b.asTable(v))
 				}
@@ -199,9 +199,9 @@ func buildStdTemplate() *stdTemplate {
 		builtinDebugSetHook:   b.builtinDebugSetHook,
 		builtinCoroYield:      b.builtinCoroYield,
 		tables:            make([]tmplTableDesc, len(tableList)),
-		registryIdx:       tableIdx[b.registry],
-		stringMetaIdx:     tableIdx[b.stringMeta],
-		fileMetaIdx:       tableIdx[b.fileMeta],
+		registryIdx:       tableIdx[b.registryTbl],
+		stringMetaIdx:     tableIdx[b.stringMetaTbl],
+		fileMetaIdx:       tableIdx[b.fileMetaTbl],
 		pkgIdx:            tableIdx[b.pkgTbl],
 	}
 	fillNil(tmpl.nilStack[:])
@@ -213,7 +213,7 @@ func buildStdTemplate() *stdTemplate {
 				return relocTable, idx, true
 			}
 		case v.IsThread():
-			if b.asThread(v) == b.mainThread {
+			if b.asThread(v) == b.mainThreadPtr {
 				return relocMainThread, 0, true
 			}
 		case v.IsUserdata():
@@ -289,7 +289,7 @@ func buildStdTemplate() *stdTemplate {
 			}
 		}
 		if t.arrKind == arrGeneric && t.arrLen > 0 {
-			arr := t.arrValSlice()
+			arr := t.arrValSlice(nil)
 			desc.arrOff = len(tmpl.arr)
 			desc.arrLen = len(arr)
 			for j, v := range arr {
@@ -360,8 +360,8 @@ func cloneFromStdTemplate(noEnv bool) *State {
 	th.errObj = NilValue()
 	th.hook = NilValue()
 	th.nny = 1
-	s.mainThread = th
-	s.cur = th
+	s.mainThreadPtr = th
+	s.curThread = th
 
 	// Bulk-copy flat table storage slabs (3 allocations total for all ~20 stdlib tables!).
 	var slotsSlab []Value
@@ -449,13 +449,13 @@ func cloneFromStdTemplate(noEnv bool) *State {
 		}
 	}
 
-	s.registry = &a.tables[tmpl.registryIdx]
-	s.stringMeta = &a.tables[tmpl.stringMetaIdx]
-	s.fileMeta = fileMeta
+	s.registryTbl = &a.tables[tmpl.registryIdx]
+	s.stringMetaTbl = &a.tables[tmpl.stringMetaIdx]
+	s.fileMetaTbl = fileMeta
 	s.pkgTbl = &a.tables[tmpl.pkgIdx]
 	s.coallocTables = a.tables[:len(tmpl.tables)]
 	s.coallocHashes = a.hashes[:len(tmpl.tables)]
-	s.typeMetas[4] = s.stringMeta
+	s.typeMetas[4] = s.stringMetaTbl
 	s.stdinInput = stdinVal
 	s.defaultInput = stdinVal
 	s.defaultOutput = stdoutVal
@@ -464,7 +464,7 @@ func cloneFromStdTemplate(noEnv bool) *State {
 	if !noEnv {
 		s.applyPackageEnv()
 	} else {
-		s.registry.RawSetStr(s, s.intern.Intern("LUA_NOENV"), TrueValue())
+		s.registryTbl.RawSetStr(s, s.intern.Intern("LUA_NOENV"), TrueValue())
 	}
 	return s
 }
