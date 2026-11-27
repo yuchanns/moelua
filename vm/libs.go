@@ -85,66 +85,126 @@ func normalizeLibMask(mask LibMask) LibMask {
 func (s *State) OpenLibs(mask LibMask) {
 	mask = normalizeLibMask(mask)
 	toOpen := mask &^ s.openedLibs
-	if toOpen == 0 {
+	if toOpen == 0 || s.memExceeded {
 		return
 	}
 
 	if toOpen&LibBase != 0 {
 		s.initBaseLib()
-		s.openedLibs |= LibBase
+		if s.memExceeded {
+			return
+		}
 		s.syncLoadedLib("_G", TableValue(s.GlobalEnv()))
+		if s.memExceeded {
+			return
+		}
+		s.openedLibs |= LibBase
 	}
 	if toOpen&LibBaseFile != 0 {
 		s.initBaseFileLib()
+		if s.memExceeded {
+			return
+		}
 		s.openedLibs |= LibBaseFile
 	}
-	if toOpen&LibMath != 0 {
-		s.openStdTableLib(LibMath, "math", s.initMathLib)
+	if toOpen&LibMath != 0 && !s.openStdTableLib(LibMath, "math", s.initMathLib) {
+		return
 	}
-	if toOpen&LibTable != 0 {
-		s.openStdTableLib(LibTable, "table", s.initTableLib)
+	if toOpen&LibTable != 0 && !s.openStdTableLib(LibTable, "table", s.initTableLib) {
+		return
 	}
-	if toOpen&LibString != 0 {
-		s.openStdTableLib(LibString, "string", s.initStringLib)
+	if toOpen&LibString != 0 && !s.openStdTableLib(LibString, "string", s.initStringLib) {
+		return
 	}
-	if toOpen&LibUTF8 != 0 {
-		s.openStdTableLib(LibUTF8, "utf8", s.initUTF8Lib)
+	if toOpen&LibUTF8 != 0 && !s.openStdTableLib(LibUTF8, "utf8", s.initUTF8Lib) {
+		return
 	}
-	if toOpen&LibCoroutine != 0 {
-		s.openStdTableLib(LibCoroutine, "coroutine", s.initCoroLib)
+	if toOpen&LibCoroutine != 0 && !s.openStdTableLib(LibCoroutine, "coroutine", s.initCoroLib) {
+		return
 	}
-	if toOpen&LibDebug != 0 {
-		s.openStdTableLib(LibDebug, "debug", s.initDebugLib)
+	if toOpen&LibDebug != 0 && !s.openStdTableLib(LibDebug, "debug", s.initDebugLib) {
+		return
 	}
-	if toOpen&LibIO != 0 {
-		s.openStdTableLib(LibIO, "io", s.initIOLib)
+	if toOpen&LibIO != 0 && !s.openStdTableLib(LibIO, "io", s.initIOLib) {
+		return
 	}
-	if toOpen&LibOS != 0 {
-		s.openStdTableLib(LibOS, "os", s.initOSLib)
+	if toOpen&LibOS != 0 && !s.openStdTableLib(LibOS, "os", s.initOSLib) {
+		return
 	}
 	if toOpen&LibPackage != 0 {
-		s.initPackageLibWithMode(true, true)
+		if s.initPackageLibWithMode(true, true) == nil || s.memExceeded {
+			return
+		}
 		s.openedLibs = (s.openedLibs &^ LibPackageSafe) | LibPackage
 		if !s.intern.bootstrapping && !s.isNoEnv() {
 			s.applyPackageEnv()
 		}
 	} else if toOpen&LibPackageSafe != 0 && s.openedLibs&LibPackage == 0 {
-		s.initPackageLibWithMode(false, true)
+		if s.initPackageLibWithMode(false, true) == nil || s.memExceeded {
+			return
+		}
 		s.openedLibs |= LibPackageSafe
 	}
 }
 
-func (s *State) openStdTableLib(bit LibMask, name string, initFn func() *Table) {
+func (s *State) pinRuntime(v Value) int {
+	if s.intern.bootstrapping || !v.IsGCObject() {
+		return 0
+	}
+	return s.Ref(v)
+}
+
+func (s *State) unpinRuntime(id int) {
+	if id != 0 {
+		s.Unref(id)
+	}
+}
+
+func (s *State) newLibTable(nseq, nrec int) *Table {
+	if s.memLimit > 0 {
+		t, err := s.TryNewTable(nseq, nrec)
+		if err != nil {
+			s.memExceeded = true
+			return nil
+		}
+		return t
+	}
+	return s.NewTable(nseq, nrec)
+}
+
+func (s *State) openStdTableLib(bit LibMask, name string, initFn func() *Table) bool {
+	if s.memExceeded {
+		return false
+	}
 	var val Value
+	fromLoaded := false
 	if existing := s.lookupLoadedLib(name); !existing.IsFalsy() {
 		val = existing
+		fromLoaded = true
 	} else {
 		tbl := initFn()
+		if s.memExceeded || tbl == nil {
+			return false
+		}
 		val = TableValue(tbl)
-		s.syncLoadedLib(name, val)
 	}
+	pinID := s.Ref(val)
+	defer s.Unref(pinID)
+
+	prevGlobal := s.GetGlobal(name)
 	s.SetGlobal(name, val)
+	if s.memExceeded {
+		return false
+	}
+	if !fromLoaded {
+		s.syncLoadedLib(name, val)
+		if s.memExceeded {
+			s.SetGlobal(name, prevGlobal)
+			return false
+		}
+	}
 	s.openedLibs |= bit
+	return true
 }
 
 func (s *State) lookupLoadedLib(name string) Value {
@@ -185,10 +245,10 @@ var (
 func nativePreloadBase(s *State, _ []Value) ([]Value, error) {
 	if s.openedLibs&LibBase == 0 {
 		s.initBaseLib()
+		if err := s.ConsumeMemErr(); err != nil {
+			return nil, err
+		}
 		s.openedLibs |= LibBase
-	}
-	if err := s.ConsumeMemErr(); err != nil {
-		return nil, err
 	}
 	return []Value{TableValue(s.GlobalEnv())}, nil
 }
@@ -196,37 +256,49 @@ func nativePreloadBase(s *State, _ []Value) ([]Value, error) {
 func nativePreloadBaseFull(s *State, _ []Value) ([]Value, error) {
 	if s.openedLibs&LibBase == 0 {
 		s.initBaseLib()
+		if err := s.ConsumeMemErr(); err != nil {
+			return nil, err
+		}
 		s.openedLibs |= LibBase
 	}
 	if s.openedLibs&LibBaseFile == 0 {
 		s.initBaseFileLib()
+		if err := s.ConsumeMemErr(); err != nil {
+			return nil, err
+		}
 		s.openedLibs |= LibBaseFile
-	}
-	if err := s.ConsumeMemErr(); err != nil {
-		return nil, err
 	}
 	return []Value{TableValue(s.GlobalEnv())}, nil
 }
 
 func nativePreloadPackage(s *State, _ []Value) ([]Value, error) {
 	pkg := s.initPackageLibWithMode(true, false)
+	if err := s.ConsumeMemErr(); err != nil {
+		return nil, err
+	}
+	if pkg == nil {
+		return nil, s.memError()
+	}
 	s.openedLibs = (s.openedLibs &^ LibPackageSafe) | LibPackage
 	if !s.intern.bootstrapping && !s.isNoEnv() {
 		s.applyPackageEnv()
-	}
-	if err := s.ConsumeMemErr(); err != nil {
-		return nil, err
+		if err := s.ConsumeMemErr(); err != nil {
+			return nil, err
+		}
 	}
 	return []Value{TableValue(pkg)}, nil
 }
 
 func nativePreloadPackageSafe(s *State, _ []Value) ([]Value, error) {
 	pkg := s.initPackageLibWithMode(false, false)
-	if s.openedLibs&LibPackage == 0 {
-		s.openedLibs |= LibPackageSafe
-	}
 	if err := s.ConsumeMemErr(); err != nil {
 		return nil, err
+	}
+	if pkg == nil {
+		return nil, s.memError()
+	}
+	if s.openedLibs&LibPackage == 0 {
+		s.openedLibs |= LibPackageSafe
 	}
 	return []Value{TableValue(pkg)}, nil
 }
@@ -478,8 +550,7 @@ func (s *State) initBaseLib() {
 	s.registerFunc(env, "collectgarbage", intrNone, nativeCollectGarbage)
 
 	s.builtinNext = s.registerFunc(env, "next", intrNext, nativeNext)
-	s.builtinIPairsIter = &NativeFunc{Name: "ipairs_iter", Fn: nativeIPairsIter, Intrinsic: intrIPairsIter}
-	registerStaticNative(s.builtinIPairsIter)
+	s.builtinIPairsIter = lookupStaticNative(registerStaticNative(&NativeFunc{Name: "ipairs_iter", Fn: nativeIPairsIter, Intrinsic: intrIPairsIter}))
 	s.registerFunc(env, "pairs", intrPairs, nativePairs)
 	s.registerFunc(env, "ipairs", intrNone, nativeIPairs)
 
@@ -494,7 +565,12 @@ func (s *State) initBaseFileLib() {
 }
 
 func (s *State) initMathLib() *Table {
-	mathTbl := s.NewTable(0, 32)
+	mathTbl := s.newLibTable(0, 32)
+	if mathTbl == nil {
+		return nil
+	}
+	pin := s.pinRuntime(TableValue(mathTbl))
+	defer s.unpinRuntime(pin)
 	mathTbl.RawSetStr(s, s.intern.Intern("pi"), FloatValue(math.Pi))
 	mathTbl.RawSetStr(s, s.intern.Intern("huge"), FloatValue(math.Inf(1)))
 	mathTbl.RawSetStr(s, s.intern.Intern("maxinteger"), IntValue(math.MaxInt64))
@@ -528,7 +604,12 @@ func (s *State) initMathLib() *Table {
 }
 
 func (s *State) initTableLib() *Table {
-	tableTbl := s.NewTable(0, 12)
+	tableTbl := s.newLibTable(0, 12)
+	if tableTbl == nil {
+		return nil
+	}
+	pin := s.pinRuntime(TableValue(tableTbl))
+	defer s.unpinRuntime(pin)
 	s.registerFunc(tableTbl, "create", intrNone, nativeTableCreate)
 	s.registerFunc(tableTbl, "insert", intrTableInsert, nativeTableInsert)
 	s.registerFunc(tableTbl, "remove", intrTableRemove, nativeTableRemove)
@@ -541,7 +622,13 @@ func (s *State) initTableLib() *Table {
 }
 
 func (s *State) initStringLib() *Table {
-	strTbl := s.NewTable(0, 20)
+	strTbl := s.newLibTable(0, 20)
+	if strTbl == nil {
+		return nil
+	}
+	pinStr := s.pinRuntime(TableValue(strTbl))
+	defer s.unpinRuntime(pinStr)
+
 	s.registerFunc(strTbl, "len", intrStringLen, nativeStringLen)
 	s.registerFunc(strTbl, "byte", intrStringByte, nativeStringByte)
 	s.registerFunc(strTbl, "char", intrNone, nativeStringChar)
@@ -559,17 +646,36 @@ func (s *State) initStringLib() *Table {
 	s.registerFunc(strTbl, "unpack", intrNone, nativeStringUnpack)
 	s.registerFunc(strTbl, "packsize", intrNone, nativeStringPackSize)
 	s.registerFunc(strTbl, "dump", intrNone, nativeStringDump)
+	if s.memExceeded {
+		return nil
+	}
 
-	strMeta := s.NewTable(0, 12)
+	strMeta := s.newLibTable(0, 12)
+	if strMeta == nil {
+		return nil
+	}
+	pinMeta := s.pinRuntime(TableValue(strMeta))
+	defer s.unpinRuntime(pinMeta)
 	strMeta.RawSetStr(s, s.intern.tms[TMIndex], TableValue(strTbl))
+	if s.memExceeded {
+		return nil
+	}
 	s.initStringArithMetamethods(strMeta)
+	if s.memExceeded {
+		return nil
+	}
 	strMeta.markProto(s)
 	s.setStringMeta(strMeta)
 	return strTbl
 }
 
 func (s *State) initUTF8Lib() *Table {
-	utf8Tbl := s.NewTable(0, 8)
+	utf8Tbl := s.newLibTable(0, 8)
+	if utf8Tbl == nil {
+		return nil
+	}
+	pin := s.pinRuntime(TableValue(utf8Tbl))
+	defer s.unpinRuntime(pin)
 	utf8Tbl.RawSetStr(s, s.intern.Intern("charpattern"), StringValue(s.intern.Intern(luastdlib.CharPattern)))
 	s.registerFunc(utf8Tbl, "char", intrNone, nativeUTF8Char)
 	s.registerFunc(utf8Tbl, "codepoint", intrNone, nativeUTF8Codepoint)
@@ -587,64 +693,116 @@ func (s *State) initPackageLibWithMode(allowOS, setGlobal bool) *Table {
 	if lv := reg.RawGetStr(s, s.intern.Intern("_LOADED")); lv.IsTable() {
 		loaded = s.asTable(lv)
 	} else {
-		loaded = s.NewTable(0, 16)
+		loaded = s.newLibTable(0, 16)
+		if loaded == nil {
+			return nil
+		}
 	}
+	pinLoaded := s.pinRuntime(TableValue(loaded))
+	defer s.unpinRuntime(pinLoaded)
+
 	if pv := reg.RawGetStr(s, s.intern.Intern("_PRELOAD")); pv.IsTable() {
 		preload = s.asTable(pv)
 	} else {
-		preload = s.NewTable(0, 8)
+		preload = s.newLibTable(0, 8)
+		if preload == nil {
+			return nil
+		}
 	}
+	pinPreload := s.pinRuntime(TableValue(preload))
+	defer s.unpinRuntime(pinPreload)
 
 	// Preserve existing package table if upgrading from LibPackageSafe -> LibPackage.
 	pkg := s.pkgTbl()
 	if pkg == nil {
-		pkg = s.NewTable(0, 10)
+		pkg = s.newLibTable(0, 10)
+		if pkg == nil {
+			return nil
+		}
+	}
+	pinPkg := s.pinRuntime(TableValue(pkg))
+	defer s.unpinRuntime(pinPkg)
+	if s.memExceeded {
+		return nil
 	}
 
 	for _, name := range []string{"_G", "math", "table", "string", "os", "io", "coroutine", "debug", "utf8"} {
 		if v := s.GetGlobal(name); !v.IsNil() {
 			if loaded.RawGetStr(s, s.intern.Intern(name)).IsNil() {
 				loaded.RawSetStr(s, s.intern.Intern(name), v)
+				if s.memExceeded {
+					return nil
+				}
 			}
 		}
 	}
-	loaded.RawSetStr(s, s.intern.Intern("package"), TableValue(pkg))
 
 	pkg.RawSetStr(s, s.intern.Intern("loaded"), TableValue(loaded))
-	pkg.RawSetStr(s, s.intern.Intern("preload"), TableValue(preload))
-	if pkg.RawGetStr(s, s.intern.Intern("path")).IsNil() {
+	if !s.memExceeded {
+		pkg.RawSetStr(s, s.intern.Intern("preload"), TableValue(preload))
+	}
+	if !s.memExceeded && pkg.RawGetStr(s, s.intern.Intern("path")).IsNil() {
 		pkg.RawSetStr(s, s.intern.Intern("path"), StringValue(s.intern.Intern(defaultLuaPath)))
 	}
-	pkg.RawSetStr(s, s.intern.Intern("config"), StringValue(s.intern.Intern("/\n;\n?\n!\n-\n")))
+	if !s.memExceeded {
+		pkg.RawSetStr(s, s.intern.Intern("config"), StringValue(s.intern.Intern("/\n;\n?\n!\n-\n")))
+	}
+	if s.memExceeded {
+		return nil
+	}
 
 	var searchers *Table
 	if sv := pkg.RawGetStr(s, s.intern.Intern("searchers")); sv.IsTable() {
 		searchers = s.asTable(sv)
 	} else {
-		searchers = s.NewTable(4, 0)
+		searchers = s.newLibTable(4, 0)
+		if searchers == nil {
+			return nil
+		}
+		pinSearchers := s.pinRuntime(TableValue(searchers))
+		defer s.unpinRuntime(pinSearchers)
 		searchers.RawSetInt(s, 1, s.allocStaticNative(&NativeFunc{Name: "searcher_preload", Fn: nativeSearcherPreload}))
-		pkg.RawSetStr(s, s.intern.Intern("searchers"), TableValue(searchers))
+		if !s.memExceeded {
+			pkg.RawSetStr(s, s.intern.Intern("searchers"), TableValue(searchers))
+		}
+	}
+	if s.memExceeded {
+		return nil
 	}
 
 	if allowOS {
 		pkg.RawSetStr(s, s.intern.Intern("cpath"), StringValue(s.intern.Intern(defaultLuaCPath)))
+		addedOS := false
+		var osStartIdx int64
 		if !s.pkgAllowOS {
 			// Append OS searchers after preload (+ any host AddFS searchers already installed).
-			nextIdx := searchers.Len(s) + 1
-			searchers.RawSetInt(s, nextIdx, s.allocStaticNative(&NativeFunc{Name: "searcher_lua", Fn: nativeSearcherLua}))
-			searchers.RawSetInt(s, nextIdx+1, s.allocStaticNative(&NativeFunc{Name: "searcher_c", Fn: nativeSearcherC}))
+			osStartIdx = searchers.Len(s) + 1
+			searchers.RawSetInt(s, osStartIdx, s.allocStaticNative(&NativeFunc{Name: "searcher_lua", Fn: nativeSearcherLua}))
+			searchers.RawSetInt(s, osStartIdx+1, s.allocStaticNative(&NativeFunc{Name: "searcher_c", Fn: nativeSearcherC}))
+			addedOS = true
 		}
 		s.registerFunc(pkg, "searchpath", intrNone, nativePackageSearchPath)
 		s.registerFunc(pkg, "loadlib", intrNone, nativePackageLoadLib)
+		if s.memExceeded {
+			if addedOS {
+				searchers.RawSetInt(s, osStartIdx, NilValue())
+				searchers.RawSetInt(s, osStartIdx+1, NilValue())
+			}
+			return nil
+		}
 		s.pkgAllowOS = true
 	}
 
-	s.pkgRef = pkg.self
-	if setGlobal {
-		s.SetGlobal("package", TableValue(pkg))
-	}
+	loaded.RawSetStr(s, s.intern.Intern("package"), TableValue(pkg))
 	reg.RawSetStr(s, s.intern.Intern("_LOADED"), TableValue(loaded))
 	reg.RawSetStr(s, s.intern.Intern("_PRELOAD"), TableValue(preload))
 	s.registerFunc(s.GlobalEnv(), "require", intrNone, nativeRequire)
+	if setGlobal {
+		s.SetGlobal("package", TableValue(pkg))
+	}
+	if s.memExceeded {
+		return nil
+	}
+	s.pkgRef = pkg.self
 	return pkg
 }

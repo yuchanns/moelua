@@ -89,11 +89,17 @@ func shortSrc(source string) string {
 }
 
 func (s *State) initDebugLib() *Table {
-	dbg := s.NewTable(0, 16)
-	s.builtinDebugGetInfo = s.registerFunc(dbg, "getinfo", intrNone, nativeDebugGetInfo)
-	s.builtinDebugTraceback = s.registerFunc(dbg, "traceback", intrNone, nativeDebugTraceback)
-	s.builtinDebugGetLocal = s.registerFunc(dbg, "getlocal", intrNone, nativeDebugGetLocal)
-	s.builtinDebugSetLocal = s.registerFunc(dbg, "setlocal", intrNone, nativeDebugSetLocal)
+	dbg := s.newLibTable(0, 16)
+	if dbg == nil {
+		return nil
+	}
+	pinDbg := s.pinRuntime(TableValue(dbg))
+	defer s.unpinRuntime(pinDbg)
+
+	getInfo := s.registerFunc(dbg, "getinfo", intrNone, nativeDebugGetInfo)
+	traceback := s.registerFunc(dbg, "traceback", intrNone, nativeDebugTraceback)
+	getLocal := s.registerFunc(dbg, "getlocal", intrNone, nativeDebugGetLocal)
+	setLocal := s.registerFunc(dbg, "setlocal", intrNone, nativeDebugSetLocal)
 	s.registerFunc(dbg, "getupvalue", intrNone, nativeDebugGetUpvalue)
 	s.registerFunc(dbg, "setupvalue", intrNone, nativeDebugSetUpvalue)
 	s.registerFunc(dbg, "upvalueid", intrNone, nativeDebugUpvalueID)
@@ -103,16 +109,43 @@ func (s *State) initDebugLib() *Table {
 	s.registerFunc(dbg, "getregistry", intrNone, nativeDebugGetRegistry)
 	s.registerFunc(dbg, "getuservalue", intrNone, nativeDebugGetUserValue)
 	s.registerFunc(dbg, "setuservalue", intrNone, nativeDebugSetUserValue)
-	s.builtinDebugSetHook = s.registerFunc(dbg, "sethook", intrNone, nativeDebugSetHook)
+	setHook := s.registerFunc(dbg, "sethook", intrNone, nativeDebugSetHook)
 	s.registerFunc(dbg, "gethook", intrNone, nativeDebugGetHook)
 	s.registerFunc(dbg, "debug", intrNone, nativeDebugDebug)
+	if s.memExceeded {
+		return nil
+	}
 
 	// Registry _HOOKKEY weak-key table matching Lua 5.5 ldblib.c (db.lua:328).
+	if s.memLimit > 0 {
+		if err := s.checkMem(256); err != nil {
+			s.memExceeded = true
+			return nil
+		}
+	}
 	hookKey := s.NewDictTable(4)
-	hkMeta := s.NewTable(0, 1)
+	pinHK := s.pinRuntime(TableValue(hookKey))
+	defer s.unpinRuntime(pinHK)
+	hkMeta := s.newLibTable(0, 1)
+	if hkMeta == nil {
+		return nil
+	}
+	pinHKM := s.pinRuntime(TableValue(hkMeta))
+	defer s.unpinRuntime(pinHKM)
 	hkMeta.RawSetStr(s, s.intern.tms[TMMode], StringValue(s.intern.Intern("k")))
+	if s.memExceeded {
+		return nil
+	}
 	s.SetMetatable(hookKey, hkMeta)
 	s.registry().RawSetStr(s, s.intern.Intern("_HOOKKEY"), TableValue(hookKey))
+	if s.memExceeded {
+		return nil
+	}
+	s.builtinDebugGetInfo = getInfo
+	s.builtinDebugTraceback = traceback
+	s.builtinDebugGetLocal = getLocal
+	s.builtinDebugSetLocal = setLocal
+	s.builtinDebugSetHook = setHook
 	return dbg
 }
 

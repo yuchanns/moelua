@@ -941,8 +941,20 @@ func nativeDoFile(s *State, args []Value) ([]Value, error) {
 // --- io library ---
 
 func (s *State) initIOLib() *Table {
-	fileMT := s.NewTable(0, 12)
-	fileMethods := s.NewTable(0, 10)
+	fileMT := s.newLibTable(0, 12)
+	if fileMT == nil {
+		return nil
+	}
+	pinMT := s.pinRuntime(TableValue(fileMT))
+	defer s.unpinRuntime(pinMT)
+
+	fileMethods := s.newLibTable(0, 10)
+	if fileMethods == nil {
+		return nil
+	}
+	pinMethods := s.pinRuntime(TableValue(fileMethods))
+	defer s.unpinRuntime(pinMethods)
+
 	s.registerFunc(fileMethods, "read", intrNone, nativeFileRead)
 	s.registerFunc(fileMethods, "write", intrNone, nativeFileWrite)
 	s.registerFunc(fileMethods, "close", intrNone, nativeFileClose)
@@ -950,29 +962,53 @@ func (s *State) initIOLib() *Table {
 	s.registerFunc(fileMethods, "seek", intrNone, nativeFileSeek)
 	s.registerFunc(fileMethods, "lines", intrNone, nativeFileLines)
 	s.registerFunc(fileMethods, "setvbuf", intrNone, nativeFileSetvbuf)
+	if s.memExceeded {
+		return nil
+	}
 
 	fileMT.RawSetStr(s, s.intern.tms[TMIndex], TableValue(fileMethods))
+	if s.memExceeded {
+		return nil
+	}
 	fileMT.RawSetStr(s, s.intern.Intern("__name"), StringValue(s.intern.Intern("FILE*")))
 	s.registerFunc(fileMT, "__tostring", intrNone, nativeFileToString)
 	s.registerFunc(fileMT, "__close", intrNone, nativeFileGCClose)
 	s.registerFunc(fileMT, "__gc", intrNone, nativeFileGCClose)
+	if s.memExceeded {
+		return nil
+	}
+	prevFileMeta := s.fileMetaRef
 	s.fileMetaRef = fileMT.self
 	fileMT.markProto(s)
 
 	stdinUD := s.newFileUD(&luaFile{f: os.Stdin, isStd: true})
+	pinIn := s.pinRuntime(stdinUD)
+	defer s.unpinRuntime(pinIn)
 	stdoutUD := s.newFileUD(&luaFile{f: os.Stdout, isStd: true})
+	pinOut := s.pinRuntime(stdoutUD)
+	defer s.unpinRuntime(pinOut)
 	stderrUD := s.newFileUD(&luaFile{f: os.Stderr, isStd: true})
-	s.stdinRef = stdinUD.Ref()
-	s.stdoutRef = stdoutUD.Ref()
-	s.stderrRef = stderrUD.Ref()
-	s.stdinInput = stdinUD
-	s.defaultInput = stdinUD
-	s.defaultOutput = stdoutUD
+	pinErr := s.pinRuntime(stderrUD)
+	defer s.unpinRuntime(pinErr)
+	if s.memExceeded {
+		s.fileMetaRef = prevFileMeta
+		return nil
+	}
 
-	ioTbl := s.NewTable(0, 16)
+	ioTbl := s.newLibTable(0, 16)
+	if ioTbl == nil {
+		s.fileMetaRef = prevFileMeta
+		return nil
+	}
+	pinIO := s.pinRuntime(TableValue(ioTbl))
+	defer s.unpinRuntime(pinIO)
 	ioTbl.RawSetStr(s, s.intern.Intern("stdin"), stdinUD)
-	ioTbl.RawSetStr(s, s.intern.Intern("stdout"), stdoutUD)
-	ioTbl.RawSetStr(s, s.intern.Intern("stderr"), stderrUD)
+	if !s.memExceeded {
+		ioTbl.RawSetStr(s, s.intern.Intern("stdout"), stdoutUD)
+	}
+	if !s.memExceeded {
+		ioTbl.RawSetStr(s, s.intern.Intern("stderr"), stderrUD)
+	}
 	s.registerFunc(ioTbl, "open", intrNone, nativeIOOpen)
 	s.registerFunc(ioTbl, "close", intrNone, nativeIOClose)
 	s.registerFunc(ioTbl, "input", intrNone, nativeIOInput)
@@ -984,6 +1020,16 @@ func (s *State) initIOLib() *Table {
 	s.registerFunc(ioTbl, "tmpfile", intrNone, nativeIOTmpfile)
 	s.registerFunc(ioTbl, "type", intrNone, nativeIOType)
 	s.registerFunc(ioTbl, "popen", intrNone, nativeIOPopen)
+	if s.memExceeded {
+		s.fileMetaRef = prevFileMeta
+		return nil
+	}
+	s.stdinRef = stdinUD.Ref()
+	s.stdoutRef = stdoutUD.Ref()
+	s.stderrRef = stderrUD.Ref()
+	s.stdinInput = stdinUD
+	s.defaultInput = stdinUD
+	s.defaultOutput = stdoutUD
 	return ioTbl
 }
 
@@ -2466,7 +2512,12 @@ func nativeIOLines(s *State, args []Value) ([]Value, error) {
 // --- os library ---
 
 func (s *State) initOSLib() *Table {
-	osTbl := s.NewTable(0, 12)
+	osTbl := s.newLibTable(0, 12)
+	if osTbl == nil {
+		return nil
+	}
+	pin := s.pinRuntime(TableValue(osTbl))
+	defer s.unpinRuntime(pin)
 	s.registerFunc(osTbl, "clock", intrNone, nativeOSClock)
 	s.registerFunc(osTbl, "time", intrNone, nativeOSTime)
 	s.registerFunc(osTbl, "difftime", intrNone, nativeOSDiffTime)

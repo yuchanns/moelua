@@ -709,6 +709,151 @@ func TestHostAuxHelpersGlobalsRegistryTracebackMeta(t *testing.T) {
 	}
 }
 
+func TestCodexRound1TemplateAndLibsRegressions(t *testing.T) {
+	t.Run("SuspendedCoroutineOpenUpvalues", func(t *testing.T) {
+		tmpl, err := NewTemplate(func(s *State) error {
+			_, err := s.DoString(`
+				co = coroutine.create(function()
+					local secret = 12345
+					getter = function() return secret end
+					setter = function(v) secret = v end
+					coroutine.yield("ready")
+					return secret
+				end)
+				local ok, tag = coroutine.resume(co)
+				assert(ok and tag == "ready")
+			`)
+			return err
+		}, WithLibs(LibSafe))
+		if err != nil {
+			t.Fatalf("NewTemplate with suspended coroutine failed: %v", err)
+		}
+
+		// Drop coroutine reference, force full GC (which must close the open upvalue via twups),
+		// and verify the surviving closures still read/mutate their isolated captured local.
+		s1 := tmpl.NewState()
+		defer s1.Close()
+		s2 := tmpl.NewState()
+		defer s2.Close()
+
+		res1, err := s1.DoString(`
+			co = nil
+			collectgarbage("collect")
+			collectgarbage("collect")
+			assert(getter() == 12345)
+			setter(99999)
+			return getter()
+		`)
+		if err != nil || len(res1) != 1 || res1[0].Int() != 99999 {
+			t.Fatalf("clone s1 upvalue closure after GC failed: res=%v err=%v", res1, err)
+		}
+
+		res2, err := s2.DoString(`
+			local ok, finalVal = coroutine.resume(co)
+			assert(ok and finalVal == 12345)
+			return getter()
+		`)
+		if err != nil || len(res2) != 1 || res2[0].Int() != 12345 {
+			t.Fatalf("clone s2 isolated coroutine failed: res=%v err=%v", res2, err)
+		}
+	})
+
+	t.Run("DebugCanonicalBuiltinsInNewTemplate", func(t *testing.T) {
+		// Warm default stdlib template first so debug builtins are already registered once.
+		warm := New()
+		warm.Close()
+
+		tmpl, err := NewTemplate(nil, WithLibs(LibBase|LibDebug))
+		if err != nil {
+			t.Fatalf("NewTemplate(LibBase|LibDebug) failed: %v", err)
+		}
+		s := tmpl.NewState()
+		defer s.Close()
+
+		res, err := s.DoString(`
+			local function probe()
+				local x = 42
+				local name, val = debug.getlocal(1, 1)
+				local info = debug.getinfo(1, "n")
+				return name, val, info.name
+			end
+			local a, b, c = probe()
+			return a, b, c
+		`)
+		if err != nil {
+			t.Fatalf("debug.getlocal in cloned template failed: %v", err)
+		}
+		if len(res) != 3 || mustStr(t, s, res[0]) != "x" || res[1].Int() != 42 || mustStr(t, s, res[2]) != "probe" {
+			t.Fatalf("debug canonical builtin mismatch: got (%v, %v, %v), want (x, 42, probe)", res[0], res[1], res[2])
+		}
+	})
+
+	t.Run("OpenLibsMemoryLimitRetry", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			mask   LibMask
+			verify string
+		}{
+			{"LibMath", LibMath, `assert(math.floor(3.9) == 3 and math.pi > 3)`},
+			{"LibTable", LibTable, `assert(table.concat({"a", "b"}, ":") == "a:b")`},
+			{"LibString", LibString, `assert(string.upper("ok") == "OK" and ("hi"):len() == 2)`},
+			{"LibUTF8", LibUTF8, `assert(utf8.len("你好") == 2)`},
+			{"LibCoroutine", LibCoroutine, `assert(type(coroutine.create) == "function")`},
+			{"LibDebug", LibDebug, `assert(type(debug.getinfo) == "function" and type(debug.getregistry()._HOOKKEY) == "table")`},
+			{"LibIO", LibIO, `assert(type(io.type) == "function" and io.stdin ~= nil)`},
+			{"LibOS", LibOS, `assert(type(os.clock) == "function")`},
+			{"LibPackageSafe", LibPackageSafe, `assert(type(require) == "function" and type(package.preload) == "table")`},
+			{"LibPackage", LibPackage, `assert(type(require) == "function" and type(package.searchpath) == "function")`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				for _, headroom := range []int64{1, 128, 512, 1536} {
+					s := New(WithLibs(LibBase))
+					s.SetMemoryLimit(s.MemoryUsage() + headroom)
+					err := s.OpenLibs(tc.mask)
+					if headroom == 1 && err == nil {
+						s.Close()
+						t.Fatalf("expected memory error for OpenLibs(%s) at headroom=1", tc.name)
+					}
+
+					// Disabling the memory limit and retrying OpenLibs must always yield a complete library.
+					s.SetMemoryLimit(0)
+					if err := s.OpenLibs(tc.mask); err != nil {
+						s.Close()
+						t.Fatalf("retry OpenLibs(%s) (headroom=%d) failed: %v", tc.name, headroom, err)
+					}
+					if _, err := s.DoString(tc.verify); err != nil {
+						s.Close()
+						t.Fatalf("retried %s incomplete (headroom=%d): %v", tc.name, headroom, err)
+					}
+					s.Close()
+				}
+			})
+		}
+	})
+
+	t.Run("SetupClosedFileAllowed", func(t *testing.T) {
+		f := filepath.Join(t.TempDir(), "setup.txt")
+		tmpl, err := NewTemplate(func(s *State) error {
+			s.SetGlobal("setup_path", s.String(f))
+			_, err := s.DoString(`
+				local fh = assert(io.open(setup_path, "w"))
+				assert(fh:write("initialized"))
+				assert(fh:close())
+				setup_done = true
+			`)
+			return err
+		}, WithLibs(LibBase|LibIO))
+		if err != nil {
+			t.Fatalf("NewTemplate rejected setup that properly closed its file: %v", err)
+		}
+		s := tmpl.NewState()
+		defer s.Close()
+		if !s.GetGlobal("setup_done").IsTrue() {
+			t.Fatalf("setup_done global missing in cloned State")
+		}
+	})
+}
+
 func BenchmarkTemplateNewState(b *testing.B) {
 	tmpl, err := NewTemplate(func(s *State) error {
 		if _, err := s.RequireLib("svc", func(st *State, _ []Value) ([]Value, error) {

@@ -73,13 +73,17 @@ type Template struct {
 	protos       []*tmplProtoDesc
 	freeProtoIDs []uint32
 
-	nextShapeID   uint64
-	shapesRootRef arena.ObjRef
-	metaRoots     map[metaRootKey]arena.ObjRef
-	metaTrans     map[metaTransKey]arena.ObjRef
-	transShapes   []arena.ObjRef
-	proxyShapes   []arena.ObjRef
-	hashedTables  []arena.ObjRef
+	nextShapeID     uint64
+	shapesRootRef   arena.ObjRef
+	metaRoots       map[metaRootKey]arena.ObjRef
+	metaTrans       map[metaTransKey]arena.ObjRef
+	transShapes     []arena.ObjRef
+	proxyShapes     []arena.ObjRef
+	hashedTables    []arena.ObjRef
+	twups           []arena.ObjRef
+	hasDeadHashKeys bool
+	warnOn          bool
+	immUpvalTokens  map[uint32][]uint64
 
 	builtinNext           *NativeFunc
 	builtinIPairsIter     *NativeFunc
@@ -156,6 +160,7 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 			b.Close()
 			return nil, err
 		}
+		b.compactOpenFiles()
 		if len(b.openFiles) > 0 {
 			b.Close()
 			return nil, fmt.Errorf("moelua: template setup left %d open file handle(s); close files before finalizing template", len(b.openFiles))
@@ -176,6 +181,7 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 		b.closeJIT()
 		b.collector.SetMode(arena.ModeIncremental)
 		b.CollectFull()
+		b.compactOpenFiles()
 		if len(b.openFiles) > 0 {
 			b.Close()
 			return nil, fmt.Errorf("moelua: template setup left %d open file handle(s) after GC", len(b.openFiles))
@@ -279,6 +285,10 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 		transShapes:           slices.Clone(b.shapes.transShapes),
 		proxyShapes:           slices.Clone(b.shapes.proxyShapes),
 		hashedTables:          slices.Clone(b.hashedTables),
+		twups:                 slices.Clone(b.twups),
+		hasDeadHashKeys:       b.hasDeadHashKeys,
+		warnOn:                b.warnOn,
+		immUpvalTokens:        cloneUpvalTokens(b.immUpvalTokens),
 		builtinNext:           b.builtinNext,
 		builtinIPairsIter:     b.builtinIPairsIter,
 		builtinDebugGetInfo:   b.builtinDebugGetInfo,
@@ -378,6 +388,10 @@ func (tmpl *Template) Clone(noEnv bool) *State {
 			proxyShapes: slices.Clone(tmpl.proxyShapes),
 		},
 		hashedTables:          slices.Clone(tmpl.hashedTables),
+		twups:                 slices.Clone(tmpl.twups),
+		hasDeadHashKeys:       tmpl.hasDeadHashKeys,
+		warnOn:                tmpl.warnOn,
+		immUpvalTokens:        cloneUpvalTokens(tmpl.immUpvalTokens),
 		nextRefID:             1,
 		out:                   os.Stdout,
 		errOut:                os.Stderr,
@@ -418,6 +432,17 @@ func (tmpl *Template) Clone(noEnv bool) *State {
 		s.registry().RawSetStr(s, s.intern.Intern("LUA_NOENV"), TrueValue())
 	}
 	return s
+}
+
+func cloneUpvalTokens(src map[uint32][]uint64) map[uint32][]uint64 {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[uint32][]uint64, len(src))
+	for k, v := range src {
+		dst[k] = slices.Clone(v)
+	}
+	return dst
 }
 
 func cloneFromStdTemplate(mask LibMask, noEnv bool) *State {

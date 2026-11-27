@@ -15,9 +15,12 @@ import (
 )
 
 func (s *State) registerFunc(tbl *Table, name string, intr uint8, fn func(*State, []Value) ([]Value, error)) *NativeFunc {
-	nf := &NativeFunc{Name: name, Fn: fn, Intrinsic: intr}
-	tbl.RawSetStr(s, s.intern.Intern(name), s.allocStaticNative(nf))
-	return nf
+	if s.memExceeded {
+		return nil
+	}
+	val := s.allocStaticNative(&NativeFunc{Name: name, Fn: fn, Intrinsic: intr})
+	tbl.RawSetStr(s, s.intern.Intern(name), val)
+	return s.asNative(val)
 }
 
 func (s *State) initStdlib() {
