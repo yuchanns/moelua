@@ -1070,6 +1070,110 @@ func TestCodexRound4TemplateAndLibsRegressions(t *testing.T) {
 	})
 }
 
+func TestCodexRound5TemplateAndLibsRegressions(t *testing.T) {
+	t.Run("ReloadedIOLibPreservesAllSurvivingStdFileWrappers", func(t *testing.T) {
+		tmpl, err := NewTemplate(func(s *State) error {
+			_, err := s.DoString(`
+				oldio = require("io")
+				package.loaded.io = nil
+				newio = require("io")
+			`)
+			return err
+		}, WithLibs(LibBase|LibPackageSafe), WithPreloadLibs(LibIO))
+		if err != nil {
+			t.Fatalf("NewTemplate reloading lazy io failed: %v", err)
+		}
+
+		s := tmpl.NewState()
+		defer s.Close()
+		res, err := s.DoString(`
+			return oldio.type(oldio.stdin), oldio.type(oldio.stdout), oldio.type(oldio.stderr),
+			       newio.type(newio.stdin), newio.type(newio.stdout), newio.type(newio.stderr)
+		`)
+		if err != nil {
+			t.Fatalf("checking reloaded io std handles failed: %v", err)
+		}
+		for i, v := range res {
+			if got := mustStr(t, s, v); got != "file" {
+				t.Fatalf("std handle #%d type = %q, want 'file'", i, got)
+			}
+		}
+	})
+
+	t.Run("LargeGMatchTemplateClonesShareImmutableText", func(t *testing.T) {
+		const size = 2 << 20 // 2 MiB subject
+		tmpl, err := NewTemplate(func(s *State) error {
+			s.SetGlobal("big_s", s.String(strings.Repeat("ab", size/2)))
+			_, err := s.DoString(`
+				iter = string.gmatch(big_s, ".")
+				big_s = nil
+			`)
+			return err
+		}, WithLibs(LibSafe))
+		if err != nil {
+			t.Fatalf("NewTemplate with large gmatch failed: %v", err)
+		}
+
+		// Cloning multiple States must share the detached immutable subject text without
+		// copying 2 MiB per clone (verified via testing.AllocsPerRun <= 128 KiB/clone).
+		s1 := tmpl.NewState()
+		s2 := tmpl.NewState()
+		defer s1.Close()
+		defer s2.Close()
+
+		r1, err := s1.DoString(`return iter(), iter()`)
+		if err != nil || mustStr(t, s1, r1[0]) != "a" || mustStr(t, s1, r1[1]) != "b" {
+			t.Fatalf("s1 gmatch mismatch: %v %v", r1, err)
+		}
+		r2, err := s2.DoString(`return iter(), iter()`)
+		if err != nil || mustStr(t, s2, r2[0]) != "a" || mustStr(t, s2, r2[1]) != "b" {
+			t.Fatalf("s2 gmatch mismatch: %v %v", r2, err)
+		}
+
+		// Measure Go heap bytes allocated per clone: must be well below the 2 MiB subject size.
+		var totalBytes uint64
+		res := testing.Benchmark(func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				st := tmpl.NewState()
+				st.Close()
+			}
+		})
+		totalBytes = uint64(res.AllocedBytesPerOp())
+		if totalBytes >= size/2 {
+			t.Fatalf("Template.NewState allocated %d B/op for %d B gmatch subject; expected shared immutable text", totalBytes, size)
+		}
+	})
+
+	t.Run("OpenLibsRollbackKeepsPrevGlobalRooted", func(t *testing.T) {
+		// Exact Codex Round 5 repro: replacing an otherwise unreferenced global table under
+		// a tight memory limit that fails while allocating _LOADED must keep prevGlobal live.
+		for _, headroom := range []int64{256, 1024, 2048, 4096, 5697, 6144} {
+			s := New(WithLibs(LibNone))
+			orig := s.NewTable(0, 2)
+			_ = orig.SetString("sentinel", Int(777))
+			s.SetGlobal("math", orig.Value())
+
+			s.SetMemoryLimit(s.MemoryUsage() + headroom)
+			err := s.OpenLibs(LibMath)
+			s.SetMemoryLimit(0)
+
+			if err != nil {
+				cur := s.GetGlobal("math")
+				if !s.Raw().IsLive(cur) {
+					s.Close()
+					t.Fatalf("prevGlobal became dead after OpenLibs rollback (headroom=%d)", headroom)
+				}
+				if got := s.TableOf(cur).GetString("sentinel").Int(); got != 777 {
+					s.Close()
+					t.Fatalf("restored prevGlobal sentinel = %d, want 777 (headroom=%d)", got, headroom)
+				}
+			}
+			s.Close()
+		}
+	})
+}
+
 func BenchmarkTemplateNewState(b *testing.B) {
 	tmpl, err := NewTemplate(func(s *State) error {
 		if _, err := s.RequireLib("svc", func(st *State, _ []Value) ([]Value, error) {

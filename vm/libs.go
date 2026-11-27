@@ -192,6 +192,9 @@ func (s *State) openStdTableLib(bit LibMask, name string, initFn func() *Table) 
 	defer s.Unref(pinID)
 
 	prevGlobal := s.GetGlobal(name)
+	pinPrev := s.pinRuntime(prevGlobal)
+	defer s.unpinRuntime(pinPrev)
+
 	s.SetGlobal(name, val)
 	if s.memExceeded {
 		return false

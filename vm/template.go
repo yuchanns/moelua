@@ -238,11 +238,18 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 				return nil
 			}
 			return &gmatchState{
-				it:     x.it.CloneWithCancel(nil),
+				it:     x.it.CloneDetached(),
 				srcLen: x.srcLen,
 			}
 		case *luaFile:
 			hasMutableGoRefs = true
+			if x != nil && x.isStd {
+				if x.w != nil {
+					_ = x.flushWriter()
+					b.subExtraMem(int64(x.w.Size()))
+				}
+				return &luaFile{f: x.f, isStd: true}
+			}
 			return &luaFile{closed: true}
 		default:
 			return v
@@ -443,6 +450,9 @@ func (tmpl *Template) Clone(noEnv bool) *State {
 					srcLen: x.srcLen,
 				}
 			case *luaFile:
+				if x != nil && x.isStd {
+					return &luaFile{f: x.f, isStd: true}
+				}
 				return &luaFile{closed: true}
 			default:
 				return v
