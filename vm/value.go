@@ -786,11 +786,6 @@ func FormatValue(v Value) string {
 		return strconv.FormatInt(v.Int(), 10)
 	case v.IsFloat():
 		return FormatFloat(v.Float())
-	case v.IsFrozenString():
-		if tmpl := stdTmpl; tmpl != nil && tmpl.strArena != nil {
-			return strings.Clone(arena.AsFast[LuaString](tmpl.strArena, v.Ref()).Str())
-		}
-		return fmt.Sprintf("string: 0x%x", v.bits)
 	case v.IsString():
 		return fmt.Sprintf("string: 0x%x", v.bits)
 	case v.IsTable():

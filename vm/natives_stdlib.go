@@ -9,30 +9,6 @@ import (
 	"github.com/yuchanns/moelua/internal/luastdlib"
 )
 
-func (s *State) initStringExtraAndUTF8(strTbl *Table) {
-	// Pattern matching, binary pack/unpack, and Lua 5.5 string.dump on string library
-	s.registerFunc(strTbl, "find", intrNone, nativeStringFind)
-	s.registerFunc(strTbl, "match", intrNone, nativeStringMatch)
-	s.registerFunc(strTbl, "gmatch", intrNone, nativeStringGMatch)
-	s.registerFunc(strTbl, "gsub", intrNone, nativeStringGSub)
-	s.registerFunc(strTbl, "pack", intrNone, nativeStringPack)
-	s.registerFunc(strTbl, "unpack", intrNone, nativeStringUnpack)
-	s.registerFunc(strTbl, "packsize", intrNone, nativeStringPackSize)
-	s.registerFunc(strTbl, "dump", intrNone, nativeStringDump)
-
-	// utf8 library (Lua 5.5.1 including two-return utf8.offset!)
-	utf8Tbl := s.NewTable(0, 8)
-	utf8Tbl.RawSetStr(s, s.intern.Intern("charpattern"), StringValue(s.intern.Intern(luastdlib.CharPattern)))
-	s.registerFunc(utf8Tbl, "char", intrNone, nativeUTF8Char)
-	s.registerFunc(utf8Tbl, "codepoint", intrNone, nativeUTF8Codepoint)
-	s.registerFunc(utf8Tbl, "len", intrNone, nativeUTF8Len)
-	s.registerFunc(utf8Tbl, "codes", intrNone, nativeUTF8Codes)
-	s.registerFunc(utf8Tbl, "offset", intrNone, nativeUTF8Offset)
-	s.SetGlobal("utf8", TableValue(utf8Tbl))
-	registerStaticNative(utf8CodesStrictIter)
-	registerStaticNative(utf8CodesLaxIter)
-}
-
 func (s *State) checkStringArg(args []Value, idx int, fnName string) (string, error) {
 	if idx >= len(args) {
 		return "", fmt.Errorf("bad argument #%d to '%s' (string expected, got no value)", idx+1, fnName)

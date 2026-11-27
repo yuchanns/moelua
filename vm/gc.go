@@ -1064,6 +1064,13 @@ func (s *State) gcFreeObject(a *arena.Arena, ref arena.ObjRef) {
 		a.Free(ref)
 	case gcKindUserdata:
 		u := arena.AsSmall[Userdata](a, ref)
+		if ref == s.stdinRef {
+			s.stdinRef = arena.NullRef
+		} else if ref == s.stdoutRef {
+			s.stdoutRef = arena.NullRef
+		} else if ref == s.stderrRef {
+			s.stderrRef = arena.NullRef
+		}
 		if u.uvalsRef != arena.NullRef {
 			a.Free(u.uvalsRef)
 		}
@@ -1072,9 +1079,13 @@ func (s *State) gcFreeObject(a *arena.Arena, ref arena.ObjRef) {
 		}
 		if u.dataRef != arena.NullGoHandle && s.goRefs != nil {
 			if raw, ok := s.goRefs.Get(u.dataRef); ok {
-				if lf, ok := raw.(*luaFile); ok && !lf.closed && !lf.isStd {
-					if freed := lf.memBytes(); freed > 0 {
-						s.subExtraMem(freed)
+				if lf, ok := raw.(*luaFile); ok && !lf.closed {
+					if !lf.isStd {
+						if freed := lf.memBytes(); freed > 0 {
+							s.subExtraMem(freed)
+						}
+					} else if lf.w != nil {
+						s.subExtraMem(int64(lf.w.Size()))
 					}
 				}
 			}

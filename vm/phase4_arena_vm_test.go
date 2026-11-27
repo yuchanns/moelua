@@ -525,7 +525,7 @@ func TestPhase4FreshStateCompactedFootprint(t *testing.T) {
 	}
 
 	// Verify frozen string arena is also compacted and shared read-only.
-	tmpl := getStdTemplate()
+	tmpl := getStdTemplate(LibAll)
 	if fb := tmpl.strArena.BackingBytes(); fb <= 0 || fb > 32*1024 {
 		t.Fatalf("frozen stdlib strArena BackingBytes = %d, want (0, 32768]", fb)
 	}

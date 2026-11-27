@@ -33,18 +33,71 @@ func (s *State) ready() bool {
 	return s != nil && !s.closed && s.vm != nil
 }
 
-// Option configures a newly created State.
+// LibMask selects which Lua 5.5.1 standard libraries are opened in a State or Template,
+// mirroring PUC-Rio Lua 5.5's luaL_openselectedlibs bitmask plus a sandboxed package option.
+type LibMask = vm.LibMask
+
+const (
+	// LibNone opens no standard libraries (an empty global environment).
+	LibNone = vm.LibNone
+	// LibBase opens core globals (_G, _VERSION, print, assert, error, pcall, xpcall, type,
+	// tostring, tonumber, select, raw*, set/getmetatable, collectgarbage, next, pairs,
+	// ipairs, warn, load) without filesystem loaders.
+	LibBase = vm.LibBase
+	// LibBaseFile opens filesystem script loaders in base (loadfile, dofile).
+	LibBaseFile = vm.LibBaseFile
+	// LibPackage opens the full package library and require() (including OS filesystem searchers).
+	LibPackage = vm.LibPackage
+	// LibPackageSafe opens a sandboxed package library and require() using ONLY in-memory
+	// package.preload plus host-registered WithFS / AddSearcher searchers (no OS disk access,
+	// no package.loadlib, no package.searchpath, ignores LUA_PATH/LUA_CPATH).
+	LibPackageSafe = vm.LibPackageSafe
+	// LibCoroutine opens the coroutine library.
+	LibCoroutine = vm.LibCoroutine
+	// LibString opens the string library and string type metatable.
+	LibString = vm.LibString
+	// LibUTF8 opens the utf8 library.
+	LibUTF8 = vm.LibUTF8
+	// LibTable opens the table library.
+	LibTable = vm.LibTable
+	// LibMath opens the math library.
+	LibMath = vm.LibMath
+	// LibIO opens the io library and binds stdin/stdout/stderr handles.
+	LibIO = vm.LibIO
+	// LibOS opens the os library.
+	LibOS = vm.LibOS
+	// LibDebug opens the debug library.
+	LibDebug = vm.LibDebug
+
+	// LibAll opens the complete Lua 5.5.1 standard library (default for New).
+	LibAll = vm.LibAll
+	// LibSafe opens the compute-safe sandbox subset (base without loadfile/dofile,
+	// coroutine, string, utf8, table, math). Combine with LibPackageSafe to also enable
+	// sandboxed require() over Preload and WithFS.
+	LibSafe = vm.LibSafe
+)
+
+type preloadSpec struct {
+	name   string
+	loader GoFunc
+}
+
+// Option configures a newly created State or Template.
 type Option func(*stateConfig)
 
 type stateConfig struct {
-	out       io.Writer
-	errOut    io.Writer
-	memLimit  int64
-	ctx       context.Context
-	insnLimit int64
-	fsList    []fs.FS
-	noEnv     bool
-	jit       bool
+	out         io.Writer
+	errOut      io.Writer
+	memLimit    int64
+	ctx         context.Context
+	insnLimit   int64
+	fsList      []fs.FS
+	preloads    []preloadSpec
+	hasLibs     bool
+	libs        LibMask
+	preloadLibs LibMask
+	noEnv       bool
+	jit         bool
 }
 
 // WithOutput redirects Lua print() output to w.
@@ -82,7 +135,7 @@ func WithInstructionLimit(limit int64) Option {
 
 // WithFS registers an io/fs.FS (such as embed.FS or os.DirFS) as a Lua require() module searcher
 // right after package.preload and before OS filesystem searchers. Multiple WithFS options are
-// searched in registration order.
+// searched in registration order. Requires LibPackage or LibPackageSafe to be enabled.
 func WithFS(fsys fs.FS) Option {
 	return func(c *stateConfig) {
 		if fsys != nil {
@@ -94,6 +147,34 @@ func WithFS(fsys fs.FS) Option {
 // WithNoEnv ignores LUA_PATH/LUA_CPATH environment variables (equivalent to lua -E).
 func WithNoEnv() Option {
 	return func(c *stateConfig) { c.noEnv = true }
+}
+
+// WithLibs selects which Lua 5.5.1 standard libraries are opened in the State or Template
+// (defaults to LibAll when omitted). Combine library flags with bitwise OR, e.g.
+// WithLibs(LibSafe | LibPackageSafe) for a sandbox with require() over Preload/WithFS.
+func WithLibs(mask LibMask) Option {
+	return func(c *stateConfig) {
+		c.hasLibs = true
+		c.libs = mask
+	}
+}
+
+// WithPreloadLibs registers lazy loaders for the selected Lua 5.5.1 standard libraries into
+// package.preload without populating globals, mirroring the preload bitmask of PUC-Rio Lua 5.5's
+// luaL_openselectedlibs(L, load, preload). Libraries already opened via WithLibs are skipped,
+// and explicit WithPreload entries override WithPreloadLibs for the same module name.
+func WithPreloadLibs(mask LibMask) Option {
+	return func(c *stateConfig) {
+		c.preloadLibs |= mask
+	}
+}
+
+// WithPreload registers a Go module loader into package.preload[name] on the created
+// State or Template so Lua require(name) loads it lazily. May be passed multiple times.
+func WithPreload(name string, loader GoFunc) Option {
+	return func(c *stateConfig) {
+		c.preloads = append(c.preloads, preloadSpec{name: name, loader: loader})
+	}
 }
 
 // WithJIT opts this State into the optional native JIT execution tier on supported
@@ -110,20 +191,18 @@ func JITSupported() bool {
 	return vm.JITSupported()
 }
 
-// New creates a new Lua 5.5.1 State cloned rapidly from the frozen stdlib template.
-func New(opts ...Option) *State {
-	var cfg stateConfig
-	for _, opt := range opts {
-		if opt != nil {
-			opt(&cfg)
-		}
+func wrapVMState(raw *vm.State) *State {
+	if raw == nil {
+		return nil
 	}
-	var raw *vm.State
-	if cfg.noEnv {
-		raw = vm.NewStateNoEnv()
-	} else {
-		raw = vm.NewState()
+	if h, ok := raw.Host().(*State); ok && h != nil {
+		return h
 	}
+	return &State{vm: raw}
+}
+
+func applyStateConfig(st *State, cfg *stateConfig) {
+	raw := st.vm
 	if cfg.out != nil {
 		raw.SetOutput(cfg.out)
 	}
@@ -142,10 +221,141 @@ func New(opts ...Option) *State {
 	for _, fsys := range cfg.fsList {
 		raw.AddFS(fsys)
 	}
+	if cfg.preloadLibs != 0 {
+		raw.PreloadLibs(cfg.preloadLibs)
+		_ = raw.ConsumeMemErr()
+	}
+	for _, p := range cfg.preloads {
+		_ = st.Preload(p.name, p.loader)
+	}
 	if cfg.jit {
 		raw.SetJITEnabled(true)
 	}
-	return &State{vm: raw}
+}
+
+// New creates a new Lua 5.5.1 State cloned rapidly from a compacted stdlib template.
+// By default all standard libraries (LibAll) are opened; pass WithLibs to select a subset.
+func New(opts ...Option) *State {
+	var cfg stateConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	var raw *vm.State
+	if cfg.hasLibs {
+		raw = vm.NewStateWithLibs(cfg.libs, cfg.noEnv)
+	} else if cfg.noEnv {
+		raw = vm.NewStateNoEnv()
+	} else {
+		raw = vm.NewState()
+	}
+	st := &State{vm: raw}
+	raw.SetHost(st)
+	applyStateConfig(st, &cfg)
+	return st
+}
+
+// Template is an immutable, compacted Arena snapshot of a preconfigured Lua 5.5.1 environment
+// (selected standard libraries plus custom host modules, globals, metatables, or Lua helpers).
+// Multiple goroutines may call (*Template).NewState concurrently to spawn isolated States in
+// microseconds without repeating library registration.
+type Template struct {
+	raw *vm.Template
+}
+
+// NewTemplate builds a reusable Template snapshot by opening the selected standard libraries
+// (default LibAll; override with WithLibs), applying any WithFS / WithPreload options, and
+// invoking setup (if non-nil) once to register custom host libraries or Lua helpers.
+//
+// Callbacks registered via RegisterFunc, RegisterFunc1, Preload, RequireLib, NewFunc,
+// NewFunc1, or AddSearcher dynamically resolve the active cloned *State at call time so a
+// single Template can safely back concurrent independent States. Setup must not leave open
+// OS file handles, unreleased Pin handles, or active debug hooks.
+func NewTemplate(setup func(s *State) error, opts ...Option) (*Template, error) {
+	var cfg stateConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	mask := LibAll
+	if cfg.hasLibs {
+		mask = cfg.libs
+	}
+	rawTmpl, err := vm.BuildTemplate(mask, func(raw *vm.State) error {
+		st := &State{vm: raw}
+		raw.SetHost(st)
+		if cfg.noEnv {
+			raw.SetNoEnv()
+		} else if setup != nil {
+			raw.ApplyPackageEnv()
+		}
+		if cfg.out != nil {
+			raw.SetOutput(cfg.out)
+		}
+		if cfg.errOut != nil {
+			raw.SetErrOutput(cfg.errOut)
+		}
+		if cfg.memLimit > 0 {
+			raw.SetMemoryLimit(cfg.memLimit)
+		}
+		if cfg.ctx != nil {
+			raw.SetContext(cfg.ctx)
+		}
+		if cfg.insnLimit > 0 {
+			raw.SetInstructionLimit(cfg.insnLimit)
+		}
+		for _, fsys := range cfg.fsList {
+			raw.AddFS(fsys)
+		}
+		if cfg.preloadLibs != 0 {
+			raw.PreloadLibs(cfg.preloadLibs)
+			if err := raw.ConsumeMemErr(); err != nil {
+				return err
+			}
+		}
+		for _, p := range cfg.preloads {
+			if err := st.Preload(p.name, p.loader); err != nil {
+				return err
+			}
+		}
+		if cfg.jit {
+			raw.SetJITEnabled(true)
+		}
+		if setup != nil {
+			return setup(st)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Template{raw: rawTmpl}, nil
+}
+
+// NewState creates an isolated Lua 5.5.1 State cloned rapidly from t.
+// Per-State runtime options (WithJIT, WithContext, WithMemoryLimit, WithInstructionLimit,
+// WithOutput, WithErrorOutput, WithNoEnv, WithFS, WithPreload, and optional additional
+// WithLibs) are applied to the newly cloned State. Safe to call concurrently.
+func (t *Template) NewState(opts ...Option) *State {
+	if t == nil || t.raw == nil {
+		return New(opts...)
+	}
+	var cfg stateConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	raw := t.raw.Clone(cfg.noEnv)
+	st := &State{vm: raw}
+	raw.SetHost(st)
+	if cfg.hasLibs {
+		raw.OpenLibs(cfg.libs)
+	}
+	applyStateConfig(st, &cfg)
+	return st
 }
 
 // JITEnabled reports whether the optional native JIT tier is active on this State.
@@ -172,6 +382,7 @@ func (s *State) Close() {
 		return
 	}
 	s.vm.Close()
+	s.vm.SetHost(nil)
 	s.closed = true
 }
 
@@ -285,12 +496,55 @@ func (s *State) Preload(name string, loader GoFunc) error {
 			return nil
 		}
 	}
-	s.vm.PreloadTable().RawSetStr(s.vm, ls, v)
+	if pt := s.vm.PreloadTable(); pt != nil {
+		pt.RawSetStr(s.vm, ls, v)
+	}
 	return s.vm.ConsumeMemErr()
 }
 
+// OpenLibs opens the selected Lua 5.5.1 standard libraries on s (idempotent per library).
+// Mirrors the load bitmask of PUC-Rio Lua 5.5's luaL_openselectedlibs.
+func (s *State) OpenLibs(mask LibMask) error {
+	if !s.ready() {
+		return ErrStateClosed
+	}
+	s.vm.OpenLibs(mask)
+	return s.vm.ConsumeMemErr()
+}
+
+// PreloadLibs registers lazy loaders for the selected Lua 5.5.1 standard libraries into
+// package.preload without populating globals, mirroring the preload bitmask of PUC-Rio Lua 5.5's
+// luaL_openselectedlibs(L, load, preload). Libraries already opened on s are skipped.
+func (s *State) PreloadLibs(mask LibMask) error {
+	if !s.ready() {
+		return ErrStateClosed
+	}
+	s.vm.PreloadLibs(mask)
+	return s.vm.ConsumeMemErr()
+}
+
+// RequireLib mirrors PUC-Rio Lua 5.5's luaL_requiref: if package.loaded[name] is absent or
+// falsy, invokes loader(s, [String(name)]), caches the returned module (defaulting to true
+// if nil/false) in package.loaded[name], and optionally sets global _G[name] when global is true.
+func (s *State) RequireLib(name string, loader GoFunc, global bool) (Value, error) {
+	if !s.ready() {
+		return vm.NilValue(), ErrStateClosed
+	}
+	if loader == nil {
+		return vm.NilValue(), fmt.Errorf("moelua: RequireLib %q requires a non-nil loader", name)
+	}
+	nf := &vm.NativeFunc{
+		Name:        name,
+		Collectable: true,
+		Fn: func(raw *vm.State, args []vm.Value) ([]vm.Value, error) {
+			return loader(wrapVMState(raw), args)
+		},
+	}
+	return s.vm.RequireLib(name, nf, global)
+}
+
 // CollectGarbage executes a full deterministic Lua 5.5 GC cycle (including weak-table
-// clearing and synchronous __gc finalizers in Tier 1 mode).
+// clearing and synchronous __gc finalizers).
 func (s *State) CollectGarbage() {
 	if s.ready() {
 		s.vm.CollectFull()
@@ -373,7 +627,7 @@ func (c *Chunk) Proto() *bytecode.Proto {
 // Value is a tagged Lua 5.5 value.
 //
 // GC Anchoring Rule: Go variables holding a Value pointing to a Lua table, closure,
-// userdata, or coroutine are invisible to MoeLua's deterministic Tier 1 tracer.
+// userdata, or coroutine are invisible to MoeLua's per-State Lua GC tracer.
 // If a Go value must stay alive across Lua execution or CollectGarbage() without
 // being stored in Lua globals/tables, anchor it with (*State).Pin(v) and call
 // (*Handle).Release() when done.
@@ -568,6 +822,82 @@ func (s *State) GetMetatableByName(name string) *Table {
 	return nil
 }
 
+// GetMetafield retrieves the raw field named event from v's metatable, or Nil() if v has
+// no metatable or the field is absent (analogous to luaL_getmetafield).
+func (s *State) GetMetafield(v Value, event string) Value {
+	if !s.ready() {
+		return vm.NilValue()
+	}
+	mt := s.vm.GetMetatableOf(v)
+	if mt == nil {
+		return vm.NilValue()
+	}
+	ls, ok := s.vm.LookupString(event)
+	if !ok {
+		return vm.NilValue()
+	}
+	return mt.RawGetStr(s.vm, ls)
+}
+
+// CallMeta looks up event in v's metatable and, if non-nil, calls it with v and returns
+// (result, true, nil) (analogous to luaL_callmeta). Returns (Nil(), false, nil) when no
+// such metafield exists.
+func (s *State) CallMeta(v Value, event string) (Value, bool, error) {
+	if !s.ready() {
+		return vm.NilValue(), false, ErrStateClosed
+	}
+	mf := s.GetMetafield(v, event)
+	if mf.IsNil() {
+		return vm.NilValue(), false, nil
+	}
+	res, err := s.Call1(mf, v)
+	if err != nil {
+		return vm.NilValue(), true, err
+	}
+	return res, true, nil
+}
+
+// Globals returns this State's global environment table (_G / LUA_RIDX_GLOBALS), or nil if closed.
+func (s *State) Globals() *Table {
+	if !s.ready() {
+		return nil
+	}
+	env := s.vm.GlobalEnv()
+	if env == nil {
+		return nil
+	}
+	return &Table{state: s, raw: env}
+}
+
+// Registry returns this State's Lua registry table (LUA_REGISTRYINDEX), or nil if closed.
+func (s *State) Registry() *Table {
+	if !s.ready() {
+		return nil
+	}
+	reg := s.vm.Registry()
+	if reg == nil {
+		return nil
+	}
+	return &Table{state: s, raw: reg}
+}
+
+// Traceback returns a Lua 5.5 formatted stack traceback for th (or the active thread when th
+// is nil), analogous to luaL_traceback(L, L1, msg, level). Returns "" if s is closed or th
+// belongs to another State.
+func (s *State) Traceback(th *Thread, msg string, level int) string {
+	if !s.ready() {
+		return ""
+	}
+	var rawTh *vm.Thread
+	if th != nil {
+		if !th.ready() || th.state != s {
+			return ""
+		}
+		rawTh = th.raw
+	}
+	return s.vm.Traceback(rawTh, msg, level)
+}
+
 // CheckUserdata verifies that v is a userdata whose metatable matches the registry
 // metatable named name (analogous to luaL_testudata) and returns its Go payload.
 func (s *State) CheckUserdata(v Value, name string) (any, bool) {
@@ -582,7 +912,7 @@ func (s *State) CheckUserdata(v Value, name string) (any, bool) {
 }
 
 // Handle is a GC-anchored host reference to a Lua Value (analogous to luaL_ref).
-// While pinned, MoeLua's Tier 1 GC tracer treats the referenced value as a live root.
+// While pinned, MoeLua's per-State Lua GC treats the referenced value as a live root.
 type Handle struct {
 	state *State
 	id    int
@@ -640,8 +970,8 @@ func (s *State) TryNewFunc(name string, fn GoFunc) (Value, error) {
 	return s.vm.TryAllocNative(&vm.NativeFunc{
 		Name:        name,
 		Collectable: true,
-		Fn: func(_ *vm.State, args []vm.Value) ([]vm.Value, error) {
-			return fn(s, args)
+		Fn: func(raw *vm.State, args []vm.Value) ([]vm.Value, error) {
+			return fn(wrapVMState(raw), args)
 		},
 	})
 }
@@ -669,8 +999,8 @@ func (s *State) TryNewFunc1(name string, fn GoFunc1) (Value, error) {
 	return s.vm.TryAllocNative(&vm.NativeFunc{
 		Name:        name,
 		Collectable: true,
-		FastFn: func(_ *vm.State, args []vm.Value) (vm.Value, error) {
-			return fn(s, args)
+		FastFn: func(raw *vm.State, args []vm.Value) (vm.Value, error) {
+			return fn(wrapVMState(raw), args)
 		},
 	})
 }
@@ -1127,7 +1457,7 @@ const (
 
 // Thread is a handle to a Lua 5.5 coroutine bound to a State.
 // Hold a Pin(th.Value()) handle if a Go-created Thread must stay alive across
-// Tier 1 CollectGarbage() without being referenced from Lua globals/tables.
+// CollectGarbage() without being referenced from Lua globals/tables.
 type Thread struct {
 	state *State
 	raw   *vm.Thread

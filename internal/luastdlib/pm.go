@@ -677,6 +677,31 @@ func GMatchWithCancel(s, pattern string, init int, checkCancel func() error) *GM
 	return it
 }
 
+// CloneDetached returns an independent copy of it with cloned subject/pattern strings
+// and a nil cancellation callback so an immutable template snapshot never retains
+// references to a temporary bootstrap State or pre-compaction Arena buffers.
+func (it *GMatchIter) CloneDetached() *GMatchIter {
+	if it == nil {
+		return nil
+	}
+	cp := *it
+	cp.ms.src = strings.Clone(it.ms.src)
+	cp.ms.pat = strings.Clone(it.ms.pat)
+	cp.ms.checkCancel = nil
+	return &cp
+}
+
+// CloneWithCancel returns an independent copy of it at its current iteration position,
+// sharing its immutable subject/pattern strings and binding a fresh cancellation callback.
+func (it *GMatchIter) CloneWithCancel(checkCancel func() error) *GMatchIter {
+	if it == nil {
+		return nil
+	}
+	cp := *it
+	cp.ms.checkCancel = checkCancel
+	return &cp
+}
+
 // Next advances the iterator to the next match.
 func (it *GMatchIter) Next() (captures []CaptureVal, ok bool, err error) {
 	for src := it.srcPos; src <= len(it.ms.src); src++ {

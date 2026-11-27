@@ -5,17 +5,26 @@ import (
 	"fmt"
 )
 
-func (s *State) initCoroLib() {
-	coro := s.NewTable(0, 10)
+func (s *State) initCoroLib() *Table {
+	coro := s.newLibTable(0, 10)
+	if coro == nil {
+		return nil
+	}
+	pin := s.pinRuntime(TableValue(coro))
+	defer s.unpinRuntime(pin)
 	s.registerFunc(coro, "create", intrNone, nativeCoroCreate)
 	s.registerFunc(coro, "resume", intrNone, nativeCoroResume)
-	s.builtinCoroYield = s.registerFunc(coro, "yield", intrNone, nativeCoroYield)
+	yieldFn := s.registerFunc(coro, "yield", intrNone, nativeCoroYield)
 	s.registerFunc(coro, "status", intrNone, nativeCoroStatus)
 	s.registerFunc(coro, "running", intrNone, nativeCoroRunning)
 	s.registerFunc(coro, "isyieldable", intrNone, nativeCoroIsYieldable)
 	s.registerFunc(coro, "wrap", intrNone, nativeCoroWrap)
 	s.registerFunc(coro, "close", intrNone, nativeCoroClose)
-	s.SetGlobal("coroutine", TableValue(coro))
+	if s.memExceeded {
+		return nil
+	}
+	s.builtinCoroYield = yieldFn
+	return coro
 }
 
 // NewThread creates a new suspended coroutine ready to run fn (matching coroutine.create).
