@@ -1157,8 +1157,16 @@ func (s *State) PreloadTable() *Table {
 	if v := reg.RawGetStr(s, key); v.IsTable() {
 		return s.asTable(v)
 	}
-	t := s.NewTable(0, 4)
+	t := s.newLibTable(0, 4)
+	if t == nil {
+		return nil
+	}
+	pin := s.pinRuntime(TableValue(t))
+	defer s.unpinRuntime(pin)
 	reg.RawSetStr(s, key, TableValue(t))
+	if s.memExceeded {
+		return nil
+	}
 	return t
 }
 

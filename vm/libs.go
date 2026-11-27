@@ -436,19 +436,15 @@ func (s *State) isNoEnv() bool {
 	return !reg.RawGetStr(s, key).IsFalsy()
 }
 
-// syncLoadedLib records an opened stdlib in registry._LOADED if package.loaded already exists.
+// syncLoadedLib records an opened stdlib in registry._LOADED (creating _LOADED on demand,
+// matching luaL_requiref) so module identity survives even before LibPackage is opened or
+// if globals are later cleared.
 func (s *State) syncLoadedLib(name string, v Value) {
-	reg := s.registry()
-	if reg == nil {
+	loaded := s.LoadedTable()
+	if loaded == nil || s.memExceeded {
 		return
 	}
-	key, ok := s.LookupString("_LOADED")
-	if !ok {
-		return
-	}
-	if lv := reg.RawGetStr(s, key); lv.IsTable() {
-		s.asTable(lv).RawSetStr(s, s.intern.Intern(name), v)
-	}
+	loaded.RawSetStr(s, s.intern.Intern(name), v)
 }
 
 // LoadedTable returns registry._LOADED (creating it on demand, matching luaL_getsubtable).
@@ -461,8 +457,16 @@ func (s *State) LoadedTable() *Table {
 	if v := reg.RawGetStr(s, key); v.IsTable() {
 		return s.asTable(v)
 	}
-	t := s.NewTable(0, 8)
+	t := s.newLibTable(0, 16)
+	if t == nil {
+		return nil
+	}
+	pin := s.pinRuntime(TableValue(t))
+	defer s.unpinRuntime(pin)
 	reg.RawSetStr(s, key, TableValue(t))
+	if s.memExceeded {
+		return nil
+	}
 	return t
 }
 
@@ -481,11 +485,11 @@ func (s *State) RequireLib(name string, loader *NativeFunc, global bool) (Value,
 	defer s.Unref(nameID)
 
 	loaded := s.LoadedTable()
-	if loaded == nil {
-		return NilValue(), fmt.Errorf("moelua: registry unavailable")
-	}
 	if err := s.ConsumeMemErr(); err != nil {
 		return NilValue(), err
+	}
+	if loaded == nil {
+		return NilValue(), fmt.Errorf("moelua: registry unavailable")
 	}
 
 	mod := loaded.RawGetStr(s, nameLS)
@@ -508,6 +512,12 @@ func (s *State) RequireLib(name string, loader *NativeFunc, global bool) (Value,
 		modID := s.Ref(mod)
 		defer s.Unref(modID)
 		loaded = s.LoadedTable()
+		if err := s.ConsumeMemErr(); err != nil {
+			return NilValue(), err
+		}
+		if loaded == nil {
+			return NilValue(), fmt.Errorf("moelua: registry unavailable")
+		}
 		loaded.RawSetStr(s, nameLS, mod)
 		if err := s.ConsumeMemErr(); err != nil {
 			return NilValue(), err

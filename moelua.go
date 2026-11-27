@@ -491,7 +491,9 @@ func (s *State) Preload(name string, loader GoFunc) error {
 			return nil
 		}
 	}
-	s.vm.PreloadTable().RawSetStr(s.vm, ls, v)
+	if pt := s.vm.PreloadTable(); pt != nil {
+		pt.RawSetStr(s.vm, ls, v)
+	}
 	return s.vm.ConsumeMemErr()
 }
 

@@ -65,6 +65,8 @@ type Template struct {
 	stdinRef      arena.ObjRef
 	stdoutRef     arena.ObjRef
 	stderrRef     arena.ObjRef
+	defaultInput  Value
+	defaultOutput Value
 	typeMetaRefs  [9]arena.ObjRef
 	openedLibs    LibMask
 	pkgAllowOS    bool
@@ -291,6 +293,8 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 		stdinRef:              stdinRef,
 		stdoutRef:             stdoutRef,
 		stderrRef:             stderrRef,
+		defaultInput:          b.defaultInput,
+		defaultOutput:         b.defaultOutput,
 		typeMetaRefs:          b.typeMetaRefs,
 		openedLibs:            b.openedLibs,
 		pkgAllowOS:            b.pkgAllowOS,
@@ -449,20 +453,20 @@ func (tmpl *Template) Clone(noEnv bool) *State {
 	s.collector.RestoreSnapshot(tmpl.gcSnap)
 	s.seedRNG(makeRandomSeed(s), 0)
 
-	// Bind fresh GoRefs handles for stdin, stdout, stderr when LibIO is present in tmpl.
+	// Bind fresh GoRefs handles for stdin, stdout, stderr when LibIO is present in tmpl,
+	// and preserve whichever default input/output streams setup configured (e.g. io.output(io.stderr)).
 	if tmpl.stdinRef != arena.NullRef {
 		arena.AsSmall[Userdata](a, tmpl.stdinRef).dataRef = goRefs.Alloc(&luaFile{f: os.Stdin, isStd: true})
-		stdinVal := userdataRefValue(tmpl.stdinRef)
-		s.stdinInput = stdinVal
-		s.defaultInput = stdinVal
+		s.stdinInput = userdataRefValue(tmpl.stdinRef)
 	}
 	if tmpl.stdoutRef != arena.NullRef {
 		arena.AsSmall[Userdata](a, tmpl.stdoutRef).dataRef = goRefs.Alloc(&luaFile{f: os.Stdout, isStd: true})
-		s.defaultOutput = userdataRefValue(tmpl.stdoutRef)
 	}
 	if tmpl.stderrRef != arena.NullRef {
 		arena.AsSmall[Userdata](a, tmpl.stderrRef).dataRef = goRefs.Alloc(&luaFile{f: os.Stderr, isStd: true})
 	}
+	s.defaultInput = tmpl.defaultInput
+	s.defaultOutput = tmpl.defaultOutput
 
 	if !noEnv {
 		s.applyPackageEnv()

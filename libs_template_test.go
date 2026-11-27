@@ -956,6 +956,67 @@ func TestCodexRound2TemplateAndLibsRegressions(t *testing.T) {
 	})
 }
 
+func TestCodexRound3TemplateAndLibsRegressions(t *testing.T) {
+	t.Run("OpenedLibsCachedInLoadedBeforePackageAndGlobalClear", func(t *testing.T) {
+		s := New(WithLibs(LibBase | LibMath))
+		defer s.Close()
+
+		origMath := s.GetGlobal("math")
+		if !origMath.IsTable() {
+			t.Fatalf("expected math table")
+		}
+
+		// RequireLib("math", ...) must return the already-opened math table without invoking loader.
+		called := false
+		got, err := s.RequireLib("math", func(*State, []Value) ([]Value, error) {
+			called = true
+			return []Value{Int(999)}, nil
+		}, false)
+		if err != nil || called || got != origMath {
+			t.Fatalf("RequireLib(math) = (got==orig:%v, called:%v, err:%v), want (true, false, nil)", got == origMath, called, err)
+		}
+
+		// Clearing _G.math BEFORE opening LibPackageSafe must still preserve require("math").
+		s.SetGlobal("math", Nil())
+		if err := s.OpenLibs(LibPackageSafe); err != nil {
+			t.Fatalf("OpenLibs(LibPackageSafe) failed: %v", err)
+		}
+		res, err := s.DoString(`
+			assert(math == nil)
+			local m = require("math")
+			return m.floor(9.8)
+		`)
+		if err != nil || len(res) != 1 || res[0].Int() != 9 {
+			t.Fatalf("require('math') after clearing global failed: res=%v err=%v", res, err)
+		}
+	})
+
+	t.Run("TemplatePreservesDefaultIOStreams", func(t *testing.T) {
+		tmpl, err := NewTemplate(func(s *State) error {
+			_, err := s.DoString(`
+				io.output(io.stderr)
+				io.input(io.stdout)
+			`)
+			return err
+		}, WithLibs(LibBase|LibIO))
+		if err != nil {
+			t.Fatalf("NewTemplate configuring default IO streams failed: %v", err)
+		}
+
+		s := tmpl.NewState()
+		defer s.Close()
+		res, err := s.DoString(`
+			return io.output() == io.stderr, io.input() == io.stdout, io.type(io.output()), io.type(io.input())
+		`)
+		if err != nil {
+			t.Fatalf("checking cloned default IO streams failed: %v", err)
+		}
+		if len(res) != 4 || !res[0].IsTrue() || !res[1].IsTrue() || mustStr(t, s, res[2]) != "file" || mustStr(t, s, res[3]) != "file" {
+			t.Fatalf("cloned default IO streams mismatch: %v", res)
+		}
+	})
+}
+
 func BenchmarkTemplateNewState(b *testing.B) {
 	tmpl, err := NewTemplate(func(s *State) error {
 		if _, err := s.RequireLib("svc", func(st *State, _ []Value) ([]Value, error) {
