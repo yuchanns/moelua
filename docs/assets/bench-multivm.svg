@@ -37,9 +37,9 @@
 
   <!-- Header -->
   <text x="24" y="30" class="title">High-Density Active Multi-VM Scalability (64 to 1000 Active VMs)</text>
-  <text x="24" y="48" class="subtitle">GitHub Actions (AMD EPYC 7763 64-Core Processor, linux/amd64) · Go 1.27.1 · GOMAXPROCS=1 · Lower is better</text>
+  <text x="24" y="48" class="subtitle">GitHub Actions (AMD EPYC 9V74 80-Core Processor, linux/amd64) · Go 1.27.1 · GOMAXPROCS=1 · Lower is better</text>
   <rect x="729.5" y="14" width="206.5" height="22" rx="6" class="badge-bg"/>
-  <text x="832.8" y="29" class="badge-txt">Updated 2026-11-27 · d68b9c9</text>
+  <text x="832.8" y="29" class="badge-txt">Updated 2026-11-27 · 9beabfd</text>
 
   <!-- Divider -->
   <line x1="490" y1="68" x2="490" y2="404" stroke="#e2e8f0" stroke-width="1"/>
@@ -50,20 +50,18 @@
 
   <line x1="64.0" y1="376.0" x2="328.0" y2="376.0" class="axis"/>
   <text x="58.0" y="379.5" class="tick-y">0</text>
-  <line x1="64.0" y1="338.3" x2="328.0" y2="338.3" class="grid"/>
-  <text x="58.0" y="341.8" class="tick-y">200ms</text>
-  <line x1="64.0" y1="300.6" x2="328.0" y2="300.6" class="grid"/>
-  <text x="58.0" y="304.1" class="tick-y">400ms</text>
-  <line x1="64.0" y1="262.9" x2="328.0" y2="262.9" class="grid"/>
-  <text x="58.0" y="266.4" class="tick-y">600ms</text>
-  <line x1="64.0" y1="225.1" x2="328.0" y2="225.1" class="grid"/>
-  <text x="58.0" y="228.6" class="tick-y">800ms</text>
-  <line x1="64.0" y1="187.4" x2="328.0" y2="187.4" class="grid"/>
-  <text x="58.0" y="190.9" class="tick-y">1000ms</text>
-  <line x1="64.0" y1="149.7" x2="328.0" y2="149.7" class="grid"/>
-  <text x="58.0" y="153.2" class="tick-y">1200ms</text>
+  <line x1="64.0" y1="332.0" x2="328.0" y2="332.0" class="grid"/>
+  <text x="58.0" y="335.5" class="tick-y">200ms</text>
+  <line x1="64.0" y1="288.0" x2="328.0" y2="288.0" class="grid"/>
+  <text x="58.0" y="291.5" class="tick-y">400ms</text>
+  <line x1="64.0" y1="244.0" x2="328.0" y2="244.0" class="grid"/>
+  <text x="58.0" y="247.5" class="tick-y">600ms</text>
+  <line x1="64.0" y1="200.0" x2="328.0" y2="200.0" class="grid"/>
+  <text x="58.0" y="203.5" class="tick-y">800ms</text>
+  <line x1="64.0" y1="156.0" x2="328.0" y2="156.0" class="grid"/>
+  <text x="58.0" y="159.5" class="tick-y">1000ms</text>
   <line x1="64.0" y1="112.0" x2="328.0" y2="112.0" class="grid"/>
-  <text x="58.0" y="115.5" class="tick-y">1400ms</text>
+  <text x="58.0" y="115.5" class="tick-y">1200ms</text>
   <line x1="64.0" y1="112.0" x2="64.0" y2="376.0" class="axis"/>
   <line x1="80.9" y1="112.0" x2="80.9" y2="376.0" class="grid"/>
   <text x="80.9" y="393" class="tick">64</text>
@@ -74,57 +72,59 @@
   <line x1="328.0" y1="112.0" x2="328.0" y2="376.0" class="grid"/>
   <text x="328.0" y="393" class="tick">1000</text>
   <text x="196.0" y="406" class="tick" style="fill:#94a3b8">active VMs</text>
-  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,362.6 131.6,322.0 199.2,264.7 328.0,159.7"/>
-  <circle cx="80.9" cy="362.6" r="2.4" fill="#94a3b8"/>
-  <circle cx="131.6" cy="322.0" r="2.4" fill="#94a3b8"/>
-  <circle cx="199.2" cy="264.7" r="2.4" fill="#94a3b8"/>
-  <circle cx="328.0" cy="159.7" r="2.4" fill="#94a3b8"/>
-  <text x="340.0" y="163.2" class="end-lbl">gopher-lua (1147ms)</text>
-  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,369.4 131.6,349.3 199.2,322.2 328.0,271.9"/>
-  <circle cx="80.9" cy="369.4" r="2.4" fill="#94a3b8"/>
-  <circle cx="131.6" cy="349.3" r="2.4" fill="#94a3b8"/>
-  <circle cx="199.2" cy="322.2" r="2.4" fill="#94a3b8"/>
-  <circle cx="328.0" cy="271.9" r="2.4" fill="#94a3b8"/>
-  <text x="340.0" y="275.4" class="end-lbl">go-lua (552ms)</text>
-  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,370.6 131.6,353.5 199.2,330.7 328.0,287.4"/>
-  <circle cx="80.9" cy="370.6" r="2.4" fill="#94a3b8"/>
-  <circle cx="131.6" cy="353.5" r="2.4" fill="#94a3b8"/>
-  <circle cx="199.2" cy="330.7" r="2.4" fill="#94a3b8"/>
-  <circle cx="328.0" cy="287.4" r="2.4" fill="#94a3b8"/>
-  <text x="340.0" y="291.4" class="end-lbl">DCLua (470ms)</text>
-  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,371.9 131.6,359.1 199.2,342.7 328.0,308.8"/>
-  <circle cx="80.9" cy="371.9" r="2.4" fill="#94a3b8"/>
-  <circle cx="131.6" cy="359.1" r="2.4" fill="#94a3b8"/>
-  <circle cx="199.2" cy="342.7" r="2.4" fill="#94a3b8"/>
-  <circle cx="328.0" cy="308.8" r="2.4" fill="#94a3b8"/>
-  <text x="340.0" y="312.3" class="end-lbl">golua (356ms)</text>
-  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,372.3 131.6,360.3 199.2,344.6 328.0,314.4"/>
-  <circle cx="80.9" cy="372.3" r="2.4" fill="#94a3b8"/>
-  <circle cx="131.6" cy="360.3" r="2.4" fill="#94a3b8"/>
-  <circle cx="199.2" cy="344.6" r="2.4" fill="#94a3b8"/>
-  <circle cx="328.0" cy="314.4" r="2.4" fill="#94a3b8"/>
-  <polyline class="leader" points="330.0,314.4 334.0,324.8 338.0,324.8"/>
-  <text x="340.0" y="328.3" class="end-lbl">Apogee JIT (327ms)</text>
-  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,372.3 131.6,360.8 199.2,345.2 328.0,315.1"/>
-  <circle cx="80.9" cy="372.3" r="2.4" fill="#94a3b8"/>
-  <circle cx="131.6" cy="360.8" r="2.4" fill="#94a3b8"/>
-  <circle cx="199.2" cy="345.2" r="2.4" fill="#94a3b8"/>
-  <circle cx="328.0" cy="315.1" r="2.4" fill="#94a3b8"/>
-  <polyline class="leader" points="330.0,315.1 334.0,340.8 338.0,340.8"/>
-  <text x="340.0" y="344.3" class="end-lbl">Apogee noJIT (323ms)</text>
-  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-dasharray="4 3" stroke-linecap="round" stroke-linejoin="round" points="80.9,375.9 131.6,375.9 199.2,375.9 328.0,375.8"/>
-  <circle cx="80.9" cy="375.9" r="2.4" fill="#94a3b8"/>
+  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,363.3 131.6,323.8 199.2,269.8 328.0,165.7"/>
+  <circle cx="80.9" cy="363.3" r="2.4" fill="#94a3b8"/>
+  <circle cx="131.6" cy="323.8" r="2.4" fill="#94a3b8"/>
+  <circle cx="199.2" cy="269.8" r="2.4" fill="#94a3b8"/>
+  <circle cx="328.0" cy="165.7" r="2.4" fill="#94a3b8"/>
+  <text x="340.0" y="169.2" class="end-lbl">gopher-lua (956ms)</text>
+  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,370.1 131.6,351.3 199.2,326.2 328.0,278.6"/>
+  <circle cx="80.9" cy="370.1" r="2.4" fill="#94a3b8"/>
+  <circle cx="131.6" cy="351.3" r="2.4" fill="#94a3b8"/>
+  <circle cx="199.2" cy="326.2" r="2.4" fill="#94a3b8"/>
+  <circle cx="328.0" cy="278.6" r="2.4" fill="#94a3b8"/>
+  <text x="340.0" y="281.5" class="end-lbl">go-lua (443ms)</text>
+  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,370.9 131.6,353.9 199.2,331.4 328.0,288.9"/>
+  <circle cx="80.9" cy="370.9" r="2.4" fill="#94a3b8"/>
+  <circle cx="131.6" cy="353.9" r="2.4" fill="#94a3b8"/>
+  <circle cx="199.2" cy="331.4" r="2.4" fill="#94a3b8"/>
+  <circle cx="328.0" cy="288.9" r="2.4" fill="#94a3b8"/>
+  <polyline class="leader" points="330.0,288.9 334.0,294.0 338.0,294.0"/>
+  <text x="340.0" y="297.5" class="end-lbl">DCLua (396ms)</text>
+  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,372.7 131.6,360.9 199.2,345.6 328.0,316.3"/>
+  <circle cx="80.9" cy="372.7" r="2.4" fill="#94a3b8"/>
+  <circle cx="131.6" cy="360.9" r="2.4" fill="#94a3b8"/>
+  <circle cx="199.2" cy="345.6" r="2.4" fill="#94a3b8"/>
+  <circle cx="328.0" cy="316.3" r="2.4" fill="#94a3b8"/>
+  <polyline class="leader" points="330.0,316.3 334.0,310.0 338.0,310.0"/>
+  <text x="340.0" y="313.5" class="end-lbl">golua (271ms)</text>
+  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,372.9 131.6,361.6 199.2,347.5 328.0,319.0"/>
+  <circle cx="80.9" cy="372.9" r="2.4" fill="#94a3b8"/>
+  <circle cx="131.6" cy="361.6" r="2.4" fill="#94a3b8"/>
+  <circle cx="199.2" cy="347.5" r="2.4" fill="#94a3b8"/>
+  <circle cx="328.0" cy="319.0" r="2.4" fill="#94a3b8"/>
+  <polyline class="leader" points="330.0,319.0 334.0,326.0 338.0,326.0"/>
+  <text x="340.0" y="329.5" class="end-lbl">Apogee JIT (259ms)</text>
+  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" points="80.9,372.7 131.6,362.0 199.2,347.9 328.0,320.3"/>
+  <circle cx="80.9" cy="372.7" r="2.4" fill="#94a3b8"/>
+  <circle cx="131.6" cy="362.0" r="2.4" fill="#94a3b8"/>
+  <circle cx="199.2" cy="347.9" r="2.4" fill="#94a3b8"/>
+  <circle cx="328.0" cy="320.3" r="2.4" fill="#94a3b8"/>
+  <polyline class="leader" points="330.0,320.3 334.0,342.0 338.0,342.0"/>
+  <text x="340.0" y="345.5" class="end-lbl">Apogee noJIT (253ms)</text>
+  <polyline fill="none" stroke="#94a3b8" stroke-width="1.7" stroke-dasharray="4 3" stroke-linecap="round" stroke-linejoin="round" points="80.9,376.0 131.6,375.9 199.2,375.9 328.0,375.9"/>
+  <circle cx="80.9" cy="376.0" r="2.4" fill="#94a3b8"/>
   <circle cx="131.6" cy="375.9" r="2.4" fill="#94a3b8"/>
   <circle cx="199.2" cy="375.9" r="2.4" fill="#94a3b8"/>
-  <circle cx="328.0" cy="375.8" r="2.4" fill="#94a3b8"/>
-  <text x="340.0" y="377.5" class="end-lbl">modernc/lua (0.9ms)</text>
-  <polyline fill="none" stroke="#10b981" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round" points="80.9,375.9 131.6,375.7 199.2,375.4 328.0,374.9"/>
+  <circle cx="328.0" cy="375.9" r="2.4" fill="#94a3b8"/>
+  <text x="340.0" y="377.5" class="end-lbl">modernc/lua (0.5ms)</text>
+  <polyline fill="none" stroke="#10b981" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round" points="80.9,375.9 131.6,375.8 199.2,375.6 328.0,375.2"/>
   <circle cx="80.9" cy="375.9" r="3.6" fill="#10b981"/>
-  <circle cx="131.6" cy="375.7" r="3.6" fill="#10b981"/>
-  <circle cx="199.2" cy="375.4" r="3.6" fill="#10b981"/>
-  <circle cx="328.0" cy="374.9" r="3.6" fill="#10b981"/>
-  <polyline class="leader" points="330.0,374.9 334.0,358.0 338.0,358.0"/>
-  <text x="340.0" y="361.5" class="end-lbl-hi">MoeLua (5.7ms)</text>
+  <circle cx="131.6" cy="375.8" r="3.6" fill="#10b981"/>
+  <circle cx="199.2" cy="375.6" r="3.6" fill="#10b981"/>
+  <circle cx="328.0" cy="375.2" r="3.6" fill="#10b981"/>
+  <polyline class="leader" points="330.0,375.2 334.0,358.0 338.0,358.0"/>
+  <text x="340.0" y="361.5" class="end-lbl-hi">MoeLua (3.6ms)</text>
 
   <!-- RIGHT PANEL: Active Memory & Cold Start -->
   <text x="512" y="78" class="panel-title">Active Memory &amp; Cold Start (1000 Active VMs)</text>
@@ -144,33 +144,33 @@
   <text x="848.0" y="393" class="tick">2.5M</text>
   <text x="640" y="135.0" class="label">modernc/lua (mmap)</text>
   <rect x="648.0" y="122.0" width="23.2" height="17.0" rx="3" class="bar-other"/>
-  <text x="677.2" y="135.0" class="val">297 KiB · 74µs</text>
+  <text x="677.2" y="135.0" class="val">297 KiB · 58µs</text>
   <text x="640" y="163.2" class="label-hi">MoeLua 5.5 (Arena)</text>
-  <rect x="648.0" y="150.2" width="23.9" height="17.0" rx="3" class="bar-moe"/>
-  <text x="677.9" y="163.2" class="val-hi">305 KiB · 33µs</text>
+  <rect x="648.0" y="150.2" width="23.8" height="17.0" rx="3" class="bar-moe"/>
+  <text x="677.8" y="163.2" class="val-hi">305 KiB · 27µs</text>
   <text x="640" y="191.4" class="label">C Lua 5.5.1 (ref)</text>
   <rect x="648.0" y="178.4" width="25.7" height="17.0" rx="3" class="bar-ref"/>
-  <text x="679.7" y="191.4" class="val">329 KiB · 33µs</text>
+  <text x="679.7" y="191.4" class="val">329 KiB · 27µs</text>
   <text x="640" y="219.7" class="label">Apogee v1.2.1 (noJIT)</text>
   <rect x="648.0" y="206.7" width="39.8" height="17.0" rx="3" class="bar-other"/>
-  <text x="693.8" y="219.7" class="val">510 KiB · 405µs</text>
+  <text x="693.8" y="219.7" class="val">510 KiB · 368µs</text>
   <text x="640" y="247.9" class="label">Apogee v1.2.1 (JIT)</text>
-  <rect x="648.0" y="234.9" width="44.1" height="17.0" rx="3" class="bar-other"/>
-  <text x="698.1" y="247.9" class="val">564 KiB · 403µs</text>
+  <rect x="648.0" y="234.9" width="43.7" height="17.0" rx="3" class="bar-other"/>
+  <text x="697.7" y="247.9" class="val">559 KiB · 369µs</text>
   <text x="640" y="276.1" class="label">arnodel/golua</text>
   <rect x="648.0" y="263.1" width="48.0" height="17.0" rx="3" class="bar-other"/>
-  <text x="702.0" y="276.1" class="val">614 KiB · 116µs</text>
+  <text x="702.0" y="276.1" class="val">614 KiB · 93µs</text>
   <text x="640" y="304.3" class="label">Shopify/go-lua</text>
   <rect x="648.0" y="291.3" width="79.7" height="17.0" rx="3" class="bar-other"/>
-  <text x="733.7" y="304.3" class="val">1020 KiB · 60µs</text>
+  <text x="733.7" y="304.3" class="val">1020 KiB · 47µs</text>
   <text x="640" y="332.6" class="label">DCLua</text>
-  <rect x="648.0" y="319.6" width="83.1" height="17.0" rx="3" class="bar-other"/>
-  <text x="737.1" y="332.6" class="val">1.0 MiB · 89µs</text>
+  <rect x="648.0" y="319.6" width="83.3" height="17.0" rx="3" class="bar-other"/>
+  <text x="737.3" y="332.6" class="val">1.0 MiB · 73µs</text>
   <text x="640" y="360.8" class="label">yuin/gopher-lua</text>
   <rect x="648.0" y="347.8" width="148.5" height="17.0" rx="3" class="bar-other"/>
-  <text x="802.5" y="360.8" class="val">1.9 MiB · 169µs</text>
+  <text x="802.5" y="360.8" class="val">1.9 MiB · 153µs</text>
 
   <!-- Footer notes -->
   <text x="24" y="424" class="foot">Left: Go-heap Lua VMs (including Apogee JIT) scale O(VMs × objects) in Go GC; MoeLua stays near-flat via noscan Arenas (ptrdata == 0).</text>
-  <text x="24" y="440" class="foot">Right: isolated subprocess per engine (256-VM idle: MoeLua 51 KiB / 0.80 ms GC vs Apogee JIT 190 KiB / 31.3 ms GC). Dashed line = off-heap mmap.</text>
+  <text x="24" y="440" class="foot">Right: isolated subprocess per engine (256-VM idle: MoeLua 51 KiB / 0.51 ms GC vs Apogee JIT 192 KiB / 26.5 ms GC). Dashed line = off-heap mmap.</text>
 </svg>
