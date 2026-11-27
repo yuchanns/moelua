@@ -1,4 +1,4 @@
-//go:build !arm64 || purego || moeluafloatnil || moeluafaithful || moeluaregcheck
+//go:build (!arm64 && !amd64) || purego || moeluafloatnil || moeluafaithful || moeluaregcheck
 
 package vm
 
