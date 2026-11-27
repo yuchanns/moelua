@@ -1340,6 +1340,7 @@ func (s *State) Close() {
 	s.collector.FreeAll()
 	s.closeOpenFiles()
 	if !wasInFin {
+		s.closeJIT()
 		s.pinnedRefs = nil
 		s.hashedTables = nil
 		s.twups = nil

@@ -21,6 +21,7 @@ type cliFlags struct {
 	hasI    bool
 	hasV    bool
 	hasNoE  bool // -E
+	hasJIT  bool // -jit
 	script  int  // index in os.Args of first script/non-option arg (0 if none)
 	badOpt  string
 	needArg string
@@ -43,6 +44,10 @@ func collectArgs(argv []string) cliFlags {
 		if arg == "-" {
 			f.script = i
 			return f
+		}
+		if arg == "-jit" {
+			f.hasJIT = true
+			continue
 		}
 		switch arg[1] {
 		case 'E':
@@ -187,12 +192,15 @@ type cliState struct {
 	msgh vm.Value
 }
 
-func newCLIState(noEnv bool) *cliState {
+func newCLIState(noEnv, jit bool) *cliState {
 	var s *vm.State
 	if noEnv {
 		s = vm.NewStateNoEnv()
 	} else {
 		s = vm.NewState()
+	}
+	if jit {
+		s.SetJITEnabled(true)
 	}
 	// Match luaL_newstate (lauxlib.c:1201): warnings start ON so LUA_INIT warnings are emitted;
 	// runArgs turns them off after handleLuaInit unless -W is passed.
@@ -390,6 +398,9 @@ func (c *cliState) runArgs(progName string, argv []string, n int) bool {
 		if arg == "--" || arg == "-" {
 			break
 		}
+		if arg == "-jit" {
+			continue
+		}
 		switch arg[1] {
 		case 'W':
 			c.s.SetWarnings(true)
@@ -539,7 +550,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	c := newCLIState(flags.hasNoE)
+	c := newCLIState(flags.hasNoE, flags.hasJIT)
 	s := c.s
 
 	if flags.hasV {

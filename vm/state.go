@@ -332,6 +332,9 @@ type State struct {
 
 	// Lua 5.5 xoshiro256** PRNG state.
 	rng [4]uint64
+
+	// Optional native JIT state (nil unless opted in via SetJITEnabled / WithJIT).
+	jit *jitState
 }
 
 func defaultCompileFunc(name, src string) (*bytecode.Proto, error) {
