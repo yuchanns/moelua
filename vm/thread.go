@@ -18,8 +18,12 @@ const (
 	ThreadDead                          // finished normally, errored, or explicitly closed
 )
 
+const (
+	thFlagInTwups uint8 = 1 << 0 // true while Thread is registered in State.twups (has open upvalues)
+)
+
 // errYieldSentinel is returned internally by run() when coroutine.yield suspends a Thread.
-// No Go panic/recover is involved; all frames remain intact on Thread.frames!
+// No Go panic/recover is involved; all frames remain intact on Thread's Arena frame stack.
 var errYieldSentinel = errors.New("moelua: yield")
 
 // errCoroCloseSelf is returned internally when a running coroutine calls coroutine.close() on itself.
@@ -53,16 +57,16 @@ const (
 	finishTailReturn          // finish OP_TAILCALL native yield when next insn is not matching OP_RETURN
 )
 
-// callFrame is one frame on a Thread's flat stackful call stack.
+// callFrame is a zero-pointer (noscan, ptrdata == 0) entry on a Thread's flat Arena call stack.
 type callFrame struct {
-	kind       frameKind
-	cl         *Closure
-	base       int // register R[0] index in Thread.stack
-	funcIdx    int // callee slot index in Thread.stack
-	pc         int // saved PC
-	nresults   int // expected results (-1 = MULTRET)
-	nextraargs int // hidden vararg count (Lua 5.5 PF_VAHID)
-	varargTab  *Table
+	kind         frameKind
+	clRef        arena.ObjRef // Closure ObjRef in State.arena (NullRef for non-Lua frames)
+	varargTabRef arena.ObjRef // Table ObjRef for vararg table (NullRef if none)
+	base         int          // register R[0] index in Thread stack
+	funcIdx      int          // callee slot index in Thread stack
+	pc           int          // saved PC
+	nresults     int          // expected results (-1 = MULTRET)
+	nextraargs   int          // hidden vararg count (Lua 5.5 PF_VAHID)
 
 	// Protected call / native hook metadata (framePCall / frameXPCall / frameNative).
 	errFunc  Value // message handler for xpcall
@@ -77,13 +81,13 @@ type callFrame struct {
 	concatStart int
 	concatIdx   int
 	// Close continuation state
-	closeLevel   int
-	closeErr     Value
-	closeHasErr  bool
-	closeResume  uint8 // 0=continue pc, 1=resume OP_RETURN, 2=resume error unwind, 3=coroutine.close
-	closeRetSrc  int
-	closeRetN    int
-	closeEntry   int
+	closeLevel  int
+	closeErr    Value
+	closeHasErr bool
+	closeResume uint8 // 0=continue pc, 1=resume OP_RETURN, 2=resume error unwind, 3=coroutine.close
+	closeRetSrc int
+	closeRetN   int
+	closeEntry  int
 
 	// Debug metadata
 	dirty        bool // true if any non-fast-path field was written (cleared lazily on next fast OP_CALL)
@@ -94,72 +98,65 @@ type callFrame struct {
 	topProtected bool // true for host CallProtected frames (rendered as "[C]: in ?" in tracebacks)
 	errHandling  bool // true while this frameXPCall's message handler is actively running
 	extraArgs    uint8
-	oldPC       int // per-frame last traced PC (-1 = fresh frame)
-	ftransfer   uint16
-	ntransfer   uint16
+	oldPC        int // per-frame last traced PC (-1 = fresh frame)
+	ftransfer    uint16
+	ntransfer    uint16
 }
 
-// Thread is a heap-allocated Lua 5.5 coroutine / execution thread (ZERO Go goroutines!).
-// An unreachable suspended Thread is naturally collected by Go's GC (and Tier 1 marker).
+// Thread is a zero-pointer (noscan, ptrdata == 0) Lua 5.5 coroutine / execution thread
+// stored in State.arena (ZERO Go goroutines, ZERO Go GC pointer scanning!).
 type Thread struct {
-	state *State
+	hdr            arena.GCHeader // 8B: Kind=gcKindThread, Flags=thFlag*
+	self           arena.ObjRef   // 4B: own ObjRef inside State.arena
+	callerRef      arena.ObjRef   // 4B: resuming parent Thread ObjRef (NullRef if none)
+	stackRef       arena.ObjRef   // 4B: raw Arena []Value
+	framesRef      arena.ObjRef   // 4B: raw Arena []callFrame
+	openUpvalsRef  arena.ObjRef   // 4B: raw Arena []arena.ObjRef (ascending stackIdx)
+	tbcRef         arena.ObjRef   // 4B: raw Arena []int32 (ascending stackIdx)
+	yieldValsRef   arena.ObjRef   // 4B: raw Arena []Value
+	syncCloseRef   arena.ObjRef   // 4B: raw Arena []Value
+	uncaughtErrRef arena.GoHandle // 8B: GoRefs handle for replacement error escaping protected call
 
-	stack      []Value
-	top        int
-	highStack  int // high-water mark of written stack slots since last top-level clear
-	frames     []callFrame
-	nframe     int
-	highFrames int // high-water mark of written frame slots since last top-level clear
+	stackLen      int
+	top           int
+	highStack     int // high-water mark of written stack slots since last top-level clear
+	framesCap     int
+	nframe        int
+	highFrames    int // high-water mark of written frame slots since last top-level clear
+	openUpvalsLen int32
+	openUpvalsCap int32
+	tbcLen        int32
+	tbcCap        int32
+	yieldValsLen  int32
+	yieldValsCap  int32
+	syncCloseLen  int32
+	syncCloseCap  int32
 
-	// Optional views of stateAlloc's embedded initStack/initFrames for mainThread.
-	// Cleared only once abandoned AND no active native args / frames can still borrow them.
-	initStack           []Value
-	initFrames          []callFrame
-	nativeArgsDepth     int
-	initStackAbandoned  bool
-	initFramesAbandoned bool
-
-	openUpvals []*Upvalue // ascending stack indices of open upvalues owned by this thread
-	tbc        []int      // ascending stack indices of active <close> variables
-
-	status        ThreadStatus
-	errObj        Value   // last error object when dead due to error
-	lastErrNative Value   // native function that raised an uncaught error on this thread (for dead-coro traceback)
-	uncaughtErrVal error   // replacement error raised while unwinding a protected call that escaped entryDepth
-	syncCloseErrs []Value // active error objects held across synchronous closeAllSync callbacks (GC-traced)
-	caller        *Thread // resuming parent thread (non-nil while running)
-
-	// Yielded results & resume target slot (transferred directly between threads on yield/resume).
-	yieldVals     []Value
 	yieldDst      int
 	yieldNRes     int
-	yieldedNative bool  // true if suspended inside a native call (for HookMaskRet on resume)
-	yieldNativeFn Value // yielded native callee (for HookMaskRet frameNative on resume)
-
-	// Debug hooks (zero overhead in fast run() when hookMask == 0!).
-	hook          Value
-	hookMask      uint8 // bit 0=call, 1=ret, 2=line, 3=count
 	baseHookCount int
 	hookCount     int
 	oldPC         int
-	inHook        bool
-	inCCallback   bool // true while a native callee is running directly inside callOnThread (C callback boundary)
-	suppressHook  bool // true inside __gc finalizers (matching L->allowhook = 0 without clobbering hookMask)
+	stackGen      uint32 // window generation counter for -tags moeluaregcheck verification
 
-	// Window generation counter for -tags moeluaregcheck verification.
-	stackGen uint32
+	errObj        Value // last error object when dead due to error
+	lastErrNative Value // native function that raised an uncaught error on this thread
+	yieldNativeFn Value // yielded native callee (for HookMaskRet frameNative on resume)
+	hook          Value // active debug hook function
 
 	// Number of non-yieldable C/Go calls active on this thread (matching Lua 5.5 L->nny).
 	// mainThread starts with nny=1; new coroutines start with nny=0.
 	nny                uint16
-	inErrHandler       bool // true while running xpcall message handler (allows extra frame headroom on stack overflow)
+	nativeArgsDepth    uint16 // >0 while Go native args slice borrows th.stackRef
+	status             ThreadStatus
+	hookMask           uint8 // bit 0=call, 1=ret, 2=line, 3=count
+	yieldedNative      bool  // true if suspended inside a native call (for HookMaskRet on resume)
+	inHook             bool
+	inCCallback        bool // true while a native callee is running directly inside callOnThread
+	suppressHook       bool // true inside __gc finalizers (matching L->allowhook = 0 without clobbering hookMask)
+	inErrHandler       bool // true while running xpcall message handler (allows extra frame headroom)
 	closing            bool // true while coroutine.close(co) is actively closing TBC vars on co
 	nextFrameFinalizer bool // consumed by next pushLuaFrame to tag __gc finalizer frame (CIST_FIN)
-
-	// Thin Arena GC stub handle (bridges Go-heap Thread into arena.Collector until Step 5d).
-	self     arena.ObjRef
-	memBytes int64
-	inTwups  bool
 }
 
 // Hook mask bits matching Lua 5.5 lua.h.
@@ -170,30 +167,212 @@ const (
 	HookMaskCount uint8 = 1 << 3
 )
 
-const defaultFrameCap = 32
+const (
+	defaultFrameCap = 32
+	maxStackSlots   = 2_000_000
+)
 
-func threadInitMemBytes(stackCap, frameCap int) int64 {
-	return 512 + int64(stackCap)*16 + int64(frameCap)*int64(unsafe.Sizeof(callFrame{}))
+func arenaRoundedBytes(n int) int64 {
+	if n <= 0 {
+		return 0
+	}
+	_, sz := arena.SizeClassFor(n)
+	return int64(sz)
 }
 
-func newThread(s *State, stackCap int) *Thread {
+func threadInitMemBytes(stackCap, frameCap int) int64 {
 	if stackCap < 128 {
 		stackCap = 128
 	}
-	th := &Thread{
-		state:  s,
-		stack:  make([]Value, stackCap),
-		frames: make([]callFrame, defaultFrameCap),
-		status: ThreadOK,
-		errObj: NilValue(),
-		hook:   NilValue(),
+	if frameCap < 16 {
+		frameCap = defaultFrameCap
 	}
-	fillNil(th.stack)
-	if s != nil {
-		s.allocThreadStub(th)
-		s.addThreadMem(th, threadInitMemBytes(stackCap, defaultFrameCap))
+	return arenaRoundedBytes(int(unsafe.Sizeof(Thread{}))) +
+		arenaRoundedBytes(stackCap*int(unsafe.Sizeof(Value{}))) +
+		arenaRoundedBytes(frameCap*int(unsafe.Sizeof(callFrame{})))
+}
+
+func (s *State) newThread(stackCap, frameCap int) (*Thread, error) {
+	if stackCap < 128 {
+		stackCap = 128
 	}
-	return th
+	if frameCap < 16 {
+		frameCap = defaultFrameCap
+	}
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Thread{})), gcKindThread)
+	if err != nil {
+		return nil, err
+	}
+	th := arena.AsSmall[Thread](s.arena, ref)
+	th.self = ref
+	th.status = ThreadOK
+	th.errObj = NilValue()
+	th.lastErrNative = NilValue()
+	th.yieldNativeFn = NilValue()
+	th.hook = NilValue()
+
+	sref, err := s.arena.Alloc(stackCap * int(unsafe.Sizeof(Value{})))
+	if err != nil {
+		return nil, err
+	}
+	s.collector.AddDebt(int64(s.arena.SlotSize(sref)))
+	fillNil(arena.SliceFast[Value](s.arena, sref, 0, stackCap))
+	th.stackRef = sref
+	th.stackLen = stackCap
+
+	fref, err := s.arena.AllocZeroed(frameCap * int(unsafe.Sizeof(callFrame{})))
+	if err != nil {
+		return nil, err
+	}
+	s.collector.AddDebt(int64(s.arena.SlotSize(fref)))
+	th.framesRef = fref
+	th.framesCap = frameCap
+	return th, nil
+}
+
+func (th *Thread) stackSlice(a *arena.Arena) []Value {
+	if th.stackRef == arena.NullRef || th.stackLen == 0 {
+		return nil
+	}
+	return arena.SliceFast[Value](a, th.stackRef, 0, th.stackLen)
+}
+
+func (th *Thread) framesSlice(a *arena.Arena) []callFrame {
+	if th.framesRef == arena.NullRef || th.framesCap == 0 {
+		return nil
+	}
+	return arena.SliceFast[callFrame](a, th.framesRef, 0, th.framesCap)
+}
+
+func (th *Thread) openUpvalsSlice(a *arena.Arena) []arena.ObjRef {
+	if th.openUpvalsRef == arena.NullRef || th.openUpvalsLen == 0 {
+		return nil
+	}
+	return arena.SliceFast[arena.ObjRef](a, th.openUpvalsRef, 0, int(th.openUpvalsLen))
+}
+
+func (th *Thread) tbcSlice(a *arena.Arena) []int32 {
+	if th.tbcRef == arena.NullRef || th.tbcLen == 0 {
+		return nil
+	}
+	return arena.SliceFast[int32](a, th.tbcRef, 0, int(th.tbcLen))
+}
+
+func (th *Thread) yieldValsSlice(a *arena.Arena) []Value {
+	if th.yieldValsRef == arena.NullRef || th.yieldValsLen == 0 {
+		return nil
+	}
+	return arena.SliceFast[Value](a, th.yieldValsRef, 0, int(th.yieldValsLen))
+}
+
+func (th *Thread) syncCloseSlice(a *arena.Arena) []Value {
+	if th.syncCloseRef == arena.NullRef || th.syncCloseLen == 0 {
+		return nil
+	}
+	return arena.SliceFast[Value](a, th.syncCloseRef, 0, int(th.syncCloseLen))
+}
+
+func (th *Thread) setYieldVals(s *State, vals []Value) error {
+	if len(vals) == 0 {
+		th.yieldValsLen = 0
+		return nil
+	}
+	if len(vals) > int(th.yieldValsCap) {
+		newCap := max(int(th.yieldValsCap)*2, len(vals), 4)
+		if s.memLimit > 0 {
+			var oldBytes int64
+			if th.yieldValsRef != arena.NullRef {
+				oldBytes = int64(s.arena.SlotSize(th.yieldValsRef))
+			}
+			delta := arenaRoundedBytes(newCap*int(unsafe.Sizeof(Value{}))) - oldBytes
+			if delta < 0 {
+				delta = 0
+			}
+			if err := s.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
+				return err
+			}
+		}
+		ref, err := s.arena.Alloc(newCap * int(unsafe.Sizeof(Value{})))
+		if err != nil {
+			return err
+		}
+		s.collector.AddDebt(int64(s.arena.SlotSize(ref)))
+		if th.yieldValsRef != arena.NullRef {
+			s.arena.Free(th.yieldValsRef)
+		}
+		th.yieldValsRef = ref
+		th.yieldValsCap = int32(newCap)
+	}
+	dst := arena.SliceFast[Value](s.arena, th.yieldValsRef, 0, int(th.yieldValsCap))
+	copy(dst[:len(vals)], vals)
+	th.yieldValsLen = int32(len(vals))
+	return nil
+}
+
+func (th *Thread) pushSyncCloseErr(s *State, v Value) int {
+	idx := int(th.syncCloseLen)
+	if idx >= int(th.syncCloseCap) {
+		newCap := max(int(th.syncCloseCap)*2, 4)
+		ref, err := s.arena.Alloc(newCap * int(unsafe.Sizeof(Value{})))
+		if err != nil {
+			return -1
+		}
+		s.collector.AddDebt(int64(s.arena.SlotSize(ref)))
+		dst := arena.SliceFast[Value](s.arena, ref, 0, newCap)
+		if idx > 0 {
+			copy(dst, th.syncCloseSlice(s.arena))
+		}
+		if th.syncCloseRef != arena.NullRef {
+			s.arena.Free(th.syncCloseRef)
+		}
+		th.syncCloseRef = ref
+		th.syncCloseCap = int32(newCap)
+	}
+	buf := arena.SliceFast[Value](s.arena, th.syncCloseRef, 0, int(th.syncCloseCap))
+	buf[idx] = v
+	th.syncCloseLen = int32(idx + 1)
+	return idx
+}
+
+func (th *Thread) setSyncCloseErr(s *State, idx int, v Value) {
+	if idx < 0 || th.syncCloseRef == arena.NullRef || idx >= int(th.syncCloseLen) {
+		return
+	}
+	arena.SliceFast[Value](s.arena, th.syncCloseRef, 0, int(th.syncCloseCap))[idx] = v
+}
+
+func (th *Thread) popSyncCloseErr(s *State, idx int) {
+	if idx < 0 || th.syncCloseRef == arena.NullRef || idx >= int(th.syncCloseLen) {
+		return
+	}
+	arena.SliceFast[Value](s.arena, th.syncCloseRef, 0, int(th.syncCloseCap))[idx] = NilValue()
+	th.syncCloseLen = int32(idx)
+}
+
+func (th *Thread) uncaughtErr(s *State) error {
+	if th.uncaughtErrRef == arena.NullGoHandle {
+		return nil
+	}
+	raw, _ := s.goRefs.Get(th.uncaughtErrRef)
+	err, _ := raw.(error)
+	return err
+}
+
+func (th *Thread) setUncaughtErr(s *State, err error) {
+	if th.uncaughtErrRef != arena.NullGoHandle {
+		s.goRefs.Free(th.uncaughtErrRef)
+		th.uncaughtErrRef = arena.NullGoHandle
+	}
+	if err != nil {
+		th.uncaughtErrRef = s.goRefs.Alloc(err)
+	}
+}
+
+func (th *Thread) caller(s *State) *Thread {
+	if th.callerRef == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Thread](s.arena, th.callerRef)
 }
 
 func (th *Thread) noteStack(end int) {
@@ -208,15 +387,15 @@ func (th *Thread) noteFrame(nf int) {
 	}
 }
 
-func (th *Thread) ensureFrameCap(_ *State, need, limit int) error {
+func (th *Thread) ensureFrameCap(s *State, need, limit int) error {
 	th.noteFrame(need)
-	if need <= len(th.frames) {
+	if need <= th.framesCap {
 		return nil
 	}
 	if need > limit {
 		return fmt.Errorf("stack overflow")
 	}
-	newCap := len(th.frames) * 2
+	newCap := th.framesCap * 2
 	if newCap < defaultFrameCap {
 		newCap = defaultFrameCap
 	}
@@ -226,34 +405,41 @@ func (th *Thread) ensureFrameCap(_ *State, need, limit int) error {
 	if newCap > limit {
 		newCap = limit
 	}
-	delta := int64(newCap-len(th.frames)) * int64(unsafe.Sizeof(callFrame{}))
-	if th.state != nil && th.state.memLimit > 0 {
-		if err := th.state.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
+	if s.memLimit > 0 {
+		var oldBytes int64
+		if th.framesRef != arena.NullRef {
+			oldBytes = int64(s.arena.SlotSize(th.framesRef))
+		}
+		delta := arenaRoundedBytes(newCap*int(unsafe.Sizeof(callFrame{}))) - oldBytes
+		if delta < 0 {
+			delta = 0
+		}
+		if err := s.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
 			return err
 		}
-	}
-	old := th.frames
-	nf := make([]callFrame, newCap)
-	copy(nf, old)
-	th.frames = nf
-	if th.state != nil {
-		th.state.addThreadMem(th, delta)
-	}
-	if th.initFrames != nil && len(old) > 0 && unsafe.SliceData(old) == unsafe.SliceData(th.initFrames) {
-		if th.nframe == 0 {
-			clear(th.initFrames)
-			th.initFrames = nil
-		} else {
-			th.initFramesAbandoned = true
+		if need <= th.framesCap {
+			return nil
 		}
 	}
+	oldRef := th.framesRef
+	oldCap := th.framesCap
+	newRef, err := s.arena.AllocZeroed(newCap * int(unsafe.Sizeof(callFrame{})))
+	if err != nil {
+		return s.memError()
+	}
+	s.collector.AddDebt(int64(s.arena.SlotSize(newRef)))
+	nf := arena.SliceFast[callFrame](s.arena, newRef, 0, newCap)
+	if oldRef != arena.NullRef && oldCap > 0 {
+		copy(nf, arena.SliceFast[callFrame](s.arena, oldRef, 0, oldCap))
+		s.arena.Free(oldRef)
+	}
+	th.framesRef = newRef
+	th.framesCap = newCap
 	return nil
 }
 
-const maxStackSlots = 2_000_000
-
-func (th *Thread) ensureStack(_ *State, need int) error {
-	if need+stackSlack <= len(th.stack) {
+func (th *Thread) ensureStack(s *State, need int) error {
+	if need+stackSlack <= th.stackLen {
 		return nil
 	}
 	limit := maxStackSlots
@@ -263,256 +449,335 @@ func (th *Thread) ensureStack(_ *State, need int) error {
 	if need < 0 || need+stackSlack > limit {
 		return fmt.Errorf("stack overflow")
 	}
-	newSize := len(th.stack) * 2
+	newSize := th.stackLen * 2
+	if newSize < 128 {
+		newSize = 128
+	}
 	for newSize < need+stackSlack {
 		newSize *= 2
 	}
 	if newSize > limit {
 		newSize = limit
 	}
-	delta := int64(newSize-len(th.stack)) * 16
-	if th.state != nil && th.state.memLimit > 0 {
-		if err := th.state.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
+	if s.memLimit > 0 {
+		delta := arenaRoundedBytes(newSize * int(unsafe.Sizeof(Value{})))
+		if th.nativeArgsDepth == 0 && th.stackRef != arena.NullRef {
+			delta -= int64(s.arena.SlotSize(th.stackRef))
+			if delta < 0 {
+				delta = 0
+			}
+		}
+		if err := s.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
 			return err
 		}
+		if need+stackSlack <= th.stackLen {
+			return nil
+		}
 	}
-	old := th.stack
-	ns := make([]Value, newSize)
-	copy(ns, old)
-	fillNil(ns[len(old):])
-	th.stack = ns
-	th.highStack = len(ns)
+	oldRef := th.stackRef
+	oldLen := th.stackLen
+	newRef, err := s.arena.Alloc(newSize * int(unsafe.Sizeof(Value{})))
+	if err != nil {
+		return s.memError()
+	}
+	s.collector.AddDebt(int64(s.arena.SlotSize(newRef)))
+	ns := arena.SliceFast[Value](s.arena, newRef, 0, newSize)
+	if oldRef != arena.NullRef && oldLen > 0 {
+		copy(ns, arena.SliceFast[Value](s.arena, oldRef, 0, oldLen))
+	}
+	fillNil(ns[oldLen:])
+	th.stackRef = newRef
+	th.stackLen = newSize
+	th.highStack = newSize
 	th.stackGen++
-	if th.state != nil {
-		th.state.addThreadMem(th, delta)
-	}
-	if th.initStack != nil && len(old) > 0 && unsafe.SliceData(old) == unsafe.SliceData(th.initStack) {
+	if oldRef != arena.NullRef {
 		if th.nativeArgsDepth == 0 {
-			clear(th.initStack)
-			th.initStack = nil
+			s.arena.Free(oldRef)
 		} else {
-			th.initStackAbandoned = true
+			s.deferredStackFrees = append(s.deferredStackFrees, deferredStackFree{owner: th.self, ref: oldRef, len: oldLen})
 		}
 	}
 	return nil
 }
 
-func (th *Thread) clearAbandonedInitStack() {
-	if th.initStackAbandoned && th.initStack != nil && th.nativeArgsDepth == 0 {
-		clear(th.initStack)
-		th.initStack = nil
-		th.initStackAbandoned = false
-	}
-}
-
 // finishNativeArgs decrements nativeArgsDepth after a borrowed-stack native call.
-// If the call grew th.stack off initStack and the native returned a slice aliasing
-// initStack (e.g. returning its args slice directly), res is copied before clearing
-// the abandoned initStack storage.
-func (th *Thread) finishNativeArgs(_ *State, res []Value) []Value {
+// If the call grew th.stackRef while args were borrowed and the native returned a slice
+// aliasing a deferred old stack buffer owned by th, res is copied before freeing th's
+// deferred buffers. Deferred buffers belonging to other threads are preserved until
+// those threads finish their own borrowed native calls.
+func (th *Thread) finishNativeArgs(s *State, res []Value) []Value {
 	th.nativeArgsDepth--
-	if th.nativeArgsDepth == 0 && th.initStackAbandoned && th.initStack != nil {
-		if len(res) > 0 && slicesOverlapValues(res, th.initStack) {
-			cp := make([]Value, len(res))
-			copy(cp, res)
-			res = cp
+	if th.nativeArgsDepth == 0 && len(s.deferredStackFrees) > 0 {
+		if len(res) > 0 {
+			for _, df := range s.deferredStackFrees {
+				if df.owner == th.self && slicesOverlapValues(res, arena.SliceFast[Value](s.arena, df.ref, 0, df.len)) {
+					cp := make([]Value, len(res))
+					copy(cp, res)
+					res = cp
+					break
+				}
+			}
 		}
-		clear(th.initStack)
-		th.initStack = nil
-		th.initStackAbandoned = false
+		keep := s.deferredStackFrees[:0]
+		for _, df := range s.deferredStackFrees {
+			if df.owner == th.self {
+				s.arena.Free(df.ref)
+			} else {
+				keep = append(keep, df)
+			}
+		}
+		s.deferredStackFrees = keep
 	}
 	return res
-}
-
-func (th *Thread) clearAbandonedInitStorage() {
-	th.clearAbandonedInitStack()
-	if th.initFramesAbandoned && th.initFrames != nil && th.nframe == 0 {
-		clear(th.initFrames)
-		th.initFrames = nil
-		th.initFramesAbandoned = false
-	}
 }
 
 // window returns a *[256]Value view rooted at th.stack[base].
 //
 //go:nocheckptr
-func (th *Thread) window(base int) *[256]Value {
-	return (*[256]Value)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(th.stack)), base*int(unsafe.Sizeof(Value{}))))
+func (th *Thread) window(a *arena.Arena, base int) *[256]Value {
+	return (*[256]Value)(unsafe.Add(a.PtrFast(th.stackRef), base*int(unsafe.Sizeof(Value{}))))
+}
+
+// windowIn returns a *[256]Value view rooted at stack[base] without dereferencing Arena.
+//
+//go:nocheckptr
+func windowIn(stack []Value, base int) *[256]Value {
+	return (*[256]Value)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(stack)), base*int(unsafe.Sizeof(Value{}))))
 }
 
 func (th *Thread) findOrCreateUpval(s *State, stackIdx int) *Upvalue {
-	if s == nil {
-		s = th.state
-	}
-	n := len(th.openUpvals)
+	a := s.arena
+	n := int(th.openUpvalsLen)
+	ups := th.openUpvalsSlice(a)
 	i := n
-	for i > 0 && int(th.openUpvals[i-1].stackIdx) > stackIdx {
+	for i > 0 && int(arena.AsSmall[Upvalue](a, ups[i-1]).stackIdx) > stackIdx {
 		i--
 	}
-	if i > 0 && int(th.openUpvals[i-1].stackIdx) == stackIdx {
-		return th.openUpvals[i-1]
+	if i > 0 && int(arena.AsSmall[Upvalue](a, ups[i-1]).stackIdx) == stackIdx {
+		return arena.AsSmall[Upvalue](a, ups[i-1])
 	}
-	uv, err := s.allocOpenUpval(th, stackIdx)
+	uvRef, err := s.collector.Alloc(int(unsafe.Sizeof(Upvalue{})), gcKindUpvalue)
 	if err != nil {
+		s.memExceeded = true
 		return nil
 	}
-	th.openUpvals = append(th.openUpvals, nil)
-	copy(th.openUpvals[i+1:], th.openUpvals[i:n])
-	th.openUpvals[i] = uv
-	if !th.inTwups {
-		th.inTwups = true
+	uv := arena.AsSmall[Upvalue](a, uvRef)
+	uv.self = uvRef
+	uv.ownerRef = th.self
+	uv.stackIdx = int32(stackIdx)
+	uv.closed = NilValue()
+
+	if n >= int(th.openUpvalsCap) {
+		newCap := max(int(th.openUpvalsCap)*2, 4)
+		newRef, aerr := a.Alloc(newCap * int(unsafe.Sizeof(arena.ObjRef(0))))
+		if aerr != nil {
+			uv.ownerRef = arena.NullRef
+			s.memExceeded = true
+			return nil
+		}
+		s.collector.AddDebt(int64(a.SlotSize(newRef)))
+		dst := arena.SliceFast[arena.ObjRef](a, newRef, 0, newCap)
+		if n > 0 {
+			copy(dst, ups)
+		}
+		if th.openUpvalsRef != arena.NullRef {
+			a.Free(th.openUpvalsRef)
+		}
+		th.openUpvalsRef = newRef
+		th.openUpvalsCap = int32(newCap)
+	}
+	buf := arena.SliceFast[arena.ObjRef](a, th.openUpvalsRef, 0, int(th.openUpvalsCap))
+	copy(buf[i+1:n+1], buf[i:n])
+	buf[i] = uvRef
+	th.openUpvalsLen = int32(n + 1)
+	if th.hdr.Flags&thFlagInTwups == 0 {
+		th.hdr.Flags |= thFlagInTwups
 		s.twups = append(s.twups, th.self)
 	}
 	return uv
 }
 
+// closeUpvalObj transitions an open upvalue uv into its closed state holding val,
+// preserving both incremental and generational GC write-barrier invariants.
 func closeUpvalObj(s *State, uv *Upvalue, val Value) {
 	uv.closed = val
 	uv.ownerRef = arena.NullRef
-	if s != nil && s.collector != nil && val.IsGCObject() && uv.hdr.IsBlack() {
+	// Open upvalues are kept Gray (never Black) while open. When closing into a
+	// closed upvalue, ensure GC traverses uv.closed if uv is already Gray or Old!
+	if uv.hdr.IsGray() {
+		uv.hdr.SetBlack()
+		if val.IsGCObject() {
+			s.collector.BarrierBack(uv.self)
+		}
+	} else if val.IsGCObject() && uv.hdr.IsBlack() {
 		s.collector.Barrier(uv.self, val.Ref())
 	}
 }
 
 func (th *Thread) closeUpvals(s *State, level int) {
-	if s == nil {
-		s = th.state
+	a := s.arena
+	n := int(th.openUpvalsLen)
+	if n == 0 {
+		return
 	}
-	n := len(th.openUpvals)
-	for n > 0 && int(th.openUpvals[n-1].stackIdx) >= level {
+	ups := arena.SliceFast[arena.ObjRef](a, th.openUpvalsRef, 0, int(th.openUpvalsCap))
+	stack := th.stackSlice(a)
+	for n > 0 {
+		uv := arena.AsSmall[Upvalue](a, ups[n-1])
+		if int(uv.stackIdx) < level {
+			break
+		}
 		n--
-		uv := th.openUpvals[n]
-		th.openUpvals[n] = nil
+		ups[n] = arena.NullRef
 		if uv.ownerRef == th.self {
-			closeUpvalObj(s, uv, th.stack[uv.stackIdx])
+			val := NilValue()
+			if int(uv.stackIdx) < len(stack) {
+				val = stack[uv.stackIdx]
+			}
+			closeUpvalObj(s, uv, val)
 		}
 	}
-	th.openUpvals = th.openUpvals[:n]
+	th.openUpvalsLen = int32(n)
 }
 
-// localSlotValue reads th.stack[slot].
-func (th *Thread) localSlotValue(_ *State, slot int) Value {
-	return th.stack[slot]
+func (th *Thread) localSlotValue(s *State, slot int) Value {
+	return th.stackSlice(s.arena)[slot]
 }
 
-// setLocalSlotValue writes val to th.stack[slot].
-func (th *Thread) setLocalSlotValue(_ *State, slot int, val Value) {
-	th.stack[slot] = val
+func (th *Thread) setLocalSlotValue(s *State, slot int, val Value) {
+	th.stackSlice(s.arena)[slot] = val
 }
 
 // markTBC marks th.stack[idx] as a <close> to-be-closed variable (OP_TBC / OP_TFORPREP).
-func (th *Thread) markTBC(_ *State, idx int) error {
-	v := th.stack[idx]
+func (th *Thread) markTBC(s *State, idx int) error {
+	v := th.stackSlice(s.arena)[idx]
 	if v.IsFalsy() {
 		return nil // nil and false are ignored for <close>
 	}
-	tm := th.state.getTMByObj(v, TMClose)
+	tm := s.getTMByObj(v, TMClose)
 	if tm.IsNil() {
-		return &LuaError{Val: StringValue(th.state.intern.Intern("variable got a non-closable value"))}
+		return &LuaError{Val: StringValue(s.intern.Intern("variable got a non-closable value"))}
 	}
-	th.tbc = append(th.tbc, idx)
+	n := int(th.tbcLen)
+	if n >= int(th.tbcCap) {
+		newCap := max(int(th.tbcCap)*2, 4)
+		ref, err := s.arena.Alloc(newCap * 4)
+		if err != nil {
+			return s.memError()
+		}
+		s.collector.AddDebt(int64(s.arena.SlotSize(ref)))
+		dst := arena.SliceFast[int32](s.arena, ref, 0, newCap)
+		if n > 0 {
+			copy(dst, th.tbcSlice(s.arena))
+		}
+		if th.tbcRef != arena.NullRef {
+			s.arena.Free(th.tbcRef)
+		}
+		th.tbcRef = ref
+		th.tbcCap = int32(newCap)
+	}
+	arena.SliceFast[int32](s.arena, th.tbcRef, 0, int(th.tbcCap))[n] = int32(idx)
+	th.tbcLen = int32(n + 1)
 	return nil
 }
 
 // hasTBCAtOrAbove reports whether any <close> variable sits at stack index >= level.
-func (th *Thread) hasTBCAtOrAbove(_ *arena.Arena, level int) bool {
-	return len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level
+func (th *Thread) hasTBCAtOrAbove(a *arena.Arena, level int) bool {
+	if th.tbcLen == 0 {
+		return false
+	}
+	return int(th.tbcSlice(a)[th.tbcLen-1]) >= level
 }
 
 // discardTBCAtOrAbove removes pending <close> entries >= level without executing user Lua
 // __close callbacks (used when unwinding after an uncatchable context/instruction-limit abort).
-// Open upvalues >= level are closed first so escaped closures capture the live values
-// before the TBC stack slots are cleared.
 func (th *Thread) discardTBCAtOrAbove(s *State, level int) {
 	th.closeUpvals(s, level)
-	for len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level {
-		idx := th.tbc[len(th.tbc)-1]
-		th.tbc = th.tbc[:len(th.tbc)-1]
-		if idx < len(th.stack) {
-			th.stack[idx] = NilValue()
+	if th.tbcLen == 0 {
+		return
+	}
+	tbc := th.tbcSlice(s.arena)
+	stack := th.stackSlice(s.arena)
+	for th.tbcLen > 0 && int(tbc[th.tbcLen-1]) >= level {
+		idx := int(tbc[th.tbcLen-1])
+		th.tbcLen--
+		if idx < len(stack) {
+			stack[idx] = NilValue()
 		}
 	}
 }
 
 // closeAllSync closes upvalues and all <close> variables >= level synchronously (used on unwind/close).
-// If errVal is non-nil (hasErr == true), passes it as the 2nd argument to __close;
-// if __close itself raises an error, the new error replaces errVal while continuing to close remaining TBC vars!
-// Returns (finalErrVal, hasErr, newErrRaisedByClose).
 func (th *Thread) closeAllSync(s *State, level int, errVal Value, hasErr bool) (Value, bool, bool) {
-	if s == nil {
-		s = th.state
-	}
 	th.closeUpvals(s, level)
 	raised := false
-	prevCur := s.cur()
+	prevCurRef := s.curRef
 	var prevStatus ThreadStatus
-	var prevCurRef int
-	if prevCur != nil && prevCur != th {
+	var prevCurPin int
+	if prevCurRef != arena.NullRef && prevCurRef != th.self {
+		prevCur := arena.AsSmall[Thread](s.arena, prevCurRef)
 		prevStatus = prevCur.status
 		prevCur.status = ThreadNormal
-		prevCurRef = s.Ref(ThreadValue(prevCur))
+		prevCurPin = s.Ref(threadRefValue(prevCurRef))
 	}
-	s.setCur(th)
-	errSlot := len(th.syncCloseErrs)
-	th.syncCloseErrs = append(th.syncCloseErrs, errVal)
+	s.curRef = th.self
+	errSlot := th.pushSyncCloseErr(s, errVal)
 	defer func() {
-		th.syncCloseErrs[errSlot] = NilValue()
-		th.syncCloseErrs = th.syncCloseErrs[:errSlot]
-		s.setCur(prevCur)
-		if prevCur != nil && prevCur != th {
-			prevCur.status = prevStatus
-			s.Unref(prevCurRef)
+		th.popSyncCloseErr(s, errSlot)
+		s.curRef = prevCurRef
+		if prevCurRef != arena.NullRef && prevCurRef != th.self {
+			arena.AsSmall[Thread](s.arena, prevCurRef).status = prevStatus
+			s.Unref(prevCurPin)
 		}
 	}()
-	for len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level {
-		idx := th.tbc[len(th.tbc)-1]
-		th.tbc = th.tbc[:len(th.tbc)-1]
-		obj := th.stack[idx]
-		th.stack[idx] = NilValue()
+	for th.tbcLen > 0 {
+		tbc := th.tbcSlice(s.arena)
+		if int(tbc[th.tbcLen-1]) < level {
+			break
+		}
+		idx := int(tbc[th.tbcLen-1])
+		th.tbcLen--
+		stack := th.stackSlice(s.arena)
+		obj := stack[idx]
+		stack[idx] = NilValue()
 		if obj.IsFalsy() {
 			continue
 		}
-		tm := th.state.getTMByObj(obj, TMClose)
+		tm := s.getTMByObj(obj, TMClose)
 		if tm.IsNil() {
-			errVal = StringValue(th.state.intern.Intern("attempt to call a nil value (metamethod 'close')"))
-			th.syncCloseErrs[errSlot] = errVal
+			errVal = StringValue(s.intern.Intern("attempt to call a nil value (metamethod 'close')"))
+			th.setSyncCloseErr(s, errSlot, errVal)
 			hasErr = true
 			raised = true
 			continue
 		}
-		// Match PUC-Rio Lua 5.5.1 lfunc.c:callclosemethod (and testes/locals.lua:314,325-330):
-		// normal closing passes 1 argument (obj) so select('#', ...) == 1;
-		// error closing passes 2 arguments (obj, errVal) so select('#', ...) == 2.
 		var args []Value
 		if hasErr {
 			args = []Value{obj, errVal}
 		} else {
 			args = []Value{obj}
 		}
-		if _, err := th.state.callOnThread(th, tm, args); err != nil {
+		if _, err := s.callOnThread(th, tm, args); err != nil {
 			if errors.Is(err, errYieldSentinel) {
-				// Yielding inside sync close path: propagate cleanly via errVal marker handled by caller.
 				return errVal, hasErr, raised
 			}
 			if errors.Is(err, errCoroCloseSelf) {
 				if th.closing {
-					// Coroutine called coroutine.close(self) while already closing:
-					// unwind this __close call and continue closing any remaining TBC vars.
-					if errors.Is(th.state.abortErr, errCoroCloseSelf) {
-						th.state.abortErr = nil
+					if errors.Is(s.abortErr, errCoroCloseSelf) {
+						s.abortErr = nil
 					}
 					continue
 				}
-				th.state.abortErr = err
+				s.abortErr = err
 				return errVal, hasErr, raised
 			}
 			if isUncatchableErr(err) {
-				th.state.abortErr = err
+				s.abortErr = err
 				th.discardTBCAtOrAbove(s, level)
 				return errVal, hasErr, raised
 			}
-			errVal = errorToLuaValue(th.state, err)
-			th.syncCloseErrs[errSlot] = errVal
+			errVal = errorToLuaValue(s, err)
+			th.setSyncCloseErr(s, errSlot, errVal)
 			hasErr = true
 			if le, ok := err.(*LuaError); ok && le.xpHandled {
 				raised = false
@@ -533,31 +798,34 @@ func (th *Thread) pushLuaFrame(s *State, cl *Closure, funcIdx, nargs, nresults i
 	if err := th.ensureFrameCap(s, th.nframe+1, limit); err != nil {
 		return err
 	}
-	p := s.boundProtoOf(cl).proto
-	nparams := int(p.NumParams)
+	bp := s.boundProtoOf(cl)
+	nparams := int(bp.numParams)
+	maxStack := int(bp.maxStack)
 	base := funcIdx + 1
 
-	if p.IsVararg() {
-		if err := th.ensureStack(th.state, base + max(nargs, int(p.MaxStackSize)) + nparams + 8); err != nil {
+	if bp.isVararg {
+		if err := th.ensureStack(s, base+max(nargs, maxStack)+nparams+8); err != nil {
 			return err
 		}
 		th.top = base + nargs
 	} else {
-		if err := th.ensureStack(th.state, base + int(p.MaxStackSize) + 8); err != nil {
+		if err := th.ensureStack(s, base+maxStack+8); err != nil {
 			return err
 		}
+		stack := th.stackSlice(s.arena)
 		if nargs < nparams {
-			fillNil(th.stack[base+nargs : base+nparams])
+			fillNil(stack[base+nargs : base+nparams])
 		}
-		if int(p.MaxStackSize) > nparams {
-			fillNil(th.stack[base+nparams : base+int(p.MaxStackSize)])
+		if maxStack > nparams {
+			fillNil(stack[base+nparams : base+maxStack])
 		}
-		th.top = base + int(p.MaxStackSize)
+		th.top = base + maxStack
 	}
 
-	th.frames[th.nframe] = callFrame{
+	frames := th.framesSlice(s.arena)
+	frames[th.nframe] = callFrame{
 		kind:        frameLua,
-		cl:          cl,
+		clRef:       cl.self,
 		base:        base,
 		funcIdx:     funcIdx,
 		pc:          0,
@@ -569,35 +837,29 @@ func (th *Thread) pushLuaFrame(s *State, cl *Closure, funcIdx, nargs, nresults i
 	th.nextFrameFinalizer = false
 	th.nframe++
 	th.noteFrame(th.nframe)
-	th.noteStack(max(th.top, base+int(p.MaxStackSize)))
+	th.noteStack(max(th.top, base+maxStack))
 	return nil
 }
 
-func (th *Thread) placeResults(_ *State, dst int, res []Value, nresults int) error {
+func (th *Thread) placeResults(s *State, dst int, res []Value, nresults int) error {
 	if nresults < 0 {
-		if th.state != nil {
-			if err := th.state.ensureStackWithRoots(th, dst+len(res)+4, NilValue(), res); err != nil {
-				return err
-			}
-		} else if err := th.ensureStack(th.state, dst + len(res) + 4); err != nil {
+		if err := s.ensureStackWithRoots(th, dst+len(res)+4, NilValue(), res); err != nil {
 			return err
 		}
-		copy(th.stack[dst:dst+len(res)], res)
+		stack := th.stackSlice(s.arena)
+		copy(stack[dst:dst+len(res)], res)
 		th.top = dst + len(res)
 		th.noteStack(th.top)
 		return nil
 	}
 	n := min(len(res), nresults)
-	if th.state != nil {
-		if err := th.state.ensureStackWithRoots(th, dst+nresults+4, NilValue(), res[:n]); err != nil {
-			return err
-		}
-	} else if err := th.ensureStack(th.state, dst + nresults + 4); err != nil {
+	if err := s.ensureStackWithRoots(th, dst+nresults+4, NilValue(), res[:n]); err != nil {
 		return err
 	}
-	copy(th.stack[dst:dst+n], res[:n])
+	stack := th.stackSlice(s.arena)
+	copy(stack[dst:dst+n], res[:n])
 	if n < nresults {
-		fillNil(th.stack[dst+n : dst+nresults])
+		fillNil(stack[dst+n : dst+nresults])
 	}
 	th.top = dst + nresults
 	th.noteStack(th.top)
@@ -610,25 +872,47 @@ func (th *Thread) IsYieldable() bool {
 }
 
 // clearDeadRefs clears all stack slots, frame entries, and transient references on a
-// completed or closed coroutine so Go's GC can reclaim discarded arguments, locals,
-// and closures immediately in Tier 0 without waiting for State.CollectFull.
-// Preserves th.hook so debug.gethook(deadCo) remains faithful to Lua 5.5.1.
-func (th *Thread) clearDeadRefs(_ *State) {
-	fillNil(th.stack)
-	clear(th.frames)
+// completed or closed coroutine while preserving th.hook (faithful to Lua 5.5.1).
+func (th *Thread) clearDeadRefs(s *State) {
+	a := s.arena
+	if stack := th.stackSlice(a); len(stack) > 0 {
+		fillNil(stack)
+	}
+	if frames := th.framesSlice(a); len(frames) > 0 {
+		clear(frames)
+	}
 	th.nframe = 0
 	th.top = 0
 	th.highStack = 0
 	th.highFrames = 0
-	clear(th.openUpvals)
-	th.openUpvals = nil
-	th.tbc = nil
-	th.yieldVals = nil
+	if th.openUpvalsRef != arena.NullRef {
+		a.Free(th.openUpvalsRef)
+		th.openUpvalsRef = arena.NullRef
+	}
+	th.openUpvalsLen = 0
+	th.openUpvalsCap = 0
+	if th.tbcRef != arena.NullRef {
+		a.Free(th.tbcRef)
+		th.tbcRef = arena.NullRef
+	}
+	th.tbcLen = 0
+	th.tbcCap = 0
+	if th.yieldValsRef != arena.NullRef {
+		a.Free(th.yieldValsRef)
+		th.yieldValsRef = arena.NullRef
+	}
+	th.yieldValsLen = 0
+	th.yieldValsCap = 0
+	if th.syncCloseRef != arena.NullRef {
+		a.Free(th.syncCloseRef)
+		th.syncCloseRef = arena.NullRef
+	}
+	th.syncCloseLen = 0
+	th.syncCloseCap = 0
 	th.yieldedNative = false
 	th.yieldNativeFn = NilValue()
 	th.lastErrNative = NilValue()
-	th.uncaughtErrVal = nil
-	th.syncCloseErrs = nil
+	th.setUncaughtErr(s, nil)
 }
 
 // clearUnusedRefs clears stack slots above the live frame/TBC/upvalue watermark and
@@ -636,38 +920,47 @@ func (th *Thread) clearDeadRefs(_ *State) {
 // and TBC variables intact for debug.traceback(co), debug.getlocal(co, ...), and
 // deferred coroutine.close(co).
 func (th *Thread) clearUnusedRefs(s *State) {
-	if s == nil {
-		s = th.state
-	}
-	if th.nframe < len(th.frames) {
-		clear(th.frames[th.nframe:])
+	a := s.arena
+	frames := th.framesSlice(a)
+	if th.nframe < len(frames) {
+		clear(frames[th.nframe:])
 	}
 	liveTop := th.top
 	for i := range th.nframe {
-		cf := &th.frames[i]
-		if cf.kind == frameLua && cf.cl != nil {
-			if end := cf.base + int(s.boundProtoOf(cf.cl).maxStack); end > liveTop {
+		cf := &frames[i]
+		if cf.kind == frameLua && cf.clRef != arena.NullRef {
+			cl := arena.AsSmall[Closure](a, cf.clRef)
+			if end := cf.base + int(s.boundProtoOf(cl).maxStack); end > liveTop {
 				liveTop = end
 			}
 		}
 	}
-	for _, idx := range th.tbc {
-		if idx+1 > liveTop {
-			liveTop = idx + 1
+	for _, idx := range th.tbcSlice(a) {
+		if int(idx)+1 > liveTop {
+			liveTop = int(idx) + 1
 		}
 	}
-	if n := len(th.openUpvals); n > 0 && int(th.openUpvals[n-1].stackIdx)+1 > liveTop {
-		liveTop = int(th.openUpvals[n-1].stackIdx) + 1
+	if ups := th.openUpvalsSlice(a); len(ups) > 0 {
+		lastIdx := int(arena.AsSmall[Upvalue](a, ups[len(ups)-1]).stackIdx)
+		if lastIdx+1 > liveTop {
+			liveTop = lastIdx + 1
+		}
 	}
-	if liveTop < len(th.stack) {
-		fillNil(th.stack[liveTop:])
+	stack := th.stackSlice(a)
+	if liveTop < len(stack) {
+		fillNil(stack[liveTop:])
 	}
 	th.highStack = liveTop
 	th.highFrames = th.nframe
-	th.yieldVals = nil
+	if th.yieldValsRef != arena.NullRef {
+		a.Free(th.yieldValsRef)
+		th.yieldValsRef = arena.NullRef
+	}
+	th.yieldValsLen = 0
+	th.yieldValsCap = 0
 	th.yieldedNative = false
 	th.yieldNativeFn = NilValue()
-	th.uncaughtErrVal = nil
+	th.setUncaughtErr(s, nil)
 }
 
 // Status returns the current ThreadStatus of th.
@@ -680,9 +973,6 @@ func (th *Thread) Status() ThreadStatus {
 
 // StatusString returns the Lua 5.5 coroutine.status(co) string.
 func (th *Thread) StatusString(s *State) string {
-	if s == nil {
-		s = th.state
-	}
 	if th.self == s.curRef {
 		return "running"
 	}
@@ -693,11 +983,11 @@ func (th *Thread) StatusString(s *State) string {
 		return "dead"
 	default:
 		if th.nframe == 0 && th.status == ThreadOK {
-			// Freshly created coroutine (has initial function on stack[0]) or finished main thread.
 			if th.self == s.mainThreadRef {
 				return "dead"
 			}
-			if !th.stack[0].IsNil() {
+			stack := th.stackSlice(s.arena)
+			if len(stack) > 0 && !stack[0].IsNil() {
 				return "suspended"
 			}
 			return "dead"
@@ -721,9 +1011,6 @@ func errorToLuaValue(s *State, err error) Value {
 	return StringValue(s.intern.Intern(err.Error()))
 }
 
-func (th *Thread) FormatStatusError() error {
-	if th.state != nil {
-		return fmt.Errorf("%s", th.state.FormatValue(th.errObj))
-	}
-	return fmt.Errorf("%s", FormatValue(th.errObj))
+func (th *Thread) FormatStatusError(s *State) error {
+	return fmt.Errorf("%s", s.FormatValue(th.errObj))
 }

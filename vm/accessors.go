@@ -25,7 +25,7 @@ func (s *State) isMainThread(th *Thread) bool {
 }
 
 func (s *State) ownsThread(th *Thread) bool {
-	return th != nil && th.state == s && th.self != arena.NullRef && s.arena.IsLive(th.self)
+	return th != nil && th.self != arena.NullRef && s.arena.IsLive(th.self) && arena.AsSmall[Thread](s.arena, th.self) == th
 }
 
 func (s *State) setStringMeta(mt *Table) {
@@ -80,7 +80,9 @@ func (s *State) gmatchPreallocBytes() int64 {
 }
 
 func (s *State) coroWrapPreallocBytes() int64 {
-	return threadInitMemBytes(128, defaultFrameCap) + int64(unsafe.Sizeof(ArenaNative{})) + 16
+	return threadInitMemBytes(128, defaultFrameCap) +
+		arenaRoundedBytes(int(unsafe.Sizeof(ArenaNative{}))) +
+		arenaRoundedBytes(int(unsafe.Sizeof(Value{})))
 }
 
 // --- Arena GC write barriers ---
@@ -99,63 +101,78 @@ func (s *State) barrierBackTable(t *Table) {
 
 // --- Thread storage & lifecycle accessors ---
 
-func (th *Thread) stackSlice(_ *arena.Arena) []Value             { return th.stack }
-func (th *Thread) framesSlice(_ *arena.Arena) []callFrame        { return th.frames }
-func (th *Thread) framesLen() int                                { return len(th.frames) }
-func (th *Thread) stackSize() int                                { return len(th.stack) }
-//go:nocheckptr
-func windowIn(stack []Value, base int) *[256]Value {
-	return (*[256]Value)(unsafe.Pointer(&stack[base]))
-}
+func (th *Thread) framesLen() int       { return th.framesCap }
+func (th *Thread) stackSize() int       { return th.stackLen }
+func (th *Thread) openUpvalsCount() int { return int(th.openUpvalsLen) }
 
-func (th *Thread) windowFor(_ *arena.Arena, base int) *[256]Value { return th.window(base) }
-func (th *Thread) openUpvalsCount() int                          { return len(th.openUpvals) }
-func (th *Thread) openUpvalAt(_ *arena.Arena, idx int) *Upvalue  { return th.openUpvals[idx] }
-func (th *Thread) yieldValsSlice(_ *arena.Arena) []Value         { return th.yieldVals }
-func (th *Thread) setYieldVals(_ *State, vals []Value) error {
-	if len(vals) == 0 {
-		th.yieldVals = nil
-		return nil
-	}
-	cp := make([]Value, len(vals))
-	copy(cp, vals)
-	th.yieldVals = cp
-	return nil
-}
-func (th *Thread) clearYieldVals()                     { th.yieldVals = nil }
-func (th *Thread) uncaughtErr(_ *State) error          { return th.uncaughtErrVal }
-func (th *Thread) setUncaughtErr(_ *State, err error)  { th.uncaughtErrVal = err }
-func (th *Thread) callerThread(_ *State) *Thread       { return th.caller }
-func (th *Thread) setCallerThread(_ *State, c *Thread) { th.caller = c }
-func (th *Thread) onSuspend()                          {}
-func (th *Thread) onResume()                           {}
-
-func (th *Thread) popTBCAtOrAbove(_ *arena.Arena, level int) (int, bool) {
-	if len(th.tbc) == 0 {
+func (th *Thread) popTBCAtOrAbove(a *arena.Arena, level int) (int, bool) {
+	if th.tbcLen <= 0 {
 		return 0, false
 	}
-	idx := th.tbc[len(th.tbc)-1]
+	idx := int(th.tbcSlice(a)[th.tbcLen-1])
 	if idx < level {
 		return 0, false
 	}
-	th.tbc = th.tbc[:len(th.tbc)-1]
+	th.tbcLen--
 	return idx, true
 }
 
-func (th *Thread) topTBCIndex(_ *arena.Arena) (int, bool) {
-	if len(th.tbc) == 0 {
+func (th *Thread) topTBCIndex(a *arena.Arena) (int, bool) {
+	if th.tbcLen <= 0 {
 		return 0, false
 	}
-	return th.tbc[len(th.tbc)-1], true
+	return int(th.tbcSlice(a)[th.tbcLen-1]), true
 }
+
+func (th *Thread) callerThread(s *State) *Thread {
+	if th.callerRef == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Thread](s.arena, th.callerRef)
+}
+
+func (th *Thread) setCallerThread(_ *State, c *Thread) {
+	if c == nil {
+		th.callerRef = arena.NullRef
+		return
+	}
+	th.callerRef = c.self
+}
+
+func (th *Thread) clearYieldVals() { th.yieldValsLen = 0 }
+func (th *Thread) onSuspend()      {}
+func (th *Thread) onResume()       {}
 
 // --- callFrame accessors ---
 
-func (s *State) frameClosure(cf *callFrame) *Closure        { return cf.cl }
-func (s *State) setFrameClosure(cf *callFrame, cl *Closure) { cf.cl = cl }
-func (s *State) frameVarargTab(cf *callFrame) *Table        { return cf.varargTab }
-func (s *State) setFrameVarargTab(cf *callFrame, t *Table)  { cf.varargTab = t }
-func (cf *callFrame) hasVarargTab() bool                    { return cf.varargTab != nil }
+func (s *State) frameClosure(cf *callFrame) *Closure {
+	if cf.clRef == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Closure](s.arena, cf.clRef)
+}
+
+func (s *State) setFrameClosure(cf *callFrame, cl *Closure) {
+	if cl == nil {
+		cf.clRef = arena.NullRef
+		return
+	}
+	cf.clRef = cl.self
+}
+
+func (s *State) frameVarargTab(cf *callFrame) *Table {
+	return s.tableByRef(cf.varargTabRef)
+}
+
+func (s *State) setFrameVarargTab(cf *callFrame, t *Table) {
+	if t == nil {
+		cf.varargTabRef = arena.NullRef
+		return
+	}
+	cf.varargTabRef = t.self
+}
+
+func (cf *callFrame) hasVarargTab() bool { return cf.varargTabRef != arena.NullRef }
 
 // --- Closure & Upvalue accessors ---
 
@@ -180,7 +197,7 @@ func (s *State) upvalOwner(uv *Upvalue) *Thread {
 	if uv.ownerRef == arena.NullRef {
 		return nil
 	}
-	return s.threadByRef(uv.ownerRef)
+	return arena.AsSmall[Thread](s.arena, uv.ownerRef)
 }
 
 func (s *State) setClosedUpvalVal(uv *Upvalue, val Value) {

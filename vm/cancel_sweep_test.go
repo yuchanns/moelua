@@ -442,7 +442,7 @@ func TestBulkFileWriteCancelAndBudget(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 			defer cancel()
-			time.Sleep(5 * time.Millisecond)
+			<-ctx.Done()
 			s.SetContext(ctx)
 			if _, err := s.Call(writeFn); !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("bufMode=%s: expected context.DeadlineExceeded, got %v", bufMode, err)
