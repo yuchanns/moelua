@@ -1,377 +1,475 @@
 package vm
 
 import (
-	"weak"
+	"unsafe"
 
 	"github.com/yuchanns/moelua/internal/arena"
 )
 
-const maxShapeProps = 64
+const (
+	maxShapeProps = 64
 
-// Shape represents a hidden class for record-like Lua tables (per State).
-// The metatable pointer is encoded directly inside the Shape so a single pointer
-// comparison covers receiver layout, __index/__newindex, and metatable identity.
-type Shape struct {
-	id     uint64
-	parent *Shape
-	key    *LuaString // key added by this transition (nil on root shapes)
-	slot   int32      // slot index for key (-1 on root shapes)
-	length int32      // total number of slots in this shape
-	meta   *Table     // metatable encoded in this shape (may be nil)
-
-	// Fast lookup for >8 properties (lazily populated).
-	index map[*LuaString]int32
-
-	// Transitions: inline small list for <= 4 children, weak map beyond that so unused shapes can be reclaimed.
-	transSmall   [4]shapeTrans
-	nTrans       uint8
-	frozen       bool // true for read-only shapes from frozen stdlib template (transitions go to shapeRegistry.frozenTrans)
-	transMap     map[uint64]weak.Pointer[Shape]
-	transInserts uint32
-}
+	shapeFlagTransMask uint8 = 0x07 // bits 0..2: nTrans (0..4)
+	shapeFlagTracked   uint8 = 1 << 3
+)
 
 type shapeTrans struct {
-	keyID uint64
-	child weak.Pointer[Shape]
+	keyID    uint64       // 8B: LuaString.ID
+	childRef arena.ObjRef // 4B: Shape ObjRef in State.arena (weak edge pruned in PreSweep)
+	_        uint32       // 4B
+}
+
+type shapeIndexEntry struct {
+	keyRef arena.ObjRef // 4B: LuaString ObjRef
+	keyTag uint8        // 1B: tagFrozenString or tagString
+	slot   int8         // 1B: slot index (0..63), -1 = empty
+	_      uint16       // 2B pad -> 8B exact
+}
+
+const (
+	_ = uint(8 - unsafe.Sizeof(shapeIndexEntry{}))
+	_ = uint(unsafe.Sizeof(shapeIndexEntry{}) - 8)
+)
+
+// Shape is a 128-byte noscan hidden class stored in State.arena (ptrdata == 0).
+// Metatable identity (metaRef) is encoded directly inside the Shape so a single
+// shapeID comparison covers receiver layout, __index/__newindex, and metatable identity.
+type Shape struct {
+	hdr        arena.GCHeader // 8B: Kind=gcKindShape, Flags=nTrans|shapeFlagTracked
+	id         uint64         // 8B: monotonic shape ID
+	keyVal     Value          // 16B: short LuaString Value added by this transition (Nil on root)
+	self       arena.ObjRef   // 4B: own ObjRef in State.arena
+	parentRef  arena.ObjRef   // 4B: parent Shape ObjRef (NullRef on root)
+	metaRef    arena.ObjRef   // 4B: metatable Table ObjRef (NullRef if none)
+	transRef   arena.ObjRef   // 4B: optional raw Arena []shapeTrans overflow array
+	indexRef   arena.ObjRef   // 4B: lazily-built compact Arena []shapeIndexEntry for >8 props
+	slot       int16          // 2B: slot index for keyVal (-1 on root)
+	length     int16          // 2B: total number of properties in this shape
+	transLen   uint16         // 2B: live entries in transRef
+	transCap   uint16         // 2B: capacity of transRef
+	indexMask  uint8          // 1B: 0 if no index, else len(entries)-1 (31/63/127)
+	lookupHits uint8          // 1B: saturated lookup count; builds index lazily on 2nd lookup
+	_          uint16         // 2B pad
+	transSmall [4]shapeTrans  // 64B: inline small transition cache (weak edges)
+}
+
+const (
+	_ = uint(128 - unsafe.Sizeof(Shape{}))
+	_ = uint(unsafe.Sizeof(Shape{}) - 128)
+)
+
+func (sh *Shape) nTrans() int {
+	return int(sh.hdr.Flags & shapeFlagTransMask)
+}
+
+func (sh *Shape) setNTrans(n int) {
+	sh.hdr.Flags = (sh.hdr.Flags &^ shapeFlagTransMask) | (uint8(n) & shapeFlagTransMask)
+}
+
+func (sh *Shape) isTracked() bool {
+	return sh.hdr.Flags&shapeFlagTracked != 0
+}
+
+func (sh *Shape) markTracked() {
+	sh.hdr.Flags |= shapeFlagTracked
+}
+
+func shapeIndexHash(v Value, mask uint32) uint32 {
+	x := v.bits ^ (v.tag * 0x9e3779b97f4a7c15)
+	x ^= x >> 33
+	x *= 0xff51afd7ed558ccd
+	return uint32(x^(x>>33)) & mask
+}
+
+func (sh *Shape) buildIndexLazy(s *State) {
+	if sh.indexRef != arena.NullRef || sh.length <= 8 || s == nil || s.arena == nil {
+		return
+	}
+	sz := 32
+	for sz < int(sh.length)*2 {
+		sz <<= 1
+	}
+	byteLen := sz * int(unsafe.Sizeof(shapeIndexEntry{}))
+	if s.memLimit > 0 {
+		_, slotBytes := arena.SizeClassFor(byteLen)
+		if s.MemoryUsage()+int64(slotBytes) > s.memLimit {
+			return
+		}
+	}
+	idxRef, err := s.arena.Alloc(byteLen)
+	if err != nil {
+		return
+	}
+	if s.collector != nil {
+		s.collector.AddDebt(int64(s.arena.SlotSize(idxRef)))
+	}
+	mask := uint32(sz - 1)
+	entries := arena.SliceFast[shapeIndexEntry](s.arena, idxRef, 0, sz)
+	for i := range entries {
+		entries[i].slot = -1
+	}
+	a := s.arena
+	for cur := sh; cur != nil && !cur.keyVal.IsNil(); {
+		pos := shapeIndexHash(cur.keyVal, mask)
+		for entries[pos].slot >= 0 {
+			pos = (pos + 1) & mask
+		}
+		entries[pos] = shapeIndexEntry{
+			keyRef: arena.ObjRef(cur.keyVal.bits),
+			keyTag: uint8(cur.keyVal.tag),
+			slot:   int8(cur.slot),
+		}
+		if cur.parentRef == arena.NullRef {
+			break
+		}
+		cur = arena.AsSmall[Shape](a, cur.parentRef)
+	}
+	sh.indexRef = idxRef
+	sh.indexMask = uint8(mask)
 }
 
 // Lookup returns the slot index for short-string key k, or -1 if absent.
-func (sh *Shape) Lookup(k *LuaString) int32 {
-	if sh == nil || sh.length == 0 {
+func (sh *Shape) Lookup(s *State, k *LuaString) int32 {
+	if sh == nil || sh.length == 0 || k == nil {
 		return -1
 	}
-	if sh.index != nil {
-		if idx, ok := sh.index[k]; ok {
-			return idx
+	kv := StringValue(k)
+	if sh.indexRef != arena.NullRef {
+		mask := uint32(sh.indexMask)
+		entries := arena.SliceFast[shapeIndexEntry](s.arena, sh.indexRef, 0, int(mask)+1)
+		idx := shapeIndexHash(kv, mask)
+		kRef := arena.ObjRef(kv.bits)
+		kTag := uint8(kv.tag)
+		for {
+			e := &entries[idx]
+			if e.slot < 0 {
+				return -1
+			}
+			if e.keyRef == kRef && e.keyTag == kTag {
+				return int32(e.slot)
+			}
+			idx = (idx + 1) & mask
 		}
-		return -1
 	}
-	for cur := sh; cur != nil && cur.key != nil; cur = cur.parent {
-		if cur.key == k {
-			return cur.slot
+	if sh.length > 8 {
+		if sh.lookupHits < 255 {
+			sh.lookupHits++
 		}
+		if sh.lookupHits == 2 {
+			sh.buildIndexLazy(s)
+			if sh.indexRef != arena.NullRef {
+				return sh.Lookup(s, k)
+			}
+		}
+	}
+	a := s.arena
+	for cur := sh; cur != nil && !cur.keyVal.IsNil(); {
+		if cur.keyVal == kv {
+			return int32(cur.slot)
+		}
+		if cur.parentRef == arena.NullRef {
+			break
+		}
+		cur = arena.AsSmall[Shape](a, cur.parentRef)
 	}
 	return -1
 }
 
-// Keys returns the ordered keys of this shape (slot 0..length-1).
-func (sh *Shape) Keys() []*LuaString {
+// Keys returns the ordered short-string Values of this shape (slot 0..length-1).
+func (sh *Shape) Keys(a *arena.Arena) []Value {
 	if sh == nil || sh.length == 0 {
 		return nil
 	}
-	out := make([]*LuaString, sh.length)
-	for cur := sh; cur != nil && cur.key != nil; cur = cur.parent {
-		out[cur.slot] = cur.key
+	out := make([]Value, sh.length)
+	for cur := sh; cur != nil && !cur.keyVal.IsNil(); {
+		out[cur.slot] = cur.keyVal
+		if cur.parentRef == arena.NullRef {
+			break
+		}
+		cur = arena.AsSmall[Shape](a, cur.parentRef)
 	}
 	return out
 }
 
-type weakFrozenTransKey struct {
-	shape weak.Pointer[Shape]
-	keyID uint64
+type metaTransKey struct {
+	shapeRef arena.ObjRef
+	metaRef  arena.ObjRef
 }
 
 type shapeRegistry struct {
 	nextID      uint64
-	frozenMaxID uint64
-	rootShape   Shape // embedded per-State root shape (meta == nil) -> zero extra alloc
-	root        *Shape
-	// metaRoots weakly caches root shapes per metatable so unreachable metatables are collected by Go's GC.
-	metaRoots map[weak.Pointer[Table]]weak.Pointer[Shape]
-	// metaTrans weakly caches (shape, newMeta) -> shape with same keys and newMeta.
-	metaTrans map[weakMetaTransKey]weak.Pointer[Shape]
-	// frozenTrans weakly caches transitions out of read-only frozen stdlib shapes without mutating them.
-	frozenTrans map[weakFrozenTransKey]weak.Pointer[Shape]
-	metaInserts uint32
+	rootRef     arena.ObjRef
+	metaRoots   map[arena.ObjRef]arena.ObjRef
+	metaTrans   map[metaTransKey]arena.ObjRef
+	transShapes []arena.ObjRef // shapes with >= 1 transition; pruned in GC PreSweep
 }
 
-type weakMetaTransKey struct {
-	shape   weak.Pointer[Shape]
-	meta    weak.Pointer[Table]
-	hasMeta bool
-}
-
-func (sr *shapeRegistry) init(nextID uint64) {
-	sr.frozenMaxID = nextID
-	sr.nextID = nextID + 1
-	sr.rootShape = Shape{id: sr.nextID, slot: -1}
-	sr.root = &sr.rootShape
-}
-
-func newShapeRegistry() shapeRegistry {
-	var sr shapeRegistry
+func (sr *shapeRegistry) init(s *State) {
 	sr.nextID = 1
-	sr.rootShape = Shape{id: 1, slot: -1}
-	sr.root = &sr.rootShape
-	return sr
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Shape{})), gcKindShape)
+	if err != nil {
+		panic(err)
+	}
+	sh := arena.AsSmall[Shape](s.arena, ref)
+	sh.id = sr.nextID
+	sh.self = ref
+	sh.keyVal = NilValue()
+	sh.slot = -1
+	sr.rootRef = ref
 }
 
-func pruneShapeTransMap(sh *Shape) {
-	for k, v := range sh.transMap {
-		if v.Value() == nil {
-			delete(sh.transMap, k)
-		}
+func (sr *shapeRegistry) trackTrans(sh *Shape) {
+	if !sh.isTracked() {
+		sh.markTracked()
+		sr.transShapes = append(sr.transShapes, sh.self)
 	}
 }
 
-// Prune removes dead weak entries from metaRoots, metaTrans, frozenTrans, and root transitions.
-func (sr *shapeRegistry) Prune() {
-	for k, v := range sr.metaRoots {
-		if k.Value() == nil || v.Value() == nil {
-			delete(sr.metaRoots, k)
+// pruneDead removes all weak shape cache entries referencing White (soon-to-be-freed)
+// shapes or metatables during GC PreSweep (zero weak.Pointer overhead!).
+func (sr *shapeRegistry) pruneDead(a *arena.Arena, c *arena.Collector) {
+	for metaRef, shRef := range sr.metaRoots {
+		if c.IsWhite(metaRef) || c.IsWhite(shRef) {
+			delete(sr.metaRoots, metaRef)
 		}
 	}
-	for k, v := range sr.metaTrans {
-		if k.shape.Value() == nil || (k.hasMeta && k.meta.Value() == nil) || v.Value() == nil {
+	for k, shRef := range sr.metaTrans {
+		if c.IsWhite(k.shapeRef) || (k.metaRef != arena.NullRef && c.IsWhite(k.metaRef)) || c.IsWhite(shRef) {
 			delete(sr.metaTrans, k)
 		}
 	}
-	for k, v := range sr.frozenTrans {
-		if k.shape.Value() == nil || v.Value() == nil {
-			delete(sr.frozenTrans, k)
+	kept := 0
+	for _, shRef := range sr.transShapes {
+		if c.IsWhite(shRef) {
+			continue
 		}
+		sh := arena.AsSmall[Shape](a, shRef)
+		n := sh.nTrans()
+		kn := 0
+		for i := range n {
+			st := sh.transSmall[i]
+			if st.childRef != arena.NullRef && !c.IsWhite(st.childRef) {
+				sh.transSmall[kn] = st
+				kn++
+			}
+		}
+		for i := kn; i < n; i++ {
+			sh.transSmall[i] = shapeTrans{}
+		}
+		sh.setNTrans(kn)
+		if sh.transRef != arena.NullRef && sh.transLen > 0 {
+			arr := arena.SliceFast[shapeTrans](a, sh.transRef, 0, int(sh.transLen))
+			kl := 0
+			for i := range int(sh.transLen) {
+				st := arr[i]
+				if st.childRef != arena.NullRef && !c.IsWhite(st.childRef) {
+					arr[kl] = st
+					kl++
+				}
+			}
+			for i := kl; i < int(sh.transLen); i++ {
+				arr[i] = shapeTrans{}
+			}
+			sh.transLen = uint16(kl)
+			if kl == 0 {
+				a.Free(sh.transRef)
+				sh.transRef = arena.NullRef
+				sh.transCap = 0
+			}
+		}
+		if kn == 0 && sh.transLen == 0 {
+			sh.hdr.Flags &^= shapeFlagTracked
+			continue
+		}
+		sr.transShapes[kept] = shRef
+		kept++
 	}
-	if sr.root != nil && sr.root.transMap != nil {
-		pruneShapeTransMap(sr.root)
-	}
+	sr.transShapes = sr.transShapes[:kept]
 }
 
-func (sr *shapeRegistry) maybePrune() {
-	sr.metaInserts++
-	if sr.metaInserts&255 == 0 {
-		sr.Prune()
+func (sr *shapeRegistry) allocShape(s *State, parentRef, metaRef arena.ObjRef, keyVal Value, slot, length int16) (*Shape, error) {
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Shape{})), gcKindShape)
+	if err != nil {
+		return nil, err
 	}
+	sr.nextID++
+	sh := arena.AsSmall[Shape](s.arena, ref)
+	sh.id = sr.nextID
+	sh.self = ref
+	sh.parentRef = parentRef
+	sh.metaRef = metaRef
+	sh.keyVal = keyVal
+	sh.slot = slot
+	sh.length = length
+	return sh, nil
 }
 
-// shapeNodeBytes estimates the retained Go heap storage of a single non-frozen Shape node
-// (excluding parent chain and interned key strings, which are counted separately).
-func shapeNodeBytes(sh *Shape) int64 {
-	if sh == nil || sh.frozen {
-		return 0
+func (sr *shapeRegistry) Root(s *State, metaRef arena.ObjRef, rootObj Value) *Shape {
+	if metaRef == arena.NullRef {
+		return arena.AsSmall[Shape](s.arena, sr.rootRef)
 	}
-	n := int64(192)
-	if sh.index != nil {
-		n += 48 + int64(len(sh.index))*32
-	}
-	if sh.transMap != nil {
-		n += 48 + int64(len(sh.transMap))*32
-	}
-	return n
-}
-
-func (sr *shapeRegistry) Root(s *State, meta *Table, rootObj Value) *Shape {
-	if meta == nil {
-		return sr.root
-	}
-	wk := weak.Make(meta)
 	if sr.metaRoots == nil {
-		sr.metaRoots = make(map[weak.Pointer[Table]]weak.Pointer[Shape], 16)
-	} else if wp, ok := sr.metaRoots[wk]; ok {
-		if sh := wp.Value(); sh != nil {
-			return sh
-		}
+		sr.metaRoots = make(map[arena.ObjRef]arena.ObjRef, 16)
+	} else if shRef, ok := sr.metaRoots[metaRef]; ok {
+		return arena.AsSmall[Shape](s.arena, shRef)
 	}
-	if s != nil && s.memLimit > 0 {
-		if err := s.checkMemWithRoots(192, rootObj, TableValue(meta), NilValue()); err != nil {
+	if s.memLimit > 0 {
+		if err := s.checkMemWithRoots(128, rootObj, tableRefValue(metaRef), NilValue()); err != nil {
 			s.memExceeded = true
 			return nil
 		}
 	}
-	sr.nextID++
-	sh := &Shape{id: sr.nextID, slot: -1, meta: meta}
-	if s != nil {
-		s.shapeMemBytes += shapeNodeBytes(sh)
+	sh, err := sr.allocShape(s, arena.NullRef, metaRef, NilValue(), -1, 0)
+	if err != nil {
+		s.memExceeded = true
+		return nil
 	}
-	sr.metaRoots[wk] = weak.Make(sh)
-	sr.maybePrune()
+	sr.metaRoots[metaRef] = sh.self
 	return sh
 }
 
+const (
+	// maxShapeTransCap caps per-shape overflow transition cache entries so uint16
+	// transLen/transCap never overflow and linear transition scans stay bounded.
+	maxShapeTransCap = 1024
+)
+
 // Transition returns the child shape adding key k (assumed absent from sh), or (nil, nil) if maxShapeProps exceeded.
-func (sr *shapeRegistry) Transition(s *State, sh *Shape, k *LuaString, r1, r2 Value) (*Shape, error) {
+func (sr *shapeRegistry) Transition(s *State, shRef arena.ObjRef, k *LuaString, r1, r2 Value) (*Shape, error) {
+	sh := arena.AsSmall[Shape](s.arena, shRef)
 	if sh.length >= maxShapeProps {
 		return nil, nil
 	}
 	kid := k.ID
-	if sh.frozen {
-		fk := weakFrozenTransKey{shape: weak.Make(sh), keyID: kid}
-		if sr.frozenTrans != nil {
-			if wp, ok := sr.frozenTrans[fk]; ok {
-				if child := wp.Value(); child != nil {
-					return child, nil
-				}
-			}
-		} else {
-			sr.frozenTrans = make(map[weakFrozenTransKey]weak.Pointer[Shape], 8)
-		}
-		if s != nil && s.memLimit > 0 {
-			est := int64(192)
-			if sh.length+1 > 8 {
-				est += 48 + int64(sh.length+1)*32
-			}
-			if err := s.checkMemWithRoots(est, r1, StringValue(k), r2); err != nil {
-				return nil, err
-			}
-		}
-		sr.nextID++
-		child := &Shape{
-			id:     sr.nextID,
-			parent: sh,
-			key:    k,
-			slot:   sh.length,
-			length: sh.length + 1,
-			meta:   sh.meta,
-		}
-		if child.length > 8 {
-			idx := make(map[*LuaString]int32, child.length)
-			for cur := child; cur != nil && cur.key != nil; cur = cur.parent {
-				idx[cur.key] = cur.slot
-			}
-			child.index = idx
-		}
-		if s != nil {
-			s.shapeMemBytes += shapeNodeBytes(child)
-		}
-		sr.frozenTrans[fk] = weak.Make(child)
-		sr.maybePrune()
-		return child, nil
-	}
-	freeSmall := -1
-	for i := range int(sh.nTrans) {
-		st := sh.transSmall[i]
-		if st.keyID == kid {
-			if child := st.child.Value(); child != nil {
-				return child, nil
-			}
-			freeSmall = i
-		} else if freeSmall < 0 && st.child.Value() == nil {
-			freeSmall = i
+	n := sh.nTrans()
+	for i := range n {
+		if sh.transSmall[i].keyID == kid && sh.transSmall[i].childRef != arena.NullRef {
+			return arena.AsSmall[Shape](s.arena, sh.transSmall[i].childRef), nil
 		}
 	}
-	if sh.transMap != nil {
-		if wp, ok := sh.transMap[kid]; ok {
-			if child := wp.Value(); child != nil {
-				return child, nil
+	if sh.transRef != arena.NullRef && sh.transLen > 0 {
+		arr := arena.SliceFast[shapeTrans](s.arena, sh.transRef, 0, int(sh.transLen))
+		for i := range arr {
+			if arr[i].keyID == kid && arr[i].childRef != arena.NullRef {
+				return arena.AsSmall[Shape](s.arena, arr[i].childRef), nil
 			}
 		}
 	}
-	if s != nil && s.memLimit > 0 {
-		est := int64(192)
-		if sh.length+1 > 8 {
-			est += 48 + int64(sh.length+1)*32
-		}
-		if freeSmall < 0 && sh.nTrans >= 4 {
-			if sh.transMap == nil {
-				est += 48 + 8*32
-			} else {
-				est += 32
+	if s.memLimit > 0 {
+		est := arenaAllocSize(int64(unsafe.Sizeof(Shape{})))
+		if n >= 4 && int(sh.transLen) >= int(sh.transCap) && int(sh.transCap) < maxShapeTransCap {
+			newCap := min(max(int(sh.transCap)*2, 8), maxShapeTransCap)
+			_, newSlot := arena.SizeClassFor(newCap * int(unsafe.Sizeof(shapeTrans{})))
+			var oldSlot int
+			if sh.transRef != arena.NullRef {
+				oldSlot = s.arena.SlotSize(sh.transRef)
+			}
+			if newSlot > oldSlot {
+				est += int64(newSlot - oldSlot)
 			}
 		}
 		if err := s.checkMemWithRoots(est, r1, StringValue(k), r2); err != nil {
 			return nil, err
 		}
 	}
-	sr.nextID++
-	child := &Shape{
-		id:     sr.nextID,
-		parent: sh,
-		key:    k,
-		slot:   sh.length,
-		length: sh.length + 1,
-		meta:   sh.meta,
+	// Reload sh pointer after potential emergency GC (Arena is non-moving, sh stays valid).
+	sh = arena.AsSmall[Shape](s.arena, shRef)
+	n = sh.nTrans()
+	child, err := sr.allocShape(s, sh.self, sh.metaRef, StringValue(k), sh.length, sh.length+1)
+	if err != nil {
+		return nil, err
 	}
-	if child.length > 8 {
-		idx := make(map[*LuaString]int32, child.length)
-		for cur := child; cur != nil && cur.key != nil; cur = cur.parent {
-			idx[cur.key] = cur.slot
-		}
-		child.index = idx
-	}
-	if s != nil {
-		s.shapeMemBytes += shapeNodeBytes(child)
-	}
-	if freeSmall >= 0 {
-		sh.transSmall[freeSmall] = shapeTrans{keyID: kid, child: weak.Make(child)}
-	} else if sh.nTrans < 4 {
-		sh.transSmall[sh.nTrans] = shapeTrans{keyID: kid, child: weak.Make(child)}
-		sh.nTrans++
+	if n < 4 {
+		sh.transSmall[n] = shapeTrans{keyID: kid, childRef: child.self}
+		sh.setNTrans(n + 1)
 	} else {
-		if sh.transMap == nil {
-			sh.transMap = make(map[uint64]weak.Pointer[Shape], 8)
+		if int(sh.transLen) >= int(sh.transCap) {
+			if int(sh.transCap) >= maxShapeTransCap {
+				return child, nil // transition cache full; child shape remains valid without caching
+			}
+			newCap := min(max(int(sh.transCap)*2, 8), maxShapeTransCap)
+			byteLen := newCap * int(unsafe.Sizeof(shapeTrans{}))
+			if s.memLimit > 0 {
+				_, newSlot := arena.SizeClassFor(byteLen)
+				var oldSlot int
+				if sh.transRef != arena.NullRef {
+					oldSlot = s.arena.SlotSize(sh.transRef)
+				}
+				if newSlot > oldSlot && s.MemoryUsage()+int64(newSlot-oldSlot) > s.memLimit {
+					return child, nil // child shape is still valid even without caching transition
+				}
+			}
+			newRef, aerr := s.arena.Alloc(byteLen)
+			if aerr != nil {
+				return child, nil // child shape is still valid even without caching transition
+			}
+			s.collector.AddDebt(int64(s.arena.SlotSize(newRef)))
+			dst := arena.SliceFast[shapeTrans](s.arena, newRef, 0, newCap)
+			if sh.transRef != arena.NullRef {
+				src := arena.SliceFast[shapeTrans](s.arena, sh.transRef, 0, int(sh.transLen))
+				copy(dst, src)
+				s.arena.Free(sh.transRef)
+			}
+			sh.transRef = newRef
+			sh.transCap = uint16(newCap)
 		}
-		sh.transMap[kid] = weak.Make(child)
-		sh.transInserts++
-		if sh.transInserts&255 == 0 {
-			pruneShapeTransMap(sh)
-		}
+		arr := arena.SliceFast[shapeTrans](s.arena, sh.transRef, 0, int(sh.transCap))
+		arr[sh.transLen] = shapeTrans{keyID: kid, childRef: child.self}
+		sh.transLen++
 	}
+	sr.trackTrans(sh)
 	return child, nil
 }
 
-// WithMeta returns a shape having the exact same ordered keys as sh, but with metatable meta.
-// Returns (newShape, true) on success, or (sh, false) when memory allocation fails.
-func (sr *shapeRegistry) WithMeta(s *State, sh *Shape, meta *Table, rootObj Value) (*Shape, bool) {
-	if sh == nil {
-		r := sr.Root(s, meta, rootObj)
-		return r, r != nil
+// WithMeta returns a shape having the exact same ordered keys as shRef, but with metatable metaRef.
+func (sr *shapeRegistry) WithMeta(s *State, shRef, metaRef arena.ObjRef, rootObj Value) (arena.ObjRef, bool) {
+	if shRef == arena.NullRef {
+		r := sr.Root(s, metaRef, rootObj)
+		if r == nil {
+			return arena.NullRef, false
+		}
+		return r.self, true
 	}
-	if sh.meta == meta {
-		return sh, true
+	sh := arena.AsSmall[Shape](s.arena, shRef)
+	if sh.metaRef == metaRef {
+		return shRef, true
 	}
 	if sh.length == 0 {
-		if r := sr.Root(s, meta, rootObj); r != nil {
-			return r, true
+		if r := sr.Root(s, metaRef, rootObj); r != nil {
+			return r.self, true
 		}
-		if s != nil {
-			s.memExceeded = true
-		}
-		return sh, false
+		s.memExceeded = true
+		return shRef, false
 	}
-	var wm weak.Pointer[Table]
-	if meta != nil {
-		wm = weak.Make(meta)
-	}
-	key := weakMetaTransKey{shape: weak.Make(sh), meta: wm, hasMeta: meta != nil}
+	key := metaTransKey{shapeRef: shRef, metaRef: metaRef}
 	if sr.metaTrans != nil {
-		if wp, ok := sr.metaTrans[key]; ok {
-			if cached := wp.Value(); cached != nil {
-				return cached, true
-			}
+		if cached, ok := sr.metaTrans[key]; ok {
+			return cached, true
 		}
 	} else {
-		sr.metaTrans = make(map[weakMetaTransKey]weak.Pointer[Shape], 16)
+		sr.metaTrans = make(map[metaTransKey]arena.ObjRef, 16)
 	}
-	cur := sr.Root(s, meta, rootObj)
+	cur := sr.Root(s, metaRef, rootObj)
 	if cur == nil {
-		if s != nil {
+		s.memExceeded = true
+		return shRef, false
+	}
+	curRef := cur.self
+	metaVal := tableRefValue(metaRef)
+	keys := sh.Keys(s.arena)
+	for _, kv := range keys {
+		prevPinned := s.pinnedShapeRef
+		s.pinnedShapeRef = curRef
+		next, err := sr.Transition(s, curRef, s.asString(kv), rootObj, metaVal)
+		s.pinnedShapeRef = prevPinned
+		if err != nil || next == nil {
 			s.memExceeded = true
+			return shRef, false
 		}
-		return sh, false
+		curRef = next.self
 	}
-	metaVal := NilValue()
-	if meta != nil {
-		metaVal = TableValue(meta)
-	}
-	keys := sh.Keys()
-	for _, k := range keys {
-		next, err := sr.Transition(s, cur, k, rootObj, metaVal)
-		if err != nil {
-			if s != nil {
-				s.memExceeded = true
-			}
-			return sh, false
-		}
-		if next == nil {
-			if s != nil {
-				s.memExceeded = true
-			}
-			return sh, false
-		}
-		cur = next
-	}
-	sr.metaTrans[key] = weak.Make(cur)
-	sr.maybePrune()
-	return cur, true
+	sr.metaTrans[key] = curRef
+	return curRef, true
 }
 
 // icKind identifies what a per-PC inline cache entry caches.
@@ -380,51 +478,64 @@ type icKind uint8
 const (
 	icEmpty icKind = iota
 	icOwnSlot      // receiver.shape.id == shapeID => receiver.slots[slot]
-	icProtoVal     // receiver.shape.id == shapeID && (noMeta || s.protoEpoch == epoch) => protoValue()
-	icAddSlot      // SETFIELD transition: receiver.shape.id == shapeID && (noMeta || s.protoEpoch == epoch) => targetShape
-	icEnvSlot      // GETTABUP on dict table: holder.Value() == table && holder.dictGen == epoch => holder.nodes[slot].val
+	icProtoVal     // receiver.shape.id == shapeID && (noMeta || s.protoEpoch == epoch) => ic.val
+	icAddSlot      // SETFIELD transition: receiver.shape.id == shapeID && (noMeta || s.protoEpoch == epoch) => targetShapeRef
+	icEnvSlot      // GETTABUP on dict table: holderRef == t.self && holder.hash.dictGen == epoch => holder.nodes[slot].val
 )
 
-// polyEntry is one slot in a lazily-allocated 4-way polymorphic IC (only used on polymorphic sites).
-// Cached Value payloads contain zero Go pointers (noscan) and are swept in PreSweep.
+// polyEntry is a 40-byte noscan slot in a lazily-allocated 4-way polymorphic IC in State.arena.
+// All cached references are weak Arena ObjRefs/Values swept in Collector PreSweep (zero weak.Pointer!).
 type polyEntry struct {
-	shapeID     uint64
-	targetShape weak.Pointer[Shape]
-	val         Value
-	epoch       uint64
-	slot        int32
-	kind        icKind
-	noMeta      bool
-	protoAbsent bool
+	val            Value
+	epoch          uint64
+	shapeRef       arena.ObjRef
+	targetShapeRef arena.ObjRef
+	slot           int32
+	kind           icKind
+	noMeta         bool
+	protoAbsent    bool
+	_              byte
 }
 
-// ICEntry is a per-State, per-PC inline cache entry (never shared across goroutines).
-// Monomorphic sites hit directly on the primary fields with zero extra indirection;
-// polymorphic sites (2..4 shapes, e.g. OOP method dispatch across subclasses) lazily
-// attach a 4-way poly array and promote hits to primary (MRU).
+const (
+	_ = uint(40 - unsafe.Sizeof(polyEntry{}))
+	_ = uint(unsafe.Sizeof(polyEntry{}) - 40)
+)
+
+// ICEntry is a 48-byte noscan per-State, per-PC inline cache entry stored in State.arena.
+// Monomorphic sites hit directly on t.shapeRef == ic.shapeRef with ZERO Shape deref and ZERO
+// weak.Pointer barriers; polymorphic sites (2..4 shapes) lazily allocate a 160B Arena [4]polyEntry array.
 type ICEntry struct {
-	shapeID     uint64
-	targetShape weak.Pointer[Shape] // for icAddSlot
-	holder      weak.Pointer[Table] // for icEnvSlot
-	poly        *[4]polyEntry
-	val         Value  // for icProtoVal (noscan Value; swept in PreSweep)
-	epoch       uint64 // protoEpoch or dictGen (uint64 prevents 32-bit wraparound)
-	slot        int32
-	kind        icKind
-	noMeta      bool // true when shape.meta == nil
-	protoAbsent bool // true when nil slot / missing key verified absent in __index / __newindex at epoch
-	polyCount   uint8
+	val            Value        // for icProtoVal (stored directly — noscan!)
+	epoch          uint64       // protoEpoch or dictGen
+	shapeRef       arena.ObjRef // receiver Shape ObjRef (swept in PreSweep before Shape reuse)
+	targetShapeRef arena.ObjRef // for icAddSlot
+	holderRef      arena.ObjRef // for icEnvSlot
+	polyRef        arena.ObjRef // optional Arena [4]polyEntry
+	slot           int32
+	kind           icKind
+	noMeta         bool
+	protoAbsent    bool
+	polyCount      uint8
 }
 
-func (ic *ICEntry) getTabUpFast(_ *arena.Arena, t *Table) (Value, bool) {
-	if ic.kind == icEnvSlot && ic.holder.Value() == t && t.hash != nil && ic.epoch == t.hash.dictGen {
-		v := t.hash.nodes[ic.slot].val
-		if !v.IsNil() || ic.noMeta {
-			return v, true
+const (
+	_ = uint(48 - unsafe.Sizeof(ICEntry{}))
+	_ = uint(unsafe.Sizeof(ICEntry{}) - 48)
+)
+
+func (ic *ICEntry) getTabUpFast(a *arena.Arena, t *Table) (Value, bool) {
+	if ic.kind == icEnvSlot && ic.holderRef == t.self && t.hashRef != arena.NullRef {
+		h := arena.AsSmall[tableHash](a, t.hashRef)
+		if ic.epoch == h.dictGen && h.nodesRef != arena.NullRef {
+			v := h.nodesSlice(a)[ic.slot].val
+			if !v.IsNil() || ic.noMeta {
+				return v, true
+			}
 		}
 	}
-	if ic.kind == icOwnSlot && t.shape != nil && t.shape.id == ic.shapeID {
-		v := t.slots[ic.slot]
+	if ic.kind == icOwnSlot && t.shapeRef == ic.shapeRef {
+		v := t.slotAt(a, int(ic.slot))
 		if !v.IsNil() || ic.noMeta {
 			return v, true
 		}
@@ -432,10 +543,10 @@ func (ic *ICEntry) getTabUpFast(_ *arena.Arena, t *Table) (Value, bool) {
 	return NilValue(), false
 }
 
-func (ic *ICEntry) getFieldFast(_ *arena.Arena, t *Table, protoEpoch uint64) (Value, bool) {
-	if t.shape != nil && t.shape.id == ic.shapeID {
+func (ic *ICEntry) getFieldFast(a *arena.Arena, t *Table, protoEpoch uint64) (Value, bool) {
+	if t.shapeRef == ic.shapeRef {
 		if ic.kind == icOwnSlot {
-			v := t.slots[ic.slot]
+			v := t.slotAt(a, int(ic.slot))
 			if !v.IsNil() || ic.noMeta || (ic.protoAbsent && protoEpoch == ic.epoch) {
 				return v, true
 			}
@@ -447,20 +558,26 @@ func (ic *ICEntry) getFieldFast(_ *arena.Arena, t *Table, protoEpoch uint64) (Va
 }
 
 func (ic *ICEntry) setFieldFast(s *State, t *Table, val Value, protoEpoch uint64) bool {
-	if t.shape != nil && t.shape.id == ic.shapeID && t.flags&tblFlagIsProto == 0 {
+	if t.shapeRef == ic.shapeRef && t.hdr.Flags&tblFlagIsProto == 0 {
+		a := s.arena
 		if ic.kind == icOwnSlot {
-			if !t.slots[ic.slot].IsNil() || ic.noMeta || (ic.protoAbsent && protoEpoch == ic.epoch) {
-				t.slots[ic.slot] = val
-				s.barrierTableVal(t, val)
+			sp := t.slotPtr(a, int(ic.slot))
+			if !sp.IsNil() || ic.noMeta || (ic.protoAbsent && protoEpoch == ic.epoch) {
+				*sp = val
+				if val.IsGCObject() && t.hdr.IsBlack() {
+					s.collector.BarrierBack(t.self)
+				}
 				return true
 			}
 		} else if ic.kind == icAddSlot && !val.IsNil() && (ic.noMeta || protoEpoch == ic.epoch) {
 			slot := int(ic.slot)
-			if ts := ic.targetShape.Value(); ts != nil && slot < cap(t.slots) {
-				t.slots = t.slots[:slot+1]
-				t.slots[slot] = val
-				t.shape = ts
-				s.barrierBackTable(t)
+			if ic.targetShapeRef != arena.NullRef && slot < int(t.slotsCap) {
+				t.slotsLen = uint8(slot + 1)
+				*t.slotPtr(a, slot) = val
+				t.shapeRef = ic.targetShapeRef
+				if t.hdr.IsBlack() {
+					s.collector.BarrierBack(t.self)
+				}
 				return true
 			}
 		}
@@ -468,11 +585,11 @@ func (ic *ICEntry) setFieldFast(s *State, t *Table, val Value, protoEpoch uint64
 	return false
 }
 
-func (ic *ICEntry) setOwnSlot(shapeID uint64, slot int32, noMeta, protoAbsent bool, epoch uint64) {
+func (ic *ICEntry) setOwnSlot(shapeRef arena.ObjRef, slot int32, noMeta, protoAbsent bool, epoch uint64) {
 	ic.kind = icOwnSlot
-	ic.shapeID = shapeID
-	ic.targetShape = weak.Pointer[Shape]{}
-	ic.holder = weak.Pointer[Table]{}
+	ic.shapeRef = shapeRef
+	ic.targetShapeRef = arena.NullRef
+	ic.holderRef = arena.NullRef
 	ic.val = NilValue()
 	ic.slot = slot
 	ic.noMeta = noMeta
@@ -480,11 +597,11 @@ func (ic *ICEntry) setOwnSlot(shapeID uint64, slot int32, noMeta, protoAbsent bo
 	ic.epoch = epoch
 }
 
-func (ic *ICEntry) setProtoVal(shapeID uint64, v Value, epoch uint64, noMeta bool) {
+func (ic *ICEntry) setProtoVal(shapeRef arena.ObjRef, v Value, epoch uint64, noMeta bool) {
 	ic.kind = icProtoVal
-	ic.shapeID = shapeID
-	ic.targetShape = weak.Pointer[Shape]{}
-	ic.holder = weak.Pointer[Table]{}
+	ic.shapeRef = shapeRef
+	ic.targetShapeRef = arena.NullRef
+	ic.holderRef = arena.NullRef
 	ic.val = v
 	ic.slot = 0
 	ic.noMeta = noMeta
@@ -492,11 +609,11 @@ func (ic *ICEntry) setProtoVal(shapeID uint64, v Value, epoch uint64, noMeta boo
 	ic.epoch = epoch
 }
 
-func (ic *ICEntry) setAddSlot(shapeID uint64, target *Shape, slot int32, epoch uint64, noMeta bool) {
+func (ic *ICEntry) setAddSlot(shapeRef, targetRef arena.ObjRef, slot int32, epoch uint64, noMeta bool) {
 	ic.kind = icAddSlot
-	ic.shapeID = shapeID
-	ic.targetShape = weak.Make(target)
-	ic.holder = weak.Pointer[Table]{}
+	ic.shapeRef = shapeRef
+	ic.targetShapeRef = targetRef
+	ic.holderRef = arena.NullRef
 	ic.val = NilValue()
 	ic.slot = slot
 	ic.epoch = epoch
@@ -504,29 +621,47 @@ func (ic *ICEntry) setAddSlot(shapeID uint64, target *Shape, slot int32, epoch u
 	ic.protoAbsent = false
 }
 
-func (ic *ICEntry) setEnvSlot(holder *Table, dictGen uint64, slot int32, noMeta bool) {
+func (ic *ICEntry) setEnvSlot(a *arena.Arena, holderRef arena.ObjRef, dictGen uint64, slot int32, noMeta bool) {
+	if ic.polyRef != arena.NullRef {
+		a.Free(ic.polyRef)
+	}
 	*ic = ICEntry{
-		kind:   icEnvSlot,
-		holder: weak.Make(holder),
-		epoch:  dictGen,
-		slot:   slot,
-		noMeta: noMeta,
+		kind:      icEnvSlot,
+		holderRef: holderRef,
+		epoch:     dictGen,
+		slot:      slot,
+		noMeta:    noMeta,
 	}
 }
 
-// polySavePrimary inserts the displaced primary entry into the 4-way polymorphic cache.
-func (ic *ICEntry) polySavePrimary() {
+// polySavePrimary inserts the displaced primary entry into the 4-way polymorphic cache in Arena.
+func (ic *ICEntry) polySavePrimary(s *State) {
 	if ic.kind != icOwnSlot && ic.kind != icProtoVal && ic.kind != icAddSlot {
 		return
 	}
-	if ic.poly == nil {
-		ic.poly = new([4]polyEntry)
+	a := s.arena
+	if ic.polyRef == arena.NullRef {
+		byteLen := 4 * int(unsafe.Sizeof(polyEntry{}))
+		if s.memLimit > 0 {
+			_, slotBytes := arena.SizeClassFor(byteLen)
+			if s.MemoryUsage()+int64(slotBytes) > s.memLimit {
+				return
+			}
+		}
+		ref, err := a.AllocZeroed(byteLen)
+		if err != nil {
+			return
+		}
+		if s.collector != nil {
+			s.collector.AddDebt(int64(a.SlotSize(ref)))
+		}
+		ic.polyRef = ref
 	}
-	// Update existing shape entry if already present.
+	poly := arena.SliceFast[polyEntry](a, ic.polyRef, 0, 4)
 	for i := range int(ic.polyCount) {
-		if ic.poly[i].shapeID == ic.shapeID {
-			ic.poly[i] = polyEntry{
-				shapeID: ic.shapeID, targetShape: ic.targetShape,
+		if poly[i].shapeRef == ic.shapeRef {
+			poly[i] = polyEntry{
+				shapeRef: ic.shapeRef, targetShapeRef: ic.targetShapeRef,
 				val: ic.val, epoch: ic.epoch, slot: ic.slot, kind: ic.kind,
 				noMeta: ic.noMeta, protoAbsent: ic.protoAbsent,
 			}
@@ -535,33 +670,33 @@ func (ic *ICEntry) polySavePrimary() {
 	}
 	idx := int(ic.polyCount)
 	if idx >= 4 {
-		idx = 3 // evict oldest slot
+		idx = 3
 	} else {
 		ic.polyCount++
 	}
-	ic.poly[idx] = polyEntry{
-		shapeID: ic.shapeID, targetShape: ic.targetShape,
+	poly[idx] = polyEntry{
+		shapeRef: ic.shapeRef, targetShapeRef: ic.targetShapeRef,
 		val: ic.val, epoch: ic.epoch, slot: ic.slot, kind: ic.kind,
 		noMeta: ic.noMeta, protoAbsent: ic.protoAbsent,
 	}
 }
 
-// polyLookup searches the 4-way poly array for shapeID; on hit, swaps it into the primary MRU slot.
-func (ic *ICEntry) polyLookup(shapeID uint64) bool {
-	if ic.poly == nil {
+// polyLookup searches the 4-way poly array for shapeRef; on hit, swaps it into the primary MRU slot.
+func (ic *ICEntry) polyLookup(a *arena.Arena, shapeRef arena.ObjRef) bool {
+	if ic.polyRef == arena.NullRef {
 		return false
 	}
+	poly := arena.SliceFast[polyEntry](a, ic.polyRef, 0, 4)
 	for i := range int(ic.polyCount) {
-		pe := &ic.poly[i]
-		if pe.shapeID == shapeID {
-			// Swap primary <-> pe (MRU promotion).
+		pe := &poly[i]
+		if pe.shapeRef == shapeRef {
 			old := polyEntry{
-				shapeID: ic.shapeID, targetShape: ic.targetShape,
+				shapeRef: ic.shapeRef, targetShapeRef: ic.targetShapeRef,
 				val: ic.val, epoch: ic.epoch, slot: ic.slot, kind: ic.kind,
 				noMeta: ic.noMeta, protoAbsent: ic.protoAbsent,
 			}
-			ic.shapeID = pe.shapeID
-			ic.targetShape = pe.targetShape
+			ic.shapeRef = pe.shapeRef
+			ic.targetShapeRef = pe.targetShapeRef
 			ic.val = pe.val
 			ic.epoch = pe.epoch
 			ic.slot = pe.slot

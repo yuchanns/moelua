@@ -681,16 +681,19 @@ func (s *State) ensureStrKeyHash(ls *LuaString) error {
 // checkTableLongStrProbe cooperatively polls execution controls before table hash probes
 // compare a huge long string against distinct same-length long strings in the probe chain.
 func (s *State) checkTableLongStrProbe(t *Table, ls *LuaString) error {
-	if s == nil || t == nil || t.hash == nil || len(t.hash.nodes) == 0 || ls == nil || ls.IsShort() || int(ls.Len) <= strCmpCancelChunk || !s.hasInterruptControl() {
+	if s == nil || t == nil || t.hashRef == arena.NullRef || ls == nil || ls.IsShort() || int(ls.Len) <= strCmpCancelChunk || !s.hasInterruptControl() {
 		return nil
 	}
-	h := t.hash
-	nodes := h.nodes
+	h := arena.AsSmall[tableHash](s.arena, t.hashRef)
+	if h.nodesRef == arena.NullRef {
+		return nil
+	}
+	nodes := h.nodesSlice(s.arena)
 	mask := h.mask
 	idx := ls.hash() & mask
 	for {
 		nd := &nodes[idx]
-		if !nd.used {
+		if nd.state == nodeEmpty {
 			return nil
 		}
 		if nd.key.IsString() {
@@ -700,7 +703,7 @@ func (s *State) checkTableLongStrProbe(t *Table, ls *LuaString) error {
 				if err != nil {
 					return err
 				}
-				if eq && !nd.dead {
+				if eq && nd.state == nodeLive {
 					return nil
 				}
 			}
@@ -710,7 +713,7 @@ func (s *State) checkTableLongStrProbe(t *Table, ls *LuaString) error {
 }
 
 func (s *State) ensureLookupStrKeyHash(t *Table, ls *LuaString) error {
-	if t == nil || t.hash == nil {
+	if t == nil || t.hashRef == arena.NullRef {
 		return nil
 	}
 	if err := s.ensureStrKeyHash(ls); err != nil {
@@ -727,7 +730,7 @@ func (s *State) ensureLookupKeyHash(t *Table, key Value) error {
 }
 
 func (s *State) ensureWriteStrKeyHash(t *Table, ls *LuaString, valNil bool) error {
-	if valNil && (t == nil || t.hash == nil) {
+	if valNil && (t == nil || t.hashRef == arena.NullRef) {
 		return nil
 	}
 	if err := s.ensureStrKeyHash(ls); err != nil {

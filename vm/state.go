@@ -246,14 +246,6 @@ const (
 	ridxMainThread = 3 // LUA_RIDX_MAINTHREAD
 )
 
-// tableStub is a 16-byte noscan Arena GC header bridging Go-heap Table structs
-// into State.collector until Step 5e migrates Table and Shape into Arena.
-type tableStub struct {
-	hdr  arena.GCHeader // 8B: Kind=gcKindTable
-	self arena.ObjRef   // 4B
-	idx  uint32         // 4B: 1-based index into State.tables
-}
-
 type deferredStackFree struct {
 	owner arena.ObjRef
 	ref   arena.ObjRef
@@ -280,10 +272,6 @@ type State struct {
 	protos       []*boundProto
 	freeProtoIDs []uint32
 
-	// Live Go-heap Table slice indexed by tableStub.idx (cleared on sweep).
-	tables       []*Table
-	freeTableIDs []uint32
-
 	// Weak/auxiliary GC tracking lists (noscan []ObjRef; maintained in PreSweep).
 	hashedTables       []arena.ObjRef
 	twups              []arena.ObjRef
@@ -292,9 +280,9 @@ type State struct {
 	preserveFramesInGC bool
 
 	// Host-pinned references (analog of luaL_ref) & transient GC roots.
-	pinnedRefs  map[int]Value
-	nextRefID   int
-	pinnedShape *Shape
+	pinnedRefs     map[int]Value
+	nextRefID      int
+	pinnedShapeRef arena.ObjRef
 
 	out       io.Writer
 	errOut    io.Writer
@@ -327,7 +315,6 @@ type State struct {
 
 	// Non-Arena Go-side memory accounting & per-State soft/hard memory limit (0 = unlimited).
 	extraMemBytes int64
-	shapeMemBytes int64
 	tempBytes     int64
 	memLimit      int64
 	memExceeded   bool
@@ -363,66 +350,8 @@ func (s *State) asString(v Value) *LuaString {
 	return arena.AsFast[LuaString](s.arena, v.Ref())
 }
 
-func (s *State) tableByRef(ref arena.ObjRef) *Table {
-	if ref == arena.NullRef {
-		return nil
-	}
-	idx := arena.AsSmall[tableStub](s.arena, ref).idx
-	if int(idx) < len(s.tables) {
-		return s.tables[idx]
-	}
-	return nil
-}
-
-func (s *State) allocTableStub(t *Table) {
-	ref, err := s.collector.Alloc(int(unsafe.Sizeof(tableStub{})), gcKindTable)
-	if err != nil {
-		panic(err)
-	}
-	var idx uint32
-	if n := len(s.freeTableIDs); n > 0 {
-		idx = s.freeTableIDs[n-1]
-		s.freeTableIDs = s.freeTableIDs[:n-1]
-		s.tables[idx] = t
-	} else {
-		if len(s.tables) == 0 {
-			s.tables = []*Table{nil}
-		}
-		idx = uint32(len(s.tables))
-		s.tables = append(s.tables, t)
-	}
-	stub := arena.AsSmall[tableStub](s.arena, ref)
-	stub.self = ref
-	stub.idx = idx
-	t.self = ref
-}
-
-func (s *State) addTableMem(t *Table, delta int64) {
-	if delta <= 0 {
-		return
-	}
-	t.memBytes += delta
-	s.extraMemBytes += delta
-	if s.collector != nil {
-		s.collector.AddDebt(delta)
-	}
-}
-
-func (s *State) subTableMem(t *Table, delta int64) {
-	if delta <= 0 {
-		return
-	}
-	if t.memBytes > delta {
-		t.memBytes -= delta
-	} else {
-		delta = t.memBytes
-		t.memBytes = 0
-	}
-	s.subExtraMem(delta)
-}
-
 func (s *State) asTable(v Value) *Table {
-	return s.tableByRef(v.Ref())
+	return arena.AsSmall[Table](s.arena, v.Ref())
 }
 
 func (s *State) asClosure(v Value) *Closure {
@@ -449,6 +378,13 @@ func (s *State) asNative(v Value) *NativeFunc {
 	raw, _ := s.goRefs.Get(an.goRef)
 	nf, _ := raw.(*NativeFunc)
 	return nf
+}
+
+func (s *State) asShape(ref arena.ObjRef) *Shape {
+	if ref == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Shape](s.arena, ref)
 }
 
 func (s *State) asUpvalue(ref arena.ObjRef) *Upvalue {
@@ -484,21 +420,30 @@ func (s *State) cur() *Thread {
 }
 
 func (s *State) registry() *Table {
-	return s.tableByRef(s.registryRef)
+	if s.registryRef == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Table](s.arena, s.registryRef)
 }
 
 func (s *State) fileMeta() *Table {
-	return s.tableByRef(s.fileMetaRef)
+	if s.fileMetaRef == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Table](s.arena, s.fileMetaRef)
 }
 
 func (s *State) pkgTbl() *Table {
-	return s.tableByRef(s.pkgRef)
+	if s.pkgRef == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Table](s.arena, s.pkgRef)
 }
 
 func (s *State) trackHashedTable(ref arena.ObjRef) {
-	t := s.tableByRef(ref)
-	if t != nil && t.flags&tblFlagTrackedHash == 0 {
-		t.flags |= tblFlagTrackedHash
+	t := arena.AsSmall[Table](s.arena, ref)
+	if t.hdr.Flags&tblFlagTrackedHash == 0 {
+		t.hdr.Flags |= tblFlagTrackedHash
 		s.hashedTables = append(s.hashedTables, ref)
 	}
 }
@@ -600,9 +545,7 @@ func newBootstrapState() *State {
 		arena:            a,
 		goRefs:           arena.NewGoRefs(),
 		intern:           newBootstrapStringInterner(),
-		shapes:           newShapeRegistry(),
 		protos:           []*boundProto{nil},
-		tables:           []*Table{nil},
 		nextRefID:        1,
 		out:              os.Stdout,
 		errOut:           os.Stderr,
@@ -612,6 +555,7 @@ func newBootstrapState() *State {
 	}
 	s.initCollector()
 	s.seedRNG(makeRandomSeed(s), 0)
+	s.shapes.init(s)
 
 	th, err := s.newThread(initFastStackCap, initFastFrameCap)
 	if err != nil {
@@ -628,8 +572,6 @@ func newBootstrapState() *State {
 	reg.RawSetInt(s, ridxGlobals, TableValue(env))
 	reg.RawSetInt(s, ridxMainThread, ThreadValue(th))
 	s.initStdlib()
-	s.shapes.frozenMaxID = s.shapes.nextID
-	s.shapeMemBytes = 0
 	return s
 }
 
@@ -650,7 +592,7 @@ func (s *State) MemoryUsage() int64 {
 	if s.arena != nil {
 		arenaBytes = s.arena.AllocBytes()
 	}
-	n := arenaBytes + s.extraMemBytes + s.shapeMemBytes + s.tempBytes
+	n := arenaBytes + s.extraMemBytes + s.tempBytes
 	if n < 0 {
 		return 0
 	}
@@ -940,7 +882,7 @@ func (s *State) UserdataMeta(u *Userdata) *Table {
 	if u == nil || u.metaRef == arena.NullRef {
 		return nil
 	}
-	return s.tableByRef(u.metaRef)
+	return arena.AsSmall[Table](s.arena, u.metaRef)
 }
 
 // UserdataUValues returns the Lua user-value slice of userdata u.
@@ -1222,11 +1164,15 @@ func (s *State) bindProtoWithCache(p *bytecode.Proto, longStrs map[string]*LuaSt
 	}
 
 	var ics []ICEntry
-	var icBytes int64
 	if OptimizeEnabled && p.ICCount > 0 {
-		ics = make([]ICEntry, p.ICCount)
+		icref, icerr := s.arena.AllocZeroed(int(p.ICCount) * int(unsafe.Sizeof(ICEntry{})))
+		if icerr != nil {
+			return nil, nil, icerr
+		}
+		s.collector.AddDebt(int64(s.arena.SlotSize(icref)))
+		ap.icRef = icref
 		ap.nIC = uint32(p.ICCount)
-		icBytes = int64(len(ics)) * int64(unsafe.Sizeof(ICEntry{}))
+		ics = arena.SliceFast[ICEntry](s.arena, icref, 0, int(p.ICCount))
 	}
 
 	var subs []arena.ObjRef
@@ -1248,7 +1194,7 @@ func (s *State) bindProtoWithCache(p *bytecode.Proto, longStrs map[string]*LuaSt
 		}
 	}
 
-	goBytes := protoGoBytes(p) + icBytes
+	goBytes := protoGoBytes(p)
 	bp := &boundProto{
 		proto:     p,
 		insns:     codeOf(p.Code),
@@ -1299,9 +1245,12 @@ func protoOwnBytes(p *bytecode.Proto, withIC bool) int64 {
 	if p == nil {
 		return 0
 	}
-	n := protoGoBytes(p) + int64(unsafe.Sizeof(ArenaProto{})) + int64(len(p.Consts))*16 + int64(len(p.Protos))*4
+	n := protoGoBytes(p) +
+		arenaAllocSize(int64(unsafe.Sizeof(ArenaProto{}))) +
+		arenaAllocSize(int64(len(p.Consts))*int64(unsafe.Sizeof(Value{}))) +
+		arenaAllocSize(int64(len(p.Protos))*int64(unsafe.Sizeof(arena.ObjRef(0))))
 	if withIC && p.ICCount > 0 {
-		n += int64(p.ICCount) * int64(unsafe.Sizeof(ICEntry{}))
+		n += arenaAllocSize(int64(p.ICCount) * int64(unsafe.Sizeof(ICEntry{})))
 	}
 	return n
 }
@@ -1323,7 +1272,7 @@ func protoTreeBytes(p *bytecode.Proto, withIC bool) int64 {
 				}
 				if _, ok := seen[c.Str]; !ok {
 					seen[c.Str] = struct{}{}
-					total += int64(luaStringHeaderSize) + int64(len(c.Str))
+					total += arenaAllocSize(int64(luaStringHeaderSize) + int64(len(c.Str)))
 				}
 			}
 		}
@@ -1333,6 +1282,16 @@ func protoTreeBytes(p *bytecode.Proto, withIC bool) int64 {
 		return total
 	}
 	return walk(p)
+}
+
+func loadPreflightBytes(p *bytecode.Proto, withIC bool) int64 {
+	if p == nil {
+		return 0
+	}
+	return arenaAllocSize(int64(unsafe.Sizeof(Closure{}))) +
+		arenaAllocSize(int64(len(p.Upvalues))*int64(unsafe.Sizeof(arena.ObjRef(0)))) +
+		int64(len(p.Upvalues))*arenaAllocSize(int64(unsafe.Sizeof(Upvalue{}))) +
+		protoTreeBytes(p, withIC)
 }
 
 func (s *State) allocClosedUpval(val Value) (*Upvalue, error) {
@@ -1370,7 +1329,7 @@ func (s *State) allocClosure(ap *ArenaProto, bp *boundProto, nUpvals int) (*Clos
 // Load instantiates an immutable verified *bytecode.Proto as a top-level Closure with _ENV as upvalue 0.
 func (s *State) Load(p *bytecode.Proto) (*Closure, error) {
 	if s.memLimit > 0 {
-		chunkBytes := int64(unsafe.Sizeof(Closure{})) + int64(len(p.Upvalues))*(int64(unsafe.Sizeof(Upvalue{}))+4) + protoTreeBytes(p, OptimizeEnabled)
+		chunkBytes := loadPreflightBytes(p, OptimizeEnabled)
 		if err := s.checkMem(chunkBytes); err != nil {
 			return nil, err
 		}
@@ -1514,7 +1473,7 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 		th.nframe = entryDepth
 		stack := th.stackSlice(s.arena)
 		fslice := th.framesSlice(s.arena)
-		if entryDepth == 0 && th.openUpvalsCount() == 0 {
+		if entryDepth == 0 && th.openUpvalsLen == 0 {
 			if end := min(max(th.highStack, th.top, setupEnd), len(stack)); base < end {
 				fillNil(stack[base:end])
 			}
@@ -1842,7 +1801,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	}
 	clearTopStack := func() {
 		th.top = funcIdx
-		if entryDepth == 0 && th.openUpvalsCount() == 0 {
+		if entryDepth == 0 && th.openUpvalsLen == 0 {
 			st := th.stackSlice(s.arena)
 			if end := min(max(th.highStack, th.top), len(st)); funcIdx < end {
 				fillNil(st[funcIdx:end])
@@ -1991,7 +1950,7 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 
 				clearTop := func() {
 					th.top = funcIdx
-					if entryDepth == 0 && th.openUpvalsCount() == 0 {
+					if entryDepth == 0 && th.openUpvalsLen == 0 {
 						st := th.stackSlice(s.arena)
 						if end := min(max(th.highStack, th.top), len(st)); funcIdx < end {
 							fillNil(st[funcIdx:end])
@@ -2117,9 +2076,16 @@ func (s *State) getMetatableOf(v Value) *Table {
 	case v.IsUserdata():
 		return s.UserdataMeta(s.asUserdata(v))
 	case v.IsString():
-		return s.tableByRef(s.stringMetaRef)
+		if s.stringMetaRef == arena.NullRef {
+			return nil
+		}
+		return arena.AsSmall[Table](s.arena, s.stringMetaRef)
 	default:
-		return s.tableByRef(s.typeMetaRefs[v.TypeTag()])
+		ref := s.typeMetaRefs[v.TypeTag()]
+		if ref == arena.NullRef {
+			return nil
+		}
+		return arena.AsSmall[Table](s.arena, ref)
 	}
 }
 
@@ -2257,7 +2223,7 @@ func (s *State) tableSetStr(tblVal Value, keyStr *LuaString, val Value) error {
 		if err := s.ensureLookupStrKeyHash(t, keyStr); err != nil {
 			return err
 		}
-		if !t.RawGetStr(s, keyStr).IsNil() || !t.hasMeta() || s.getTM(t.Metatable(s), TMNewIndex).IsNil() {
+		if !t.RawGetStr(s, keyStr).IsNil() || t.metaRef == arena.NullRef || s.getTM(t.Metatable(s), TMNewIndex).IsNil() {
 			t.RawSetStr(s, keyStr, val)
 			return s.ConsumeMemErr()
 		}
