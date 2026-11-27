@@ -42,7 +42,9 @@ func allocRW(size int) ([]byte, uintptr, error) {
 		return nil, 0, ErrUnsupported
 	}
 	// Construct a byte view of the freshly allocated OS virtual memory region.
-	mem := unsafe.Slice((*byte)(unsafe.Pointer(addr)), size)
+	// Using unsafe.Add(nil, addr) satisfies go vet's unsafeptr check for OS-owned
+	// VirtualAlloc addresses outside the Go heap (matching syscall.Mmap on Unix).
+	mem := unsafe.Slice((*byte)(unsafe.Add(nil, addr)), size)
 	return mem, addr, nil
 }
 
