@@ -80,7 +80,9 @@ func (s *State) gmatchPreallocBytes() int64 {
 }
 
 func (s *State) coroWrapPreallocBytes() int64 {
-	return threadInitMemBytes(128, defaultFrameCap) + int64(unsafe.Sizeof(ArenaNative{})) + 16
+	return threadInitMemBytes(128, defaultFrameCap) +
+		arenaRoundedBytes(int(unsafe.Sizeof(ArenaNative{}))) +
+		arenaRoundedBytes(int(unsafe.Sizeof(Value{})))
 }
 
 // --- Arena GC write barriers ---

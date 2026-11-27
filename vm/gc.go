@@ -686,7 +686,32 @@ func (s *State) gcTraverseThread(c *arena.Collector, th *Thread) int64 {
 					th.framesRef = arena.NullRef
 					th.framesCap = 0
 				}
+				if th.openUpvalsRef != arena.NullRef {
+					a.Free(th.openUpvalsRef)
+					th.openUpvalsRef = arena.NullRef
+					th.openUpvalsCap = 0
+				}
+				if th.tbcRef != arena.NullRef {
+					a.Free(th.tbcRef)
+					th.tbcRef = arena.NullRef
+					th.tbcCap = 0
+				}
+				if th.yieldValsRef != arena.NullRef && th.yieldValsLen == 0 {
+					a.Free(th.yieldValsRef)
+					th.yieldValsRef = arena.NullRef
+					th.yieldValsCap = 0
+				}
+				if th.syncCloseRef != arena.NullRef && th.syncCloseLen == 0 {
+					a.Free(th.syncCloseRef)
+					th.syncCloseRef = arena.NullRef
+					th.syncCloseCap = 0
+				}
 			} else if th.status == ThreadSuspended {
+				if th.yieldValsRef != arena.NullRef && th.yieldValsLen == 0 && th.yieldValsCap > 16 {
+					a.Free(th.yieldValsRef)
+					th.yieldValsRef = arena.NullRef
+					th.yieldValsCap = 0
+				}
 				keepEnd := max(lim, maxFrameEnd)
 				if maxOpenUpvalIdx+1 > keepEnd {
 					keepEnd = maxOpenUpvalIdx + 1

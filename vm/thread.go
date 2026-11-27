@@ -172,8 +172,24 @@ const (
 	maxStackSlots   = 2_000_000
 )
 
+func arenaRoundedBytes(n int) int64 {
+	if n <= 0 {
+		return 0
+	}
+	_, sz := arena.SizeClassFor(n)
+	return int64(sz)
+}
+
 func threadInitMemBytes(stackCap, frameCap int) int64 {
-	return int64(unsafe.Sizeof(Thread{})) + int64(stackCap)*16 + int64(frameCap)*int64(unsafe.Sizeof(callFrame{}))
+	if stackCap < 128 {
+		stackCap = 128
+	}
+	if frameCap < 16 {
+		frameCap = defaultFrameCap
+	}
+	return arenaRoundedBytes(int(unsafe.Sizeof(Thread{}))) +
+		arenaRoundedBytes(stackCap*int(unsafe.Sizeof(Value{}))) +
+		arenaRoundedBytes(frameCap*int(unsafe.Sizeof(callFrame{})))
 }
 
 func (s *State) newThread(stackCap, frameCap int) (*Thread, error) {
@@ -263,6 +279,19 @@ func (th *Thread) setYieldVals(s *State, vals []Value) error {
 	}
 	if len(vals) > int(th.yieldValsCap) {
 		newCap := max(int(th.yieldValsCap)*2, len(vals), 4)
+		if s.memLimit > 0 {
+			var oldBytes int64
+			if th.yieldValsRef != arena.NullRef {
+				oldBytes = int64(s.arena.SlotSize(th.yieldValsRef))
+			}
+			delta := arenaRoundedBytes(newCap*int(unsafe.Sizeof(Value{}))) - oldBytes
+			if delta < 0 {
+				delta = 0
+			}
+			if err := s.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
+				return err
+			}
+		}
 		ref, err := s.arena.Alloc(newCap * int(unsafe.Sizeof(Value{})))
 		if err != nil {
 			return err
@@ -306,14 +335,14 @@ func (th *Thread) pushSyncCloseErr(s *State, v Value) int {
 }
 
 func (th *Thread) setSyncCloseErr(s *State, idx int, v Value) {
-	if idx < 0 || idx >= int(th.syncCloseLen) {
+	if idx < 0 || th.syncCloseRef == arena.NullRef || idx >= int(th.syncCloseLen) {
 		return
 	}
 	arena.SliceFast[Value](s.arena, th.syncCloseRef, 0, int(th.syncCloseCap))[idx] = v
 }
 
 func (th *Thread) popSyncCloseErr(s *State, idx int) {
-	if idx < 0 || idx >= int(th.syncCloseLen) {
+	if idx < 0 || th.syncCloseRef == arena.NullRef || idx >= int(th.syncCloseLen) {
 		return
 	}
 	arena.SliceFast[Value](s.arena, th.syncCloseRef, 0, int(th.syncCloseCap))[idx] = NilValue()
@@ -377,7 +406,14 @@ func (th *Thread) ensureFrameCap(s *State, need, limit int) error {
 		newCap = limit
 	}
 	if s.memLimit > 0 {
-		delta := int64(newCap-th.framesCap) * int64(unsafe.Sizeof(callFrame{}))
+		var oldBytes int64
+		if th.framesRef != arena.NullRef {
+			oldBytes = int64(s.arena.SlotSize(th.framesRef))
+		}
+		delta := arenaRoundedBytes(newCap*int(unsafe.Sizeof(callFrame{}))) - oldBytes
+		if delta < 0 {
+			delta = 0
+		}
 		if err := s.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
 			return err
 		}
@@ -424,7 +460,13 @@ func (th *Thread) ensureStack(s *State, need int) error {
 		newSize = limit
 	}
 	if s.memLimit > 0 {
-		delta := int64(newSize-th.stackLen) * 16
+		delta := arenaRoundedBytes(newSize * int(unsafe.Sizeof(Value{})))
+		if th.nativeArgsDepth == 0 && th.stackRef != arena.NullRef {
+			delta -= int64(s.arena.SlotSize(th.stackRef))
+			if delta < 0 {
+				delta = 0
+			}
+		}
 		if err := s.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
 			return err
 		}
@@ -843,10 +885,30 @@ func (th *Thread) clearDeadRefs(s *State) {
 	th.top = 0
 	th.highStack = 0
 	th.highFrames = 0
+	if th.openUpvalsRef != arena.NullRef {
+		a.Free(th.openUpvalsRef)
+		th.openUpvalsRef = arena.NullRef
+	}
 	th.openUpvalsLen = 0
+	th.openUpvalsCap = 0
+	if th.tbcRef != arena.NullRef {
+		a.Free(th.tbcRef)
+		th.tbcRef = arena.NullRef
+	}
 	th.tbcLen = 0
+	th.tbcCap = 0
+	if th.yieldValsRef != arena.NullRef {
+		a.Free(th.yieldValsRef)
+		th.yieldValsRef = arena.NullRef
+	}
 	th.yieldValsLen = 0
+	th.yieldValsCap = 0
+	if th.syncCloseRef != arena.NullRef {
+		a.Free(th.syncCloseRef)
+		th.syncCloseRef = arena.NullRef
+	}
 	th.syncCloseLen = 0
+	th.syncCloseCap = 0
 	th.yieldedNative = false
 	th.yieldNativeFn = NilValue()
 	th.lastErrNative = NilValue()
@@ -890,7 +952,12 @@ func (th *Thread) clearUnusedRefs(s *State) {
 	}
 	th.highStack = liveTop
 	th.highFrames = th.nframe
+	if th.yieldValsRef != arena.NullRef {
+		a.Free(th.yieldValsRef)
+		th.yieldValsRef = arena.NullRef
+	}
 	th.yieldValsLen = 0
+	th.yieldValsCap = 0
 	th.yieldedNative = false
 	th.yieldNativeFn = NilValue()
 	th.setUncaughtErr(s, nil)

@@ -181,3 +181,147 @@ func TestFindOrCreateUpvalOOMClearsOwnerRef(t *testing.T) {
 	th.closeUpvals(s, 0)
 	s.CollectFull()
 }
+
+func TestThreadAllocMemoryLimitAccountsArenaSizeClasses(t *testing.T) {
+	s := NewState()
+	defer s.Close()
+
+	fn, err := s.LoadChunk([]byte(`return 1`), "=tiny_coro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fnPin := s.Ref(fn)
+	defer s.Unref(fnPin)
+	s.CollectFull()
+
+	base := s.MemoryUsage()
+	est := threadInitMemBytes(128, defaultFrameCap)
+
+	// Setting the limit 1 byte below the rounded Arena cost must reject NewThread without overshooting.
+	s.SetMemoryLimit(base + est - 1)
+	if co, err := s.NewThread(fn); err == nil {
+		t.Fatalf("NewThread unexpectedly succeeded under limit=%d (est=%d, usage=%d, co=%v)",
+			base+est-1, est, s.MemoryUsage(), co)
+	}
+	if usage := s.MemoryUsage(); usage > base+est-1 {
+		t.Fatalf("MemoryUsage=%d exceeded limit=%d after rejected NewThread", usage, base+est-1)
+	}
+
+	// Setting the limit to the exact rounded Arena cost must allow NewThread and stay within budget.
+	s.SetMemoryLimit(base + est)
+	co, err := s.NewThread(fn)
+	if err != nil {
+		t.Fatalf("NewThread failed at exact rounded budget (base=%d est=%d): %v", base, est, err)
+	}
+	if usage := s.MemoryUsage(); usage > base+est {
+		t.Fatalf("NewThread succeeded while exceeding memory limit: usage=%d > limit=%d (base=%d est=%d)",
+			usage, base+est, base, est)
+	}
+	coPin := s.Ref(ThreadValue(co))
+	defer s.Unref(coPin)
+
+	// Frame growth check must also use rounded Arena slot deltas.
+	beforeGrow := s.MemoryUsage()
+	growNeed := defaultFrameCap + 1
+	oldFrameBytes := int64(s.arena.SlotSize(co.framesRef))
+	newFrameBytes := arenaRoundedBytes(defaultFrameCap * 2 * int(unsafe.Sizeof(callFrame{})))
+	growDelta := newFrameBytes - oldFrameBytes
+	s.SetMemoryLimit(beforeGrow + growDelta - 1)
+	if err := co.ensureFrameCap(s, growNeed, maxFrames); err == nil {
+		t.Fatalf("ensureFrameCap unexpectedly succeeded under limit=%d (usage=%d)",
+			beforeGrow+growDelta-1, s.MemoryUsage())
+	}
+	s.SetMemoryLimit(beforeGrow + growDelta)
+	if err := co.ensureFrameCap(s, growNeed, maxFrames); err != nil {
+		t.Fatalf("ensureFrameCap failed at exact rounded delta=%d: %v", growDelta, err)
+	}
+	if usage := s.MemoryUsage(); usage > beforeGrow+growDelta {
+		t.Fatalf("ensureFrameCap exceeded limit: usage=%d > limit=%d", usage, beforeGrow+growDelta)
+	}
+}
+
+func TestDeadCoroutineReleasesAuxiliaryArenaBuffers(t *testing.T) {
+	s := NewState()
+	defer s.Close()
+
+	cl, err := s.LoadChunk([]byte(`
+		local function make_vals(n)
+			local t = {}
+			for i = 1, n do t[i] = i end
+			return t
+		end
+		local big = make_vals(5000)
+		local closable = setmetatable({}, { __close = function() end })
+
+		-- Normal completion: retain coroutine handle globally after yielding 5,000 values,
+		-- opening upvalues, and marking a <close> variable.
+		DEAD_CO = coroutine.create(function()
+			local x = 42
+			local f = function() return x end
+			local c <close> = closable
+			coroutine.yield(table.unpack(big))
+			return f()
+		end)
+		local ok = coroutine.resume(DEAD_CO)
+		assert(ok)
+		local ok2, v = coroutine.resume(DEAD_CO)
+		assert(ok2 and v == 42)
+
+		-- Errored completion: retain errored coroutine handle globally after yielding 5,000 values.
+		ERR_CO = coroutine.create(function()
+			local c <close> = closable
+			coroutine.yield(table.unpack(big))
+			error("boom")
+		end)
+		assert(coroutine.resume(ERR_CO))
+		local ok3 = coroutine.resume(ERR_CO)
+		assert(not ok3)
+
+		big = nil
+		collectgarbage("collect")
+		collectgarbage("collect")
+		return DEAD_CO, ERR_CO
+	`), "=dead_coro_aux_release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Call(cl)
+	if err != nil {
+		t.Fatalf("Call failed: %v", err)
+	}
+	deadCo := s.asThread(res[0])
+	if deadCo.yieldValsRef != arena.NullRef || deadCo.yieldValsCap != 0 {
+		t.Fatalf("completed coroutine retained yieldValsRef=%v cap=%d", deadCo.yieldValsRef, deadCo.yieldValsCap)
+	}
+	if deadCo.openUpvalsRef != arena.NullRef || deadCo.openUpvalsCap != 0 {
+		t.Fatalf("completed coroutine retained openUpvalsRef=%v cap=%d", deadCo.openUpvalsRef, deadCo.openUpvalsCap)
+	}
+	if deadCo.tbcRef != arena.NullRef || deadCo.tbcCap != 0 {
+		t.Fatalf("completed coroutine retained tbcRef=%v cap=%d", deadCo.tbcRef, deadCo.tbcCap)
+	}
+	if deadCo.syncCloseRef != arena.NullRef || deadCo.syncCloseCap != 0 {
+		t.Fatalf("completed coroutine retained syncCloseRef=%v cap=%d", deadCo.syncCloseRef, deadCo.syncCloseCap)
+	}
+
+	errCo := s.asThread(res[1])
+	if errCo.yieldValsRef != arena.NullRef || errCo.yieldValsCap != 0 {
+		t.Fatalf("errored coroutine retained yieldValsRef=%v cap=%d", errCo.yieldValsRef, errCo.yieldValsCap)
+	}
+
+	// Closing the errored coroutine must also release its remaining TBC/openUpvals/syncClose buffers.
+	closeCl, err := s.LoadChunk([]byte(`
+		local ok, err = coroutine.close(ERR_CO)
+		assert(not ok and string.find(tostring(err), "boom", 1, true))
+		collectgarbage("collect")
+	`), "=close_err_co")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call(closeCl); err != nil {
+		t.Fatalf("close_err_co failed: %v", err)
+	}
+	if errCo.tbcRef != arena.NullRef || errCo.openUpvalsRef != arena.NullRef || errCo.syncCloseRef != arena.NullRef {
+		t.Fatalf("closed errored coroutine retained aux buffers: tbc=%v upvals=%v syncClose=%v",
+			errCo.tbcRef, errCo.openUpvalsRef, errCo.syncCloseRef)
+	}
+}
