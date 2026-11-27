@@ -62,27 +62,45 @@ jobs:
           echo "tag=v$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
           echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout release source
+      - name: Checkout release branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
-          ref: ${{ github.sha }}
+          ref: ${{ github.ref }}
 
       - name: Resolve release state and previous tag
         id: plan
         env:
+          DISPATCH_SHA: ${{ github.sha }}
           RELEASE_VERSION: ${{ steps.validate.outputs.version }}
           BASE_VERSION: ${{ steps.validate.outputs.base_version }}
           RELEASE_TAG: ${{ steps.validate.outputs.tag }}
           IS_PRERELEASE: ${{ steps.validate.outputs.is_prerelease }}
         run: |
           set -euo pipefail
-          head_sha="$(git rev-parse HEAD)"
-          head_subject="$(git show -s --format=%s HEAD)"
+          branch_head="$(git rev-parse HEAD)"
+          branch_subject="$(git show -s --format=%s HEAD)"
+          branch_parent="$(git rev-parse HEAD^ 2>/dev/null || true)"
           mode="new"
           existing_release_commit=""
-          source_commit="$head_sha"
+          source_commit="$DISPATCH_SHA"
+
+          child_release="$(python3 - <<'PY'
+          import os, subprocess
+          dispatch = os.environ["DISPATCH_SHA"]
+          want = "Release " + os.environ["RELEASE_TAG"]
+          out = subprocess.check_output(
+              ["git", "log", "--first-parent", "--format=%H\x00%P\x00%s", f"{dispatch}..HEAD"],
+              text=True,
+          )
+          for line in out.splitlines():
+              parts = line.split("\x00", 2)
+              if len(parts) == 3 and parts[1] == dispatch and parts[2] == want:
+                  print(parts[0])
+                  break
+          PY
+          )"
 
           if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
             if [ "$(git cat-file -t "refs/tags/$RELEASE_TAG")" != "tag" ]; then
@@ -90,22 +108,53 @@ jobs:
               exit 1
             fi
             tagged_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
-            if [ "$tagged_commit" != "$head_sha" ]; then
-              echo "::error::Tag $RELEASE_TAG already exists on $tagged_commit (expected $head_sha)"
+            tagged_subject="$(git show -s --format=%s "$tagged_commit")"
+            tagged_parent="$(git rev-parse "${tagged_commit}^" 2>/dev/null || true)"
+            if [ "$tagged_commit" = "$DISPATCH_SHA" ]; then
+              mode="existing"
+              existing_release_commit="$tagged_commit"
+              if [ "$tagged_subject" = "Release $RELEASE_TAG" ] && [ -n "$tagged_parent" ]; then
+                source_commit="$tagged_parent"
+              fi
+            elif [ "$tagged_subject" = "Release $RELEASE_TAG" ] && [ "$tagged_parent" = "$DISPATCH_SHA" ]; then
+              mode="existing"
+              existing_release_commit="$tagged_commit"
+              source_commit="$DISPATCH_SHA"
+            else
+              echo "::error::Tag $RELEASE_TAG already exists on $tagged_commit (expected $DISPATCH_SHA or its Release $RELEASE_TAG child)"
               exit 1
             fi
+          elif [ -n "$child_release" ]; then
             mode="existing"
-            existing_release_commit="$tagged_commit"
-          elif [ "$head_subject" = "Release $RELEASE_TAG" ]; then
+            existing_release_commit="$child_release"
+            source_commit="$DISPATCH_SHA"
+          elif [ "$branch_head" = "$DISPATCH_SHA" ] && [ "$branch_subject" = "Release $RELEASE_TAG" ]; then
             mode="existing"
-            existing_release_commit="$head_sha"
-            parent_sha="$(git rev-parse HEAD^ 2>/dev/null || true)"
-            if [ -n "$parent_sha" ]; then
-              source_commit="$parent_sha"
+            existing_release_commit="$branch_head"
+            if [ -n "$branch_parent" ]; then
+              source_commit="$branch_parent"
             fi
           fi
 
-          previous_tag="$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vxF "$RELEASE_TAG" | head -n 1 || true)"
+          previous_tag="$(SOURCE_COMMIT="$source_commit" python3 - <<'PY'
+          import os, re, subprocess
+
+          source_commit = os.environ["SOURCE_COMMIT"]
+          base_ver = tuple(int(x) for x in os.environ["BASE_VERSION"].split("."))
+          release_tag = os.environ["RELEASE_TAG"]
+          tags = subprocess.check_output(
+              ["git", "tag", "--merged", source_commit, "-l", "v*", "--sort=-v:refname"],
+              text=True,
+          ).splitlines()
+          for t in tags:
+              if t == release_tag:
+                  continue
+              m = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", t)
+              if m and tuple(int(x) for x in m.groups()) < base_ver:
+                  print(t)
+                  break
+          PY
+          )"
 
           echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
           echo "base_version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
