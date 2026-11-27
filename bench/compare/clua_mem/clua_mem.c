@@ -10,6 +10,10 @@
 #include "lua.h"
 #include "lualib.h"
 
+#ifndef ENGINE_NAME
+#define ENGINE_NAME "C"
+#endif
+
 static const char *ACTIVE_LUA =
     "local function makeTree(d)\n"
     "  if d == 0 then return { x = 1, y = 2 } end\n"
@@ -39,7 +43,7 @@ static double now_us(void) {
 static lua_State *new_full_state(void) {
   lua_State *L = luaL_newstate();
   if (!L) {
-    fprintf(stderr, "clua_mem: luaL_newstate failed\n");
+    fprintf(stderr, "%s_mem: luaL_newstate failed\n", ENGINE_NAME);
     exit(1);
   }
   luaL_openlibs(L);
@@ -54,7 +58,7 @@ int main(int argc, char **argv) {
   const char *mode = argv[1];
   int n = atoi(argv[2]);
   if (n <= 0) {
-    fprintf(stderr, "clua_mem: invalid count %s\n", argv[2]);
+    fprintf(stderr, "%s_mem: invalid count %s\n", ENGINE_NAME, argv[2]);
     return 2;
   }
 
@@ -67,7 +71,7 @@ int main(int argc, char **argv) {
 
   lua_State **vms = (lua_State **)calloc((size_t)n, sizeof(lua_State *));
   if (!vms) {
-    fprintf(stderr, "clua_mem: calloc failed\n");
+    fprintf(stderr, "%s_mem: calloc failed\n", ENGINE_NAME);
     return 1;
   }
 
@@ -79,22 +83,22 @@ int main(int argc, char **argv) {
     double dt = now_us() - t0;
     has_rss = has_rss && current_rss_kib(&rss1);
     double idle_rss = has_rss ? (double)(rss1 - rss0) / (double)n : 0.0;
-    printf("{\"engine\":\"C\",\"vms\":%d,\"new_state_us\":%.6f,\"idle_rss_kib\":%.6f,\"has_rss\":%s}\n",
+    printf("{\"engine\":\"" ENGINE_NAME "\",\"vms\":%d,\"new_state_us\":%.6f,\"idle_rss_kib\":%.6f,\"has_rss\":%s}\n",
            n, dt / (double)n, idle_rss, has_rss ? "true" : "false");
   } else if (strcmp(mode, "active") == 0) {
     for (int i = 0; i < n; i++) {
       vms[i] = new_full_state();
-      if (luaL_dostring(vms[i], ACTIVE_LUA) != LUA_OK) {
-        fprintf(stderr, "clua_mem: active init failed at VM %d: %s\n", i, lua_tostring(vms[i], -1));
+      if (luaL_dostring(vms[i], ACTIVE_LUA) != 0) {
+        fprintf(stderr, "%s_mem: active init failed at VM %d: %s\n", ENGINE_NAME, i, lua_tostring(vms[i], -1));
         return 1;
       }
     }
     has_rss = has_rss && current_rss_kib(&rss1);
     double act_rss = has_rss ? (double)(rss1 - rss0) / (double)n : 0.0;
-    printf("{\"engine\":\"C\",\"vms\":%d,\"active_rss_kib\":%.6f,\"has_rss\":%s}\n",
+    printf("{\"engine\":\"" ENGINE_NAME "\",\"vms\":%d,\"active_rss_kib\":%.6f,\"has_rss\":%s}\n",
            n, act_rss, has_rss ? "true" : "false");
   } else {
-    fprintf(stderr, "clua_mem: unknown mode %s\n", mode);
+    fprintf(stderr, "%s_mem: unknown mode %s\n", ENGINE_NAME, mode);
     free(vms);
     return 2;
   }

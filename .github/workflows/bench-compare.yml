@@ -173,12 +173,15 @@ jobs:
               ).splitlines()
               matched = [p for p in changed if is_bench_relevant(p)]
               if matched:
+                  pr_mem_engines = PR_ENGINES
+                  if any(p in ("Makefile", ".github/workflows/bench-compare.yml", "bench/compare/memcmp.go", "bench/compare/clua_mem/clua_mem.c") for p in matched):
+                      pr_mem_engines = "^(C|LuaJIT|MoeLua-JIT|MoeLua)$"
                   plan.update({
                       "run": "true",
                       "mode": "pr",
                       "lua_targets": PR_LUA_TARGETS,
                       "engines": PR_ENGINES,
-                      "mem_engines": PR_ENGINES,
+                      "mem_engines": pr_mem_engines,
                       "run_memcmp": "true",
                       "generate_charts": "false",
                       "commit_charts": "false",
@@ -187,10 +190,14 @@ jobs:
               else:
                   reason = f"PR changed {len(changed)} file(s), none benchmark-relevant; skipping benchmarks"
 
-          if plan["run"] == "true" and plan["engines"]:
-              eng_re = re.compile(plan["engines"])
-              if eng_re.search("LuaJIT") or eng_re.search("LuaJIT-joff"):
-                  plan["install_luajit"] = "true"
+          if plan["run"] == "true":
+              if plan["engines"]:
+                  eng_re = re.compile(plan["engines"])
+                  if eng_re.search("LuaJIT") or eng_re.search("LuaJIT-joff"):
+                      plan["install_luajit"] = "true"
+              if plan["run_memcmp"] == "true":
+                  if not plan["mem_engines"] or re.search(plan["mem_engines"], "LuaJIT"):
+                      plan["install_luajit"] = "true"
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               for k, v in plan.items():
@@ -228,12 +235,13 @@ jobs:
         with:
           targets: ${{ needs.plan.outputs.lua_targets }}
 
-      - name: Install LuaJIT reference binary
+      - name: Install LuaJIT reference binary and build luajit_mem
         if: needs.plan.outputs.install_luajit == 'true'
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends luajit
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends luajit libluajit-5.1-dev pkg-config
           luajit -v
+          make build/luajit_mem
 
       - id: bench
         uses: ./.github/actions/bench-compare

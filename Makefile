@@ -55,6 +55,11 @@ $(BUILD_DIR)/clua_mem: bench/compare/clua_mem/clua_mem.c | $(BUILD_DIR)
 	$(check_lua_src)
 	cc -O2 $(LUA_PLAT_CFLAGS) -DMAKE_LIB -I$(LUA55_SRC) $(LUA55_SRC)/onelua.c bench/compare/clua_mem/clua_mem.c $(LUA_PLAT_LIBS) -o $@
 
+$(BUILD_DIR)/luajit_mem: bench/compare/clua_mem/clua_mem.c | $(BUILD_DIR)
+	LUAJIT_CFLAGS="$$(pkg-config --cflags luajit 2>/dev/null || echo '-I/usr/include/luajit-2.1')"; \
+	LUAJIT_LIBS="$$(pkg-config --libs luajit 2>/dev/null || echo '-lluajit-5.1')"; \
+	cc -O2 '-DENGINE_NAME="LuaJIT"' $$LUAJIT_CFLAGS bench/compare/clua_mem/clua_mem.c $$LUAJIT_LIBS -lm -o $@
+
 $(BUILD_DIR)/luac55: $(BUILD_DIR)/lua55_o2 | $(BUILD_DIR)
 	printf '#!/bin/sh\nset -e\nSTRIP=false\nOUT=luac.out\nwhile [ "$$#" -gt 0 ]; do\n  case "$$1" in\n    -s) STRIP=true; shift ;;\n    -o) OUT="$$2"; shift 2 ;;\n    *) IN="$$1"; shift ;;\n  esac\ndone\nLUAC_IN="$$IN" LUAC_OUT="$$OUT" LUAC_STRIP="$$STRIP" exec "$$(dirname "$$0")/lua55_o2" -e "local f=assert(loadfile(os.getenv('\''LUAC_IN'\''))); local o=assert(io.open(os.getenv('\''LUAC_OUT'\''), '\''wb'\'')); o:write(string.dump(f, os.getenv('\''LUAC_STRIP'\'')=='\''true'\'')); o:close()"\n' > $@
 	chmod +x $@
