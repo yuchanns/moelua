@@ -51,7 +51,7 @@ type stdTemplate struct {
 
 	nextShapeID   uint64
 	shapesRootRef arena.ObjRef
-	metaRoots     map[arena.ObjRef]arena.ObjRef
+	metaRoots     map[metaRootKey]arena.ObjRef
 	metaTrans     map[metaTransKey]arena.ObjRef
 	transShapes   []arena.ObjRef
 	hashedTables  []arena.ObjRef

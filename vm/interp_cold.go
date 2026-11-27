@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/yuchanns/moelua/bytecode"
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
 type coldAction uint8
@@ -745,6 +746,28 @@ func (s *State) getTabUpSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 	return s.catchSlow(th, ev, pushed, err)
 }
 
+// resolvePoisonedProxyShape migrates t away from a canonical __index-proxy Shape
+// if its target prototype was proxy-poisoned by an in-place mutation to any proxy metatable.
+// Returns (activeShape, canCacheIC).
+func (s *State) resolvePoisonedProxyShape(t *Table, sh *Shape) (*Shape, bool) {
+	if !sh.isMetaProxy() {
+		return sh, true
+	}
+	if arena.AsSmall[Table](s.arena, sh.metaRef).hdr.Flags&tblFlagProxyPoisoned == 0 {
+		return sh, true
+	}
+	if newRef, ok := s.shapes.WithMeta(s, t.shapeRef, t.metaRef, false, TableValue(t), tableRefValue(t.metaRef)); ok {
+		t.shapeRef = newRef
+		if t.hdr.IsBlack() {
+			s.collector.BarrierBack(t.self)
+		}
+		return arena.AsSmall[Shape](s.arena, newRef), true
+	}
+	// Optional IC migration failed under memLimit; clear pending memExceeded and skip IC write.
+	s.memExceeded = false
+	return sh, false
+}
+
 //go:noinline
 func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruction, regs *[256]Value) (bool, error) {
 	a := uint8(w >> bytecode.PosA)
@@ -755,20 +778,24 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 	if rb.IsTable() {
 		t := s.asTable(rb)
 		if sh := t.shapePtr(s.arena); OptimizeEnabled && sh != nil && key.IsShort() {
+			var canCacheIC bool
+			sh, canCacheIC = s.resolvePoisonedProxyShape(t, sh)
 			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
-			if ic.polyLookupFor(s, sh) {
+			if canCacheIC && ic.polyLookupFor(s, sh) {
 				if v, ok := ic.tryPolyGetField(s, t); ok {
 					regs[a] = v
 					return false, nil
 				}
 			}
-			if ic.differsFromShape(sh) {
+			if canCacheIC && ic.differsFromShape(sh) {
 				ic.polySavePrimaryFor(s)
 			}
 			if slot := sh.lookupKey(s, key); slot >= 0 {
 				v := t.slotAt(s.arena, int(slot))
 				if !v.IsNil() || !t.hasMeta() {
-					ic.setOwnSlotFor(sh, slot, !t.hasMeta(), false, 0)
+					if canCacheIC {
+						ic.setOwnSlotFor(sh, slot, !t.hasMeta(), false, 0)
+					}
 					regs[a] = v
 					return false, nil
 				}
@@ -779,14 +806,16 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					p, e := s.pushMetamethodFrame(th, ev, fnTM, []Value{fnObj, StringValue(key)}, finishSetReg, a, false)
 					return s.catchSlow(th, ev, p, e)
 				} else {
-					if cacheable && pv.IsNil() {
+					if canCacheIC && cacheable && pv.IsNil() {
 						ic.setOwnSlotFor(sh, slot, false, true, s.protoEpoch)
 					}
 					regs[a] = pv
 					return false, nil
 				}
 			} else if !t.hasMeta() {
-				ic.setProtoValFor(sh, NilValue(), 0, true)
+				if canCacheIC {
+					ic.setProtoValFor(sh, NilValue(), 0, true)
+				}
 				regs[a] = NilValue()
 				return false, nil
 			} else {
@@ -796,7 +825,7 @@ func (s *State) getFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					p, e := s.pushMetamethodFrame(th, ev, fnTM, []Value{fnObj, StringValue(key)}, finishSetReg, a, false)
 					return s.catchSlow(th, ev, p, e)
 				} else {
-					if cacheable {
+					if canCacheIC && cacheable {
 						ic.setProtoValFor(sh, v, s.protoEpoch, false)
 					}
 					regs[a] = v
@@ -880,13 +909,15 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 	if ra.IsTable() {
 		t := s.asTable(ra)
 		if sh := t.shapePtr(s.arena); OptimizeEnabled && sh != nil && key.IsShort() {
+			var canCacheIC bool
+			sh, canCacheIC = s.resolvePoisonedProxyShape(t, sh)
 			ic := icAt(ev.bp.ic, ev.bp.icSlots[ipc])
-			if !t.isProto() && ic.polyLookupFor(s, sh) {
+			if canCacheIC && !t.isProto() && ic.polyLookupFor(s, sh) {
 				if ic.tryPolySetField(s, t, val) {
 					return false, nil
 				}
 			}
-			if !t.isProto() && ic.differsFromShape(sh) {
+			if canCacheIC && !t.isProto() && ic.differsFromShape(sh) {
 				ic.polySavePrimaryFor(s)
 			}
 			if slot := sh.lookupKey(s, key); slot >= 0 {
@@ -894,19 +925,21 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 				sp := t.slotPtr(s.arena, int(slot))
 				if !sp.IsNil() || noNewIdx {
 					s.noteShapeMetaKeyWrite(t, key)
+					if t.isProto() {
+						s.onProtoMutate(t)
+					}
 					*sp = val
 					s.barrierTableVal(t, val)
 					if t.tmFlags != 0 {
 						t.tmFlags = 0
 					}
 					if t.isProto() {
-						s.protoEpoch++
 						if key == s.intern.tms[TMIndex] || key == s.intern.tms[TMNewIndex] {
 							if val.IsTable() {
 								s.asTable(val).markProto(s)
 							}
 						}
-					} else {
+					} else if canCacheIC {
 						ic.setOwnSlotFor(sh, slot, !t.hasMeta(), noNewIdx && t.hasMeta(), s.protoEpoch)
 					}
 					return false, nil
@@ -925,6 +958,9 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 					if err := s.checkShapeSlotMem(t, next, key, val); err != nil {
 						return s.catchSlow(th, ev, false, err)
 					}
+					if t.isProto() {
+						s.onProtoMutate(t)
+					}
 					if !t.appendSlotFor(s, val) {
 						return s.catchSlow(th, ev, false, s.ConsumeMemErr())
 					}
@@ -934,13 +970,12 @@ func (s *State) setFieldSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 						t.tmFlags = 0
 					}
 					if t.isProto() {
-						s.protoEpoch++
 						if key == s.intern.tms[TMIndex] || key == s.intern.tms[TMNewIndex] {
 							if val.IsTable() {
 								s.asTable(val).markProto(s)
 							}
 						}
-					} else {
+					} else if canCacheIC {
 						ic.setAddSlotFor(oldSh, next, int32(next.slot), s.protoEpoch, !oldSh.hasMeta())
 					}
 					return false, nil
@@ -2583,9 +2618,15 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		} else {
 			val = regs[c]
 		}
-		key := s.asString(ev.consts[b])
 		if tv.IsTable() {
 			t := s.asTable(tv)
+			if OptimizeEnabled {
+				ic := icAt(ev.bp.ic, ev.bp.icSlots[pc-1])
+				if ic.setTabUpFast(s, t, val) {
+					return coldContinue, pc, nil
+				}
+			}
+			key := s.asString(ev.consts[b])
 			if err := s.ensureLookupStrKeyHash(t, key); err != nil {
 				return coldContinue, pc, err
 			}
@@ -2593,6 +2634,11 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				t.RawSetStr(s, key, val)
 				if err := s.ConsumeMemErr(); err != nil {
 					return coldContinue, pc, err
+				}
+				if OptimizeEnabled && t.shapeRef == arena.NullRef && !t.isProto() && !val.IsNil() {
+					if slot, ok := t.hashFindStrSlot(s, key); ok {
+						icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).setEnvSlotFor(s, t, int32(slot), !t.hasMeta())
+					}
 				}
 				return coldContinue, pc, nil
 			}

@@ -1891,7 +1891,7 @@ func nativeTableUnpack(s *State, args []Value) ([]Value, error) {
 			}
 		}
 	}
-	if err := th.ensureStack(s, baseTop+n+4); err != nil {
+	if err := th.ensureStack(s, baseTop+n+16); err != nil {
 		return nil, err
 	}
 	written := 0
@@ -2149,7 +2149,7 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 			}
 		}
 	}
-	if err := th.ensureStack(s, baseTop+n+4); err != nil {
+	if err := th.ensureStack(s, baseTop+n+16); err != nil {
 		return nil, err
 	}
 	written := 0
@@ -2186,11 +2186,11 @@ func nativeTableSort(s *State, args []Value) ([]Value, error) {
 		}
 		th.top = baseTop + n
 		if hasComp {
-			res, err := s.Call(args[1], a, b)
+			res, err := s.call2OnThread(th, args[1], a, b)
 			if err != nil {
 				return false, err
 			}
-			return len(res) > 0 && !res[0].IsFalsy(), nil
+			return !res.IsFalsy(), nil
 		}
 		return s.lessThan(a, b)
 	}

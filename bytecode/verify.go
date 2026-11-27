@@ -228,6 +228,8 @@ func verifyDepth(p *Proto, depth int, checkMem func(int64) error, memUsed *int64
 			} else if err := checkReg(pc, op, "C", inst.C()); err != nil {
 				return err
 			}
+			p.ICSlot[pc] = int32(icCount)
+			icCount++
 		case OP_GETTABLE:
 			if err := checkReg(pc, op, "A", inst.A()); err != nil {
 				return err

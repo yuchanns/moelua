@@ -1,0 +1,115 @@
+name: Cross-Engine Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      engines:
+        description: "Engine regex (ArnodelGolua runs in its own PGO build automatically if matched)"
+        required: false
+        default: "^(C|C-O3|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$"
+      programs:
+        description: "Optional program regex filter (empty = all 32 programs)"
+        required: false
+        default: ""
+      benchtime:
+        description: "go test -benchtime value"
+        required: false
+        default: "300ms"
+      count:
+        description: "go test -count rounds"
+        required: false
+        default: "3"
+      run_memcmp:
+        description: "Run isolated-process 256-VM memory & Go GC comparison"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bench/compare/go.mod
+          cache: false
+
+      - name: Build reference C Lua 5.5.1 (-O2 and -O3)
+        run: make build/lua55_o2 build/lua55_o3
+
+      - name: Verify 32/32 output equivalence (C vs MoeLua)
+        working-directory: bench/compare
+        run: go test -vet=off -timeout 10m -run TestOutputs -engines '^(C|MoeLua)$' .
+
+      - name: Run 256-VM memory & Go GC comparison
+        if: ${{ inputs.run_memcmp }}
+        working-directory: bench/compare
+        run: |
+          go build -o /tmp/memcmp memcmp.go
+          /tmp/memcmp | tee memcmp.txt
+          {
+            echo "### 256-VM Memory & Go GC Comparison"
+            echo '```text'
+            cat memcmp.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run cross-engine CPU benchmarks
+        working-directory: bench/compare
+        env:
+          INPUT_ENGINES: ${{ inputs.engines }}
+          INPUT_PROGRAMS: ${{ inputs.programs }}
+          INPUT_BENCHTIME: ${{ inputs.benchtime }}
+          INPUT_COUNT: ${{ inputs.count }}
+        run: |
+          set -euo pipefail
+          MAIN_ENGINES="$(python3 -c '
+import os, re
+pat = re.compile(os.environ["INPUT_ENGINES"])
+names = ["C", "C-O3", "MoeLua", "Apogee-JIT", "Apogee-Interp", "CCGO", "GopherLua", "GoLua", "DCLua", "LuaJIT-joff", "LuaJIT"]
+picked = [n for n in names if pat.search(n)]
+print("^(" + "|".join(re.escape(n) for n in picked) + ")$" if picked else "")
+')"
+          RUN_GOLUA="$(python3 -c '
+import os, re
+print("1" if re.compile(os.environ["INPUT_ENGINES"]).search("ArnodelGolua") else "0")
+')"
+          : > bench_raw.txt
+          if [ -n "$MAIN_ENGINES" ]; then
+            GOMAXPROCS=1 go test -vet=off -timeout 60m -run @ -bench . \
+              -benchtime "$INPUT_BENCHTIME" -count "$INPUT_COUNT" \
+              -engines "$MAIN_ENGINES" -programs "$INPUT_PROGRAMS" . | tee -a bench_raw.txt
+          fi
+          if [ "$RUN_GOLUA" = "1" ]; then
+            GOLUA_DIR="$(go list -m -f '{{.Dir}}' github.com/arnodel/golua)"
+            PGO_ARGS=()
+            if [ -f "$GOLUA_DIR/default.pgo" ]; then
+              PGO_ARGS=(-pgo="$GOLUA_DIR/default.pgo")
+            fi
+            GOMAXPROCS=1 go test -vet=off -timeout 30m "${PGO_ARGS[@]}" -run @ -bench . \
+              -benchtime "$INPUT_BENCHTIME" -count "$INPUT_COUNT" \
+              -engines '^ArnodelGolua$' -programs "$INPUT_PROGRAMS" . | tee -a bench_raw.txt
+          fi
+          go run benchreport.go < bench_raw.txt > bench_report.txt
+          {
+            echo "### Cross-Engine CPU Benchmarks (relative to C Lua 5.5.1 -O2, lower is faster)"
+            echo '```text'
+            awk '/^are-we-fast-yet,|^Benchmarks Game,|^SciMark|^the Go engines|^micro benchmarks,|^all but micro/{show=1} /^ms\/op, best\/median/{show=0} show{print}' bench_report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-compare-report
+          path: |
+            bench/compare/bench_report.txt
+            bench/compare/memcmp.txt
+          if-no-files-found: ignore

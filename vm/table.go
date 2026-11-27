@@ -19,10 +19,12 @@ const (
 )
 
 const (
-	tblFlagIsProto     uint8 = 1 << 0
-	tblFlagGCWeakCand  uint8 = 1 << 1
-	tblFlagHasDeadKeys uint8 = 1 << 2
-	tblFlagTrackedHash uint8 = 1 << 3
+	tblFlagIsProto       uint8 = 1 << 0
+	tblFlagGCWeakCand    uint8 = 1 << 1
+	tblFlagHasDeadKeys   uint8 = 1 << 2
+	tblFlagTrackedHash   uint8 = 1 << 3
+	tblFlagIndexProxy    uint8 = 1 << 4 // unmutated single-entry {__index = protoTable} proxy metatable
+	tblFlagProxyPoisoned uint8 = 1 << 5 // proto table had one of its proxy metatables mutated in place
 )
 
 const (
@@ -406,32 +408,95 @@ func (s *State) tableBarrierRef(t *Table, ref arena.ObjRef) {
 	}
 }
 
+// pureIndexProxyProto returns the target prototype table when mt is an unmutated
+// single-entry {__index = protoTable} metatable whose prototype is not proxy-poisoned.
+// Sharing Shapes on the target prototype prevents per-instance metatable wrappers
+// (such as setmetatable(obj, {__index = Class})) from thrashing Shapes and ICs.
+func (s *State) pureIndexProxyProto(mt *Table) *Table {
+	if mt == nil || mt.metaRef != arena.NullRef || mt.arrLen != 0 || mt.hashRef != arena.NullRef ||
+		mt.shapeRef == arena.NullRef || mt.slotsLen != 1 {
+		return nil
+	}
+	sh := arena.AsSmall[Shape](s.arena, mt.shapeRef)
+	if sh.length != 1 || sh.keyVal != StringValue(s.intern.tms[TMIndex]) {
+		return nil
+	}
+	v := mt.slotAt(s.arena, 0)
+	if !v.IsTable() {
+		return nil
+	}
+	proto := s.asTable(v)
+	if proto.hdr.Flags&tblFlagProxyPoisoned != 0 {
+		return nil
+	}
+	return proto
+}
+
+// poisonIndexProxy marks mt's target prototype as proxy-poisoned before mt is mutated,
+// preventing stale proxy-shape IC reuse across distinct metatables.
+func (s *State) poisonIndexProxy(mt *Table) {
+	mt.hdr.Flags &^= tblFlagIndexProxy
+	if mt.shapeRef != arena.NullRef && mt.slotsLen == 1 {
+		if v := mt.slotAt(s.arena, 0); v.IsTable() {
+			s.asTable(v).hdr.Flags |= tblFlagProxyPoisoned
+		}
+	}
+}
+
+// onProtoMutate must be called BEFORE mutating a table with tblFlagIsProto set.
+func (s *State) onProtoMutate(t *Table) {
+	if t.hdr.Flags&tblFlagIndexProxy != 0 {
+		s.poisonIndexProxy(t)
+	}
+	s.protoEpoch++
+}
+
 // SetMetatable sets t's metatable, updating Shape (in opt mode), tmFlags, proto flags,
 // write barriers, weak-candidate flag, and Collector finalizer registration.
 func (s *State) SetMetatable(t, mt *Table) {
 	var mtRef arena.ObjRef
+	var shapeMetaRef arena.ObjRef
+	var shapeMetaProxy bool
+	var proxyProto *Table
 	if mt != nil {
 		mtRef = mt.self
+		if OptimizeEnabled && mt != t {
+			proxyProto = s.pureIndexProxyProto(mt)
+		}
+		if proxyProto != nil {
+			shapeMetaRef = proxyProto.self
+			shapeMetaProxy = true
+		} else {
+			shapeMetaRef = mtRef
+		}
 	}
 	var newShapeRef arena.ObjRef
 	if OptimizeEnabled && t.shapeRef != arena.NullRef {
 		var ok bool
-		newShapeRef, ok = s.shapes.WithMeta(s, t.shapeRef, mtRef, TableValue(t))
+		newShapeRef, ok = s.shapes.WithMeta(s, t.shapeRef, shapeMetaRef, shapeMetaProxy, TableValue(t), tableRefValue(mtRef))
 		if !ok {
 			s.memExceeded = true
 			return
 		}
 	}
+	if t.hdr.Flags&tblFlagIndexProxy != 0 {
+		s.poisonIndexProxy(t)
+	}
 	if mt != nil {
 		mt.markProto(s)
-		if idx := mt.RawGetStr(s, s.intern.tms[TMIndex]); idx.IsTable() {
-			s.asTable(idx).markProto(s)
+		if shapeMetaProxy {
+			mt.hdr.Flags |= tblFlagIndexProxy
+			proxyProto.markProto(s)
+		} else {
+			if idx := mt.RawGetStr(s, s.intern.tms[TMIndex]); idx.IsTable() {
+				s.asTable(idx).markProto(s)
+			}
+			if nidx := mt.RawGetStr(s, s.intern.tms[TMNewIndex]); nidx.IsTable() {
+				s.asTable(nidx).markProto(s)
+			}
+			s.registerFinalizable(t.self, mt)
+			s.registerWeakCandidate(t, mt)
 		}
-		if nidx := mt.RawGetStr(s, s.intern.tms[TMNewIndex]); nidx.IsTable() {
-			s.asTable(nidx).markProto(s)
-		}
-		s.registerFinalizable(t.self, mt)
-		s.registerWeakCandidate(t, mt)
 	}
 	t.metaRef = mtRef
 	t.tmFlags = 0
@@ -448,10 +513,9 @@ func (s *State) SetMetatable(t, mt *Table) {
 	}
 }
 
-func (t *Table) markProto(s *State) {
+func (t *Table) markProto(_ *State) {
 	if t.hdr.Flags&tblFlagIsProto == 0 {
 		t.hdr.Flags |= tblFlagIsProto
-		s.protoEpoch++
 	}
 }
 
@@ -836,7 +900,7 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 		return
 	}
 	if t.isProto() {
-		s.protoEpoch++
+		s.onProtoMutate(t)
 		if k == s.intern.tms[TMIndex] || k == s.intern.tms[TMNewIndex] {
 			if val.IsTable() {
 				s.asTable(val).markProto(s)
@@ -1053,7 +1117,7 @@ func (t *Table) migrateHashIntRange(s *State, oldLen, newLen int, skipIdx int64)
 // RawSetInt sets integer key i -> val.
 func (t *Table) RawSetInt(s *State, i int64, val Value) {
 	if t.isProto() {
-		s.protoEpoch++
+		s.onProtoMutate(t)
 	}
 	if t.hashRef != arena.NullRef && (i < 1 || uint64(i-1) >= uint64(t.arrLen)) {
 		h := arena.AsSmall[tableHash](s.arena, t.hashRef)
@@ -1501,7 +1565,7 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 			return s.ConsumeMemErr()
 		}
 		if t.isProto() {
-			s.protoEpoch++
+			s.onProtoMutate(t)
 		}
 		if OptimizeEnabled && t.shapeRef != arena.NullRef {
 			if val.IsNil() {
@@ -1519,7 +1583,7 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 		return fmt.Errorf("table index is nil")
 	default:
 		if t.isProto() {
-			s.protoEpoch++
+			s.onProtoMutate(t)
 		}
 		if OptimizeEnabled && t.shapeRef != arena.NullRef {
 			if val.IsNil() {
