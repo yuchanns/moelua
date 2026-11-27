@@ -10,8 +10,8 @@ func (s *State) initCoroLib() {
 	s.registerFunc(coro, "create", intrNone, nativeCoroCreate)
 	s.registerFunc(coro, "resume", intrNone, nativeCoroResume)
 	s.registerFunc(coro, "yield", intrNone, nativeCoroYield)
-	if v := coro.RawGetStr(s.intern.Intern("yield")); v.IsNative() {
-		s.builtinCoroYield = v.AsNative()
+	if v := coro.RawGetStr(s, s.intern.Intern("yield")); v.IsNative() {
+		s.builtinCoroYield = s.asNative(v)
 	}
 	s.registerFunc(coro, "status", intrNone, nativeCoroStatus)
 	s.registerFunc(coro, "running", intrNone, nativeCoroRunning)
@@ -79,7 +79,7 @@ func (s *State) CloseThread(co *Thread) error {
 	if co.state != s {
 		return fmt.Errorf("cannot close thread belonging to another State")
 	}
-	switch co.StatusString() {
+	switch co.StatusString(s) {
 	case "normal":
 		return fmt.Errorf("cannot close a normal coroutine")
 	case "running":
@@ -178,7 +178,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			return false, []Value{StringValue(s.intern.Intern("cannot resume dead coroutine"))}, nil
 		}
 		if fn.IsNative() {
-			nf := fn.AsNative()
+			nf := s.asNative(fn)
 			if nf.Intrinsic == intrPCall && len(args) >= 1 && isFlatProtectedTarget(args[0]) {
 				if err := s.ensureStackWithRoots(co, len(args)+8, NilValue(), args); err != nil {
 					co.status = ThreadDead
@@ -261,7 +261,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					co.errObj = ev
 					return false, []Value{ev}, nil
 				}
-				cl := loaded[0].AsClosure()
+				cl := s.asClosure(loaded[0])
 				co.stack[0] = loaded[0]
 				co.top = 1
 				if err := co.pushLuaFrame(cl, 0, 0, -1); err != nil {
@@ -294,7 +294,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					copy(co.stack[1:1+len(cargs)], cargs)
 					co.top = 1 + len(cargs)
 					if tm.IsClosure() {
-						cl := tm.AsClosure()
+						cl := s.asClosure(tm)
 						if err := co.pushLuaFrame(cl, 0, len(cargs), 4); err != nil {
 							co.status = ThreadDead
 							ev := s.runtimeErrorToValue(co, err)
@@ -405,7 +405,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			co.clearDeadRefs()
 			return false, []Value{StringValue(s.intern.Intern("cannot resume non-function coroutine"))}, nil
 		}
-		cl := fn.AsClosure()
+		cl := s.asClosure(fn)
 		if err := s.ensureStackWithRoots(co, 1+len(args)+int(cl.bp.proto.MaxStackSize)+16, NilValue(), args); err != nil {
 			co.status = ThreadDead
 			ev := s.runtimeErrorToValue(co, err)
@@ -717,7 +717,7 @@ func nativeCoroResume(s *State, args []Value) ([]Value, error) {
 		}
 		return nil, fmt.Errorf("bad argument #1 to 'resume' (thread expected, got %s)", got)
 	}
-	co := args[0].AsThread()
+	co := s.asThread(args[0])
 	ok, res, uerr := s.resumeThread(co, args[1:])
 	if uerr != nil {
 		return nil, uerr
@@ -750,7 +750,7 @@ func nativeCoroStatus(s *State, args []Value) ([]Value, error) {
 		}
 		return nil, fmt.Errorf("bad argument #1 to 'status' (thread expected, got %s)", got)
 	}
-	return []Value{StringValue(s.intern.Intern(args[0].AsThread().StatusString()))}, nil
+	return []Value{StringValue(s.intern.Intern(s.asThread(args[0]).StatusString(s)))}, nil
 }
 
 func nativeCoroRunning(s *State, _ []Value) ([]Value, error) {
@@ -764,7 +764,7 @@ func nativeCoroIsYieldable(s *State, args []Value) ([]Value, error) {
 		if !args[0].IsThread() {
 			return nil, fmt.Errorf("bad argument #1 to 'isyieldable' (thread expected, got %s)", s.objTypeName(args[0]))
 		}
-		th = args[0].AsThread()
+		th = s.asThread(args[0])
 	}
 	return []Value{BoolValue(th.IsYieldable())}, nil
 }
@@ -795,7 +795,7 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 			if !wrapper.upvals[0].IsThread() {
 				return nil, fmt.Errorf("thread expected, got %s", s.objTypeName(wrapper.upvals[0]))
 			}
-			co := wrapper.upvals[0].AsThread()
+			co := s.asThread(wrapper.upvals[0])
 			wasActive := co == s.cur || co.status == ThreadNormal
 			ok, res, uerr := s.resumeThread(co, callArgs)
 			if uerr != nil {
@@ -822,7 +822,7 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 				// Match Lua 5.5 lcorolib.c:luaB_auxwrap: prepend caller location to string error objects.
 				if errVal.IsString() {
 					if where := s.errorWhere(1); where != "" {
-						if ls, ierr := s.TryIntern(where + errVal.AsString().Str()); ierr == nil {
+						if ls, ierr := s.TryIntern(where + s.asString(errVal).Str()); ierr == nil {
 							errVal = StringValue(ls)
 						} else {
 							return nil, ierr
@@ -834,7 +834,7 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 			return res, nil
 		},
 	}
-	return []Value{NativeValue(wrapper)}, nil
+	return []Value{s.NativeValue(wrapper)}, nil
 }
 
 func nativeCoroClose(s *State, args []Value) ([]Value, error) {
@@ -843,9 +843,9 @@ func nativeCoroClose(s *State, args []Value) ([]Value, error) {
 		if !args[0].IsThread() {
 			return nil, fmt.Errorf("bad argument #1 to 'close' (thread expected, got %s)", s.objTypeName(args[0]))
 		}
-		co = args[0].AsThread()
+		co = s.asThread(args[0])
 	}
-	status := co.StatusString()
+	status := co.StatusString(s)
 	switch status {
 	case "normal":
 		return nil, fmt.Errorf("cannot close a normal coroutine")

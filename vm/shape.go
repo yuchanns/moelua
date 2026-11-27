@@ -1,6 +1,9 @@
 package vm
 
-import "weak"
+import (
+	"unsafe"
+	"weak"
+)
 
 const maxShapeProps = 64
 
@@ -385,20 +388,20 @@ const (
 func encodeICProtoVal(v Value) (val Value, weakCl weak.Pointer[Closure], weakVal any, wk icWeakKind) {
 	switch {
 	case v.IsClosure():
-		return NilValue(), weak.Make(v.AsClosure()), nil, icWeakClosure
+		return NilValue(), weak.Make((*Closure)(v.ptr)), nil, icWeakClosure
 	case v.IsTable():
-		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsTable()), icWeakAny
+		return NilValue(), weak.Pointer[Closure]{}, weak.Make((*Table)(v.ptr)), icWeakAny
 	case v.IsString():
 		// Arena strings live inside noscan slab pages and are swept explicitly by
 		// tr.sweepInlineCaches() BEFORE s.intern.Sweep() frees unmarked string slots;
 		// never wrap slab interior pointers in weak.Pointer (which would pin the 64 KiB page).
 		return v, weak.Pointer[Closure]{}, nil, icWeakNone
 	case v.IsUserdata():
-		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsUserdata()), icWeakAny
+		return NilValue(), weak.Pointer[Closure]{}, weak.Make((*Userdata)(v.ptr)), icWeakAny
 	case v.IsThread():
-		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsThread()), icWeakAny
+		return NilValue(), weak.Pointer[Closure]{}, weak.Make((*Thread)(v.ptr)), icWeakAny
 	case v.IsNative():
-		return NilValue(), weak.Pointer[Closure]{}, weak.Make(v.AsNative()), icWeakAny
+		return NilValue(), weak.Pointer[Closure]{}, weak.Make((*NativeFunc)(v.ptr)), icWeakAny
 	default:
 		return v, weak.Pointer[Closure]{}, nil, icWeakNone
 	}
@@ -421,7 +424,7 @@ func loadWeakICVal(w any) (Value, bool) {
 		}
 	case weak.Pointer[NativeFunc]:
 		if nf := wp.Value(); nf != nil {
-			return NativeValue(nf), true
+			return Value{ptr: unsafe.Pointer(nf), bits: kindNative}, true
 		}
 	}
 	return NilValue(), false

@@ -107,14 +107,14 @@ func (u *Upvalue) tokenID() uint64 {
 	return u.id
 }
 
-func (u *Upvalue) Get() Value {
+func (u *Upvalue) Get(_ *State) Value {
 	if ow := u.owner; ow != nil {
 		return ow.stack[u.stackIdx]
 	}
 	return u.closed
 }
 
-func (u *Upvalue) Set(v Value) {
+func (u *Upvalue) Set(_ *State, v Value) {
 	if ow := u.owner; ow != nil {
 		ow.stack[u.stackIdx] = v
 	} else {
@@ -226,6 +226,83 @@ func defaultCompileFunc(name, src string) (*bytecode.Proto, error) {
 
 func defaultCompileReaderFunc(name string, r io.Reader, opts ...compiler.Option) (*bytecode.Proto, error) {
 	return compiler.CompileReader(name, r, opts...)
+}
+
+// State-scoped Value dereference and native construction helpers (prepare for Arena ObjRef Values).
+func (s *State) asString(v Value) *LuaString  { return (*LuaString)(v.ptr) }
+func (s *State) asTable(v Value) *Table       { return (*Table)(v.ptr) }
+func (s *State) asClosure(v Value) *Closure   { return (*Closure)(v.ptr) }
+func (s *State) asNative(v Value) *NativeFunc { return (*NativeFunc)(v.ptr) }
+func (s *State) asThread(v Value) *Thread     { return (*Thread)(v.ptr) }
+func (s *State) asUserdata(v Value) *Userdata { return (*Userdata)(v.ptr) }
+
+// AsString returns the *LuaString for a string Value owned by s, or nil if v is not a string.
+func (s *State) AsString(v Value) *LuaString {
+	if !v.IsString() {
+		return nil
+	}
+	return s.asString(v)
+}
+
+// AsTable returns the *Table for a table Value owned by s, or nil if v is not a table.
+func (s *State) AsTable(v Value) *Table {
+	if !v.IsTable() {
+		return nil
+	}
+	return s.asTable(v)
+}
+
+// AsClosure returns the *Closure for a closure Value owned by s, or nil if v is not a closure.
+func (s *State) AsClosure(v Value) *Closure {
+	if !v.IsClosure() {
+		return nil
+	}
+	return s.asClosure(v)
+}
+
+// AsNative returns the *NativeFunc for a native function Value owned by s, or nil if v is not native.
+func (s *State) AsNative(v Value) *NativeFunc {
+	if !v.IsNative() {
+		return nil
+	}
+	return s.asNative(v)
+}
+
+// AsThread returns the *Thread for a thread Value owned by s, or nil if v is not a thread.
+func (s *State) AsThread(v Value) *Thread {
+	if !v.IsThread() {
+		return nil
+	}
+	return s.asThread(v)
+}
+
+// AsUserdata returns the *Userdata for a full userdata Value owned by s, or nil if v is not userdata.
+func (s *State) AsUserdata(v Value) *Userdata {
+	if !v.IsUserdata() {
+		return nil
+	}
+	return s.asUserdata(v)
+}
+
+// NativeValue wraps a Go *NativeFunc as a Lua function Value owned by s.
+func (s *State) NativeValue(f *NativeFunc) Value {
+	return Value{ptr: unsafe.Pointer(f), bits: kindNative}
+}
+
+// UserdataMeta returns the metatable attached to u, or nil.
+func (s *State) UserdataMeta(u *Userdata) *Table {
+	if u == nil {
+		return nil
+	}
+	return u.Meta
+}
+
+// UserdataUValues returns the user-value slice attached to u.
+func (s *State) UserdataUValues(u *Userdata) []Value {
+	if u == nil {
+		return nil
+	}
+	return u.UValues
 }
 
 // NewState creates a new Lua 5.5.1 State with the complete standard library installed,
@@ -637,7 +714,7 @@ func (s *State) FormatError(err error) string {
 			if le.hasMsg {
 				return le.msg
 			}
-			return strings.Clone(v.AsString().Str())
+			return strings.Clone(s.asString(v).Str())
 		}
 		if v.IsNumber() {
 			return s.FormatValue(v)
@@ -645,7 +722,7 @@ func (s *State) FormatError(err error) string {
 		if tm := s.getTMByObj(v, TMToString); !tm.IsNil() {
 			res, terr := s.Call(tm, v)
 			if terr == nil && len(res) > 0 && res[0].IsString() {
-				return strings.Clone(res[0].AsString().Str())
+				return strings.Clone(s.asString(res[0]).Str())
 			}
 		}
 		return fmt.Sprintf("error object is a %s value", v.TypeName())
@@ -657,14 +734,14 @@ func (s *State) globalEnvValue() Value {
 	if s.registry == nil {
 		return NilValue()
 	}
-	return s.registry.RawGetInt(ridxGlobals)
+	return s.registry.RawGetInt(s, ridxGlobals)
 }
 
 // GlobalEnv returns the current global environment table at registry[LUA_RIDX_GLOBALS],
 // or nil if Lua replaced registry[2] with a non-table value.
 func (s *State) GlobalEnv() *Table {
 	if v := s.globalEnvValue(); v.IsTable() {
-		return v.AsTable()
+		return s.asTable(v)
 	}
 	return nil
 }
@@ -679,8 +756,8 @@ func (s *State) PreloadTable() *Table {
 		return nil
 	}
 	key := s.intern.Intern("_PRELOAD")
-	if v := s.registry.RawGetStr(key); v.IsTable() {
-		return v.AsTable()
+	if v := s.registry.RawGetStr(s, key); v.IsTable() {
+		return s.asTable(v)
 	}
 	t := s.NewTable(0, 4)
 	s.registry.RawSetStr(s, key, TableValue(t))
@@ -718,7 +795,7 @@ func (s *State) GetGlobal(name string) Value {
 	if !ok {
 		return NilValue()
 	}
-	return env.RawGetStr(ls)
+	return env.RawGetStr(s, ls)
 }
 
 func (s *State) bindProto(p *bytecode.Proto) *boundProto {
@@ -1171,7 +1248,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			res []Value
 			err error
 		)
-		nf := fn.AsNative()
+		nf := s.asNative(fn)
 		isDirectProtected := (nf.Intrinsic == intrPCall && len(args) >= 1) ||
 			(nf.Intrinsic == intrXPCall && len(args) >= 2 && args[1].IsFunction())
 		if isDirectProtected {
@@ -1261,7 +1338,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		th.inCCallback = prevCB
 	}()
 
-	cl := fn.AsClosure()
+	cl := s.asClosure(fn)
 	p := cl.bp.proto
 	base := th.top
 	if th.nframe > 0 {
@@ -1381,7 +1458,7 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 	// Zero-allocation single-return fast path for direct Lua closure calls with no hooks/interrupts.
 	if fn.IsClosure() && s.abortErr == nil && !s.hasInterruptControl() &&
 		s.nCcalls < maxCCalls && th.hookMask == 0 && !th.inHook && !th.suppressHook {
-		cl := fn.AsClosure()
+		cl := s.asClosure(fn)
 		p := cl.bp.proto
 		if !p.IsVararg() {
 			s.nCcalls++
@@ -1553,7 +1630,7 @@ func (s *State) getTM(mt *Table, tm TM) Value {
 	if tm < 6 && (mt.tmFlags&(1<<tm)) != 0 {
 		return NilValue()
 	}
-	v := mt.RawGetStr(s.intern.tms[tm])
+	v := mt.RawGetStr(s, s.intern.tms[tm])
 	if v.IsNil() && tm < 6 {
 		mt.tmFlags |= 1 << tm
 	}
@@ -1563,9 +1640,9 @@ func (s *State) getTM(mt *Table, tm TM) Value {
 func (s *State) getMetatableOf(v Value) *Table {
 	switch {
 	case v.IsTable():
-		return v.AsTable().meta
+		return s.asTable(v).meta
 	case v.IsUserdata():
-		return v.AsUserdata().Meta
+		return s.asUserdata(v).Meta
 	case v.IsString():
 		return s.stringMeta
 	default:
@@ -1576,9 +1653,9 @@ func (s *State) getMetatableOf(v Value) *Table {
 func (s *State) setMetatableOf(v Value, mt *Table) {
 	switch {
 	case v.IsTable():
-		s.SetMetatable(v.AsTable(), mt)
+		s.SetMetatable(s.asTable(v), mt)
 	case v.IsUserdata():
-		u := v.AsUserdata()
+		u := s.asUserdata(v)
 		u.Meta = mt
 		if mt != nil {
 			mt.markProto(s)
@@ -1650,7 +1727,7 @@ func (s *State) TryAllocNative(nf *NativeFunc) (Value, error) {
 			return NilValue(), err
 		}
 	}
-	return NativeValue(nf), nil
+	return s.NativeValue(nf), nil
 }
 
 // TryNewUserdata allocates a full Lua userdata carrying data with nUValues user values
@@ -1682,11 +1759,11 @@ func (s *State) SetGlobalMM(name string, val Value) error {
 // (matching PUC-Rio `lua_setfield`).
 func (s *State) tableSetStr(tblVal Value, keyStr *LuaString, val Value) error {
 	if tblVal.IsTable() {
-		t := tblVal.AsTable()
+		t := s.asTable(tblVal)
 		if err := s.ensureLookupStrKeyHash(t, keyStr); err != nil {
 			return err
 		}
-		if !t.RawGetStr(keyStr).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+		if !t.RawGetStr(s, keyStr).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
 			t.RawSetStr(s, keyStr, val)
 			return s.ConsumeMemErr()
 		}
@@ -1696,12 +1773,12 @@ func (s *State) tableSetStr(tblVal Value, keyStr *LuaString, val Value) error {
 	for loop := range 2000 {
 		var tm Value
 		if cur.IsTable() {
-			t := cur.AsTable()
+			t := s.asTable(cur)
 			if loop > 0 {
 				if err := s.ensureLookupKeyHash(t, key); err != nil {
 					return err
 				}
-				if !t.RawGet(key).IsNil() {
+				if !t.RawGet(s, key).IsNil() {
 					if err := t.RawSet(s, key, val); err != nil {
 						return err
 					}

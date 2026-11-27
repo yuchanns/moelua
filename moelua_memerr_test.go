@@ -91,9 +91,8 @@ func TestEmbeddingAPIMemErrUnpinnedSweep(t *testing.T) {
 			t.Fatal(err)
 		}
 		callee := res[0]
-		tb := buildHeavyTable(t, s)
-
 		hFn := s.Pin(callee)
+		tb := buildHeavyTable(t, s)
 		hTB := s.Pin(tb.Value())
 		fillToMargin(t, s, 256)
 		hFn.Release()
@@ -119,7 +118,10 @@ func TestEmbeddingAPIMemErrUnpinnedSweep(t *testing.T) {
 		}
 
 		// Also test Thread.Resume with unpinned heavy arg across stack growth.
+		// Pin tb across NewThread (which only sees callee) and release right before Resume.
+		hTB2 := s.Pin(tb.Value())
 		co, err := s.NewThread(callee)
+		hTB2.Release()
 		if err != nil {
 			if !strings.Contains(err.Error(), "not enough memory") {
 				t.Fatalf("unexpected NewThread error: %v", err)

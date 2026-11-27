@@ -81,7 +81,7 @@ return function(n)
 end
 `)
 	s := vm.NewState()
-	s.SetGlobal("host_add", vm.NativeValue(&vm.NativeFunc{
+	s.SetGlobal("host_add", s.NativeValue(&vm.NativeFunc{
 		Name: "host_add",
 		Fn: func(_ *vm.State, args []vm.Value) ([]vm.Value, error) {
 			return []vm.Value{vm.IntValue(args[0].Int() + args[1].Int())}, nil
@@ -118,7 +118,7 @@ return function(n)
 end
 `)
 	s := vm.NewState()
-	s.SetGlobal("host_add", vm.NativeValue(&vm.NativeFunc{
+	s.SetGlobal("host_add", s.NativeValue(&vm.NativeFunc{
 		Name: "host_add",
 		FastFn: func(_ *vm.State, args []vm.Value) (vm.Value, error) {
 			return vm.IntValue(args[0].Int() + args[1].Int()), nil

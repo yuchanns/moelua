@@ -55,7 +55,7 @@ func TestPublicAPIQuickstart(t *testing.T) {
 	if out.String() != "hello\t50\n" {
 		t.Fatalf("unexpected output: %q", out.String())
 	}
-	if len(res) != 2 || res[0].Int() != 123 || res[1].AsString().Str() != "done" {
+	if len(res) != 2 || res[0].Int() != 123 || s.FormatValue(res[1]) != "done" {
 		t.Fatalf("unexpected results: %v", res)
 	}
 }
@@ -85,7 +85,7 @@ func TestPublicAPIPinHandleGCAnchoring(t *testing.T) {
 	if _, err := s.DoString(`assert(weak[1] ~= nil and weak[1].tag == "anchored" and not finalized)`); err != nil {
 		t.Fatalf("pinned value should survive GC: %v", err)
 	}
-	if h.Value().AsTable().RawGetStr(s.Raw().Intern("tag")).AsString().Str() != "anchored" {
+	if s.FormatValue(s.TableOf(h.Value()).GetString("tag")) != "anchored" {
 		t.Fatalf("handle value mismatch")
 	}
 
@@ -202,7 +202,7 @@ func TestPublicAPIMemoryLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(res) != 1 || res[0].AsString().Str() != "still-alive" {
+	if len(res) != 1 || s.FormatValue(res[0]) != "still-alive" {
 		t.Fatalf("unexpected res: %v", res)
 	}
 }
@@ -404,7 +404,7 @@ func TestPublicAPIFSModuleLoaderAndCustomSearcher(t *testing.T) {
 	defer s.Close()
 
 	s.AddSearcher("virtual", func(st *moelua.State, args []moelua.Value) ([]moelua.Value, error) {
-		name := moelua.FormatValue(args[0])
+		name := st.FormatValue(args[0])
 		if name == "virtual.cfg" {
 			loader := st.NewFunc("virtual_loader", func(st *moelua.State, _ []moelua.Value) ([]moelua.Value, error) {
 				tbl := st.NewTable(0, 1)
@@ -453,7 +453,7 @@ func TestPublicAPIFSModuleLoaderAndCustomSearcher(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DoString failed: %v", err)
 	}
-	if len(res) != 1 || res[0].AsString().Str() != "ok" {
+	if len(res) != 1 || s.FormatValue(res[0]) != "ok" {
 		t.Fatalf("unexpected res: %v", res)
 	}
 }
@@ -576,7 +576,7 @@ func TestMetatablesAndTypedUserdata(t *testing.T) {
 	if got := s.GetMetatableByName("moelua.Counter"); got == nil || got.Raw() != mt.Raw() {
 		t.Fatalf("GetMetatableByName mismatch")
 	}
-	if name := mt.GetString("__name"); !name.IsString() || name.AsString().Str() != "moelua.Counter" {
+	if name := mt.GetString("__name"); !name.IsString() || s.FormatValue(name) != "moelua.Counter" {
 		t.Fatalf("expected __name='moelua.Counter', got %v", name)
 	}
 
@@ -668,7 +668,7 @@ func TestTableNextAndForEach(t *testing.T) {
 
 	seen := map[string]string{}
 	if err := tbl.ForEach(func(k, v moelua.Value) error {
-		seen[moelua.FormatValue(k)] = moelua.FormatValue(v)
+		seen[s.FormatValue(k)] = s.FormatValue(v)
 		return nil
 	}); err != nil {
 		t.Fatalf("ForEach: %v", err)
@@ -762,7 +762,7 @@ func TestGoDrivenCoroutines(t *testing.T) {
 	}
 
 	r1, yielded, err := th.Resume(moelua.Int(4))
-	if err != nil || !yielded || len(r1) != 2 || r1[0].AsString().Str() != "step1" || r1[1].Int() != 5 {
+	if err != nil || !yielded || len(r1) != 2 || s.FormatValue(r1[0]) != "step1" || r1[1].Int() != 5 {
 		t.Fatalf("Resume 1: res=%v yielded=%v err=%v", r1, yielded, err)
 	}
 	if th.Status() != moelua.ThreadSuspended || th.StatusString() != "suspended" {
@@ -770,12 +770,12 @@ func TestGoDrivenCoroutines(t *testing.T) {
 	}
 
 	r2, yielded, err := th.Resume(moelua.Int(7))
-	if err != nil || !yielded || len(r2) != 2 || r2[0].AsString().Str() != "step2" || r2[1].Int() != 70 {
+	if err != nil || !yielded || len(r2) != 2 || s.FormatValue(r2[0]) != "step2" || r2[1].Int() != 70 {
 		t.Fatalf("Resume 2: res=%v yielded=%v err=%v", r2, yielded, err)
 	}
 
 	r3, yielded, err := th.Resume(moelua.Int(100))
-	if err != nil || yielded || len(r3) != 2 || r3[0].AsString().Str() != "done" || r3[1].Int() != 105 {
+	if err != nil || yielded || len(r3) != 2 || s.FormatValue(r3[0]) != "done" || r3[1].Int() != 105 {
 		t.Fatalf("Resume 3: res=%v yielded=%v err=%v", r3, yielded, err)
 	}
 	if th.Status() != moelua.ThreadDead || th.StatusString() != "dead" {

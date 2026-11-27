@@ -700,7 +700,7 @@ func (th *Thread) Status() ThreadStatus {
 }
 
 // StatusString returns the Lua 5.5 coroutine.status(co) string.
-func (th *Thread) StatusString() string {
+func (th *Thread) StatusString(_ *State) string {
 	if th == th.state.cur {
 		return "running"
 	}

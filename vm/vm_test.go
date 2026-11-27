@@ -280,7 +280,7 @@ func TestDeletedCollectableHashKeyReclaimedInTier0(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		wp = weak.Make(res[0].AsTable())
+		wp = weak.Make(s.AsTable(res[0]))
 		res[0] = vm.NilValue()
 	}()
 
@@ -328,8 +328,8 @@ func TestNativeResultRootedAcrossStackGrowthEmergencyGC(t *testing.T) {
 
 		kStr := s.Intern("k")
 		cStr := s.Intern("c")
-		wTbl := s.GetGlobal("W").AsTable()
-		cb := vm.NativeValue(&vm.NativeFunc{
+		wTbl := s.AsTable(s.GetGlobal("W"))
+		cb := s.NativeValue(&vm.NativeFunc{
 			Name: "make_many",
 			Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
 				// Release 512 KiB garbage + canary so emergency GC during stack growth succeeds
@@ -376,11 +376,11 @@ func TestNativeResultRootedAcrossStackGrowthEmergencyGC(t *testing.T) {
 			if len(res) != 5000 || !res[0].IsTable() {
 				t.Fatalf("unexpected result slice len=%d type=%s", len(res), res[0].TypeName())
 			}
-			if !wTbl.RawGetStr(cStr).IsNil() {
+			if !wTbl.RawGetStr(s, cStr).IsNil() {
 				t.Fatalf("expected stack growth to trigger emergency GC and clear canary W.c")
 			}
-			gotWeak := wTbl.RawGetStr(kStr)
-			if !gotWeak.IsTable() || gotWeak.AsTable() != res[0].AsTable() {
+			gotWeak := wTbl.RawGetStr(s, kStr)
+			if !gotWeak.IsTable() || s.AsTable(gotWeak) != s.AsTable(res[0]) {
 				t.Fatalf("weak-value entry cleared during stack-growth emergency GC in State.Call: got %s", gotWeak.TypeName())
 			}
 		} else {
@@ -527,7 +527,7 @@ func TestNativeNumericCoercionCancelAndBudget(t *testing.T) {
 	t.Run("direct_state_call_math_sqrt", func(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
-		mathSqrt := s.GetGlobal("math").AsTable().RawGetStr(s.Intern("sqrt"))
+		mathSqrt := s.AsTable(s.GetGlobal("math")).RawGetStr(s, s.Intern("sqrt"))
 		bigVal := vm.StringValue(s.Intern(bigZeros))
 
 		s.SetInstructionLimit(100)
@@ -540,7 +540,7 @@ func TestNativeNumericCoercionCancelAndBudget(t *testing.T) {
 
 		s2 := vm.NewState()
 		defer s2.Close()
-		mathSqrt2 := s2.GetGlobal("math").AsTable().RawGetStr(s2.Intern("sqrt"))
+		mathSqrt2 := s2.AsTable(s2.GetGlobal("math")).RawGetStr(s, s2.Intern("sqrt"))
 		bigVal2 := vm.StringValue(s2.Intern(bigZeros))
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 		defer cancel()
@@ -642,7 +642,7 @@ func TestLongStringComparisonAndEqualityCancelAndBudget(t *testing.T) {
 	t.Run("direct_state_call_math_min", func(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
-		mathMin := s.GetGlobal("math").AsTable().RawGetStr(s.Intern("min"))
+		mathMin := s.AsTable(s.GetGlobal("math")).RawGetStr(s, s.Intern("min"))
 		vA := vm.StringValue(s.Intern(sA))
 		vB := vm.StringValue(s.Intern(sB))
 		s.SetInstructionLimit(100)
@@ -675,7 +675,7 @@ func TestDeadCoroutineClearsStackAndFramesInTier0(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wp = weak.Make(res[0].AsTable())
+			wp = weak.Make(s.AsTable(res[0]))
 			res[0] = vm.NilValue()
 		}()
 
@@ -789,7 +789,7 @@ func TestLargeSubstringCopyCancelAndBudget(t *testing.T) {
 	t.Run("direct_state_call_string_sub", func(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
-		strSub := s.GetGlobal("string").AsTable().RawGetStr(s.Intern("sub"))
+		strSub := s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("sub"))
 		bigVal := vm.StringValue(s.Intern(bigStr))
 
 		s.SetInstructionLimit(100)
@@ -802,7 +802,7 @@ func TestLargeSubstringCopyCancelAndBudget(t *testing.T) {
 
 		s2 := vm.NewState()
 		defer s2.Close()
-		strSub2 := s2.GetGlobal("string").AsTable().RawGetStr(s2.Intern("sub"))
+		strSub2 := s2.AsTable(s2.GetGlobal("string")).RawGetStr(s, s2.Intern("sub"))
 		bigVal2 := vm.StringValue(s2.Intern(bigStr))
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 		defer cancel()
@@ -882,7 +882,7 @@ func TestUnreachableSuspendedCoroutineReclaimedInTier0(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wp = weak.Make(res[0].AsTable())
+			wp = weak.Make(s.AsTable(res[0]))
 			res[0] = vm.NilValue()
 		}()
 
@@ -940,7 +940,7 @@ func TestUnreachableSuspendedCoroutineReclaimedInTier0(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wp = weak.Make(res[0].AsTable())
+			wp = weak.Make(s.AsTable(res[0]))
 			res[0] = vm.NilValue()
 		}()
 
@@ -1347,13 +1347,13 @@ assert(callXP == 1 and retXP == 1, "expected 1 call/return hook for xpcall, got 
 	}
 	// Verify nativePCall inside an outer xpcall does NOT trigger the outer xpcall's handler.
 	outerCalled := false
-	s.SetGlobal("GO_CALL_PCALL", vm.NativeValue(&vm.NativeFunc{
+	s.SetGlobal("GO_CALL_PCALL", s.NativeValue(&vm.NativeFunc{
 		Name: "go_call_pcall",
 		Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
 			return st.Call(st.GetGlobal("pcall"), st.GetGlobal("FAILING"))
 		},
 	}))
-	s.SetGlobal("OUTER_MSGH", vm.NativeValue(&vm.NativeFunc{
+	s.SetGlobal("OUTER_MSGH", s.NativeValue(&vm.NativeFunc{
 		Name: "outer_msgh",
 		Fn: func(_ *vm.State, args []vm.Value) ([]vm.Value, error) {
 			outerCalled = true
@@ -1450,7 +1450,7 @@ func TestInlineCacheDoesNotPinObjectsInTier0(t *testing.T) {
 			if len(res) != 1 || !res[0].IsTable() {
 				t.Fatalf("expected table canary, got %v", res)
 			}
-			wp = weak.Make(res[0].AsTable())
+			wp = weak.Make(s.AsTable(res[0]))
 			res[0] = vm.NilValue()
 		}()
 		reclaimed := false
@@ -1549,7 +1549,7 @@ func TestLargeStringCopyCancelAndBudget(t *testing.T) {
 	t.Run("direct_state_call_table_concat", func(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
-		tblConcat := s.GetGlobal("table").AsTable().RawGetStr(s.Intern("concat"))
+		tblConcat := s.AsTable(s.GetGlobal("table")).RawGetStr(s, s.Intern("concat"))
 		arr := s.NewTable(1, 0)
 		arr.RawSetInt(s, 1, vm.StringValue(s.Intern(bigStr)))
 
@@ -1563,7 +1563,7 @@ func TestLargeStringCopyCancelAndBudget(t *testing.T) {
 
 		s2 := vm.NewState()
 		defer s2.Close()
-		tblConcat2 := s2.GetGlobal("table").AsTable().RawGetStr(s2.Intern("concat"))
+		tblConcat2 := s2.AsTable(s2.GetGlobal("table")).RawGetStr(s, s2.Intern("concat"))
 		arr2 := s2.NewTable(1, 0)
 		arr2.RawSetInt(s2, 1, vm.StringValue(s2.Intern(bigStr)))
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
@@ -1685,7 +1685,7 @@ func TestStringPackAndUnpackCancelAndBudget(t *testing.T) {
 	t.Run("direct_state_call_pack_s8", func(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
-		strPack := s.GetGlobal("string").AsTable().RawGetStr(s.Intern("pack"))
+		strPack := s.AsTable(s.GetGlobal("string")).RawGetStr(s, s.Intern("pack"))
 		fmtVal := vm.StringValue(s.Intern("s8"))
 		bigVal := vm.StringValue(s.Intern(bigStr))
 
@@ -1699,7 +1699,7 @@ func TestStringPackAndUnpackCancelAndBudget(t *testing.T) {
 
 		s2 := vm.NewState()
 		defer s2.Close()
-		strPack2 := s2.GetGlobal("string").AsTable().RawGetStr(s2.Intern("pack"))
+		strPack2 := s2.AsTable(s2.GetGlobal("string")).RawGetStr(s, s2.Intern("pack"))
 		fmtVal2 := vm.StringValue(s2.Intern("s8"))
 		bigVal2 := vm.StringValue(s2.Intern(bigStr))
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
@@ -1760,7 +1760,7 @@ func TestStdlibSlabAndInitStackGrowthDoNotPinObjects(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wp = weak.Make(res[0].AsTable())
+			wp = weak.Make(s.AsTable(res[0]))
 			res[0] = vm.NilValue()
 		}()
 		reclaimed := false
@@ -1893,7 +1893,7 @@ func TestDebugAndOptionStringScansCancelAndBudget(t *testing.T) {
 	t.Run("direct_state_call_debug_sethook", func(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
-		setHook := s.GetGlobal("debug").AsTable().RawGetStr(s.Intern("sethook"))
+		setHook := s.AsTable(s.GetGlobal("debug")).RawGetStr(s, s.Intern("sethook"))
 		noop := s.GetGlobal("tostring")
 		maskVal := vm.StringValue(s.Intern(bigMask))
 
@@ -1907,7 +1907,7 @@ func TestDebugAndOptionStringScansCancelAndBudget(t *testing.T) {
 
 		s2 := vm.NewState()
 		defer s2.Close()
-		setHook2 := s2.GetGlobal("debug").AsTable().RawGetStr(s2.Intern("sethook"))
+		setHook2 := s2.AsTable(s2.GetGlobal("debug")).RawGetStr(s, s2.Intern("sethook"))
 		noop2 := s2.GetGlobal("tostring")
 		maskVal2 := vm.StringValue(s2.Intern(bigMask))
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
@@ -1996,7 +1996,7 @@ return w.oldLoaded == nil, w.oldPreload == nil, w.mod == nil, w.pre == nil, #fin
 	goMod := s.NewTable(0, 1)
 	goMod.RawSetStr(s, s.Intern("buf"), vm.StringValue(s.Intern(strings.Repeat("z", 1024*1024))))
 	wpMod := weak.Make(goMod)
-	s.Registry().RawGetStr(s.Intern("_LOADED")).AsTable().RawSetStr(s, s.Intern("go_mod"), vm.TableValue(goMod))
+	s.AsTable(s.Registry().RawGetStr(s, s.Intern("_LOADED"))).RawSetStr(s, s.Intern("go_mod"), vm.TableValue(goMod))
 	goMod = nil
 
 	cl, err := s.LoadChunk([]byte(script), "=replaced_pkg_caches")
@@ -2027,13 +2027,13 @@ return w.oldLoaded == nil, w.oldPreload == nil, w.mod == nil, w.pre == nil, #fin
 
 	// State.PreloadTable must follow the live registry._PRELOAD replacement and recreate if cleared.
 	reg := s.Registry()
-	livePreload := reg.RawGetStr(s.Intern("_PRELOAD")).AsTable()
+	livePreload := s.AsTable(reg.RawGetStr(s, s.Intern("_PRELOAD")))
 	if s.PreloadTable() != livePreload {
 		t.Fatalf("PreloadTable() did not return live registry._PRELOAD replacement")
 	}
 	reg.RawSetStr(s, s.Intern("_PRELOAD"), vm.NilValue())
 	recreated := s.PreloadTable()
-	if recreated == nil || reg.RawGetStr(s.Intern("_PRELOAD")).AsTable() != recreated {
+	if recreated == nil || s.AsTable(reg.RawGetStr(s, s.Intern("_PRELOAD"))) != recreated {
 		t.Fatalf("PreloadTable() did not recreate cleared registry._PRELOAD")
 	}
 }
@@ -2057,7 +2057,7 @@ func TestNativeReturningArgsAfterStackGrowthPreservesResults(t *testing.T) {
 			t.Fatal(err)
 		}
 		growFn := growRes[0]
-		echoGrow := vm.NativeValue(&vm.NativeFunc{
+		echoGrow := s.NativeValue(&vm.NativeFunc{
 			Name: "echo_grow",
 			Fn: func(st *vm.State, args []vm.Value) ([]vm.Value, error) {
 				if _, err := st.Call(growFn, vm.IntValue(400)); err != nil {
@@ -2081,7 +2081,7 @@ func TestNativeReturningArgsAfterStackGrowthPreservesResults(t *testing.T) {
 			t.Fatalf("expected 2 results, got %d", len(res))
 		}
 		got, ok := res[0].ToInt()
-		if !ok || got != 42 || !res[1].IsString() || res[1].AsString().Str() != "ok" {
+		if !ok || got != 42 || !res[1].IsString() || s.AsString(res[1]).Str() != "ok" {
 			t.Fatalf("aliased native results corrupted: got (%v, %v)", res[0], res[1])
 		}
 	})
@@ -2101,7 +2101,7 @@ func TestNativeReturningArgsAfterStackGrowthPreservesResults(t *testing.T) {
 			t.Fatal(err)
 		}
 		got, ok := res[0].ToInt()
-		if len(res) != 2 || !ok || got != 42 || !res[1].IsString() || res[1].AsString().Str() != "ok" {
+		if len(res) != 2 || !ok || got != 42 || !res[1].IsString() || s.AsString(res[1]).Str() != "ok" {
 			t.Fatalf("hooked aliased native results corrupted: got %v", res)
 		}
 	})
@@ -2109,7 +2109,7 @@ func TestNativeReturningArgsAfterStackGrowthPreservesResults(t *testing.T) {
 	t.Run("lua_call_and_nested_native", func(t *testing.T) {
 		s, echoGrow := makeState(t)
 		defer s.Close()
-		outer := vm.NativeValue(&vm.NativeFunc{
+		outer := s.NativeValue(&vm.NativeFunc{
 			Name: "outer_echo",
 			Fn: func(st *vm.State, args []vm.Value) ([]vm.Value, error) {
 				innerRes, err := st.Call(echoGrow, args...)
@@ -2353,8 +2353,8 @@ func TestUTF8ContinuationScanCancelAndBudget(t *testing.T) {
 			s := vm.NewState()
 			defer s.Close()
 			s.SetInstructionLimit(100)
-			utf8Tbl := s.GetGlobal("utf8").AsTable()
-			offsetFn := utf8Tbl.RawGetStr(s.Intern("offset"))
+			utf8Tbl := s.AsTable(s.GetGlobal("utf8"))
+			offsetFn := utf8Tbl.RawGetStr(s, s.Intern("offset"))
 			_, err := s.Call(offsetFn, vm.StringValue(s.Intern(tc.str)), vm.IntValue(tc.n))
 			if !errors.Is(err, vm.ErrInstructionLimit) {
 				t.Fatalf("utf8.offset(%s) expected ErrInstructionLimit, got %v", tc.name, err)
@@ -2366,8 +2366,8 @@ func TestUTF8ContinuationScanCancelAndBudget(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			s.SetContext(ctx)
-			utf8Tbl := s.GetGlobal("utf8").AsTable()
-			offsetFn := utf8Tbl.RawGetStr(s.Intern("offset"))
+			utf8Tbl := s.AsTable(s.GetGlobal("utf8"))
+			offsetFn := utf8Tbl.RawGetStr(s, s.Intern("offset"))
 			_, err := s.Call(offsetFn, vm.StringValue(s.Intern(tc.str)), vm.IntValue(tc.n))
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("utf8.offset(%s) expected context.Canceled, got %v", tc.name, err)
@@ -2378,8 +2378,8 @@ func TestUTF8ContinuationScanCancelAndBudget(t *testing.T) {
 	t.Run("codes_iter_pos0_limit", func(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
-		utf8Tbl := s.GetGlobal("utf8").AsTable()
-		codesFn := utf8Tbl.RawGetStr(s.Intern("codes"))
+		utf8Tbl := s.AsTable(s.GetGlobal("utf8"))
+		codesFn := utf8Tbl.RawGetStr(s, s.Intern("codes"))
 		res, err := s.Call(codesFn, vm.StringValue(s.Intern("a")))
 		if err != nil {
 			t.Fatal(err)
@@ -2397,7 +2397,7 @@ func TestColdOpcodeCallbackSwitchesToHookedDispatch(t *testing.T) {
 	t.Run("native_index_enables_instruction_limit", func(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
-		s.SetGlobal("arm_limit", vm.NativeValue(&vm.NativeFunc{
+		s.SetGlobal("arm_limit", s.NativeValue(&vm.NativeFunc{
 			Name: "arm_limit",
 			Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
 				st.SetInstructionLimit(10)
@@ -2425,7 +2425,7 @@ func TestColdOpcodeCallbackSwitchesToHookedDispatch(t *testing.T) {
 	t.Run("native_add_cold_opcode_enables_instruction_limit", func(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
-		s.SetGlobal("arm_limit", vm.NativeValue(&vm.NativeFunc{
+		s.SetGlobal("arm_limit", s.NativeValue(&vm.NativeFunc{
 			Name: "arm_limit",
 			Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
 				st.SetInstructionLimit(10)
@@ -2498,8 +2498,8 @@ func TestSetMemoryLimitRecountsExistingAllocations(t *testing.T) {
 		if initial <= 4096 {
 			t.Fatalf("expected SetMemoryLimit to recount stdlib baseline (>4096), got %d", initial)
 		}
-		strTbl := s.GetGlobal("string").AsTable()
-		repFn := strTbl.RawGetStr(s.Intern("rep"))
+		strTbl := s.AsTable(s.GetGlobal("string"))
+		repFn := strTbl.RawGetStr(s, s.Intern("rep"))
 		res, err := s.Call(repFn, vm.StringValue(s.Intern("x")), vm.IntValue(49152))
 		if err == nil {
 			s.SetGlobal("PIN", res[0])
@@ -2537,8 +2537,8 @@ func TestSetMemoryLimitRecountsExistingAllocations(t *testing.T) {
 		// Enable a tight limit directly from unlimited state without calling CollectFull first.
 		tight := baseline + 16*1024
 		s.SetMemoryLimit(tight)
-		strTbl := s.GetGlobal("string").AsTable()
-		repFn := strTbl.RawGetStr(s.Intern("rep"))
+		strTbl := s.AsTable(s.GetGlobal("string"))
+		repFn := strTbl.RawGetStr(s, s.Intern("rep"))
 		_, err = s.Call(repFn, vm.StringValue(s.Intern("z")), vm.IntValue(64*1024))
 		if err == nil || !strings.Contains(err.Error(), "not enough memory") {
 			t.Fatalf("expected 'not enough memory' for 64 KiB alloc with 16 KiB headroom above Tier-0 preload, got %v", err)
@@ -2553,8 +2553,8 @@ func TestStringFormatLargeStringCancelAndBudget(t *testing.T) {
 			s := vm.NewState()
 			defer s.Close()
 			s.SetInstructionLimit(100)
-			strTbl := s.GetGlobal("string").AsTable()
-			fmtFn := strTbl.RawGetStr(s.Intern("format"))
+			strTbl := s.AsTable(s.GetGlobal("string"))
+			fmtFn := strTbl.RawGetStr(s, s.Intern("format"))
 			_, err := s.Call(fmtFn, vm.StringValue(s.Intern(spec)), vm.StringValue(s.Intern(big)))
 			if !errors.Is(err, vm.ErrInstructionLimit) {
 				t.Fatalf("string.format(%q, 4MiB) expected ErrInstructionLimit, got %v", spec, err)
@@ -2566,8 +2566,8 @@ func TestStringFormatLargeStringCancelAndBudget(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			s.SetContext(ctx)
-			strTbl := s.GetGlobal("string").AsTable()
-			fmtFn := strTbl.RawGetStr(s.Intern("format"))
+			strTbl := s.AsTable(s.GetGlobal("string"))
+			fmtFn := strTbl.RawGetStr(s, s.Intern("format"))
 			_, err := s.Call(fmtFn, vm.StringValue(s.Intern(spec)), vm.StringValue(s.Intern(big)))
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("string.format(%q, 4MiB) expected context.Canceled, got %v", spec, err)
@@ -2599,7 +2599,7 @@ func TestShapeTransitionRootsNewShapeAcrossSlotGrowthMemLimit(t *testing.T) {
 
 			var opErr error
 			if viaRawSet {
-				tbl := s.GetGlobal("t").AsTable()
+				tbl := s.AsTable(s.GetGlobal("t"))
 				k := s.Intern("c")
 				tbl.RawSetStr(s, k, vm.IntValue(42))
 				opErr = s.ConsumeMemErr()
@@ -2678,9 +2678,9 @@ func TestRequireDiagnosticsAndStringFormatErrorsCancelAndBudget(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
 		bigVal := vm.StringValue(s.Intern(bigDiag))
-		pkgTbl := s.GetGlobal("package").AsTable()
+		pkgTbl := s.AsTable(s.GetGlobal("package"))
 		searchers := s.NewTable(1, 0)
-		searchers.RawSetInt(s, 1, vm.NativeValue(&vm.NativeFunc{
+		searchers.RawSetInt(s, 1, s.NativeValue(&vm.NativeFunc{
 			Name: "big_diag_searcher",
 			Fn: func(*vm.State, []vm.Value) ([]vm.Value, error) {
 				return []vm.Value{bigVal}, nil
@@ -2703,9 +2703,9 @@ func TestRequireDiagnosticsAndStringFormatErrorsCancelAndBudget(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
 		bigVal := vm.StringValue(s.Intern(bigDiag))
-		pkgTbl := s.GetGlobal("package").AsTable()
+		pkgTbl := s.AsTable(s.GetGlobal("package"))
 		searchers := s.NewTable(1, 0)
-		searchers.RawSetInt(s, 1, vm.NativeValue(&vm.NativeFunc{
+		searchers.RawSetInt(s, 1, s.NativeValue(&vm.NativeFunc{
 			Name: "big_diag_searcher",
 			Fn: func(*vm.State, []vm.Value) ([]vm.Value, error) {
 				return []vm.Value{bigVal}, nil
@@ -2726,15 +2726,15 @@ func TestRequireDiagnosticsAndStringFormatErrorsCancelAndBudget(t *testing.T) {
 	t.Run("require_normal_not_found_format", func(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
-		pkgTbl := s.GetGlobal("package").AsTable()
+		pkgTbl := s.AsTable(s.GetGlobal("package"))
 		searchers := s.NewTable(2, 0)
-		searchers.RawSetInt(s, 1, vm.NativeValue(&vm.NativeFunc{
+		searchers.RawSetInt(s, 1, s.NativeValue(&vm.NativeFunc{
 			Name: "s1",
 			Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
 				return []vm.Value{vm.StringValue(st.Intern("no foo"))}, nil
 			},
 		}))
-		searchers.RawSetInt(s, 2, vm.NativeValue(&vm.NativeFunc{
+		searchers.RawSetInt(s, 2, s.NativeValue(&vm.NativeFunc{
 			Name: "s2",
 			Fn: func(st *vm.State, _ []vm.Value) ([]vm.Value, error) {
 				return []vm.Value{vm.StringValue(st.Intern("no bar"))}, nil
@@ -2754,9 +2754,9 @@ func TestRequireDiagnosticsAndStringFormatErrorsCancelAndBudget(t *testing.T) {
 		s := vm.NewState()
 		defer s.Close()
 		bigVal := vm.StringValue(s.Intern(bigDiag))
-		pkgTbl := s.GetGlobal("package").AsTable()
-		searchers := pkgTbl.RawGetStr(s.Intern("searchers")).AsTable()
-		preloadFn := searchers.RawGetInt(1)
+		pkgTbl := s.AsTable(s.GetGlobal("package"))
+		searchers := s.AsTable(pkgTbl.RawGetStr(s, s.Intern("searchers")))
+		preloadFn := searchers.RawGetInt(s, 1)
 		s.SetInstructionLimit(100)
 		_, err := s.Call(preloadFn, bigVal)
 		if !errors.Is(err, vm.ErrInstructionLimit) {

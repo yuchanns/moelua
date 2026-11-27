@@ -290,13 +290,13 @@ func (s *State) registerFinalizable(obj Value, mt *Table) {
 	if mt == nil || s.gc.closing {
 		return
 	}
-	if mt.RawGetStr(s.intern.tms[TMGC]).IsNil() {
+	if mt.RawGetStr(s, s.intern.tms[TMGC]).IsNil() {
 		return
 	}
 	s.activateTier1()
 	switch {
 	case obj.IsTable():
-		t := obj.AsTable()
+		t := s.asTable(obj)
 		if t.flags&tblFlagGCPending != 0 {
 			return // already separated into toBeFnz; matches lgc.c:luaC_checkfinalizer FINALIZEDBIT
 		}
@@ -310,7 +310,7 @@ func (s *State) registerFinalizable(obj Value, mt *Table) {
 			s.gc.finalizable = append(s.gc.finalizable, gcFinalEntry{obj: obj, seq: s.gc.finalSeq})
 		}
 	case obj.IsUserdata():
-		u := obj.AsUserdata()
+		u := s.asUserdata(obj)
 		if u.gcPending {
 			return
 		}
@@ -330,7 +330,7 @@ func (s *State) registerWeakCandidate(t, mt *Table) {
 	if mt == nil {
 		return
 	}
-	if !mt.RawGetStr(s.intern.tms[TMMode]).IsNil() {
+	if !mt.RawGetStr(s, s.intern.tms[TMMode]).IsNil() {
 		s.activateTier1()
 		t.flags |= tblFlagGCWeakCand
 	}
@@ -356,11 +356,11 @@ func (s *State) weakModeOf(t *Table) (weakK, weakV bool) {
 	if t.meta == nil {
 		return false, false
 	}
-	mv := t.meta.RawGetStr(s.intern.tms[TMMode])
+	mv := t.meta.RawGetStr(s, s.intern.tms[TMMode])
 	if !mv.IsString() {
 		return false, false
 	}
-	ms := mv.AsString().Str()
+	ms := s.asString(mv).Str()
 	cancelFn := s.nativeCancelFunc()
 	if nul, err := indexByteWithCancel(ms, 0, cancelFn); err != nil {
 		return false, false
@@ -384,7 +384,7 @@ func (s *State) weakModeOf(t *Table) (weakK, weakV bool) {
 // Lua closures and dynamic C closures (coroutine.wrap, gmatch, io.lines, utf8.codes) ARE collectable.
 func isCollectableWeak(v Value) bool {
 	if v.IsNative() {
-		return v.AsNative().Collectable
+		return (*NativeFunc)(v.ptr).Collectable
 	}
 	return v.IsTable() || v.IsClosure() || v.IsUserdata() || v.IsThread()
 }
@@ -392,18 +392,18 @@ func isCollectableWeak(v Value) bool {
 func gcObjPtr(v Value) (unsafe.Pointer, bool) {
 	switch {
 	case v.IsTable():
-		return unsafe.Pointer(v.AsTable()), true
+		return v.ptr, true
 	case v.IsClosure():
-		return unsafe.Pointer(v.AsClosure()), true
+		return v.ptr, true
 	case v.IsNative():
-		nf := v.AsNative()
+		nf := (*NativeFunc)(v.ptr)
 		if nf.Collectable {
 			return unsafe.Pointer(nf), true
 		}
 	case v.IsUserdata():
-		return unsafe.Pointer(v.AsUserdata()), true
+		return v.ptr, true
 	case v.IsThread():
-		return unsafe.Pointer(v.AsThread()), true
+		return v.ptr, true
 	}
 	return nil, false
 }
@@ -555,25 +555,27 @@ func (tr *gcTracer) isMarked(v Value) bool {
 	if !isCollectableWeak(v) {
 		return true // primitives & strings are always "marked" (never cleared from weak tables)
 	}
+	s := tr.s
 	switch {
 	case v.IsTable():
-		return v.AsTable().gcMark == tr.epoch
+		return s.asTable(v).gcMark == tr.epoch
 	case v.IsClosure():
-		return v.AsClosure().gcMark == tr.epoch
+		return s.asClosure(v).gcMark == tr.epoch
 	case v.IsNative():
-		return v.AsNative().gcMark == tr.epoch
+		return s.asNative(v).gcMark == tr.epoch
 	case v.IsUserdata():
-		return v.AsUserdata().gcMark == tr.epoch
+		return s.asUserdata(v).gcMark == tr.epoch
 	case v.IsThread():
-		return v.AsThread().gcMark == tr.epoch
+		return s.asThread(v).gcMark == tr.epoch
 	default:
 		return true
 	}
 }
 
 func (tr *gcTracer) mark(v Value) {
+	s := tr.s
 	if v.IsString() {
-		ls := v.AsString()
+		ls := s.asString(v)
 		if !ls.IsFixed() && !ls.hdr.IsBlack() {
 			ls.hdr.SetBlack()
 			if tr.countStrings {
@@ -587,7 +589,7 @@ func (tr *gcTracer) mark(v Value) {
 	}
 	switch {
 	case v.IsTable():
-		t := v.AsTable()
+		t := s.asTable(v)
 		if t.gcMark == tr.epoch {
 			return
 		}
@@ -614,7 +616,7 @@ func (tr *gcTracer) mark(v Value) {
 		tr.liveBytes += 96 + slotBytes + nodeBytes + arrBytes
 		tr.gray = append(tr.gray, v)
 	case v.IsClosure():
-		c := v.AsClosure()
+		c := s.asClosure(v)
 		if c.gcMark == tr.epoch {
 			return
 		}
@@ -624,7 +626,7 @@ func (tr *gcTracer) mark(v Value) {
 		tr.markBoundProto(c.bp)
 		tr.gray = append(tr.gray, v)
 	case v.IsNative():
-		nf := v.AsNative()
+		nf := s.asNative(v)
 		if nf.gcMark == tr.epoch {
 			return
 		}
@@ -635,7 +637,7 @@ func (tr *gcTracer) mark(v Value) {
 			tr.gray = append(tr.gray, v)
 		}
 	case v.IsUserdata():
-		u := v.AsUserdata()
+		u := s.asUserdata(v)
 		if u.gcMark == tr.epoch {
 			return
 		}
@@ -647,7 +649,7 @@ func (tr *gcTracer) mark(v Value) {
 		}
 		tr.gray = append(tr.gray, v)
 	case v.IsThread():
-		th := v.AsThread()
+		th := s.asThread(v)
 		if th.gcMark == tr.epoch {
 			return
 		}
@@ -659,6 +661,7 @@ func (tr *gcTracer) mark(v Value) {
 }
 
 func (tr *gcTracer) propagateAll() {
+	s := tr.s
 	for len(tr.gray) > 0 {
 		if tr.tickCancel() {
 			return
@@ -667,12 +670,12 @@ func (tr *gcTracer) propagateAll() {
 		tr.gray = tr.gray[:len(tr.gray)-1]
 		switch {
 		case v.IsTable():
-			tr.traverseTable(v.AsTable())
+			tr.traverseTable(s.asTable(v))
 			if tr.aborted {
 				return
 			}
 		case v.IsClosure():
-			c := v.AsClosure()
+			c := s.asClosure(v)
 			for _, uv := range c.upvals {
 				if uv == nil {
 					continue
@@ -683,17 +686,17 @@ func (tr *gcTracer) propagateAll() {
 					// Per lgc.c:remarkupvals, mark open upvalue's slot value WITHOUT marking
 					// uv.owner so an unreachable coroutine can still be collected while live closures
 					// keep their captured values intact (closed after Step 4 if owner remains unmarked).
-					tr.mark(uv.Get())
+					tr.mark(uv.Get(s))
 					tr.liveOpenUpvals = append(tr.liveOpenUpvals, uv)
 				}
 			}
 		case v.IsNative():
-			nf := v.AsNative()
+			nf := s.asNative(v)
 			for _, uv := range nf.upvals {
 				tr.mark(uv)
 			}
 		case v.IsUserdata():
-			u := v.AsUserdata()
+			u := s.asUserdata(v)
 			if u.Meta != nil {
 				tr.mark(TableValue(u.Meta))
 			}
@@ -707,7 +710,7 @@ func (tr *gcTracer) propagateAll() {
 				tr.mark(rv)
 			}
 		case v.IsThread():
-			tr.traverseThread(v.AsThread())
+			tr.traverseThread(s.asThread(v))
 			if tr.aborted {
 				return
 			}
@@ -1106,7 +1109,7 @@ func (tr *gcTracer) clearDeadHashKeys() bool {
 				continue
 			}
 			if nd.key.IsString() {
-				ls := nd.key.AsString()
+				ls := tr.s.asString(nd.key)
 				if !ls.IsFixed() && !ls.hdr.IsBlack() {
 					nd.key = NilValue()
 					continue
@@ -1148,7 +1151,7 @@ func (tr *gcTracer) clearDeadHashKeys() bool {
 
 func (tr *gcTracer) icValAlive(v Value) bool {
 	if v.IsString() {
-		ls := v.AsString()
+		ls := tr.s.asString(v)
 		return ls.IsFixed() || ls.hdr.IsBlack()
 	}
 	if isCollectableWeak(v) {
@@ -1345,10 +1348,10 @@ func (s *State) recountLiveBytes() {
 	tr.propagateAll()
 	tr.convergeEphemerons()
 	for _, fe := range s.gc.finalizable {
-		if fe.obj.IsTable() && fe.obj.AsTable().flags&tblFlagGCFnzed != 0 {
+		if fe.obj.IsTable() && s.asTable(fe.obj).flags&tblFlagGCFnzed != 0 {
 			continue
 		}
-		if fe.obj.IsUserdata() && fe.obj.AsUserdata().gcFnzed {
+		if fe.obj.IsUserdata() && s.asUserdata(fe.obj).gcFnzed {
 			continue
 		}
 		if !tr.isMarked(fe.obj) {
@@ -1451,10 +1454,10 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 				if tr.cancelFn != nil && tr.tickCancel() {
 					return
 				}
-				if fe.obj.IsTable() && fe.obj.AsTable().flags&tblFlagGCFnzed != 0 {
+				if fe.obj.IsTable() && s.asTable(fe.obj).flags&tblFlagGCFnzed != 0 {
 					continue
 				}
-				if fe.obj.IsUserdata() && fe.obj.AsUserdata().gcFnzed {
+				if fe.obj.IsUserdata() && s.asUserdata(fe.obj).gcFnzed {
 					continue
 				}
 				if !tr.isMarked(fe.obj) {
@@ -1612,10 +1615,10 @@ func (s *State) collectFullImpl(preserveFrames bool, emergency bool) {
 	for _, obj := range newlySep {
 		switch {
 		case obj.IsTable():
-			t := obj.AsTable()
+			t := s.asTable(obj)
 			t.flags = (t.flags | tblFlagGCFnzed | tblFlagGCPending) &^ tblFlagGCInFnz
 		case obj.IsUserdata():
-			u := obj.AsUserdata()
+			u := s.asUserdata(obj)
 			u.gcFnzed = true
 			u.gcPending = true
 			u.gcInFnz = false
@@ -1713,18 +1716,18 @@ func (s *State) runFinalizerObj(th *Thread, obj Value) bool {
 	var mt *Table
 	switch {
 	case obj.IsTable():
-		t := obj.AsTable()
+		t := s.asTable(obj)
 		t.flags &^= tblFlagGCPending
 		mt = t.meta
 	case obj.IsUserdata():
-		u := obj.AsUserdata()
+		u := s.asUserdata(obj)
 		u.gcPending = false
 		mt = u.Meta
 	}
 	if mt == nil {
 		return true
 	}
-	tm := mt.RawGetStr(s.intern.tms[TMGC])
+	tm := mt.RawGetStr(s, s.intern.tms[TMGC])
 	if tm.IsNil() {
 		return true
 	}
@@ -1743,7 +1746,7 @@ func (s *State) runFinalizerObj(th *Thread, obj Value) bool {
 		var le *LuaError
 		if errors.As(err, &le) {
 			if le.Val.IsString() {
-				if werr := s.emitWarningParts("error in __gc (", le.Val.AsString().Str(), ")"); werr != nil {
+				if werr := s.emitWarningParts("error in __gc (", s.asString(le.Val).Str(), ")"); werr != nil {
 					s.abortErr = werr
 					return false
 				}
@@ -1833,10 +1836,10 @@ func (s *State) Close() {
 			fi--
 			switch {
 			case obj.IsTable():
-				t := obj.AsTable()
+				t := s.asTable(obj)
 				t.flags = (t.flags | tblFlagGCFnzed | tblFlagGCPending) &^ tblFlagGCInFnz
 			case obj.IsUserdata():
-				u := obj.AsUserdata()
+				u := s.asUserdata(obj)
 				u.gcFnzed = true
 				u.gcPending = true
 				u.gcInFnz = false
@@ -1894,7 +1897,7 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 		if !args[0].IsString() {
 			return nil, fmt.Errorf("bad argument #1 to 'collectgarbage' (string expected, got %s)", s.objTypeName(args[0]))
 		}
-		opt = args[0].AsString().Str()
+		opt = s.asString(args[0]).Str()
 	}
 	switch opt {
 	case "collect":
@@ -1980,9 +1983,9 @@ func nativeCollectGarbage(s *State, args []Value) ([]Value, error) {
 			}
 			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (string expected, got %s)", got)
 		}
-		idx, ok := gcParamNames[args[1].AsString().Str()]
+		idx, ok := gcParamNames[s.asString(args[1]).Str()]
 		if !ok {
-			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (invalid option '%s')", args[1].AsString().Str())
+			return nil, fmt.Errorf("bad argument #2 to 'collectgarbage' (invalid option '%s')", s.asString(args[1]).Str())
 		}
 		nv := int64(-1)
 		if len(args) >= 3 && !args[2].IsNil() {

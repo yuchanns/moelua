@@ -3,6 +3,7 @@ package arena
 import (
 	"math"
 	"math/bits"
+	"slices"
 )
 
 // GCState identifies the current phase of the incremental Lua 5.5.1 GC state machine
@@ -192,6 +193,7 @@ type Collector struct {
 	inFinalizer  bool
 	emergency    bool
 	closing      bool
+	freedAll     bool
 
 	// Intrusive GC object lists linked via GCHeader.Next (zero Go pointers).
 	allgc   ObjRef
@@ -281,6 +283,58 @@ func (c *Collector) Restart() { c.running = true }
 // IsEmergency reports whether the collector is currently inside an emergency GC cycle.
 func (c *Collector) IsEmergency() bool { return c.emergency }
 
+// InFinalizer reports whether a __gc finalizer callback is currently executing.
+func (c *Collector) InFinalizer() bool { return c.inFinalizer }
+
+// IsClosing reports whether FreeAll has begun shutting down this Collector.
+func (c *Collector) IsClosing() bool { return c.closing }
+
+// CollectorSnapshot captures the intrusive GC list heads of a quiescent Collector
+// (in GCSPause, ModeIncremental) so a cloned Arena snapshot can initialize its Collector
+// with zero pointer relocation or list reconstruction.
+type CollectorSnapshot struct {
+	AllGC        ObjRef
+	FinObj       ObjRef
+	FixedGC      ObjRef
+	CurrentWhite uint8
+}
+
+// Snapshot returns the current intrusive list heads for template cloning.
+func (c *Collector) Snapshot() CollectorSnapshot {
+	return CollectorSnapshot{
+		AllGC:        c.allgc,
+		FinObj:       c.finobj,
+		FixedGC:      c.fixedgc,
+		CurrentWhite: c.currentWhite,
+	}
+}
+
+// RestoreSnapshot initializes a fresh Collector from a cloned Arena's template snapshot.
+func (c *Collector) RestoreSnapshot(snap CollectorSnapshot) {
+	c.allgc = snap.AllGC
+	c.finobj = snap.FinObj
+	c.fixedgc = snap.FixedGC
+	c.tobefnz = NullRef
+	c.currentWhite = snap.CurrentWhite
+	if c.currentWhite != MarkWhite0 && c.currentWhite != MarkWhite1 {
+		c.currentWhite = MarkWhite0
+	}
+	c.state = GCSPause
+	c.mode = ModeIncremental
+	c.inFinalizer = false
+	c.closing = false
+	c.freedAll = false
+	c.cancelErr = nil
+	c.survival, c.old1, c.reallyold, c.firstold1 = NullRef, NullRef, NullRef, NullRef
+	c.finobjsur, c.finobjold1, c.finobjrold = NullRef, NullRef, NullRef
+	c.sweepList = sweepListNone
+	c.sweepPrev = NullRef
+	c.clearGrayLists()
+	c.gcMarked = c.arena.AllocBytes()
+	c.gcMajorMinor = c.gcMarked
+	c.setPause()
+}
+
 // IsWhite reports whether ref is currently white (unmarked / dead during atomic weak clearing & PreSweep).
 func (c *Collector) IsWhite(ref ObjRef) bool {
 	return ref != NullRef && c.arena.Header(ref).IsWhite()
@@ -300,6 +354,18 @@ func (c *Collector) CancelErr() error {
 	err := c.cancelErr
 	c.cancelErr = nil
 	return err
+}
+
+// SetCancelErr records a cooperative cancellation error observed inside a VM GC callback.
+func (c *Collector) SetCancelErr(err error) {
+	if err != nil && c.cancelErr == nil {
+		c.cancelErr = err
+	}
+}
+
+// HasCancelErr reports whether a cooperative cancellation error has been recorded in this cycle.
+func (c *Collector) HasCancelErr() bool {
+	return c.cancelErr != nil
 }
 
 // SetParam updates GC parameter idx to val (or returns its current decoded value if val == math.MaxUint64).
@@ -632,6 +698,13 @@ func (c *Collector) propagateOne() int64 {
 			work = w
 		}
 	}
+	if c.cancelErr != nil {
+		// Traverse was interrupted before visiting all outgoing references;
+		// requeue ref as gray so resuming GC completes its traversal.
+		hdr.SetGray()
+		c.gray = append(c.gray, ref)
+		return work
+	}
 	if hdr.IsBlack() {
 		c.GenLink(ref)
 	}
@@ -639,7 +712,7 @@ func (c *Collector) propagateOne() int64 {
 }
 
 func (c *Collector) propagateAll() {
-	for len(c.gray) > 0 {
+	for len(c.gray) > 0 && c.cancelErr == nil {
 		c.propagateOne()
 	}
 }
@@ -647,14 +720,18 @@ func (c *Collector) propagateAll() {
 func (c *Collector) convergeEphemerons() {
 	dir := 0
 	for {
-		if len(c.ephemeron) == 0 {
+		if len(c.ephemeron) == 0 || c.cancelErr != nil {
 			return
 		}
 		list := make([]ObjRef, len(c.ephemeron))
 		copy(list, c.ephemeron)
 		c.ephemeron = c.ephemeron[:0]
 		changed := false
-		for _, ref := range list {
+		for i, ref := range list {
+			if c.cancelErr != nil {
+				c.ephemeron = append(c.ephemeron, list[i:]...)
+				return
+			}
 			hdr := c.arena.Header(ref)
 			hdr.SetBlack()
 			if c.cb.TraverseEphemeron != nil {
@@ -662,6 +739,13 @@ func (c *Collector) convergeEphemerons() {
 					c.propagateAll()
 					changed = true
 				}
+			}
+			if c.cancelErr != nil {
+				if !slices.Contains(c.ephemeron, ref) {
+					c.ephemeron = append(c.ephemeron, ref)
+				}
+				c.ephemeron = append(c.ephemeron, list[i+1:]...)
+				return
 			}
 		}
 		if !changed {
@@ -683,7 +767,15 @@ func (c *Collector) separateToBeFnz(all bool) {
 	}
 	var prev ObjRef
 	cur := c.finobj
+	steps := 0
 	for cur != limit && cur != NullRef {
+		if !all && c.cb.CancelCheck != nil && (steps&2047) == 2047 {
+			if err := c.cb.CancelCheck(); err != nil {
+				c.cancelErr = err
+				break
+			}
+		}
+		steps++
 		hdr := c.arena.Header(cur)
 		next := hdr.Next
 		if !all && !hdr.IsWhite() {
@@ -722,6 +814,27 @@ func (c *Collector) markBeingFnz() {
 	}
 }
 
+func (c *Collector) abortAtomic(savedGrayAgain []ObjRef) {
+	requeue := func(list []ObjRef) {
+		for _, ref := range list {
+			c.arena.Header(ref).SetGray()
+			if !slices.Contains(c.grayAgain, ref) {
+				c.grayAgain = append(c.grayAgain, ref)
+			}
+		}
+	}
+	requeue(savedGrayAgain)
+	requeue(c.weak)
+	requeue(c.ephemeron)
+	requeue(c.ephemeronClear)
+	requeue(c.allWeak)
+	c.weak = c.weak[:0]
+	c.ephemeron = c.ephemeron[:0]
+	c.ephemeronClear = c.ephemeronClear[:0]
+	c.allWeak = c.allWeak[:0]
+	c.state = GCSPropagate
+}
+
 func (c *Collector) atomic() {
 	// Save grayAgain before re-marking roots.
 	savedGrayAgain := make([]ObjRef, len(c.grayAgain))
@@ -735,26 +848,51 @@ func (c *Collector) atomic() {
 		c.cb.MarkRoots(c)
 	}
 	c.propagateAll()
+	if c.cancelErr != nil {
+		c.abortAtomic(savedGrayAgain)
+		return
+	}
 
 	// Re-traverse grayAgain objects (tables hit by BarrierBack, active threads, etc.).
 	c.gray = append(c.gray, savedGrayAgain...)
 	c.propagateAll()
 
+	if c.cancelErr != nil {
+		c.abortAtomic(savedGrayAgain)
+		return
+	}
+
 	if c.cb.AfterGrayAgain != nil {
 		c.cb.AfterGrayAgain(c)
 		c.propagateAll()
 	}
+	if c.cancelErr != nil {
+		c.abortAtomic(savedGrayAgain)
+		return
+	}
 
 	// 1. Converge ephemeron tables before clearing weak values.
 	c.convergeEphemerons()
+	if c.cancelErr != nil {
+		c.abortAtomic(savedGrayAgain)
+		return
+	}
 
 	// 2. Clear dead values from weak-v and all-weak tables BEFORE checking finalizers.
 	if c.cb.ClearByValues != nil {
 		for _, ref := range c.weak {
 			c.cb.ClearByValues(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 		for _, ref := range c.allWeak {
 			c.cb.ClearByValues(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 	}
 	origWeakLen := len(c.weak)
@@ -762,22 +900,46 @@ func (c *Collector) atomic() {
 
 	// 3. Separate unreachable objects with __gc into tobefnz (strict LIFO).
 	c.separateToBeFnz(false)
+	if c.cancelErr != nil {
+		c.abortAtomic(savedGrayAgain)
+		return
+	}
 
 	// 4. Mark objects pending finalization and propagate resurrection (keeps weak keys alive during __gc!).
 	c.markBeingFnz()
 	c.propagateAll()
+	if c.cancelErr != nil {
+		c.abortAtomic(savedGrayAgain)
+		return
+	}
 
 	// 5. Re-converge ephemerons and clear dead keys from ephemeron & all-weak tables.
 	c.convergeEphemerons()
+	if c.cancelErr != nil {
+		c.abortAtomic(savedGrayAgain)
+		return
+	}
 	if c.cb.ClearByKeys != nil {
 		for _, ref := range c.ephemeron {
 			c.cb.ClearByKeys(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 		for _, ref := range c.ephemeronClear {
 			c.cb.ClearByKeys(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 		for _, ref := range c.allWeak {
 			c.cb.ClearByKeys(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 	}
 
@@ -785,14 +947,26 @@ func (c *Collector) atomic() {
 	if c.cb.ClearByValues != nil {
 		for _, ref := range c.weak[origWeakLen:] {
 			c.cb.ClearByValues(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 		for _, ref := range c.allWeak[origAllWeakLen:] {
 			c.cb.ClearByValues(c, ref)
+			if c.cancelErr != nil {
+				c.abortAtomic(savedGrayAgain)
+				return
+			}
 		}
 	}
 
 	if c.cb.PreSweep != nil {
 		c.cb.PreSweep(c)
+		if c.cancelErr != nil {
+			c.abortAtomic(savedGrayAgain)
+			return
+		}
 	}
 
 	// Flip current white for the upcoming sweep phase.
@@ -935,6 +1109,9 @@ func (c *Collector) runOneFinalizer() bool {
 
 func (c *Collector) callAllPendingFinalizers() {
 	for c.tobefnz != NullRef && !c.emergency {
+		if c.cancelErr != nil {
+			break
+		}
 		if c.cb.CancelCheck != nil {
 			if err := c.cb.CancelCheck(); err != nil {
 				c.cancelErr = err
@@ -1197,6 +1374,9 @@ func (c *Collector) youngCollection() {
 	c.markOld(c.tobefnz, NullRef)
 
 	c.atomic()
+	if c.cancelErr != nil {
+		return
+	}
 
 	// Sweep nursery [allgc..survival) and survival [survival..old1).
 	c.state = GCSSwpAllGC
@@ -1243,6 +1423,9 @@ func (c *Collector) singleStep(fast bool) int64 {
 		}
 	case GCSEnterAtomic:
 		c.atomic()
+		if c.cancelErr != nil {
+			return 0
+		}
 		if c.checkMajorMinor() {
 			res = stepRes2Minor
 		} else {
@@ -1266,6 +1449,15 @@ func (c *Collector) singleStep(fast bool) int64 {
 		res = gcSweepMax
 	case GCSCallFin:
 		if c.tobefnz != NullRef && !c.emergency {
+			if c.cancelErr != nil {
+				return 0
+			}
+			if c.cb.CancelCheck != nil {
+				if err := c.cb.CancelCheck(); err != nil {
+					c.cancelErr = err
+					return 0
+				}
+			}
 			c.runOneFinalizer()
 			res = cwuFin
 		} else {
@@ -1277,8 +1469,22 @@ func (c *Collector) singleStep(fast bool) int64 {
 }
 
 func (c *Collector) runUntilState(target GCState, fast bool) {
+	iters := 0
 	for c.state != target {
+		if c.cancelErr != nil {
+			return
+		}
+		if c.cb.CancelCheck != nil && (iters&4095) == 4095 {
+			if err := c.cb.CancelCheck(); err != nil {
+				c.cancelErr = err
+				return
+			}
+		}
 		c.singleStep(fast)
+		if c.cancelErr != nil {
+			return
+		}
+		iters++
 	}
 }
 
@@ -1289,6 +1495,9 @@ func (c *Collector) incStep(stepSize int64) bool {
 	iters := 0
 	for {
 		stres := c.singleStep(fast)
+		if c.cancelErr != nil {
+			break
+		}
 		if stres == stepRes2Minor {
 			return true
 		}
@@ -1306,7 +1515,7 @@ func (c *Collector) incStep(stepSize int64) bool {
 			break
 		}
 		iters++
-		if c.cb.CancelCheck != nil && (iters&255) == 0 {
+		if c.cb.CancelCheck != nil && (iters&1023) == 1023 {
 			if err := c.cb.CancelCheck(); err != nil {
 				c.cancelErr = err
 				break
@@ -1323,8 +1532,17 @@ func (c *Collector) incStep(stepSize int64) bool {
 
 func (c *Collector) enterGen() {
 	c.runUntilState(GCSPause, true)
+	if c.cancelErr != nil {
+		return
+	}
 	c.runUntilState(GCSPropagate, true)
+	if c.cancelErr != nil {
+		return
+	}
 	c.atomic()
+	if c.cancelErr != nil {
+		return
+	}
 	c.atomic2Gen()
 	c.setMinorDebt()
 }
@@ -1335,6 +1553,7 @@ func (c *Collector) SetMode(newMode GCMode) {
 		return
 	}
 	c.inGC = true
+	c.cancelErr = nil
 	defer func() { c.inGC = false }()
 	c.setModeLocked(newMode)
 }
@@ -1366,6 +1585,7 @@ func (c *Collector) Step() {
 		return
 	}
 	c.inGC = true
+	c.cancelErr = nil
 	defer func() { c.inGC = false }()
 	switch c.mode {
 	case ModeIncremental, ModeGenMajor:
@@ -1386,9 +1606,13 @@ func (c *Collector) StepBytes(stepBytes int64) bool {
 		return false
 	}
 	c.inGC = true
+	c.cancelErr = nil
 	defer func() { c.inGC = false }()
 	if c.mode == ModeGenMinor {
 		c.youngCollection()
+		if c.cancelErr != nil {
+			return false
+		}
 		if c.mode == ModeGenMinor {
 			c.setMinorDebt()
 		}
@@ -1409,6 +1633,7 @@ func (c *Collector) Full(emergency bool) {
 		return
 	}
 	c.inGC = true
+	c.cancelErr = nil
 	prevEmergency := c.emergency
 	c.emergency = emergency
 	defer func() {
@@ -1435,16 +1660,34 @@ func (c *Collector) fullInc() {
 		c.enterSweep()
 	}
 	c.runUntilState(GCSPause, true)
+	if c.cancelErr != nil {
+		return
+	}
 	c.runUntilState(GCSCallFin, true)
+	if c.cancelErr != nil {
+		return
+	}
 	c.runUntilState(GCSPause, true)
+	if c.cancelErr != nil {
+		return
+	}
 	c.setPause()
 }
 
 // FreeAll runs all remaining __gc finalizers in strict LIFO order and frees every
 // arena object on allgc, tobefnz, and fixedgc (matching luaC_freeallobjects on State.Close).
 func (c *Collector) FreeAll() {
-	if c.closing {
+	if c.freedAll {
 		return
+	}
+	wasInFin := c.inFinalizer
+	if c.closing {
+		if wasInFin {
+			c.callAllPendingFinalizers()
+			return
+		}
+	} else if !wasInFin {
+		c.cancelErr = nil
 	}
 	c.closing = true
 	c.inGC = true
@@ -1454,6 +1697,9 @@ func (c *Collector) FreeAll() {
 	c.separateToBeFnz(true)
 	c.inGC = false
 	c.callAllPendingFinalizers()
+	if wasInFin {
+		return
+	}
 	c.inGC = true
 
 	freeList := func(head *ObjRef) {
@@ -1470,4 +1716,5 @@ func (c *Collector) FreeAll() {
 	c.clearGrayLists()
 	c.sweepList = sweepListNone
 	c.sweepPrev = NullRef
+	c.freedAll = true
 }

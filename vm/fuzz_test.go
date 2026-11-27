@@ -19,15 +19,15 @@ func newBoundedFuzzState(stepLimit int) (*vm.State, error) {
 	s.SetGlobal("dofile", vm.NilValue())
 	s.SetGlobal("loadfile", vm.NilValue())
 	if pkgVal := s.GetGlobal("package"); pkgVal.IsTable() {
-		pkg := pkgVal.AsTable()
-		if loadedVal := pkg.RawGetStr(s.Intern("loaded")); loadedVal.IsTable() {
-			loaded := loadedVal.AsTable()
+		pkg := s.AsTable(pkgVal)
+		if loadedVal := pkg.RawGetStr(s, s.Intern("loaded")); loadedVal.IsTable() {
+			loaded := s.AsTable(loadedVal)
 			loaded.RawSetStr(s, s.Intern("io"), vm.NilValue())
 			loaded.RawSetStr(s, s.Intern("os"), vm.NilValue())
 		}
-		if searchersVal := pkg.RawGetStr(s.Intern("searchers")); searchersVal.IsTable() {
+		if searchersVal := pkg.RawGetStr(s, s.Intern("searchers")); searchersVal.IsTable() {
 			// Keep only searcher_preload (slot 1); drop filesystem/C searchers.
-			searchers := searchersVal.AsTable()
+			searchers := s.AsTable(searchersVal)
 			searchers.RawSetInt(s, 2, vm.NilValue())
 			searchers.RawSetInt(s, 3, vm.NilValue())
 		}

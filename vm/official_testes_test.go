@@ -62,7 +62,7 @@ func runOfficialTestSource(t *testing.T, dir, file, src string, hookCount int) (
 	s.SetGlobal("_soft", vm.TrueValue())
 	s.SetGlobal("_port", vm.TrueValue())
 	s.SetGlobal("_nomsg", vm.TrueValue())
-	pkg := s.GetGlobal("package").AsTable()
+	pkg := s.AsTable(s.GetGlobal("package"))
 	pkg.RawSetStr(s, s.Intern("path"), vm.StringValue(s.Intern(filepath.Join(dir, "?.lua")+";./?.lua")))
 
 	cl, err := s.Load(proto)
@@ -95,7 +95,7 @@ func runOfficialTestSource(t *testing.T, dir, file, src string, hookCount int) (
 	if len(res) == 0 || res[0].IsFalsy() {
 		var msg string
 		if len(res) > 1 {
-			msg = vm.FormatValue(res[1])
+			msg = s.FormatValue(res[1])
 		}
 		return false, msg, out.String()
 	}
