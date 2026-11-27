@@ -81,13 +81,13 @@ func (s *State) coroWrapPreallocBytes() int64 {
 
 func (s *State) barrierTableVal(t *Table, val Value) {
 	if val.IsGCObject() && t.hdr.IsBlack() {
-		s.collector.BarrierBack(t.self)
+		s.barrierBackRef(t.self)
 	}
 }
 
 func (s *State) barrierBackTable(t *Table) {
 	if t.hdr.IsBlack() {
-		s.collector.BarrierBack(t.self)
+		s.barrierBackRef(t.self)
 	}
 }
 
@@ -173,7 +173,9 @@ func (cf *callFrame) hasVarargTab() bool { return cf.varargTabRef != arena.NullR
 func (s *State) closureUpvalCount(cl *Closure) int { return int(cl.nUpvals) }
 
 func (s *State) closureUpval(cl *Closure, idx int) *Upvalue {
-	return arena.AsSmall[Upvalue](s.arena, cl.upvalsSlice(s.arena)[idx])
+	a := s.arena
+	uvRef := *(*arena.ObjRef)(unsafe.Add(a.PtrSmall(cl.upvalsRef), uintptr(idx)*unsafe.Sizeof(arena.ObjRef(0))))
+	return arena.AsSmall[Upvalue](a, uvRef)
 }
 
 func (s *State) setClosureUpval(cl *Closure, idx int, uv *Upvalue) {
@@ -187,6 +189,19 @@ func (s *State) setClosureUpval(cl *Closure, idx int, uv *Upvalue) {
 	}
 }
 
+func (uv *Upvalue) isClosed() bool            { return uv.ownerRef == arena.NullRef }
+func (uv *Upvalue) isOwnedBy(th *Thread) bool { return uv.ownerRef == th.self }
+
+//go:noinline
+func (s *State) getCrossThreadUpval(uv *Upvalue) Value {
+	return arena.AsSmall[Thread](s.arena, uv.ownerRef).stackSlice(s.arena)[uv.stackIdx]
+}
+
+//go:noinline
+func (s *State) setCrossThreadUpval(uv *Upvalue, val Value) {
+	arena.AsSmall[Thread](s.arena, uv.ownerRef).stackSlice(s.arena)[uv.stackIdx] = val
+}
+
 func (s *State) upvalOwner(uv *Upvalue) *Thread {
 	if uv.ownerRef == arena.NullRef {
 		return nil
@@ -194,10 +209,15 @@ func (s *State) upvalOwner(uv *Upvalue) *Thread {
 	return arena.AsSmall[Thread](s.arena, uv.ownerRef)
 }
 
+//go:noinline
+func (s *State) barrierObjRef(parent, child arena.ObjRef) {
+	s.collector.Barrier(parent, child)
+}
+
 func (s *State) setClosedUpvalVal(uv *Upvalue, val Value) {
 	uv.closed = val
-	if val.IsGCObject() && uv.hdr.IsBlack() {
-		s.collector.Barrier(uv.self, val.Ref())
+	if val.tag >= tagFirstGC && uv.hdr.Mark&arena.MarkBlack != 0 {
+		s.barrierObjRef(uv.self, val.Ref())
 	}
 }
 
@@ -312,6 +332,14 @@ func (s *State) userdataUValGet(u *Userdata, idx int) Value {
 
 func (t *Table) hasMeta() bool { return t.metaRef != arena.NullRef }
 func (t *Table) hasHash() bool { return t.hashRef != arena.NullRef }
+
+func (ic *ICEntry) hitOwnSlot(t *Table) bool {
+	return ic.kind == icOwnSlot && t.shapeRef == ic.shapeRef
+}
+
+func (ic *ICEntry) hitSetOwnSlot(t *Table) bool {
+	return ic.kind == icOwnSlot && t.shapeRef == ic.shapeRef && t.hdr.Flags&tblFlagIsProto == 0
+}
 
 func (t *Table) shapePtr(a *arena.Arena) *Shape {
 	if t.shapeRef == arena.NullRef {

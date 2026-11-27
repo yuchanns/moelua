@@ -508,26 +508,32 @@ func (th *Thread) ensureStack(s *State, need int) error {
 func (th *Thread) finishNativeArgs(s *State, res []Value) []Value {
 	th.nativeArgsDepth--
 	if th.nativeArgsDepth == 0 && len(s.deferredStackFrees) > 0 {
-		if len(res) > 0 {
-			for _, df := range s.deferredStackFrees {
-				if df.owner == th.self && slicesOverlapValues(res, arena.SliceFast[Value](s.arena, df.ref, 0, df.len)) {
-					cp := make([]Value, len(res))
-					copy(cp, res)
-					res = cp
-					break
-				}
-			}
-		}
-		keep := s.deferredStackFrees[:0]
-		for _, df := range s.deferredStackFrees {
-			if df.owner == th.self {
-				s.arena.Free(df.ref)
-			} else {
-				keep = append(keep, df)
-			}
-		}
-		s.deferredStackFrees = keep
+		return th.finishNativeArgsSlow(s, res)
 	}
+	return res
+}
+
+//go:noinline
+func (th *Thread) finishNativeArgsSlow(s *State, res []Value) []Value {
+	if len(res) > 0 {
+		for _, df := range s.deferredStackFrees {
+			if df.owner == th.self && slicesOverlapValues(res, arena.SliceFast[Value](s.arena, df.ref, 0, df.len)) {
+				cp := make([]Value, len(res))
+				copy(cp, res)
+				res = cp
+				break
+			}
+		}
+	}
+	keep := s.deferredStackFrees[:0]
+	for _, df := range s.deferredStackFrees {
+		if df.owner == th.self {
+			s.arena.Free(df.ref)
+		} else {
+			keep = append(keep, df)
+		}
+	}
+	s.deferredStackFrees = keep
 	return res
 }
 

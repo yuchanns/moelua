@@ -109,16 +109,44 @@ func (t *Table) arrIntSlice(a *arena.Arena) []int64 {
 	return arena.SliceFast[int64](a, t.arrRef, 0, int(t.arrLen))
 }
 
+func (t *Table) arrIntAt(a *arena.Arena, idx uint64) int64 {
+	return *(*int64)(unsafe.Add(a.PtrFast(t.arrRef), uintptr(idx)*8))
+}
+
+func (t *Table) setArrIntAt(a *arena.Arena, idx uint64, v int64) {
+	*(*int64)(unsafe.Add(a.PtrFast(t.arrRef), uintptr(idx)*8)) = v
+}
+
 func (t *Table) arrFloatSlice(a *arena.Arena) []float64 {
 	return arena.SliceFast[float64](a, t.arrRef, 0, int(t.arrLen))
+}
+
+func (t *Table) arrFloatAt(a *arena.Arena, idx uint64) float64 {
+	return *(*float64)(unsafe.Add(a.PtrFast(t.arrRef), uintptr(idx)*8))
+}
+
+func (t *Table) setArrFloatAt(a *arena.Arena, idx uint64, v float64) {
+	*(*float64)(unsafe.Add(a.PtrFast(t.arrRef), uintptr(idx)*8)) = v
 }
 
 func (t *Table) arrBoolSlice(a *arena.Arena) []bool {
 	return arena.SliceFast[bool](a, t.arrRef, 0, int(t.arrLen))
 }
 
+func (t *Table) arrBoolAt(a *arena.Arena, idx uint64) bool {
+	return *(*bool)(unsafe.Add(a.PtrFast(t.arrRef), uintptr(idx)))
+}
+
+func (t *Table) setArrBoolAt(a *arena.Arena, idx uint64, v bool) {
+	*(*bool)(unsafe.Add(a.PtrFast(t.arrRef), uintptr(idx))) = v
+}
+
 func (t *Table) arrValSlice(a *arena.Arena) []Value {
 	return arena.SliceFast[Value](a, t.arrRef, 0, int(t.arrLen))
+}
+
+func (t *Table) arrValPtr(a *arena.Arena, idx uint64) *Value {
+	return (*Value)(unsafe.Add(a.PtrFast(t.arrRef), uintptr(idx)*unsafe.Sizeof(Value{})))
 }
 
 func (t *Table) slotsSlice(a *arena.Arena) []Value {
@@ -135,14 +163,14 @@ func (t *Table) slotAt(a *arena.Arena, idx int) Value {
 	if t.slotsRef == arena.NullRef {
 		return t.inlineSlots[idx]
 	}
-	return arena.SliceFast[Value](a, t.slotsRef, 0, int(t.slotsCap))[idx]
+	return *(*Value)(unsafe.Add(a.PtrSmall(t.slotsRef), uintptr(idx)*unsafe.Sizeof(Value{})))
 }
 
 func (t *Table) slotPtr(a *arena.Arena, idx int) *Value {
 	if t.slotsRef == arena.NullRef {
 		return &t.inlineSlots[idx]
 	}
-	return &arena.SliceFast[Value](a, t.slotsRef, 0, int(t.slotsCap))[idx]
+	return (*Value)(unsafe.Add(a.PtrSmall(t.slotsRef), uintptr(idx)*unsafe.Sizeof(Value{})))
 }
 
 func (s *State) allocArrBuf(elemSize, capElems int) (arena.ObjRef, error) {
@@ -367,14 +395,14 @@ func (t *Table) Metatable(s *State) *Table {
 }
 
 func (s *State) tableBarrier(t *Table, v Value) {
-	if v.IsGCObject() && t.hdr.IsBlack() {
-		s.collector.BarrierBack(t.self)
+	if v.tag >= tagFirstGC && t.hdr.Mark&arena.MarkBlack != 0 {
+		s.barrierBackRef(t.self)
 	}
 }
 
 func (s *State) tableBarrierRef(t *Table, ref arena.ObjRef) {
 	if ref != arena.NullRef && t.hdr.IsBlack() {
-		s.collector.BarrierBack(t.self)
+		s.barrierBackRef(t.self)
 	}
 }
 

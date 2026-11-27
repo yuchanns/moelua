@@ -528,11 +528,12 @@ func (ic *ICEntry) getTabUpFast(a *arena.Arena, t *Table) (Value, bool) {
 	if ic.kind == icEnvSlot && ic.holderRef == t.self && t.hashRef != arena.NullRef {
 		h := arena.AsSmall[tableHash](a, t.hashRef)
 		if ic.epoch == h.dictGen && h.nodesRef != arena.NullRef {
-			v := h.nodesSlice(a)[ic.slot].val
+			v := (*hashNode)(unsafe.Add(a.PtrFast(h.nodesRef), uintptr(ic.slot)*unsafe.Sizeof(hashNode{}))).val
 			if !v.IsNil() || ic.noMeta {
 				return v, true
 			}
 		}
+		return NilValue(), false
 	}
 	if ic.kind == icOwnSlot && t.shapeRef == ic.shapeRef {
 		v := t.slotAt(a, int(ic.slot))
@@ -554,32 +555,104 @@ func (ic *ICEntry) getFieldFast(a *arena.Arena, t *Table, protoEpoch uint64) (Va
 			return ic.val, true
 		}
 	}
+	if ic.polyRef != arena.NullRef {
+		return ic.getFieldPoly(a, t, protoEpoch)
+	}
+	return NilValue(), false
+}
+
+//go:noinline
+func (ic *ICEntry) getFieldPoly(a *arena.Arena, t *Table, protoEpoch uint64) (Value, bool) {
+	poly := (*[4]polyEntry)(a.PtrSmall(ic.polyRef))
+	shRef := t.shapeRef
+	for i := range int(ic.polyCount) {
+		pe := &poly[i]
+		if pe.shapeRef == shRef {
+			if pe.kind == icOwnSlot {
+				v := t.slotAt(a, int(pe.slot))
+				if !v.IsNil() || pe.noMeta || (pe.protoAbsent && protoEpoch == pe.epoch) {
+					return v, true
+				}
+			} else if pe.kind == icProtoVal && (pe.noMeta || protoEpoch == pe.epoch) {
+				return pe.val, true
+			}
+			return NilValue(), false
+		}
+	}
 	return NilValue(), false
 }
 
 func (ic *ICEntry) setFieldFast(s *State, t *Table, val Value, protoEpoch uint64) bool {
-	if t.shapeRef == ic.shapeRef && t.hdr.Flags&tblFlagIsProto == 0 {
-		a := s.arena
-		if ic.kind == icOwnSlot {
-			sp := t.slotPtr(a, int(ic.slot))
-			if !sp.IsNil() || ic.noMeta || (ic.protoAbsent && protoEpoch == ic.epoch) {
-				*sp = val
-				if val.IsGCObject() && t.hdr.IsBlack() {
-					s.collector.BarrierBack(t.self)
+	if t.hdr.Flags&tblFlagIsProto == 0 {
+		if t.shapeRef == ic.shapeRef {
+			if ic.kind == icOwnSlot {
+				sp := t.slotPtr(s.arena, int(ic.slot))
+				if !sp.IsNil() || ic.noMeta || (ic.protoAbsent && protoEpoch == ic.epoch) {
+					*sp = val
+					if val.IsGCObject() && t.hdr.IsBlack() {
+						s.barrierBackRef(t.self)
+					}
+					return true
 				}
-				return true
+				return false
 			}
-		} else if ic.kind == icAddSlot && !val.IsNil() && (ic.noMeta || protoEpoch == ic.epoch) {
-			slot := int(ic.slot)
-			if ic.targetShapeRef != arena.NullRef && slot < int(t.slotsCap) {
-				t.slotsLen = uint8(slot + 1)
-				*t.slotPtr(a, slot) = val
-				t.shapeRef = ic.targetShapeRef
-				if t.hdr.IsBlack() {
-					s.collector.BarrierBack(t.self)
+			if ic.kind == icAddSlot {
+				return ic.setAddSlotFast(s, t, val, protoEpoch)
+			}
+		} else if ic.polyRef != arena.NullRef {
+			return ic.setFieldPoly(s, t, val, protoEpoch)
+		}
+	}
+	return false
+}
+
+//go:noinline
+func (ic *ICEntry) setAddSlotFast(s *State, t *Table, val Value, protoEpoch uint64) bool {
+	if !val.IsNil() && (ic.noMeta || protoEpoch == ic.epoch) {
+		slot := int(ic.slot)
+		if ic.targetShapeRef != arena.NullRef && slot < int(t.slotsCap) {
+			t.slotsLen = uint8(slot + 1)
+			*t.slotPtr(s.arena, slot) = val
+			t.shapeRef = ic.targetShapeRef
+			if t.hdr.IsBlack() {
+				s.barrierBackRef(t.self)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+//go:noinline
+func (ic *ICEntry) setFieldPoly(s *State, t *Table, val Value, protoEpoch uint64) bool {
+	a := s.arena
+	poly := (*[4]polyEntry)(a.PtrSmall(ic.polyRef))
+	shRef := t.shapeRef
+	for i := range int(ic.polyCount) {
+		pe := &poly[i]
+		if pe.shapeRef == shRef {
+			if pe.kind == icOwnSlot {
+				sp := t.slotPtr(a, int(pe.slot))
+				if !sp.IsNil() || pe.noMeta || (pe.protoAbsent && protoEpoch == pe.epoch) {
+					*sp = val
+					if val.IsGCObject() && t.hdr.IsBlack() {
+						s.barrierBackRef(t.self)
+					}
+					return true
 				}
-				return true
+			} else if pe.kind == icAddSlot && !val.IsNil() && (pe.noMeta || protoEpoch == pe.epoch) {
+				slot := int(pe.slot)
+				if pe.targetShapeRef != arena.NullRef && slot < int(t.slotsCap) {
+					t.slotsLen = uint8(slot + 1)
+					*t.slotPtr(a, slot) = val
+					t.shapeRef = pe.targetShapeRef
+					if t.hdr.IsBlack() {
+						s.barrierBackRef(t.self)
+					}
+					return true
+				}
 			}
+			return false
 		}
 	}
 	return false
@@ -686,7 +759,7 @@ func (ic *ICEntry) polyLookup(a *arena.Arena, shapeRef arena.ObjRef) bool {
 	if ic.polyRef == arena.NullRef {
 		return false
 	}
-	poly := arena.SliceFast[polyEntry](a, ic.polyRef, 0, 4)
+	poly := (*[4]polyEntry)(a.PtrSmall(ic.polyRef))
 	for i := range int(ic.polyCount) {
 		pe := &poly[i]
 		if pe.shapeRef == shapeRef {

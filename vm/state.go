@@ -344,10 +344,11 @@ func defaultCompileReaderFunc(name string, r io.Reader, opts ...compiler.Option)
 
 // Fast per-State Arena dereference helpers.
 func (s *State) asString(v Value) *LuaString {
+	a := s.arena
 	if v.tag == tagFrozenString {
-		return arena.AsFast[LuaString](s.intern.frozenArena, v.Ref())
+		a = s.intern.frozenArena
 	}
-	return arena.AsFast[LuaString](s.arena, v.Ref())
+	return arena.AsFast[LuaString](a, v.Ref())
 }
 
 func (s *State) asTable(v Value) *Table {
@@ -374,10 +375,19 @@ func (s *State) asNative(v Value) *NativeFunc {
 	if v.tag == tagStaticNative {
 		return lookupStaticNative(v.staticNativeIdx())
 	}
+	return s.asDynNative(v)
+}
+
+func (s *State) asDynNative(v Value) *NativeFunc {
 	an := arena.AsSmall[ArenaNative](s.arena, v.Ref())
 	raw, _ := s.goRefs.Get(an.goRef)
 	nf, _ := raw.(*NativeFunc)
 	return nf
+}
+
+//go:noinline
+func (s *State) barrierBackRef(ref arena.ObjRef) {
+	s.collector.BarrierBack(ref)
 }
 
 func (s *State) asShape(ref arena.ObjRef) *Shape {

@@ -32,6 +32,8 @@ func (s *State) run(th *Thread, entryDepth int) error {
 	ev.entryDepth = entryDepth
 	var regs *[256]Value
 	var pc int
+	var pushed bool
+	var err error
 
 reloadFrame:
 	if th.nframe <= entryDepth {
@@ -110,96 +112,71 @@ reloadFrame:
 
 		case bytecode.OP_GETUPVAL:
 			uv := s.closureUpval(ev.cl, int(uint8(w>>bytecode.PosB)))
-			if ow := s.upvalOwner(uv); ow != nil {
-				if ow == th {
-					regs[a] = ev.stack[uv.stackIdx]
-				} else {
-					regs[a] = ow.stackSlice(s.arena)[uv.stackIdx]
-				}
-			} else {
+			if uv.isClosed() {
 				regs[a] = uv.closed
+			} else if uv.isOwnedBy(th) {
+				regs[a] = ev.stack[uv.stackIdx]
+			} else {
+				regs[a] = s.getCrossThreadUpval(uv)
 			}
 			continue
 
 		case bytecode.OP_SETUPVAL:
 			uv := s.closureUpval(ev.cl, int(uint8(w>>bytecode.PosB)))
 			val := regs[a]
-			if ow := s.upvalOwner(uv); ow != nil {
-				if ow == th {
-					ev.stack[uv.stackIdx] = val
-				} else {
-					ow.stackSlice(s.arena)[uv.stackIdx] = val
-				}
-			} else {
+			if uv.isClosed() {
 				s.setClosedUpvalVal(uv, val)
+			} else if uv.isOwnedBy(th) {
+				ev.stack[uv.stackIdx] = val
+			} else {
+				s.setCrossThreadUpval(uv, val)
 			}
 			continue
 
 		case bytecode.OP_GETTABUP:
 			uv := s.closureUpval(ev.cl, int(uint8(w>>bytecode.PosB)))
 			var tv Value
-			if ow := s.upvalOwner(uv); ow != nil {
-				if ow == th {
-					tv = ev.stack[uv.stackIdx]
-				} else {
-					tv = ow.stackSlice(s.arena)[uv.stackIdx]
-				}
-			} else {
+			if uv.isClosed() {
 				tv = uv.closed
+			} else if uv.isOwnedBy(th) {
+				tv = ev.stack[uv.stackIdx]
+			} else {
+				tv = s.getCrossThreadUpval(uv)
 			}
-			if tv.IsTable() {
+			if OptimizeEnabled && tv.IsTable() {
 				t := s.asTable(tv)
-				if OptimizeEnabled {
-					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getTabUpFast(s.arena, t); ok {
-						regs[a] = v
-						continue
-					}
-				} else if k := s.asString(ev.consts[uint8(w>>bytecode.PosC)]); k.IsShort() {
-					if v := t.RawGetStr(s, k); !v.IsNil() || !t.hasMeta() {
-						regs[a] = v
-						continue
-					}
+				if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getTabUpFast(s.arena, t); ok {
+					regs[a] = v
+					continue
 				}
 			}
 			ev.frames[ev.ci].pc = pc
-			pushed, err := s.getTabUpSlow(th, &ev, pc-1, w, regs)
-			if err != nil {
-				return err
-			}
-			if pushed {
-				goto slowReload
-			}
-			goto slowContinue
+			pushed, err = s.getTabUpSlow(th, &ev, pc-1, w, regs)
+			goto slowFinish
 
 		case bytecode.OP_GETFIELD:
 			rb := regs[uint8(w>>bytecode.PosB)]
-			if rb.IsTable() {
+			if OptimizeEnabled && rb.IsTable() {
 				t := s.asTable(rb)
-				if OptimizeEnabled {
-					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getFieldFast(s.arena, t, s.protoEpoch); ok {
-						regs[a] = v
-						continue
-					}
-				} else if k := s.asString(ev.consts[uint8(w>>bytecode.PosC)]); k.IsShort() {
-					if v := t.RawGetStr(s, k); !v.IsNil() || !t.hasMeta() {
+				ic := icAt(ev.bp.ic, ev.bp.icSlots[pc-1])
+				if ic.hitOwnSlot(t) {
+					if v := t.slotAt(s.arena, int(ic.slot)); !v.IsNil() || ic.noMeta {
 						regs[a] = v
 						continue
 					}
 				}
+				if v, ok := ic.getFieldFast(s.arena, t, s.protoEpoch); ok {
+					regs[a] = v
+					continue
+				}
 			}
 			ev.frames[ev.ci].pc = pc
-			pushed, err := s.getFieldSlow(th, &ev, pc-1, w, regs)
-			if err != nil {
-				return err
-			}
-			if pushed {
-				goto slowReload
-			}
-			goto slowContinue
+			pushed, err = s.getFieldSlow(th, &ev, pc-1, w, regs)
+			goto slowFinish
 
 		case bytecode.OP_SETFIELD:
 			ra := regs[a]
-			if ra.IsTable() {
+			if OptimizeEnabled && ra.IsTable() {
 				t := s.asTable(ra)
 				var val Value
 				if w.K() {
@@ -207,21 +184,21 @@ reloadFrame:
 				} else {
 					val = regs[uint8(w>>bytecode.PosC)]
 				}
-				if OptimizeEnabled {
-					if icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).setFieldFast(s, t, val, s.protoEpoch) {
+				ic := icAt(ev.bp.ic, ev.bp.icSlots[pc-1])
+				if ic.hitSetOwnSlot(t) {
+					if sp := t.slotPtr(s.arena, int(ic.slot)); !sp.IsNil() || ic.noMeta {
+						*sp = val
+						s.tableBarrier(t, val)
 						continue
 					}
 				}
+				if ic.setFieldFast(s, t, val, s.protoEpoch) {
+					continue
+				}
 			}
 			ev.frames[ev.ci].pc = pc
-			pushed, err := s.setFieldSlow(th, &ev, pc-1, w, regs)
-			if err != nil {
-				return err
-			}
-			if pushed {
-				goto slowReload
-			}
-			goto slowContinue
+			pushed, err = s.setFieldSlow(th, &ev, pc-1, w, regs)
+			goto slowFinish
 
 		case bytecode.OP_NEWTABLE:
 			if OptimizeEnabled && !s.gcNeedsStep() && s.memLimit == 0 && !w.K() && w.VC() == 0 && w.VB() <= 2 {
@@ -236,29 +213,23 @@ reloadFrame:
 		case bytecode.OP_SELF:
 			rb := regs[uint8(w>>bytecode.PosB)]
 			regs[a+1] = rb
-			if rb.IsTable() {
+			if OptimizeEnabled && rb.IsTable() {
 				t := s.asTable(rb)
-				if OptimizeEnabled {
-					if v, ok := icAt(ev.bp.ic, ev.bp.icSlots[pc-1]).getFieldFast(s.arena, t, s.protoEpoch); ok {
-						regs[a] = v
-						continue
-					}
-				} else if k := s.asString(ev.consts[uint8(w>>bytecode.PosC)]); k.IsShort() {
-					if v := t.RawGetStr(s, k); !v.IsNil() || !t.hasMeta() {
+				ic := icAt(ev.bp.ic, ev.bp.icSlots[pc-1])
+				if ic.hitOwnSlot(t) {
+					if v := t.slotAt(s.arena, int(ic.slot)); !v.IsNil() || ic.noMeta {
 						regs[a] = v
 						continue
 					}
 				}
+				if v, ok := ic.getFieldFast(s.arena, t, s.protoEpoch); ok {
+					regs[a] = v
+					continue
+				}
 			}
 			ev.frames[ev.ci].pc = pc
-			pushed, err := s.selfSlow(th, &ev, pc-1, w, regs)
-			if err != nil {
-				return err
-			}
-			if pushed {
-				goto slowReload
-			}
-			goto slowContinue
+			pushed, err = s.selfSlow(th, &ev, pc-1, w, regs)
+			goto slowFinish
 
 		case bytecode.OP_GETI:
 			rb := regs[uint8(w>>bytecode.PosB)]
@@ -268,16 +239,16 @@ reloadFrame:
 				if idx < uint64(t.arrLen) {
 					if OptimizeEnabled {
 						if t.arrKind == arrInt {
-							regs[a].SetInt(t.arrIntSlice(s.arena)[idx])
+							regs[a].SetInt(t.arrIntAt(s.arena, idx))
 							continue
 						}
 						if t.arrKind == arrFloat {
-							regs[a].SetFloat(t.arrFloatSlice(s.arena)[idx])
+							regs[a].SetFloat(t.arrFloatAt(s.arena, idx))
 							continue
 						}
 					}
 					if !OptimizeEnabled || t.arrKind == arrGeneric {
-						v := t.arrValSlice(s.arena)[idx]
+						v := *t.arrValPtr(s.arena, idx)
 						if !v.IsNil() || !t.hasMeta() {
 							regs[a] = v
 							continue
@@ -286,14 +257,8 @@ reloadFrame:
 				}
 			}
 			ev.frames[ev.ci].pc = pc
-			pushed, err := s.getISlow(th, &ev, w, regs)
-			if err != nil {
-				return err
-			}
-			if pushed {
-				goto slowReload
-			}
-			goto slowContinue
+			pushed, err = s.getISlow(th, &ev, w, regs)
+			goto slowFinish
 
 		case bytecode.OP_GETTABLE:
 			rb := regs[uint8(w>>bytecode.PosB)]
@@ -304,20 +269,20 @@ reloadFrame:
 				if idx < uint64(t.arrLen) {
 					if OptimizeEnabled {
 						if t.arrKind == arrInt {
-							regs[a].SetInt(t.arrIntSlice(s.arena)[idx])
+							regs[a].SetInt(t.arrIntAt(s.arena, idx))
 							continue
 						}
 						if t.arrKind == arrFloat {
-							regs[a].SetFloat(t.arrFloatSlice(s.arena)[idx])
+							regs[a].SetFloat(t.arrFloatAt(s.arena, idx))
 							continue
 						}
 						if t.arrKind == arrBool {
-							regs[a].SetBool(t.arrBoolSlice(s.arena)[idx])
+							regs[a].SetBool(t.arrBoolAt(s.arena, idx))
 							continue
 						}
 					}
 					if !OptimizeEnabled || t.arrKind == arrGeneric {
-						v := t.arrValSlice(s.arena)[idx]
+						v := *t.arrValPtr(s.arena, idx)
 						if !v.IsNil() || !t.hasMeta() {
 							regs[a] = v
 							continue
@@ -326,14 +291,8 @@ reloadFrame:
 				}
 			}
 			ev.frames[ev.ci].pc = pc
-			pushed, err := s.getTableSlow(th, &ev, w, regs)
-			if err != nil {
-				return err
-			}
-			if pushed {
-				goto slowReload
-			}
-			goto slowContinue
+			pushed, err = s.getTableSlow(th, &ev, w, regs)
+			goto slowFinish
 
 		case bytecode.OP_SETI:
 			ra := regs[a]
@@ -349,33 +308,27 @@ reloadFrame:
 				if idx < uint64(t.arrLen) {
 					if OptimizeEnabled && !t.isProto() {
 						if t.arrKind == arrInt && val.IsInt() {
-							t.arrIntSlice(s.arena)[idx] = val.Int()
+							t.setArrIntAt(s.arena, idx, val.Int())
 							continue
 						}
 						if t.arrKind == arrFloat && val.IsFloat() {
-							t.arrFloatSlice(s.arena)[idx] = val.Float()
+							t.setArrFloatAt(s.arena, idx, val.Float())
 							continue
 						}
 					}
 					if !OptimizeEnabled || (!t.isProto() && t.arrKind == arrGeneric) {
-						arr := t.arrValSlice(s.arena)
-						if !arr[idx].IsNil() || !t.hasMeta() {
-							arr[idx] = val
-							s.barrierTableVal(t, val)
+						vp := t.arrValPtr(s.arena, idx)
+						if !vp.IsNil() || !t.hasMeta() {
+							*vp = val
+							s.tableBarrier(t, val)
 							continue
 						}
 					}
 				}
 			}
 			ev.frames[ev.ci].pc = pc
-			pushed, err := s.setISlow(th, &ev, w, regs)
-			if err != nil {
-				return err
-			}
-			if pushed {
-				goto slowReload
-			}
-			goto slowContinue
+			pushed, err = s.setISlow(th, &ev, w, regs)
+			goto slowFinish
 
 		case bytecode.OP_SETTABLE:
 			ra := regs[a]
@@ -399,7 +352,7 @@ reloadFrame:
 								n++
 							}
 							if idx < n {
-								t.arrIntSlice(s.arena)[idx] = val.Int()
+								t.setArrIntAt(s.arena, idx, val.Int())
 								continue
 							}
 						} else if t.arrKind == arrFloat && val.IsFloat() {
@@ -408,7 +361,7 @@ reloadFrame:
 								n++
 							}
 							if idx < n {
-								t.arrFloatSlice(s.arena)[idx] = val.Float()
+								t.setArrFloatAt(s.arena, idx, val.Float())
 								continue
 							}
 						} else if t.arrKind == arrBool && val.IsBool() {
@@ -417,7 +370,7 @@ reloadFrame:
 								n++
 							}
 							if idx < n {
-								t.arrBoolSlice(s.arena)[idx] = val.IsTrue()
+								t.setArrBoolAt(s.arena, idx, val.IsTrue())
 								continue
 							}
 						}
@@ -428,10 +381,10 @@ reloadFrame:
 							n++
 						}
 						if idx < n {
-							arr := t.arrValSlice(s.arena)
-							if !arr[idx].IsNil() || !t.hasMeta() {
-								arr[idx] = val
-								s.barrierTableVal(t, val)
+							vp := t.arrValPtr(s.arena, idx)
+							if !vp.IsNil() || !t.hasMeta() {
+								*vp = val
+								s.tableBarrier(t, val)
 								continue
 							}
 						}
@@ -439,14 +392,8 @@ reloadFrame:
 				}
 			}
 			ev.frames[ev.ci].pc = pc
-			pushed, err := s.setTableSlow(th, &ev, w, regs)
-			if err != nil {
-				return err
-			}
-			if pushed {
-				goto slowReload
-			}
-			goto slowContinue
+			pushed, err = s.setTableSlow(th, &ev, w, regs)
+			goto slowFinish
 
 		case bytecode.OP_ADDI:
 			rb := regs[uint8(w>>bytecode.PosB)]
@@ -625,7 +572,7 @@ reloadFrame:
 			rb := regs[uint8(w>>bytecode.PosB)]
 			if rb.IsTable() {
 				t := s.asTable(rb)
-				if !t.hasMeta() || s.getTM(t.Metatable(s), TMLen).IsNil() {
+				if !t.hasMeta() {
 					regs[a].SetInt(t.Len(s))
 					continue
 				}
@@ -651,9 +598,7 @@ reloadFrame:
 					goto cold
 				}
 				cond = false
-			} else if ra.IsUserdata() && rb.IsUserdata() {
-				goto cold
-			} else if ra.IsString() && rb.IsString() && !s.asString(ra).IsShort() {
+			} else if (ra.IsUserdata() && rb.IsUserdata()) || (ra.IsString() && rb.IsString()) {
 				goto cold
 			} else {
 				cond = RawEqual(ra, rb)
@@ -701,10 +646,14 @@ reloadFrame:
 
 		case bytecode.OP_EQK:
 			ra, rb := regs[a], ev.consts[uint8(w>>bytecode.PosB)]
-			if ra != rb && ra.IsString() && rb.IsString() && !s.asString(ra).IsShort() {
+			var cond bool
+			if ra == rb && !ra.IsFloat() {
+				cond = true
+			} else if ra.IsString() && rb.IsString() {
 				goto cold
+			} else {
+				cond = RawEqual(ra, rb)
 			}
-			cond := RawEqual(ra, rb)
 			if cond != w.K() {
 				pc++
 			} else {
@@ -885,14 +834,8 @@ reloadFrame:
 				}
 			}
 			ev.frames[ev.ci].pc = pc
-			pushed, err := s.callSlow(th, &ev, w, int(a), nargs, c-1)
-			if err != nil {
-				return err
-			}
-			if pushed {
-				goto slowReload
-			}
-			goto slowContinue
+			pushed, err = s.callSlow(th, &ev, w, int(a), nargs, c-1)
+			goto slowFinish
 
 		case bytecode.OP_RETURN0:
 			nres := ev.frames[ev.ci].nresults
@@ -927,6 +870,19 @@ reloadFrame:
 			}
 			if th.nframe <= entryDepth {
 				return nil
+			}
+			if cf := &ev.frames[th.nframe-1]; cf.kind == frameLua && cf.finish == finishNone {
+				ev.ci = th.nframe - 1
+				ev.cl = s.frameClosure(cf)
+				if bp := s.boundProtoOf(ev.cl); bp != ev.bp {
+					ev.bp = bp
+					ev.consts = bp.consts
+					ev.insns = bp.insns
+				}
+				ev.base = cf.base
+				pc = cf.pc
+				regs = windowIn(ev.stack, ev.base)
+				continue
 			}
 			goto reloadFrame
 
@@ -995,14 +951,8 @@ reloadFrame:
 				}
 			}
 			ev.frames[ev.ci].pc = pc
-			pushed, err := s.tforCallSlow(th, &ev, a, c)
-			if err != nil {
-				return err
-			}
-			if pushed {
-				goto slowReload
-			}
-			goto slowContinue
+			pushed, err = s.tforCallSlow(th, &ev, a, c)
+			goto slowFinish
 
 		case bytecode.OP_TFORLOOP:
 			if !regs[a+3].IsNil() {
@@ -1032,6 +982,14 @@ reloadFrame:
 			}
 		}
 		continue
+
+	slowFinish:
+		if err != nil {
+			return err
+		}
+		if pushed {
+			goto slowReload
+		}
 
 	slowContinue:
 		if (th.hookMask != 0 && !th.inHook) || s.hasInterruptControl() {

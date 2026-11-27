@@ -1361,7 +1361,12 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			}
 		}
 		// Slice arguments after any call hook in case the hook grew stackRef or modified locals via debug.setlocal.
-		args := th.stackSlice(s.arena)[funcIdx+1 : funcIdx+1+nargs]
+		var args []Value
+		if pushedFrame {
+			args = th.stackSlice(s.arena)[funcIdx+1 : funcIdx+1+nargs]
+		} else {
+			args = ev.stack[funcIdx+1 : funcIdx+1+nargs]
+		}
 		if nf.FastFn != nil && !pushedFrame {
 			th.nativeArgsDepth++
 			rv, err := nf.FastFn(s, args)
@@ -2900,6 +2905,10 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 		rb := regs[uint8(w>>bytecode.PosB)]
 		tm := s.getTMByObj(rb, TMLen)
 		if tm.IsNil() {
+			if rb.IsTable() {
+				regs[a].SetInt(s.asTable(rb).Len(s))
+				return coldContinue, pc, nil
+			}
 			return coldContinue, pc, fmt.Errorf("attempt to get length of a %s value", rb.TypeName())
 		}
 		pushed, err := s.pushMetamethodFrame(th, ev, tm, []Value{rb, rb}, finishSetReg, a, false)

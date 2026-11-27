@@ -158,8 +158,15 @@ func TestMultiPageGrowthFullUnlinkAndWholePageReclamation(t *testing.T) {
 	a := arena.New()
 	defer a.Close()
 
-	// Allocate 3 full pages of 64-byte slots (3 * 1024 = 3072 objects).
-	const total = 3072
+	// Progressive 64-byte pages: 2 KiB (32) + 8 KiB (128) + 32 KiB (512) + 64 KiB (1024) + 64 KiB (1024) = 2720 slots across 5 pages.
+	const (
+		p1Count = 32
+		p2Count = 128
+		p3Count = 512
+		p4Count = 1024
+		p5Count = 1024
+		total   = p1Count + p2Count + p3Count + p4Count + p5Count
+	)
 	refs := make([]arena.ObjRef, total)
 	for i := range total {
 		ref, err := a.Alloc(64)
@@ -169,47 +176,198 @@ func TestMultiPageGrowthFullUnlinkAndWholePageReclamation(t *testing.T) {
 		binary.LittleEndian.PutUint64(a.Bytes(ref, 8), uint64(i+1))
 		refs[i] = ref
 	}
-	if a.ActivePages() != 3 {
-		t.Fatalf("ActivePages=%d, want 3", a.ActivePages())
+	if a.ActivePages() != 5 {
+		t.Fatalf("ActivePages=%d, want 5", a.ActivePages())
 	}
 	if a.AllocBytes() != total*64 {
 		t.Fatalf("AllocBytes=%d, want %d", a.AllocBytes(), total*64)
 	}
+	wantBacking := int64((p1Count + p2Count + p3Count + p4Count + p5Count) * 64)
+	if a.BackingBytes() != wantBacking {
+		t.Fatalf("BackingBytes=%d, want %d", a.BackingBytes(), wantBacking)
+	}
 
-	// Free middle page entirely (slots 1024..2047) -> ActivePages must drop to 2.
-	for i := 1024; i < 2048; i++ {
+	// Free the entire 4th page (full 64 KiB page) -> ActivePages must drop to 4 and sparePage caches the 64 KiB page.
+	p4Start := p1Count + p2Count + p3Count
+	for i := p4Start; i < p4Start+p4Count; i++ {
 		a.Free(refs[i])
 	}
-	if a.ActivePages() != 2 {
-		t.Fatalf("after freeing middle page: ActivePages=%d, want 2", a.ActivePages())
+	if a.ActivePages() != 4 {
+		t.Fatalf("after freeing full 64 KiB page: ActivePages=%d, want 4", a.ActivePages())
+	}
+	// Free the entire 1st page (2 KiB small page) -> ActivePages drops to 3 without displacing 64 KiB spare.
+	for i := range p1Count {
+		a.Free(refs[i])
+	}
+	if a.ActivePages() != 3 {
+		t.Fatalf("after freeing small page: ActivePages=%d, want 3", a.ActivePages())
 	}
 
-	// Free one slot in page 1 (which was previously full & unlinked from classAvail),
+	// Free one slot in page 2 (which was previously full & unlinked from classAvail),
 	// then re-allocate and ensure the freed slot is reused without adding a new page.
-	a.Free(refs[10])
+	targetIdx := p1Count + 10
+	a.Free(refs[targetIdx])
 	reused, err := a.AllocZeroed(64)
 	if err != nil {
 		t.Fatalf("re-alloc failed: %v", err)
 	}
-	if reused != refs[10] {
-		t.Fatalf("expected reused slot %v, got %v", refs[10], reused)
+	if reused != refs[targetIdx] {
+		t.Fatalf("expected reused slot %v, got %v", refs[targetIdx], reused)
 	}
-	if a.ActivePages() != 2 {
+	if a.ActivePages() != 3 {
 		t.Fatalf("reusing freed slot should not allocate new page; ActivePages=%d", a.ActivePages())
 	}
-	// Verify survivors on pages 1 & 3 stayed intact.
-	for i := range 1024 {
-		if i == 10 {
+	// Verify survivors on pages 2, 3, and 5 stayed intact.
+	for i := p1Count; i < p4Start; i++ {
+		if i == targetIdx {
 			continue
 		}
 		if got := binary.LittleEndian.Uint64(a.Bytes(refs[i], 8)); got != uint64(i+1) {
-			t.Fatalf("page 1 slot %d corrupted: got %d", i, got)
+			t.Fatalf("survivor slot %d corrupted: got %d", i, got)
 		}
 	}
-	for i := 2048; i < total; i++ {
+	for i := p4Start + p4Count; i < total; i++ {
 		if got := binary.LittleEndian.Uint64(a.Bytes(refs[i], 8)); got != uint64(i+1) {
-			t.Fatalf("page 3 slot %d corrupted: got %d", i, got)
+			t.Fatalf("page 5 slot %d corrupted: got %d", i, got)
 		}
+	}
+}
+
+func TestProgressiveSlabGrowthAndSpareSafety(t *testing.T) {
+	a := arena.New()
+	defer a.Close()
+
+	// Single 48-byte allocation opens a compact initial slab page (<= 2048B), not 64 KiB.
+	r1, err := a.AllocZeroed(48)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.BackingBytes() > 2048 || a.BackingBytes() < 48 {
+		t.Fatalf("expected compact initial 48B slab page <= 2048B, got BackingBytes=%d", a.BackingBytes())
+	}
+
+	// Freeing a small (< PageSize) page must release it immediately and NEVER stash it in sparePage,
+	// so a subsequent 64 KiB page allocation (32 KiB class) gets a valid full 64 KiB backing buffer.
+	a.Free(r1)
+	if a.ActivePages() != 0 || a.BackingBytes() != 0 {
+		t.Fatalf("expected small page to release without spare caching, got pages=%d backing=%d",
+			a.ActivePages(), a.BackingBytes())
+	}
+
+	rBig1, err := a.AllocZeroed(arena.MaxSmallSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rBig2, err := a.AllocZeroed(arena.MaxSmallSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.ActivePages() != 1 || a.BackingBytes() != arena.PageSize {
+		t.Fatalf("32 KiB class should allocate 1 full 64 KiB page: pages=%d backing=%d",
+			a.ActivePages(), a.BackingBytes())
+	}
+	a.Bytes(rBig1, arena.MaxSmallSize)[arena.MaxSmallSize-1] = 0xAA
+	a.Bytes(rBig2, arena.MaxSmallSize)[arena.MaxSmallSize-1] = 0xBB
+	if a.Bytes(rBig1, arena.MaxSmallSize)[arena.MaxSmallSize-1] != 0xAA ||
+		a.Bytes(rBig2, arena.MaxSmallSize)[arena.MaxSmallSize-1] != 0xBB {
+		t.Fatalf("32 KiB slots corrupted")
+	}
+}
+
+func TestCompactSnapshotAndCloneSnapshot(t *testing.T) {
+	// Empty and large-only CompactSnapshot must be safe no-ops.
+	empty := arena.New()
+	empty.CompactSnapshot()
+	if empty.BackingBytes() != 0 || empty.ActivePages() != 0 {
+		t.Fatalf("empty CompactSnapshot corrupted state: backing=%d pages=%d", empty.BackingBytes(), empty.ActivePages())
+	}
+
+	src := arena.New()
+	defer src.Close()
+
+	// Populate multiple size classes, leaving one freed slot in class 64B to test freeHead preservation.
+	r16, err := src.AllocZeroed(16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(src.Bytes(r16, 16), "0123456789abcdef")
+
+	r64a, err := src.AllocZeroed(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(src.Bytes(r64a, 12), "keep-slot-64")
+	r64free, err := src.AllocZeroed(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r64b, err := src.AllocZeroed(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(src.Bytes(r64b, 12), "tail-slot-64")
+	src.Free(r64free)
+
+	r512, err := src.AllocZeroed(512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(src.Bytes(r512, 10), "slot-512-x")
+
+	beforeBacking := src.BackingBytes()
+	src.CompactSnapshot()
+	afterBacking := src.BackingBytes()
+	// Exact bumped prefix: 16B + 3*64B (192B) + 512B = 720B.
+	if afterBacking != 16+192+512 {
+		t.Fatalf("CompactSnapshot BackingBytes=%d, want %d (before=%d)", afterBacking, 16+192+512, beforeBacking)
+	}
+	if !bytes.Equal(src.Bytes(r16, 16), []byte("0123456789abcdef")) ||
+		!bytes.Equal(src.Bytes(r64a, 12), []byte("keep-slot-64")) ||
+		!bytes.Equal(src.Bytes(r64b, 12), []byte("tail-slot-64")) ||
+		!bytes.Equal(src.Bytes(r512, 10), []byte("slot-512-x")) {
+		t.Fatalf("CompactSnapshot corrupted live slot contents")
+	}
+
+	// Clone compacted snapshot and verify complete isolation, free-list reuse, and fresh runtime page growth.
+	clone := src.CloneSnapshot()
+	defer clone.Close()
+	if clone.BackingBytes() != afterBacking || clone.AllocBytes() != src.AllocBytes() || clone.LiveObjects() != src.LiveObjects() {
+		t.Fatalf("clone stats mismatch: got (backing=%d alloc=%d live=%d) want (%d %d %d)",
+			clone.BackingBytes(), clone.AllocBytes(), clone.LiveObjects(), afterBacking, src.AllocBytes(), src.LiveObjects())
+	}
+
+	// First 64B alloc in clone must reuse preserved r64free slot without opening a new page.
+	reused, err := clone.AllocZeroed(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused != r64free {
+		t.Fatalf("expected clone to reuse freed slot %v, got %v", r64free, reused)
+	}
+	if clone.ActivePages() != 3 {
+		t.Fatalf("expected 3 active pages after reusing freed slot, got %d", clone.ActivePages())
+	}
+
+	// Next 64B alloc has no room in the compacted 64B page -> opens a fresh progressive 2 KiB runtime page.
+	fresh64, err := clone.AllocZeroed(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clone.ActivePages() != 4 || clone.BackingBytes() != afterBacking+2048 {
+		t.Fatalf("expected fresh 2 KiB runtime page: pages=%d backing=%d want %d",
+			clone.ActivePages(), clone.BackingBytes(), afterBacking+2048)
+	}
+	copy(clone.Bytes(fresh64, 9), "fresh-run")
+	copy(clone.Bytes(r16, 4), "XXXX")
+	if !bytes.Equal(src.Bytes(r16, 16), []byte("0123456789abcdef")) {
+		t.Fatalf("mutating compacted clone corrupted template src")
+	}
+
+	// Freeing every object on a compacted page must release that page cleanly without stashing flatSlab in sparePage.
+	clone.Free(r16)
+	if clone.ActivePages() != 3 || clone.BackingBytes() != afterBacking+2048-16 {
+		t.Fatalf("freeing compacted 16B page accounting mismatch: pages=%d backing=%d",
+			clone.ActivePages(), clone.BackingBytes())
 	}
 }
 
