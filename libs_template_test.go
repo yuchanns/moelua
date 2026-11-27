@@ -1017,6 +1017,59 @@ func TestCodexRound3TemplateAndLibsRegressions(t *testing.T) {
 	})
 }
 
+func TestCodexRound4TemplateAndLibsRegressions(t *testing.T) {
+	t.Run("CollectedStdFilesDoNotAliasRecycledHostUserdata", func(t *testing.T) {
+		type hostPayload struct{ label string }
+		want := &hostPayload{label: "host-resource"}
+
+		tmpl, err := NewTemplate(func(s *State) error {
+			// Drop io.stdout and io.stderr, redirect default output to io.stdin, and collect
+			// twice so the standard-file Arena slots are swept and recycled.
+			if _, err := s.DoString(`
+				io.output(io.stdin)
+				io.stdout = nil
+				io.stderr = nil
+				collectgarbage("collect")
+				collectgarbage("collect")
+			`); err != nil {
+				return err
+			}
+			mt, created, err := s.TryNewMetatable("host_res")
+			if err != nil || !created {
+				t.Fatalf("TryNewMetatable = (%v, %v, %v)", mt, created, err)
+			}
+			// Allocate several host userdatas so at least one reuses the collected std-file slot.
+			for i := range 4 {
+				ud, err := s.NewUserdataWithMeta(want, mt)
+				if err != nil {
+					return err
+				}
+				if err := s.TrySetGlobal("res_"+string(rune('0'+i)), ud); err != nil {
+					return err
+				}
+			}
+			return nil
+		}, WithLibs(LibBase|LibIO))
+		if err != nil {
+			t.Fatalf("NewTemplate after collecting std files failed: %v", err)
+		}
+
+		s := tmpl.NewState()
+		defer s.Close()
+		for i := range 4 {
+			name := "res_" + string(rune('0'+i))
+			got, ok := s.CheckUserdata(s.GetGlobal(name), "host_res")
+			if !ok {
+				t.Fatalf("CheckUserdata(%s) failed", name)
+			}
+			hp, isHP := got.(*hostPayload)
+			if !isHP || hp != want {
+				t.Fatalf("cloned %s payload corrupted: got %T (%v), want %v", name, got, got, want)
+			}
+		}
+	})
+}
+
 func BenchmarkTemplateNewState(b *testing.B) {
 	tmpl, err := NewTemplate(func(s *State) error {
 		if _, err := s.RequireLib("svc", func(st *State, _ []Value) ([]Value, error) {

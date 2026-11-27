@@ -203,20 +203,24 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 	// Clear template GoRefs handles on std file Userdatas so each cloned State binds fresh
 	// os.Stdin/os.Stdout/os.Stderr handles without retaining template-owned *luaFile wrappers.
 	clearStdFileRef := func(ref arena.ObjRef) arena.ObjRef {
-		if ref == arena.NullRef || !b.arena.IsLive(ref) {
+		if ref == arena.NullRef || !b.arena.IsLive(ref) || b.arena.Header(ref).Kind != gcKindUserdata {
 			return arena.NullRef
 		}
 		u := arena.AsSmall[Userdata](b.arena, ref)
-		if !u.dataRef.IsNull() {
-			if v, ok := b.goRefs.Get(u.dataRef); ok {
-				if lf, ok := v.(*luaFile); ok && lf != nil && lf.w != nil {
-					_ = lf.flushWriter()
-					b.subExtraMem(int64(lf.w.Size()))
-				}
-			}
-			b.goRefs.Free(u.dataRef)
-			u.dataRef = arena.NullGoHandle
+		if u.dataRef.IsNull() {
+			return arena.NullRef
 		}
+		v, ok := b.goRefs.Get(u.dataRef)
+		lf, isLF := v.(*luaFile)
+		if !ok || !isLF || lf == nil || !lf.isStd {
+			return arena.NullRef
+		}
+		if lf.w != nil {
+			_ = lf.flushWriter()
+			b.subExtraMem(int64(lf.w.Size()))
+		}
+		b.goRefs.Free(u.dataRef)
+		u.dataRef = arena.NullGoHandle
 		return ref
 	}
 	stdinRef := clearStdFileRef(b.stdinRef)
