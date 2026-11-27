@@ -69,7 +69,7 @@ jobs:
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
-          GITHUB_REF_NAME: ${{ github.ref }}
+          TARGET_REF: ${{ github.ref }}
           HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           INPUT_ENGINES: ${{ inputs.engines }}
@@ -87,7 +87,7 @@ jobs:
           PR_ENGINES = "^(C|MoeLua)$"
 
           event = os.environ["EVENT_NAME"]
-          ref = os.environ["GITHUB_REF_NAME"]
+          ref = os.environ["TARGET_REF"]
 
           plan = {
               "run": "false",
@@ -320,8 +320,8 @@ jobs:
             echo "charts_generated=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload generated chart SVGs for commit job
-        if: needs.plan.outputs.commit_charts == 'true' && steps.gencharts.outputs.charts_generated == 'true'
+      - name: Upload generated chart SVGs
+        if: steps.gencharts.outputs.charts_generated == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: bench-charts
