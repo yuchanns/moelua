@@ -4,7 +4,18 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/internal/jit/execmem"
+)
+
+const (
+	// jitEntryCold marks a protoIdx that has not yet been JIT-compiled.
+	jitEntryCold uintptr = 0
+	// jitEntrySkip marks a protoIdx that could not be compiled and should stay interpreted.
+	jitEntrySkip uintptr = 1
+	// jitCompileThreshold is the call count before compiling loop-free functions.
+	// Functions containing backward branches or numeric/generic loops compile on first entry.
+	jitCompileThreshold = 4
 )
 
 var (
@@ -16,7 +27,7 @@ var (
 // restricted environments (e.g. hardened containers or SELinux execmem denial) fall back
 // cleanly to the Plan 9 / Go interpreter instead of failing mid-execution.
 func jitRuntimeAvailable() bool {
-	if !execmem.Supported() {
+	if !jitLayoutSupported || !execmem.Supported() {
 		return false
 	}
 	jitProbeOnce.Do(func() {
@@ -43,25 +54,91 @@ func jitRuntimeAvailable() bool {
 // Note that OS security policies may still deny PROT_EXEC at runtime, in which case
 // SetJITEnabled(true) gracefully falls back to the interpreter.
 func JITSupported() bool {
-	return execmem.Supported()
+	return jitLayoutSupported && execmem.Supported()
 }
 
-// jitState holds optional per-State JIT code regions and compilation state.
+// jitFunc owns the sealed executable code region and per-bytecode-PC native entry table
+// for one compiled *bytecode.Proto.
+type jitFunc struct {
+	proto     *bytecode.Proto
+	region    *execmem.Region
+	pcEntries []uintptr // len == len(proto.Code); pcEntries[pc] is the native resume address
+}
+
+func (f *jitFunc) free() {
+	if f == nil {
+		return
+	}
+	if f.region != nil {
+		f.region.Free()
+		f.region = nil
+	}
+	f.pcEntries = nil
+	f.proto = nil
+}
+
+// jitState holds optional per-State JIT code regions and compilation tables.
 // It stays nil unless a caller opts in via SetJITEnabled(true) / moelua.WithJIT(),
 // keeping idle and noJIT States at zero extra memory and zero dispatch overhead.
 type jitState struct {
-	enabled bool
-	regions []*execmem.Region
+	enabled  bool
+	entries  []uintptr  // indexed by protoIdx: 0=cold, 1=skip, >=4096=pcEntries[0]
+	pcTables []uintptr  // indexed by protoIdx: &funcs[i].pcEntries[0] (0 if uncompiled)
+	hotness  []uint16   // indexed by protoIdx: call count for loop-free functions
+	funcs    []*jitFunc // indexed by protoIdx
+}
+
+func (j *jitState) ensureIdx(idx uint32) {
+	need := int(idx) + 1
+	if need <= len(j.entries) {
+		return
+	}
+	newCap := max(need, len(j.entries)*2)
+	if newCap < 16 {
+		newCap = 16
+	}
+	growU := func(s []uintptr) []uintptr {
+		n := make([]uintptr, newCap)
+		copy(n, s)
+		return n
+	}
+	j.entries = growU(j.entries)
+	j.pcTables = growU(j.pcTables)
+	nh := make([]uint16, newCap)
+	copy(nh, j.hotness)
+	j.hotness = nh
+	nf := make([]*jitFunc, newCap)
+	copy(nf, j.funcs)
+	j.funcs = nf
+}
+
+func (j *jitState) invalidateProto(idx uint32) {
+	if j == nil || int(idx) >= len(j.entries) {
+		return
+	}
+	if f := j.funcs[idx]; f != nil {
+		f.free()
+		j.funcs[idx] = nil
+	}
+	j.entries[idx] = jitEntryCold
+	j.pcTables[idx] = 0
+	j.hotness[idx] = 0
 }
 
 func (j *jitState) close() {
 	if j == nil {
 		return
 	}
-	for _, r := range j.regions {
-		r.Free()
+	for i, f := range j.funcs {
+		if f != nil {
+			f.free()
+			j.funcs[i] = nil
+		}
 	}
-	j.regions = nil
+	j.entries = nil
+	j.pcTables = nil
+	j.hotness = nil
+	j.funcs = nil
 	j.enabled = false
 }
 

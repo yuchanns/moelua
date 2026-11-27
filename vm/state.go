@@ -831,6 +831,58 @@ func (s *State) hasInterruptControl() bool {
 	return s.intrFlag != nil || s.ctx != nil || s.insnLimit > 0
 }
 
+// canFastAsyncInterrupt reports whether the active native execution path (JIT or Plan 9 asm)
+// has periodic poll safepoints that can service intrFlag and ctx.Done() without falling back
+// to the per-instruction runHooked loop.
+func (s *State) canFastAsyncInterrupt() bool {
+	return (s.jit != nil && s.jit.enabled) || asmDispatchEnabled
+}
+
+// needsHookedRun reports whether execution must use runHooked instead of runFast.
+// Debug hooks and exact instruction limits always require runHooked; async SIGINT / context
+// cancellation only requires runHooked when neither JIT nor Plan 9 asm polling is active.
+func (s *State) needsHookedRun(th *Thread) bool {
+	if (th.hookMask != 0 && !th.inHook && !th.suppressHook) || s.insnLimit > 0 {
+		return true
+	}
+	if (s.intrFlag != nil || s.ctx != nil) && !s.canFastAsyncInterrupt() {
+		return true
+	}
+	return false
+}
+
+// checkAsyncInterrupt services asynchronous cancellation (SIGINT flag or context.Context)
+// at native poll and frame boundaries. When syncPC is true, ev.frames[ev.ci].pc is synced
+// to pc before raising a catchable SIGINT error so tracebacks report the exact line.
+//
+//go:noinline
+func (s *State) checkAsyncInterrupt(th *Thread, ev *frameEnv, pc int, syncPC bool, entryDepth int) (reload bool, err error) {
+	if s.abortErr != nil {
+		return false, s.abortErr
+	}
+	if s.intrFlag != nil && s.intrFlag.Load() {
+		s.intrFlag.Store(false)
+		if syncPC {
+			frames := th.framesSlice(s.arena)
+			if ev.ci >= 0 && ev.ci < len(frames) {
+				frames[ev.ci].pc = pc
+			}
+		}
+		lerr := &LuaError{Val: StringValue(s.intern.Intern("interrupted!"))}
+		if s.handleError(th, entryDepth, lerr) {
+			return true, nil
+		}
+		return false, lerr
+	}
+	if s.ctx != nil {
+		if cerr := s.ctx.Err(); cerr != nil {
+			s.abortErr = cerr
+			return false, cerr
+		}
+	}
+	return false, nil
+}
+
 func (s *State) checkNativeCancelStep() error {
 	if s.abortErr != nil {
 		return s.abortErr
@@ -2229,10 +2281,10 @@ func (s *State) call2OnThread(th *Thread, fn, a, b Value) (Value, error) {
 	return s.call1OnThread(th, fn, args[:])
 }
 
-// runThread dispatches to the fast loop when no debug hooks or interrupt controls are active,
-// or to the hooked variant when debug.sethook / ctx / instruction limits are active (zero cost in fast path!).
+// runThread dispatches to the fast loop when no debug hooks or exact instruction limits
+// require runHooked (async SIGINT / context cancellation is polled natively by JIT/asm).
 func (s *State) runThread(th *Thread, entryDepth int) error {
-	if (th.hookMask != 0 && !th.inHook && !th.suppressHook) || s.hasInterruptControl() {
+	if s.needsHookedRun(th) {
 		return s.runHooked(th, entryDepth)
 	}
 	return s.runFast(th, entryDepth)

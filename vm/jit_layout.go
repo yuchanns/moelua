@@ -8,6 +8,8 @@ import (
 	"github.com/yuchanns/moelua/internal/arena"
 )
 
+const jitLayoutSupported = true
+
 // jitExitCode values returned by native JIT code through internal/jit/call.Call.
 const (
 	jitExitDone   uint64 = 0 // Returned below entryDepth; execution complete
@@ -16,62 +18,76 @@ const (
 	jitExitCold   uint64 = 3 // Fallback to Go interpreter for current PC
 )
 
-// jitExecCtx is the pointer-free execution context passed by uintptr to JIT-compiled
+// jitPollInterval bounds backward edges and native Lua-to-Lua calls executed inside
+// JIT machine code before yielding briefly to Go for GC/preemption safepoints.
+const jitPollInterval = 8192
+
+// jitExecCtx is the pointer-free execution context passed by unsafe.Pointer to JIT-compiled
 // ARM64/AMD64 machine code. Every backing buffer referenced by uintptr is strongly
-// rooted by State, Thread, and boundProto for the duration of the native call and never
-// moves while native code runs (all allocations exit via jitExitCold).
+// rooted by State, Thread, jitState, and boundProto for the duration of the native call
+// and never moves while native code runs (all allocations exit via jitExitCold).
 type jitExecCtx struct {
-	regs       uintptr // &stack[base] (frame R[0])
-	consts     uintptr // &bp.consts[0]
-	pagePtrs   uintptr // &s.arena.pagePtrs[0]
-	largeSpans uintptr // &s.arena.largeSpans[0] (24B Go slice headers)
-	stack      uintptr // &th.stack[0]
-	frames     uintptr // &th.frames[0]
-	protos     uintptr // &s.protos[0]
-	ic         uintptr // &bp.ic[0]
-	icSlots    uintptr // &bp.icSlots[0]
-	clUpvals   uintptr // &cl.upvals[0] (0 if nUpvals == 0)
-	curBP      uintptr // uintptr(unsafe.Pointer(bp))
-	th         uintptr // uintptr(unsafe.Pointer(th))
-	protoEpoch uint64  // s.protoEpoch
-	pc         int64   // current / resume instruction index
-	poll       int64   // countdown budget before jitExitPoll
-	ci         int64   // active frame index (th.nframe - 1)
-	base       int64   // active frame register base
-	entryDepth int64   // return jitExitDone when th.nframe <= entryDepth
-	thSelf     uint32  // th.self (arena.ObjRef)
-	sqrtIdx    uint32  // staticNative idx for math.sqrt (0 if unregistered)
-	absIdx     uint32  // staticNative idx for math.abs (0 if unregistered)
-	deoptID    uint32  // side-exit / deopt descriptor index (0 for baseline PC exits)
+	regs        uintptr // &stack[base] (frame R[0])
+	consts      uintptr // &bp.consts[0]
+	pagePtrs    uintptr // &s.arena.pagePtrs[0]
+	largeSpans  uintptr // &s.arena.largeSpans[0] (24B Go slice headers)
+	stack       uintptr // &th.stack[0]
+	frames      uintptr // &th.frames[0]
+	protos      uintptr // &s.protos[0]
+	ic          uintptr // &bp.ic[0]
+	icSlots     uintptr // &bp.icSlots[0]
+	clUpvals    uintptr // &cl.upvals[0] (0 if nUpvals == 0)
+	curBP       uintptr // uintptr(unsafe.Pointer(bp))
+	th          uintptr // uintptr(unsafe.Pointer(th))
+	entryPC     uintptr // target native PC jumped to by the shared JIT trampoline
+	epilogue    uintptr // shared trampoline epilogue address jumped to on exit
+	jitEntries  uintptr // &s.jit.entries[0] (0 if empty)
+	jitPCTables uintptr // &s.jit.pcTables[0] (0 if empty)
+	jitProtoCap int64   // len(s.jit.entries)
+	protoEpoch  uint64  // s.protoEpoch
+	pc          int64   // current / resume instruction index
+	poll        int64   // countdown budget before jitExitPoll
+	ci          int64   // active frame index (th.nframe - 1)
+	base        int64   // active frame register base
+	entryDepth  int64   // return jitExitDone when th.nframe <= entryDepth
+	thSelf      uint32  // th.self (arena.ObjRef)
+	sqrtIdx     uint32  // staticNative idx for math.sqrt (0 if unregistered)
+	absIdx      uint32  // staticNative idx for math.abs (0 if unregistered)
+	deoptID     uint32  // side-exit / deopt descriptor index (0 for baseline PC exits)
 }
 
 // Compile-time struct field offset constants consumed directly by the ARM64 and AMD64
 // JIT code generators so emitted machine code cannot drift from Go struct layouts.
 const (
 	// jitExecCtx offsets
-	jitCtxSize       = int32(unsafe.Sizeof(jitExecCtx{}))
-	jitCtxRegs       = int32(unsafe.Offsetof(jitExecCtx{}.regs))
-	jitCtxConsts     = int32(unsafe.Offsetof(jitExecCtx{}.consts))
-	jitCtxPagePtrs   = int32(unsafe.Offsetof(jitExecCtx{}.pagePtrs))
-	jitCtxLargeSpans = int32(unsafe.Offsetof(jitExecCtx{}.largeSpans))
-	jitCtxStack      = int32(unsafe.Offsetof(jitExecCtx{}.stack))
-	jitCtxFrames     = int32(unsafe.Offsetof(jitExecCtx{}.frames))
-	jitCtxProtos     = int32(unsafe.Offsetof(jitExecCtx{}.protos))
-	jitCtxIC         = int32(unsafe.Offsetof(jitExecCtx{}.ic))
-	jitCtxICSlots    = int32(unsafe.Offsetof(jitExecCtx{}.icSlots))
-	jitCtxClUpvals   = int32(unsafe.Offsetof(jitExecCtx{}.clUpvals))
-	jitCtxCurBP      = int32(unsafe.Offsetof(jitExecCtx{}.curBP))
-	jitCtxTh         = int32(unsafe.Offsetof(jitExecCtx{}.th))
-	jitCtxProtoEpoch = int32(unsafe.Offsetof(jitExecCtx{}.protoEpoch))
-	jitCtxPC         = int32(unsafe.Offsetof(jitExecCtx{}.pc))
-	jitCtxPoll       = int32(unsafe.Offsetof(jitExecCtx{}.poll))
-	jitCtxCI         = int32(unsafe.Offsetof(jitExecCtx{}.ci))
-	jitCtxBase       = int32(unsafe.Offsetof(jitExecCtx{}.base))
-	jitCtxEntryDepth = int32(unsafe.Offsetof(jitExecCtx{}.entryDepth))
-	jitCtxThSelf     = int32(unsafe.Offsetof(jitExecCtx{}.thSelf))
-	jitCtxSqrtIdx    = int32(unsafe.Offsetof(jitExecCtx{}.sqrtIdx))
-	jitCtxAbsIdx     = int32(unsafe.Offsetof(jitExecCtx{}.absIdx))
-	jitCtxDeoptID    = int32(unsafe.Offsetof(jitExecCtx{}.deoptID))
+	jitCtxSize        = int32(unsafe.Sizeof(jitExecCtx{}))
+	jitCtxRegs        = int32(unsafe.Offsetof(jitExecCtx{}.regs))
+	jitCtxConsts      = int32(unsafe.Offsetof(jitExecCtx{}.consts))
+	jitCtxPagePtrs    = int32(unsafe.Offsetof(jitExecCtx{}.pagePtrs))
+	jitCtxLargeSpans  = int32(unsafe.Offsetof(jitExecCtx{}.largeSpans))
+	jitCtxStack       = int32(unsafe.Offsetof(jitExecCtx{}.stack))
+	jitCtxFrames      = int32(unsafe.Offsetof(jitExecCtx{}.frames))
+	jitCtxProtos      = int32(unsafe.Offsetof(jitExecCtx{}.protos))
+	jitCtxIC          = int32(unsafe.Offsetof(jitExecCtx{}.ic))
+	jitCtxICSlots     = int32(unsafe.Offsetof(jitExecCtx{}.icSlots))
+	jitCtxClUpvals    = int32(unsafe.Offsetof(jitExecCtx{}.clUpvals))
+	jitCtxCurBP       = int32(unsafe.Offsetof(jitExecCtx{}.curBP))
+	jitCtxTh          = int32(unsafe.Offsetof(jitExecCtx{}.th))
+	jitCtxEntryPC     = int32(unsafe.Offsetof(jitExecCtx{}.entryPC))
+	jitCtxEpilogue    = int32(unsafe.Offsetof(jitExecCtx{}.epilogue))
+	jitCtxJITEntries  = int32(unsafe.Offsetof(jitExecCtx{}.jitEntries))
+	jitCtxJITPCTables = int32(unsafe.Offsetof(jitExecCtx{}.jitPCTables))
+	jitCtxJITProtoCap = int32(unsafe.Offsetof(jitExecCtx{}.jitProtoCap))
+	jitCtxProtoEpoch  = int32(unsafe.Offsetof(jitExecCtx{}.protoEpoch))
+	jitCtxPC          = int32(unsafe.Offsetof(jitExecCtx{}.pc))
+	jitCtxPoll        = int32(unsafe.Offsetof(jitExecCtx{}.poll))
+	jitCtxCI          = int32(unsafe.Offsetof(jitExecCtx{}.ci))
+	jitCtxBase        = int32(unsafe.Offsetof(jitExecCtx{}.base))
+	jitCtxEntryDepth  = int32(unsafe.Offsetof(jitExecCtx{}.entryDepth))
+	jitCtxThSelf      = int32(unsafe.Offsetof(jitExecCtx{}.thSelf))
+	jitCtxSqrtIdx     = int32(unsafe.Offsetof(jitExecCtx{}.sqrtIdx))
+	jitCtxAbsIdx      = int32(unsafe.Offsetof(jitExecCtx{}.absIdx))
+	jitCtxDeoptID     = int32(unsafe.Offsetof(jitExecCtx{}.deoptID))
 
 	// Value layout
 	jitValSize = int32(unsafe.Sizeof(Value{}))
@@ -95,6 +111,12 @@ const (
 	jitTblArrKind     = int32(unsafe.Offsetof(Table{}.arrKind))
 	jitTblTMFlags     = int32(unsafe.Offsetof(Table{}.tmFlags))
 	jitTblInlineSlots = int32(unsafe.Offsetof(Table{}.inlineSlots))
+
+	// tableHash & hashNode layout
+	jitThashNodesRef = int32(unsafe.Offsetof(tableHash{}.nodesRef))
+	jitThashDictGen  = int32(unsafe.Offsetof(tableHash{}.dictGen))
+	jitHNodeSize     = int32(unsafe.Sizeof(hashNode{}))
+	jitHNodeVal      = int32(unsafe.Offsetof(hashNode{}.val))
 
 	// Closure layout
 	jitClSize      = int32(unsafe.Sizeof(Closure{}))
@@ -167,6 +189,10 @@ const (
 	jitThFramesCap  = int32(unsafe.Offsetof(Thread{}.framesCap))
 	jitThNFrame     = int32(unsafe.Offsetof(Thread{}.nframe))
 	jitThHighFrames = int32(unsafe.Offsetof(Thread{}.highFrames))
+
+	// LuaString layout
+	jitStrKind = int32(unsafe.Offsetof(LuaString{}.hdr) + unsafe.Offsetof(arena.GCHeader{}.Kind))
+	jitStrLen  = int32(unsafe.Offsetof(LuaString{}.Len))
 
 	// Arena ObjRef & slab constants
 	jitArenaWordBits   = 13

@@ -176,7 +176,7 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 		}
 		th.framesSlice(s.arena)[th.nframe-1].isHook = true
 		var err error
-		if s.hasInterruptControl() {
+		if s.needsHookedRun(th) {
 			err = s.runHooked(th, entryDepth)
 		} else {
 			err = s.runFast(th, entryDepth)
