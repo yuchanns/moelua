@@ -306,12 +306,21 @@ type State struct {
 	stringMetaRef  arena.ObjRef
 	fileMetaRef    arena.ObjRef
 	pkgRef         arena.ObjRef
+	stdinRef       arena.ObjRef
+	stdoutRef      arena.ObjRef
+	stderrRef      arena.ObjRef
+	openedLibs     LibMask
+	pkgAllowOS     bool
 	typeMetaRefs   [9]arena.ObjRef // per-type metatables (debug.setmetatable on primitives!)
 	stdinInput     Value
 	defaultInput   Value
 	defaultOutput  Value
 	openFiles      []*fileInner        // open non-std file handles flushed on os.exit / closed LIFO on State.Close
 	immUpvalTokens map[uint32][]uint64 // lazy debug.upvalueid tokens for shared static builtins
+
+	// Optional back-pointer to the owning high-level host wrapper (e.g. *moelua.State)
+	// so callbacks registered inside a reusable Template resolve the active cloned State.
+	host any
 
 	// Non-Arena Go-side memory accounting & per-State soft/hard memory limit (0 = unlimited).
 	extraMemBytes int64
@@ -506,13 +515,25 @@ func (s *State) AsUserdata(v Value) *Userdata {
 
 // NewState creates a new Lua 5.5.1 State with the complete standard library installed,
 // cloned rapidly via Arena.CloneSnapshot() from the process-wide frozen stdlib template.
+// SetHost attaches an opaque host wrapper (such as *moelua.State) to this VM State.
+func (s *State) SetHost(h any) { s.host = h }
+
+// Host returns the opaque host wrapper attached via SetHost.
+func (s *State) Host() any { return s.host }
+
+// NewState creates a new Lua 5.5.1 State cloned rapidly from the frozen full-stdlib template.
 func NewState() *State {
-	return cloneFromStdTemplate(false)
+	return cloneFromStdTemplate(LibAll, false)
 }
 
 // NewStateNoEnv creates a new Lua 5.5.1 State ignoring LUA_PATH/LUA_CPATH environment variables (CLI -E).
 func NewStateNoEnv() *State {
-	return cloneFromStdTemplate(true)
+	return cloneFromStdTemplate(LibAll, true)
+}
+
+// NewStateWithLibs creates a new Lua 5.5.1 State with only the standard libraries selected by mask.
+func NewStateWithLibs(mask LibMask, noEnv bool) *State {
+	return cloneFromStdTemplate(mask, noEnv)
 }
 
 // ArenaStats reports live memory and handle-table diagnostics for a State's noscan Arena.
@@ -551,8 +572,9 @@ func (s *State) IsLive(v Value) bool {
 	return s.arena.IsLive(v.Ref())
 }
 
-// newBootstrapState builds a fresh State from scratch via initStdlib(); used once to construct stdTemplate.
-func newBootstrapState() *State {
+// newBootstrapStateWithLibs builds a fresh State from scratch with the selected stdlibs;
+// used once to construct a reusable Template snapshot.
+func newBootstrapStateWithLibs(mask LibMask) *State {
 	a := arena.New()
 	s := &State{
 		arena:            a,
@@ -584,8 +606,13 @@ func newBootstrapState() *State {
 	reg.RawSetInt(s, ridxRef, FalseValue())
 	reg.RawSetInt(s, ridxGlobals, TableValue(env))
 	reg.RawSetInt(s, ridxMainThread, ThreadValue(th))
-	s.initStdlib()
+	s.OpenLibs(mask)
 	return s
+}
+
+// newBootstrapState builds a fresh State with the full Lua 5.5.1 stdlib.
+func newBootstrapState() *State {
+	return newBootstrapStateWithLibs(LibAll)
 }
 
 // SetMemoryLimit sets a per-State VM memory limit in bytes (<= 0 disables the limit).
@@ -613,7 +640,12 @@ func (s *State) MemoryUsage() int64 {
 }
 
 func (s *State) memError() *LuaError {
-	return &LuaError{Val: StringValue(s.intern.Intern("not enough memory")), isMemErr: true}
+	return &LuaError{
+		Val:      StringValue(s.intern.Intern("not enough memory")),
+		msg:      "not enough memory",
+		hasMsg:   true,
+		isMemErr: true,
+	}
 }
 
 func isMemError(err error) bool {

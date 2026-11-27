@@ -88,7 +88,7 @@ func shortSrc(source string) string {
 	return fmt.Sprintf(`[string "%s"]`, line)
 }
 
-func (s *State) initDebugLib() {
+func (s *State) initDebugLib() *Table {
 	dbg := s.NewTable(0, 16)
 	s.builtinDebugGetInfo = s.registerFunc(dbg, "getinfo", intrNone, nativeDebugGetInfo)
 	s.builtinDebugTraceback = s.registerFunc(dbg, "traceback", intrNone, nativeDebugTraceback)
@@ -106,7 +106,6 @@ func (s *State) initDebugLib() {
 	s.builtinDebugSetHook = s.registerFunc(dbg, "sethook", intrNone, nativeDebugSetHook)
 	s.registerFunc(dbg, "gethook", intrNone, nativeDebugGetHook)
 	s.registerFunc(dbg, "debug", intrNone, nativeDebugDebug)
-	s.SetGlobal("debug", TableValue(dbg))
 
 	// Registry _HOOKKEY weak-key table matching Lua 5.5 ldblib.c (db.lua:328).
 	hookKey := s.NewDictTable(4)
@@ -114,6 +113,7 @@ func (s *State) initDebugLib() {
 	hkMeta.RawSetStr(s, s.intern.tms[TMMode], StringValue(s.intern.Intern("k")))
 	s.SetMetatable(hookKey, hkMeta)
 	s.registry().RawSetStr(s, s.intern.Intern("_HOOKKEY"), TableValue(hookKey))
+	return dbg
 }
 
 func (s *State) topFrameIsNative(th *Thread, fn *NativeFunc) bool {
@@ -129,6 +129,18 @@ func optThreadArg(s *State, args []Value) (*Thread, []Value) {
 		return s.asThread(args[0]), args[1:]
 	}
 	return s.cur(), args
+}
+
+// Traceback returns a Lua 5.5 formatted stack traceback for th (or the active thread
+// when th is nil), matching PUC-Rio luaL_traceback(L, L1, msg, level).
+func (s *State) Traceback(th *Thread, msg string, level int) string {
+	if th == nil {
+		th = s.cur()
+	}
+	if th == nil {
+		return ""
+	}
+	return s.formatTraceback(th, msg, msg != "", level)
 }
 
 func (s *State) formatTraceback(th *Thread, msg string, hasMsg bool, level int) string {

@@ -22,12 +22,12 @@
 - **Hooked dispatch parity (`TestOfficialLua55TestesHooked`)**: 23 / 23 portable files pass inside `(*State).runHooked` with an active count hook.
 - **Differential parity against live C `lua55_o2`**:
   - Pure-Go stdlib kernels (`internal/luastdlib`): patterns, `string.format`, `string.pack`/`unpack`, `utf8`, `math` RNG, number parsing.
-  - **15 / 15** yield-across-native/metamethod matrix (`TestPhase2P6YieldAcrossNativeMatrix`): `table.sort`, `string.gsub`, `load` reader, `tostring`/`print`, `require`, `table.insert`/`concat`, `coroutine.close`, `pcall`/`xpcall`, `pairs`, iterators, and arithmetic/index/`<close>` metamethods.
-  - Float array `table.sort` with `NaN` (`TestPhase2P5FloatSortNaNParity`).
+  - **15 / 15** yield-across-native/metamethod matrix: `table.sort`, `string.gsub`, `load` reader, `tostring`/`print`, `require`, `table.insert`/`concat`, `coroutine.close`, `pcall`/`xpcall`, `pairs`, iterators, and arithmetic/index/`<close>` metamethods.
+  - Float array `table.sort` with `NaN` parity against C Lua 5.5.1.
 
-### 1C. Phase 4 Noscan Arena, Per-State GC & Multi-Configuration Matrix
-- **Zero-Pointer Arena Guarantee (`TestPhase4NoscanArenaStructZeroPointers`)**: verified by reflection across all 17 Arena VM types (`Value`, `LuaString`, `Table`, `tableHash`, `hashNode`, `Shape`, `shapeTrans`, `shapeIndexEntry`, `ICEntry`, `polyEntry`, `Thread`, `callFrame`, `Closure`, `Upvalue`, `ArenaNative`, `Userdata`, `ArenaProto`) — zero Go pointers inside any Lua VM heap slab.
-- **True Per-State Lua 5.5.1 Collector (`internal/arena/gc.go`, `vm/gc.go`)**: unified PUC-Rio `lgc.c` incremental tri-color + generational minor/major GC with exact 6-step `atomic()`, ephemeron convergence, LIFO `__gc` finalizers, resurrection, weak-table pruning, and automatic `GoRefs` release on sweep — always active with no Tier 0 / Tier 1 split.
+### 1C. Noscan Arena, Per-State GC & Multi-Configuration Matrix
+- **Zero-Pointer Arena Guarantee**: verified by reflection across all 17 Arena VM types (`Value`, `LuaString`, `Table`, `tableHash`, `hashNode`, `Shape`, `shapeTrans`, `shapeIndexEntry`, `ICEntry`, `polyEntry`, `Thread`, `callFrame`, `Closure`, `Upvalue`, `ArenaNative`, `Userdata`, `ArenaProto`) — zero Go pointers inside any Lua VM heap slab.
+- **True Per-State Lua 5.5.1 Collector (`internal/arena/gc.go`, `vm/gc.go`)**: unified PUC-Rio `lgc.c` incremental tri-color + generational minor/major GC with exact 6-step `atomic()`, ephemeron convergence, LIFO `__gc` finalizers, resurrection, weak-table pruning, and automatic `GoRefs` release on sweep.
 - **All packages pass under**:
   - `default` (`opt + intnil`, Plan 9 threaded interpreter + optional native JIT)
   - `-tags moeluanojit` (Plan 9 threaded interpreter, native JIT excluded at compile time)
@@ -42,7 +42,7 @@
 - **Fuzzing (zero Go panics; zero `recover()` inside `vm/`)**:
   - `FuzzBytecode`, `FuzzRun`, `FuzzStructuredProto` (under `-tags moeluaregcheck`), and `FuzzCompileIdentity` totaling **10.5M+** executions.
 
-### 1D. Phase 5A Threaded Interpreter & Phase 5B Native JIT Verification
+### 1D. Threaded Interpreter & Native JIT Verification
 - **3-Way Execution Parity (`Pure-Go` vs `Plan 9 Threaded (noJIT)` vs `Native JIT`)**:
   - Official `testes/` suite passes with `SetJITEnabled(true)` on both native ARM64 (`darwin/arm64`) and AMD64 (`linux/amd64`, `windows/amd64`, Rosetta 2 `darwin/amd64`).
   - `bench/compare` `TestOutputs` verifies **32 / 32** byte-exact stdout parity against C Lua 5.5.1 `-O2` for both `MoeLua` (`noJIT`) and `MoeLua-JIT` on ARM64 and AMD64.
@@ -59,11 +59,11 @@
 
 ---
 
-## 3. Core VM Reference Benchmarks (`GOMAXPROCS=1`, Pure-Go Phase 4 Baseline, Multi-VM & Embedding)
+## 3. Core VM Reference Benchmarks (`GOMAXPROCS=1`, Pure-Go Baseline, Multi-VM & Embedding)
 
-### 3A. Pure-Go Interpreter Reference (`-tags "purego moeluanojit"` / Phase 4, 10-Round ABAB, Peak RSS)
+### 3A. Pure-Go Interpreter Reference (`-tags "purego moeluanojit"`, 10-Round ABAB, Peak RSS)
 
-*(See Section 4 below for current Phase 5A Plan 9 threaded `MoeLua 5.5 (noJIT)` and Phase 5B `MoeLua 5.5 (JIT)` cross-engine numbers across all 32 programs.)*
+*(See Section 4 below for current Plan 9 threaded `MoeLua 5.5 (noJIT)` and native `MoeLua 5.5 (JIT)` cross-engine numbers across all 32 programs.)*
 
 | Benchmark | Class | C `-O2` CPU (±IQR) | C `-O3 -mcpu=apple-m1` CPU (±IQR) | Pure-Go No-PGO CPU (±IQR) | Pure-Go vs `-O2` (C / W) | Pure-Go vs `-O3` (C) | Peak RSS C / Moe (MiB) |
 |---|---|--:|--:|--:|--:|--:|--:|
@@ -79,7 +79,7 @@
 | `ecs_stdlib` | (b) | 77.4 (±7.5) ms | 74.1 (±2.7) ms | 79.4 (±0.6) ms | **0.97× / 0.99×** | **0.93×** | 2.1 / 6.8 |
 | `spectralnorm` (400) | (c) | 260.7 (±1.7) ms | 209.0 (±5.0) ms | 335.1 (±5.0) ms | 0.78× / 0.79× | 0.62× | 1.7 / 6.3 |
 | `matmul` (160²) | (c) | 96.9 (±1.3) ms | 70.7 (±1.5) ms | 93.9 (±1.7) ms | **1.03× / 1.05×** | **0.75×** | 2.4 / 6.8 |
-| **Core VM Geomean (`n=12`)** | | | | *(Phase 5A Plan 9 threaded noJIT: **1.08×** vs `-O2`; Phase 5B JIT: **3.77×** vs `-O2`, `matmul` **63.98×** via NEON SIMD)* | **0.88× / 0.89×** | **0.74×** | |
+| **Core VM Geomean (`n=12`)** | | | | *(Plan 9 threaded noJIT: **1.08×** vs `-O2`; Native JIT: **3.77×** vs `-O2`, `matmul` **63.98×** via NEON SIMD)* | **0.88× / 0.89×** | **0.74×** | |
 
 ### 3B. Stdlib Algorithmic Fast Path (excluded from VM Geomean)
 

@@ -180,21 +180,6 @@ func (lf *luaFile) closeFile() error {
 	return err
 }
 
-func (s *State) initIOOSPackageLibs() {
-	s.initBaseExtra()
-	s.initIOLib()
-	s.initOSLib()
-	s.initPackageLib()
-}
-
-func (s *State) initBaseExtra() {
-	env := s.GlobalEnv()
-	s.registerFunc(env, "warn", intrNone, nativeWarn)
-	s.registerFunc(env, "load", intrNone, nativeLoad)
-	s.registerFunc(env, "loadfile", intrNone, nativeLoadFile)
-	s.registerFunc(env, "dofile", intrDoFile, nativeDoFile)
-}
-
 func (s *State) emitWarning(msg string) {
 	if !s.warnOn || s.errOut == nil {
 		return
@@ -955,7 +940,7 @@ func nativeDoFile(s *State, args []Value) ([]Value, error) {
 
 // --- io library ---
 
-func (s *State) initIOLib() {
+func (s *State) initIOLib() *Table {
 	fileMT := s.NewTable(0, 12)
 	fileMethods := s.NewTable(0, 10)
 	s.registerFunc(fileMethods, "read", intrNone, nativeFileRead)
@@ -977,6 +962,9 @@ func (s *State) initIOLib() {
 	stdinUD := s.newFileUD(&luaFile{f: os.Stdin, isStd: true})
 	stdoutUD := s.newFileUD(&luaFile{f: os.Stdout, isStd: true})
 	stderrUD := s.newFileUD(&luaFile{f: os.Stderr, isStd: true})
+	s.stdinRef = stdinUD.Ref()
+	s.stdoutRef = stdoutUD.Ref()
+	s.stderrRef = stderrUD.Ref()
 	s.stdinInput = stdinUD
 	s.defaultInput = stdinUD
 	s.defaultOutput = stdoutUD
@@ -996,7 +984,7 @@ func (s *State) initIOLib() {
 	s.registerFunc(ioTbl, "tmpfile", intrNone, nativeIOTmpfile)
 	s.registerFunc(ioTbl, "type", intrNone, nativeIOType)
 	s.registerFunc(ioTbl, "popen", intrNone, nativeIOPopen)
-	s.SetGlobal("io", TableValue(ioTbl))
+	return ioTbl
 }
 
 func (s *State) allocFileUD(lf *luaFile) (Value, error) {
@@ -2477,7 +2465,7 @@ func nativeIOLines(s *State, args []Value) ([]Value, error) {
 
 // --- os library ---
 
-func (s *State) initOSLib() {
+func (s *State) initOSLib() *Table {
 	osTbl := s.NewTable(0, 12)
 	s.registerFunc(osTbl, "clock", intrNone, nativeOSClock)
 	s.registerFunc(osTbl, "time", intrNone, nativeOSTime)
@@ -2490,7 +2478,7 @@ func (s *State) initOSLib() {
 	s.registerFunc(osTbl, "setlocale", intrNone, nativeOSSetLocale)
 	s.registerFunc(osTbl, "execute", intrNone, nativeOSExecute)
 	s.registerFunc(osTbl, "exit", intrNone, nativeOSExit)
-	s.SetGlobal("os", TableValue(osTbl))
+	return osTbl
 }
 
 func nativeOSTime(s *State, args []Value) ([]Value, error) {
@@ -3087,43 +3075,6 @@ func nativeOSExit(s *State, args []Value) ([]Value, error) {
 }
 
 // --- package library & require ---
-
-func (s *State) initPackageLib() {
-	pkg := s.NewTable(0, 10)
-	loaded := s.NewTable(0, 16)
-	preload := s.NewTable(0, 8)
-	searchers := s.NewTable(4, 0)
-
-	// Pre-populate standard libraries in package.loaded
-	for _, name := range []string{"_G", "math", "table", "string", "os", "io", "coroutine", "debug", "utf8"} {
-		if v := s.GetGlobal(name); !v.IsNil() {
-			loaded.RawSetStr(s, s.intern.Intern(name), v)
-		}
-	}
-	loaded.RawSetStr(s, s.intern.Intern("package"), TableValue(pkg))
-
-	pkg.RawSetStr(s, s.intern.Intern("loaded"), TableValue(loaded))
-	pkg.RawSetStr(s, s.intern.Intern("preload"), TableValue(preload))
-	pkg.RawSetStr(s, s.intern.Intern("path"), StringValue(s.intern.Intern(defaultLuaPath)))
-	pkg.RawSetStr(s, s.intern.Intern("cpath"), StringValue(s.intern.Intern(defaultLuaCPath)))
-	pkg.RawSetStr(s, s.intern.Intern("config"), StringValue(s.intern.Intern("/\n;\n?\n!\n-\n")))
-
-	// Stateless searchers & require (safe to share across States via frozen stdlib template!).
-	searchers.RawSetInt(s, 1, s.allocStaticNative(&NativeFunc{Name: "searcher_preload", Fn: nativeSearcherPreload}))
-	searchers.RawSetInt(s, 2, s.allocStaticNative(&NativeFunc{Name: "searcher_lua", Fn: nativeSearcherLua}))
-	searchers.RawSetInt(s, 3, s.allocStaticNative(&NativeFunc{Name: "searcher_c", Fn: nativeSearcherC}))
-	pkg.RawSetStr(s, s.intern.Intern("searchers"), TableValue(searchers))
-	s.registerFunc(pkg, "searchpath", intrNone, nativePackageSearchPath)
-	s.registerFunc(pkg, "loadlib", intrNone, nativePackageLoadLib)
-
-	s.pkgRef = pkg.self
-	s.SetGlobal("package", TableValue(pkg))
-	reg := s.registry()
-	reg.RawSetStr(s, s.intern.Intern("_LOADED"), TableValue(loaded))
-	reg.RawSetStr(s, s.intern.Intern("_PRELOAD"), TableValue(preload))
-
-	s.registerFunc(s.GlobalEnv(), "require", intrNone, nativeRequire)
-}
 
 func (s *State) pkgField(name string) (Value, error) {
 	pkg := s.pkgTbl()

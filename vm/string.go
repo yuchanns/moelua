@@ -760,7 +760,7 @@ func (si *stringInterner) lookupExistingShort(s string) (*LuaString, bool) {
 		for ref := si.buckets[h&mask]; ref != arena.NullRef; {
 			ls := arena.AsSmall[LuaString](a, ref)
 			if ls.Hash == h && ls.Len == uint32(len(s)) && ls.Str() == s {
-				if si.collector != nil && ls.hdr.IsDead(si.collector.OtherWhite()) {
+				if !si.bootstrapping && si.collector != nil && ls.hdr.IsDead(si.collector.OtherWhite()) {
 					// Resurrect dead-but-unswept short string during incremental sweep (lstring.c:internshrstr).
 					ls.hdr.SetWhite(si.collector.CurrentWhite())
 					ls.hdr.SetAge(arena.AgeNew)
@@ -793,7 +793,7 @@ func (si *stringInterner) Intern(s string) *LuaString {
 			for ref := si.buckets[h&mask]; ref != arena.NullRef; {
 				ls := arena.AsSmall[LuaString](a, ref)
 				if ls.Hash == h && ls.Len == uint32(len(s)) && ls.Str() == s {
-					if si.collector != nil && ls.hdr.IsDead(si.collector.OtherWhite()) {
+					if !si.bootstrapping && si.collector != nil && ls.hdr.IsDead(si.collector.OtherWhite()) {
 						// Resurrect dead-but-unswept short string during incremental sweep (lstring.c:internshrstr).
 						ls.hdr.SetWhite(si.collector.CurrentWhite())
 						ls.hdr.SetAge(arena.AgeNew)

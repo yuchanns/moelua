@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-func (s *State) initCoroLib() {
+func (s *State) initCoroLib() *Table {
 	coro := s.NewTable(0, 10)
 	s.registerFunc(coro, "create", intrNone, nativeCoroCreate)
 	s.registerFunc(coro, "resume", intrNone, nativeCoroResume)
@@ -15,7 +15,7 @@ func (s *State) initCoroLib() {
 	s.registerFunc(coro, "isyieldable", intrNone, nativeCoroIsYieldable)
 	s.registerFunc(coro, "wrap", intrNone, nativeCoroWrap)
 	s.registerFunc(coro, "close", intrNone, nativeCoroClose)
-	s.SetGlobal("coroutine", TableValue(coro))
+	return coro
 }
 
 // NewThread creates a new suspended coroutine ready to run fn (matching coroutine.create).

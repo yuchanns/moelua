@@ -1,5 +1,7 @@
 package arena
 
+import "slices"
+
 // GoHandle is a generation-tagged 64-bit handle stored inside noscan Arena objects
 // to reference Go heap values (userdata payloads, Go native callbacks, open file handles)
 // without placing any Go pointers inside the noscan []byte Arena.
@@ -145,6 +147,20 @@ func (g *GoRefs) LiveCount() int {
 		return 0
 	}
 	return g.liveCount
+}
+
+// Clone returns an independent copy of g preserving all active GoHandle indices and
+// generations (used by Template.Clone so cloned States share immutable Go callbacks
+// without sharing mutable handle-table state).
+func (g *GoRefs) Clone() *GoRefs {
+	if g == nil || len(g.slots) <= 1 {
+		return NewGoRefs()
+	}
+	return &GoRefs{
+		slots:     slices.Clone(g.slots),
+		freeHead:  g.freeHead,
+		liveCount: g.liveCount,
+	}
 }
 
 // ClearAll releases every pinned Go value immediately (used on State.Close),
