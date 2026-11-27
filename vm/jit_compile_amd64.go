@@ -188,7 +188,7 @@ func compileBaselineNative(bp *boundProto, fb *ir.Feedback) (*jitFunc, error) {
 	}
 	return &jitFunc{
 		proto:     bp.proto,
-		region:    reg,
+		code:      newJITCode(reg, entries),
 		pcEntries: entries,
 	}, nil
 }

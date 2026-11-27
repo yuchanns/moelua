@@ -141,8 +141,8 @@ func TestLabelErrorsAndForwardBackwardBranches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Finish failed: %v", err)
 	}
-	if got := mustWord(t, code, 0); got != (0xB4000000 | (3 << 5)) {
-		t.Fatalf("CBZ = 0x%08X, want 0x%08X", got, 0xB4000000|(3<<5))
+	if got := mustWord(t, code, 0); got != uint32(0xB4000000|(3<<5)) {
+		t.Fatalf("CBZ = 0x%08X, want 0x%08X", got, uint32(0xB4000000|(3<<5)))
 	}
 	neg1 := int32(-1)
 	wantBack := uint32(0xB5000000) | ((uint32(neg1) & 0x7FFFF) << 5)

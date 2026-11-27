@@ -44,6 +44,14 @@ runs:
       shell: bash
       run: go test -tags moeluafaithful -count=1 ./...
 
+    - name: Test (-tags moeluanojit)
+      shell: bash
+      run: go test -tags moeluanojit -count=1 . ./vm ./internal/jit/... ./cmd/moelua
+
+    - name: Test (-tags purego)
+      shell: bash
+      run: go test -tags purego -count=1 . ./vm ./internal/jit/... ./cmd/moelua
+
     - name: Test (-race)
       if: inputs.run-race == 'true' && runner.os != 'Windows'
       shell: bash
@@ -65,7 +73,7 @@ runs:
       working-directory: bench/compare
       run: |
         set -euo pipefail
-        go test -vet=off -timeout 5m -run TestOutputs -engines '^(C|MoeLua)$' .
+        go test -vet=off -timeout 5m -run TestOutputs -engines '^(C|MoeLua-JIT|MoeLua)$' .
         go build -o /dev/null benchreport.go
         go build -o /dev/null memcmp.go
         go build -o /dev/null genchart.go

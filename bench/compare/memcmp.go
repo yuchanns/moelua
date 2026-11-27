@@ -92,6 +92,17 @@ func allHarnesses() []vmHarness {
 			},
 		},
 		{
+			name: "MoeLua-JIT",
+			newIdle: func() (any, func()) {
+				s := moelua.New(moelua.WithJIT())
+				return s, s.Close
+			},
+			runInit: func(k any, code string) error {
+				_, err := k.(*moelua.State).DoString(code)
+				return err
+			},
+		},
+		{
 			name: "Apogee-noJIT",
 			newIdle: func() (any, func()) {
 				l := apogeelua.NewState(apogeelua.WithoutJIT())

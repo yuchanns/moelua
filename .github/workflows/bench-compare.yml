@@ -15,7 +15,7 @@ on:
       engines:
         description: "Engine regex (ArnodelGolua runs in its own PGO build automatically if matched)"
         required: false
-        default: "^(C|C-O3|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$"
+        default: "^(C|C-O3|MoeLua-JIT|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$"
       programs:
         description: "Optional program regex filter (empty = all 32 programs)"
         required: false
@@ -85,8 +85,8 @@ jobs:
           python3 - <<'PY'
           import os, subprocess
 
-          FULL_ENGINES = "^(C|C-O3|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$"
-          PR_ENGINES = "^(C|MoeLua)$"
+          FULL_ENGINES = "^(C|C-O3|MoeLua-JIT|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$"
+          PR_ENGINES = "^(C|MoeLua-JIT|MoeLua)$"
           FULL_LUA_TARGETS = "build/lua55_o2 build/lua55_o3 build/clua_mem"
           PR_LUA_TARGETS = "build/lua55_o2 build/clua_mem"
 

@@ -9,7 +9,6 @@ import (
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/internal/arena"
 	"github.com/yuchanns/moelua/internal/jit/call"
-	"github.com/yuchanns/moelua/internal/jit/ir"
 )
 
 // protoHasLoop reports whether p contains any numeric/generic loop or backward branch.
@@ -49,13 +48,12 @@ func (j *jitState) getOrCompileJIT(bp *boundProto) *jitFunc {
 	if h < jitCompileThreshold && !protoHasLoop(bp.proto) {
 		return nil
 	}
-	f, err := compileBaselineNative(bp, &ir.Feedback{EnableSIMD: !j.disableSIMD})
+	f, err := getOrCompileSharedTier1(bp, !j.disableSIMD)
 	if err != nil || f == nil || len(f.pcEntries) == 0 {
 		j.entries[idx] = jitEntrySkip
 		return nil
 	}
 	f.tier = 1
-	f.hasFeedbackQ = protoNeedsFeedback(bp.proto)
 	j.funcs[idx] = f
 	j.entries[idx] = f.pcEntries[0]
 	j.pcTables[idx] = uintptr(unsafe.Pointer(&f.pcEntries[0]))

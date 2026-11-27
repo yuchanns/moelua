@@ -28,9 +28,9 @@ const refEngine = "C"
 
 var (
 	// The engines in the order of the columns. refEngine ("C") is always the ratio baseline.
-	engines = []string{"C", "C-O3", "MoeLua", "Apogee-JIT", "Apogee-Interp", "CCGO", "ArnodelGolua", "GopherLua", "GoLua", "DCLua", "LuaJIT-joff", "LuaJIT"}
+	engines = []string{"C", "C-O3", "MoeLua-JIT", "MoeLua", "Apogee-JIT", "Apogee-Interp", "CCGO", "ArnodelGolua", "GopherLua", "GoLua", "DCLua", "LuaJIT-joff", "LuaJIT"}
 	// The column titles of the engines whose benchmark names say less.
-	titles = map[string]string{"GoLua": "go-lua", "ArnodelGolua": "golua", "Apogee-Interp": "Apogee-noJIT"}
+	titles = map[string]string{"GoLua": "go-lua", "ArnodelGolua": "golua", "Apogee-Interp": "Apogee-noJIT", "MoeLua": "MoeLua-noJIT"}
 	suites = []struct{ name, title string }{
 		{"awfy", "are-we-fast-yet"},
 		{"game", "Benchmarks Game"},

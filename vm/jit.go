@@ -3,6 +3,7 @@ package vm
 import (
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/internal/jit/execmem"
@@ -57,13 +58,52 @@ func JITSupported() bool {
 	return jitLayoutSupported && execmem.Supported()
 }
 
-// jitFunc owns the sealed executable code region and per-bytecode-PC native entry table
-// for one compiled *bytecode.Proto.
+// jitCode owns one sealed RX executable code region and its per-PC native entry table.
+// Tier-1 compiled code is state-independent and reference-counted across States via the
+// shared code cache; Tier-2 code holds State-specific feedback (ShapeRefs/ProtoIdxs) and
+// is owned exclusively by one State (refs == 1).
+type jitCode struct {
+	region    *execmem.Region
+	pcEntries []uintptr
+	refs      atomic.Int32
+}
+
+func newJITCode(reg *execmem.Region, entries []uintptr) *jitCode {
+	c := &jitCode{
+		region:    reg,
+		pcEntries: entries,
+	}
+	c.refs.Store(1)
+	return c
+}
+
+func (c *jitCode) retain() *jitCode {
+	if c == nil {
+		return nil
+	}
+	c.refs.Add(1)
+	return c
+}
+
+func (c *jitCode) release() {
+	if c == nil {
+		return
+	}
+	if c.refs.Add(-1) == 0 {
+		if c.region != nil {
+			c.region.Free()
+			c.region = nil
+		}
+		c.pcEntries = nil
+	}
+}
+
+// jitFunc binds a compiled jitCode to one State's protoIdx slot.
 type jitFunc struct {
 	proto        *bytecode.Proto
-	region       *execmem.Region
-	pcEntries    []uintptr // len == len(proto.Code); pcEntries[pc] is the native resume address
-	tier         uint8     // 1 = baseline + static SSA loops; 2 = recompiled with live IC/callee feedback
+	code         *jitCode
+	pcEntries    []uintptr // len == len(proto.Code); direct immutable view of code.pcEntries
+	tier         uint8     // 1 = baseline + static SSA loops (shareable); 2 = State-specific feedback
 	hasFeedbackQ bool      // true when proto contains loops with GETFIELD/SETFIELD/CALL that benefit from Tier-2 feedback
 }
 
@@ -71,9 +111,9 @@ func (f *jitFunc) free() {
 	if f == nil {
 		return
 	}
-	if f.region != nil {
-		f.region.Free()
-		f.region = nil
+	if f.code != nil {
+		f.code.release()
+		f.code = nil
 	}
 	f.pcEntries = nil
 	f.proto = nil

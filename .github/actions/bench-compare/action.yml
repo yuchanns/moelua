@@ -5,7 +5,7 @@ inputs:
   engines:
     description: Engine regex for CPU benchmarks
     required: false
-    default: "^(C|MoeLua)$"
+    default: "^(C|MoeLua-JIT|MoeLua)$"
   mem-engines:
     description: Optional engine regex for memcmp.go (empty = all engines)
     required: false
@@ -47,10 +47,10 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Verify 32/32 output equivalence (C vs MoeLua)
+    - name: Verify 32/32 output equivalence (C vs MoeLua & MoeLua-JIT)
       shell: bash
       working-directory: bench/compare
-      run: go test -vet=off -timeout 10m -run TestOutputs -engines '^(C|MoeLua)$' .
+      run: go test -vet=off -timeout 10m -run TestOutputs -engines '^(C|MoeLua-JIT|MoeLua)$' .
 
     - name: Run high-density multi-VM memory & Go GC comparison
       if: inputs.run-memcmp == 'true'
@@ -82,7 +82,7 @@ runs:
         MAIN_ENGINES="$(python3 -c '
         import os, re
         pat = re.compile(os.environ["INPUT_ENGINES"])
-        names = ["C", "C-O3", "MoeLua", "Apogee-JIT", "Apogee-Interp", "CCGO", "GopherLua", "GoLua", "DCLua", "LuaJIT-joff", "LuaJIT"]
+        names = ["C", "C-O3", "MoeLua-JIT", "MoeLua", "Apogee-JIT", "Apogee-Interp", "CCGO", "GopherLua", "GoLua", "DCLua", "LuaJIT-joff", "LuaJIT"]
         picked = [n for n in names if pat.search(n)]
         print("^(" + "|".join(re.escape(n) for n in picked) + ")$" if picked else "")
         ')"
