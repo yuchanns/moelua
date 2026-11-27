@@ -566,6 +566,7 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 		isDashed bool
 	}{
 		"C":              {"C Lua 5.5.1 (ref)", "C Lua", "ref", false, false},
+		"LuaJIT":         {"LuaJIT 2.1 (ref)", "LuaJIT", "ref", false, false},
 		"MoeLua-JIT":     {"MoeLua 5.5 (JIT)", "MoeLua 5.5 (JIT)", "moe-jit", true, false},
 		"MoeLua":         {"MoeLua 5.5 (noJIT)", "MoeLua 5.5 (noJIT)", "moe", true, false},
 		"CCGO":           {"modernc/lua (mmap)", "modernc/lua", "other", true, true},
@@ -645,7 +646,7 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 		if r.HasRSS && last.ActiveRSSKiB > 0 {
 			memVal = last.ActiveRSSKiB
 		} else if meta.kind == "ref" {
-			// Skip C reference bar on platforms without OS RSS measurement (e.g. Windows).
+			// Skip native reference bars on platforms without OS RSS measurement (e.g. Windows).
 			continue
 		}
 		note := formatMemSize(memVal)
@@ -703,7 +704,7 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 		rX0        = 648.0
 		rPlotW     = 200.0
 		plotTop    = 112.0
-		plotBottom = 376.0
+		plotBottom = 396.0
 		barH       = 15.0
 	)
 	lPlotH := plotBottom - plotTop
@@ -726,7 +727,7 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, `<svg xmlns="http://www.w3.org/2000/svg" width="960" height="450" viewBox="0 0 960 450" role="img" aria-label="MoeLua 5.5 high-density multi-VM scalability: Go GC pause from %d to %d active VMs and per-VM memory and cold start">
+	fmt.Fprintf(&sb, `<svg xmlns="http://www.w3.org/2000/svg" width="960" height="470" viewBox="0 0 960 470" role="img" aria-label="MoeLua 5.5 high-density multi-VM scalability: Go GC pause from %d to %d active VMs and per-VM memory and cold start">
   <defs>
     <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
       <rect width="6" height="6" fill="#e2e8f0"/>
@@ -735,18 +736,18 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 %s
   </defs>
 
-  <rect x="0.5" y="0.5" width="959" height="449" rx="10" class="bg"/>
-  <rect x="0.5" y="0.5" width="959" height="449" rx="10" class="border"/>
+  <rect x="0.5" y="0.5" width="959" height="469" rx="10" class="bg"/>
+  <rect x="0.5" y="0.5" width="959" height="469" rx="10" class="border"/>
 
   <!-- Header -->
-  <text x="24" y="30" class="title">High-Density Active Multi-VM Scalability (%d to %d Active VMs)</text>
+  <text x="24" y="30" class="title">High-Density Active Multi-VM Scalability (%d to %s Active VMs)</text>
   <text x="24" y="48" class="subtitle">%s</text>
-`, minVMs, maxVMs, commonCSS, minVMs, maxVMs, html.EscapeString(subtitle))
+`, minVMs, maxVMs, commonCSS, minVMs, formatIntComma(maxVMs), html.EscapeString(subtitle))
 	writeBadge(&sb, badge)
 
 	fmt.Fprintf(&sb, `
   <!-- Divider -->
-  <line x1="490" y1="68" x2="490" y2="404" stroke="#e2e8f0" stroke-width="1"/>
+  <line x1="490" y1="68" x2="490" y2="424" stroke="#e2e8f0" stroke-width="1"/>
 
   <!-- LEFT PANEL: GC Scaling Line Chart -->
   <text x="24" y="78" class="panel-title">Go GC Pause Scaling by Active VM Count</text>
@@ -773,9 +774,9 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 	for _, vt := range xTicks {
 		xx := xOf(vt)
 		fmt.Fprintf(&sb, "  <line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" class=\"grid\"/>\n", xx, plotTop, xx, plotBottom)
-		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"393\" class=\"tick\">%d</text>\n", xx, vt)
+		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"413\" class=\"tick\">%d</text>\n", xx, vt)
 	}
-	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"406\" class=\"tick\" style=\"fill:#94a3b8\">active VMs</text>\n", lX0+lPlotW/2)
+	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"426\" class=\"tick\" style=\"fill:#94a3b8\">active VMs</text>\n", lX0+lPlotW/2)
 
 	// Draw non-MoeLua curves first, MoeLua last on top.
 	isMoeCurve := func(c *curveSpec) bool { return c.kind == "moe" || c.kind == "moe-jit" }
@@ -832,13 +833,13 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 	// Right Panel: Active OS RSS/VM + NewState cold start
 	fmt.Fprintf(&sb, `
   <!-- RIGHT PANEL: Active Memory & Cold Start -->
-  <text x="512" y="78" class="panel-title">Active Memory &amp; Cold Start (%d Active VMs)</text>
+  <text x="512" y="78" class="panel-title">Active Memory &amp; Cold Start (%s Active VMs)</text>
   <text x="512" y="94" class="panel-sub">Active %s (2,047 tables/VM) · NewState init latency · lower is better</text>
 
-`, maxVMs, memKindTitle)
+`, formatIntComma(maxVMs), memKindTitle)
 
 	fmt.Fprintf(&sb, "  <line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" class=\"axis\"/>\n", rX0, plotTop, rX0, plotBottom)
-	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"393\" class=\"tick\">0</text>\n", rX0)
+	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"413\" class=\"tick\">0</text>\n", rX0)
 	for tick := memStep; tick <= memAxisMax+1e-6; tick += memStep {
 		x := rX0 + (tick/memAxisMax)*rPlotW
 		fmt.Fprintf(&sb, "  <line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" class=\"grid\"/>\n", x, plotTop, x, plotBottom)
@@ -852,7 +853,7 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 		} else {
 			tLbl = fmt.Sprintf("%.0fK", tick)
 		}
-		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"393\" class=\"tick\">%s</text>\n", x, tLbl)
+		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"413\" class=\"tick\">%s</text>\n", x, tLbl)
 	}
 
 	rightRowH := (plotBottom - plotTop - 10) / float64(max(len(rightRows), 1))
@@ -889,8 +890,8 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 
 	fmt.Fprintf(&sb, `
   <!-- Footer notes -->
-  <text x="24" y="424" class="foot">%s</text>
-  <text x="24" y="440" class="foot">%s</text>
+  <text x="24" y="444" class="foot">%s</text>
+  <text x="24" y="460" class="foot">%s</text>
 </svg>
 `, html.EscapeString(leftFoot), html.EscapeString(rightFoot))
 
