@@ -595,21 +595,23 @@ func skipped(engine, program string) string {
 	return why
 }
 
-func moeLua(b *testing.B, src string, n int) (string, error) {
-	s := moelua.New()
-	defer s.Close()
-	s.SetGlobal("N", moelua.Int(int64(n)))
-	if b != nil {
-		b.ResetTimer()
+func moeLuaRun(opts ...moelua.Option) func(b *testing.B, src string, n int) (string, error) {
+	return func(b *testing.B, src string, n int) (string, error) {
+		s := moelua.New(opts...)
+		defer s.Close()
+		s.SetGlobal("N", moelua.Int(int64(n)))
+		if b != nil {
+			b.ResetTimer()
+		}
+		rets, err := s.DoString(src)
+		if err != nil {
+			return "", err
+		}
+		if len(rets) == 0 {
+			return "", nil
+		}
+		return s.FormatValue(rets[0]), nil
 	}
-	rets, err := s.DoString(src)
-	if err != nil {
-		return "", err
-	}
-	if len(rets) == 0 {
-		return "", nil
-	}
-	return s.FormatValue(rets[0]), nil
 }
 
 func apogeeRun(opts ...apogeelua.Option) func(b *testing.B, src string, n int) (string, error) {
@@ -637,7 +639,8 @@ func engines() []engine {
 	return slices.DeleteFunc([]engine{
 		{"C", process(*oLua)},
 		{"C-O3", process(*oLuaO3)},
-		{"MoeLua", moeLua},
+		{"MoeLua-JIT", moeLuaRun(moelua.WithJIT())},
+		{"MoeLua", moeLuaRun()},
 		{"Apogee-JIT", apogeeRun()},
 		{"Apogee-Interp", apogeeRun(apogeelua.WithoutJIT())},
 		{"CCGO", ccgo},

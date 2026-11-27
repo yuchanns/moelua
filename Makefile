@@ -69,6 +69,8 @@ test:
 	go test -tags moeluaregcheck -count=1 ./...
 	go test -tags moeluafloatnil -count=1 ./...
 	go test -tags moeluafaithful -count=1 ./...
+	go test -tags moeluanojit -count=1 . ./vm ./internal/jit/... ./cmd/moelua
+	go test -tags purego -count=1 . ./vm ./internal/jit/... ./cmd/moelua
 	go test -race -count=1 ./...
 
 bench: tools
@@ -80,12 +82,12 @@ bench-pgo: tools pgo
 	./$(BUILD_DIR)/benchcmp_pgo -rounds 10 -gomaxprocs 1 -lua-o3 $(BUILD_DIR)/lua55_o3_m1
 
 test-compare: $(BUILD_DIR)/lua55_o2
-	cd bench/compare && go test -vet=off -timeout 5m -run TestOutputs -engines '^(C|MoeLua)$$' .
+	cd bench/compare && go test -vet=off -timeout 5m -run TestOutputs -engines '^(C|MoeLua-JIT|MoeLua)$$' .
 
 bench-compare: $(BUILD_DIR)/lua55_o2 $(BUILD_DIR)/lua55_o3
 	cd bench/compare && GOLUA_DIR="$$(go list -m -f '{{.Dir}}' github.com/arnodel/golua)" && \
 		( GOMAXPROCS=1 go test -vet=off -timeout 60m -run @ -bench . -benchtime 300ms -count 3 \
-			-engines '^(C|C-O3|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|GopherLua|GoLua|DCLua)$$' . && \
+			-engines '^(C|C-O3|MoeLua-JIT|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|GopherLua|GoLua|DCLua)$$' . && \
 		  GOMAXPROCS=1 go test -vet=off -timeout 30m -pgo="$$GOLUA_DIR/default.pgo" -run @ -bench . -benchtime 300ms -count 3 \
 			-engines '^ArnodelGolua$$' . ) | go run benchreport.go
 

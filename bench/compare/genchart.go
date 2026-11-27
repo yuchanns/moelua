@@ -136,6 +136,7 @@ const commonCSS = `    <style>
       .tick { font: 400 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #64748b; text-anchor: middle; }
       .tick-y { font: 400 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #64748b; text-anchor: end; }
       .foot { font: 400 10.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #64748b; }
+      .bar-moe-jit { fill: #059669; }
       .bar-moe { fill: #10b981; }
       .bar-other { fill: #64748b; }
       .bar-ref { fill: url(#hatch); stroke: #94a3b8; stroke-width: 1; }
@@ -152,6 +153,7 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 	}{
 		"C-O3":          {"C Lua 5.5.1 -O3 (ref)", "ref"},
 		"C":             {"C Lua 5.5.1 -O2 (ref)", "ref"},
+		"MoeLua-JIT":    {"MoeLua 5.5 (JIT)", "moe-jit"},
 		"Apogee-JIT":    {"Apogee v1.2.1 (JIT)", "other"},
 		"MoeLua":        {"MoeLua 5.5 (noJIT)", "moe"},
 		"Apogee-Interp": {"Apogee v1.2.1 (noJIT)", "other"},
@@ -179,7 +181,8 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		label string
 		kind  string
 	}{
-		"MoeLua":         {"MoeLua 5.5 (Arena)", "moe"},
+		"MoeLua-JIT":     {"MoeLua 5.5 (JIT)", "moe-jit"},
+		"MoeLua":         {"MoeLua 5.5 (noJIT)", "moe"},
 		"CCGO":           {"modernc/lua (mmap)", "other"},
 		"arnodel/golua":  {"arnodel/golua", "other"},
 		"Apogee-JIT":     {"Apogee v1.2.1 (JIT)", "other"},
@@ -274,7 +277,7 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		rightPlotW = 210.0
 		plotTop    = 108.0
 		plotBottom = 378.0
-		barH       = 17.0
+		barH       = 15.0
 	)
 
 	var sb strings.Builder
@@ -330,18 +333,18 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		w := max((r.val/leftAxisMax)*leftPlotW, 2.0)
 		lblCls := "label"
 		valCls := "val"
-		if r.kind == "moe" {
+		if r.kind == "moe" || r.kind == "moe-jit" {
 			lblCls = "label-hi"
 			valCls = "val-hi"
 		}
-		barCls := map[string]string{"moe": "bar-moe", "ref": "bar-ref", "other": "bar-other"}[r.kind]
-		fmt.Fprintf(&sb, "  <text x=\"157\" y=\"%.1f\" class=\"%s\">%s</text>\n", y+13, lblCls, html.EscapeString(r.label))
+		barCls := map[string]string{"moe-jit": "bar-moe-jit", "moe": "bar-moe", "ref": "bar-ref", "other": "bar-other"}[r.kind]
+		fmt.Fprintf(&sb, "  <text x=\"157\" y=\"%.1f\" class=\"%s\">%s</text>\n", y+12, lblCls, html.EscapeString(r.label))
 		fmt.Fprintf(&sb, "  <rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" rx=\"3\" class=\"%s\"/>\n", leftX0, y, w, barH, barCls)
 		valX := leftX0 + w + 6
 		if leftX0+w < refX+2 && valX < refX+5 {
 			valX = refX + 5
 		}
-		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"%s\">%.2fx</text>\n", valX, y+13, valCls, r.val)
+		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"%s\">%.2fx</text>\n", valX, y+12, valCls, r.val)
 		y += leftRowH
 	}
 
@@ -369,18 +372,18 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		w := max((r.val/rightAxisMax)*rightPlotW, 3.0)
 		lblCls := "label"
 		valCls := "val"
-		if r.kind == "moe" {
+		if r.kind == "moe" || r.kind == "moe-jit" {
 			lblCls = "label-hi"
 			valCls = "val-hi"
 		}
-		barCls := map[string]string{"moe": "bar-moe", "ref": "bar-ref", "other": "bar-other"}[r.kind]
-		fmt.Fprintf(&sb, "  <text x=\"640\" y=\"%.1f\" class=\"%s\">%s</text>\n", y+13, lblCls, html.EscapeString(r.label))
+		barCls := map[string]string{"moe-jit": "bar-moe-jit", "moe": "bar-moe", "ref": "bar-ref", "other": "bar-other"}[r.kind]
+		fmt.Fprintf(&sb, "  <text x=\"640\" y=\"%.1f\" class=\"%s\">%s</text>\n", y+12, lblCls, html.EscapeString(r.label))
 		fmt.Fprintf(&sb, "  <rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" rx=\"3\" class=\"%s\"/>\n", rightX0, y, w, barH, barCls)
 		estTextW := float64(len(r.note)) * 7.0
 		if rightX0+w+6+estTextW > svgW-14 && w > estTextW+12 {
-			fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"val\" style=\"fill:#ffffff;text-anchor:end\">%s</text>\n", rightX0+w-6, y+13, html.EscapeString(r.note))
+			fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"val\" style=\"fill:#ffffff;text-anchor:end\">%s</text>\n", rightX0+w-6, y+12, html.EscapeString(r.note))
 		} else {
-			fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"%s\">%s</text>\n", rightX0+w+6, y+13, valCls, html.EscapeString(r.note))
+			fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"%s\">%s</text>\n", rightX0+w+6, y+12, valCls, html.EscapeString(r.note))
 		}
 		y += rightRowH
 	}
@@ -416,7 +419,7 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 type curveSpec struct {
 	engine   string
 	shortLbl string
-	isMoe    bool
+	kind     string // "moe-jit", "moe", "other"
 	isDashed bool
 	points   []scalePoint
 	endY     float64
@@ -472,7 +475,8 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 		isDashed bool
 	}{
 		"C":              {"C Lua 5.5.1 (ref)", "C Lua", "ref", false, false},
-		"MoeLua":         {"MoeLua 5.5 (Arena)", "MoeLua", "moe", true, false},
+		"MoeLua-JIT":     {"MoeLua 5.5 (JIT)", "MoeLua 5.5 (JIT)", "moe-jit", true, false},
+		"MoeLua":         {"MoeLua 5.5 (noJIT)", "MoeLua 5.5 (noJIT)", "moe", true, false},
 		"CCGO":           {"modernc/lua (mmap)", "modernc/lua", "other", true, true},
 		"arnodel/golua":  {"arnodel/golua", "golua", "other", true, false},
 		"Apogee-JIT":     {"Apogee v1.2.1 (JIT)", "Apogee JIT", "other", true, false},
@@ -521,7 +525,7 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 			curves = append(curves, &curveSpec{
 				engine:   r.Engine,
 				shortLbl: meta.shortLbl,
-				isMoe:    meta.kind == "moe",
+				kind:     meta.kind,
 				isDashed: meta.isDashed,
 				points:   pts,
 				endMs:    last.ActiveGCMs,
@@ -604,12 +608,12 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 	const (
 		svgW       = 960.0
 		lX0        = 64.0
-		lPlotW     = 264.0
+		lPlotW     = 244.0
 		rX0        = 648.0
 		rPlotW     = 200.0
 		plotTop    = 112.0
 		plotBottom = 376.0
-		barH       = 17.0
+		barH       = 15.0
 	)
 	lPlotH := plotBottom - plotTop
 
@@ -683,6 +687,7 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"406\" class=\"tick\" style=\"fill:#94a3b8\">active VMs</text>\n", lX0+lPlotW/2)
 
 	// Draw non-MoeLua curves first, MoeLua last on top.
+	isMoeCurve := func(c *curveSpec) bool { return c.kind == "moe" || c.kind == "moe-jit" }
 	drawCurve := func(c *curveSpec) {
 		var pts []string
 		for _, pt := range c.points {
@@ -695,10 +700,14 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 		if c.isDashed {
 			dash = ` stroke-dasharray="4 3"`
 		}
-		if c.isMoe {
-			stroke = "#10b981"
+		if c.kind == "moe-jit" {
+			stroke = "#059669"
 			sw = 3.0
 			rDot = 3.6
+		} else if c.kind == "moe" {
+			stroke = "#10b981"
+			sw = 2.6
+			rDot = 3.2
 		}
 		fmt.Fprintf(&sb, "  <polyline fill=\"none\" stroke=\"%s\" stroke-width=\"%.1f\"%s stroke-linecap=\"round\" stroke-linejoin=\"round\" points=\"%s\"/>\n",
 			stroke, sw, dash, strings.Join(pts, " "))
@@ -712,19 +721,19 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 				endX+2, c.endY, endX+6, c.labelY, lblX-2, c.labelY)
 		}
 		cls := "end-lbl"
-		if c.isMoe {
+		if isMoeCurve(c) {
 			cls = "end-lbl-hi"
 		}
 		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"%s\">%s (%s)</text>\n",
 			lblX, c.labelY+3.5, cls, html.EscapeString(c.shortLbl), formatMsShort(c.endMs))
 	}
 	for _, c := range curves {
-		if !c.isMoe {
+		if !isMoeCurve(c) {
 			drawCurve(c)
 		}
 	}
 	for _, c := range curves {
-		if c.isMoe {
+		if isMoeCurve(c) {
 			drawCurve(c)
 		}
 	}
@@ -764,18 +773,18 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 		w := max((r.val/memAxisMax)*rPlotW, 3.0)
 		lblCls := "label"
 		valCls := "val"
-		if r.kind == "moe" {
+		if r.kind == "moe" || r.kind == "moe-jit" {
 			lblCls = "label-hi"
 			valCls = "val-hi"
 		}
-		barCls := map[string]string{"moe": "bar-moe", "ref": "bar-ref", "other": "bar-other"}[r.kind]
-		fmt.Fprintf(&sb, "  <text x=\"640\" y=\"%.1f\" class=\"%s\">%s</text>\n", y+13, lblCls, html.EscapeString(r.label))
+		barCls := map[string]string{"moe-jit": "bar-moe-jit", "moe": "bar-moe", "ref": "bar-ref", "other": "bar-other"}[r.kind]
+		fmt.Fprintf(&sb, "  <text x=\"640\" y=\"%.1f\" class=\"%s\">%s</text>\n", y+12, lblCls, html.EscapeString(r.label))
 		fmt.Fprintf(&sb, "  <rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" rx=\"3\" class=\"%s\"/>\n", rX0, y, w, barH, barCls)
 		estTextW := float64(len([]rune(r.note))) * 7.0
 		if rX0+w+6+estTextW > svgW-14 && w > estTextW+12 {
-			fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"val\" style=\"fill:#ffffff;text-anchor:end\">%s</text>\n", rX0+w-6, y+13, html.EscapeString(r.note))
+			fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"val\" style=\"fill:#ffffff;text-anchor:end\">%s</text>\n", rX0+w-6, y+12, html.EscapeString(r.note))
 		} else {
-			fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"%s\">%s</text>\n", rX0+w+6, y+13, valCls, html.EscapeString(r.note))
+			fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"%.1f\" class=\"%s\">%s</text>\n", rX0+w+6, y+12, valCls, html.EscapeString(r.note))
 		}
 		y += rightRowH
 	}
