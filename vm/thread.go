@@ -156,8 +156,10 @@ type Thread struct {
 	closing            bool // true while coroutine.close(co) is actively closing TBC vars on co
 	nextFrameFinalizer bool // consumed by next pushLuaFrame to tag __gc finalizer frame (CIST_FIN)
 
-	// Tier 1 GC mark field.
-	gcMark uint64
+	// Thin Arena GC stub handle (bridges Go-heap Thread into arena.Collector until Step 5d).
+	self     arena.ObjRef
+	memBytes int64
+	inTwups  bool
 }
 
 // Hook mask bits matching Lua 5.5 lua.h.
@@ -187,6 +189,10 @@ func newThread(s *State, stackCap int) *Thread {
 		hook:   NilValue(),
 	}
 	fillNil(th.stack)
+	if s != nil {
+		s.allocThreadStub(th)
+		s.addThreadMem(th, threadInitMemBytes(stackCap, defaultFrameCap))
+	}
 	return th
 }
 
@@ -220,9 +226,9 @@ func (th *Thread) ensureFrameCap(_ *State, need, limit int) error {
 	if newCap > limit {
 		newCap = limit
 	}
-	if th.state != nil && (th.state.memLimit > 0 || th.state.gc.tier1) {
-		delta := int64(newCap-len(th.frames)) * int64(unsafe.Sizeof(callFrame{}))
-		if err := th.state.checkMemAndAccountWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
+	delta := int64(newCap-len(th.frames)) * int64(unsafe.Sizeof(callFrame{}))
+	if th.state != nil && th.state.memLimit > 0 {
+		if err := th.state.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
 			return err
 		}
 	}
@@ -230,6 +236,9 @@ func (th *Thread) ensureFrameCap(_ *State, need, limit int) error {
 	nf := make([]callFrame, newCap)
 	copy(nf, old)
 	th.frames = nf
+	if th.state != nil {
+		th.state.addThreadMem(th, delta)
+	}
 	if th.initFrames != nil && len(old) > 0 && unsafe.SliceData(old) == unsafe.SliceData(th.initFrames) {
 		if th.nframe == 0 {
 			clear(th.initFrames)
@@ -262,8 +271,8 @@ func (th *Thread) ensureStack(_ *State, need int) error {
 		newSize = limit
 	}
 	delta := int64(newSize-len(th.stack)) * 16
-	if th.state != nil && (th.state.memLimit > 0 || th.state.gc.tier1) {
-		if err := th.state.checkMemAndAccountWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
+	if th.state != nil && th.state.memLimit > 0 {
+		if err := th.state.checkMemWithRoots(delta, ThreadValue(th), NilValue(), NilValue()); err != nil {
 			return err
 		}
 	}
@@ -274,6 +283,9 @@ func (th *Thread) ensureStack(_ *State, need int) error {
 	th.stack = ns
 	th.highStack = len(ns)
 	th.stackGen++
+	if th.state != nil {
+		th.state.addThreadMem(th, delta)
+	}
 	if th.initStack != nil && len(old) > 0 && unsafe.SliceData(old) == unsafe.SliceData(th.initStack) {
 		if th.nativeArgsDepth == 0 {
 			clear(th.initStack)
@@ -328,98 +340,63 @@ func (th *Thread) window(base int) *[256]Value {
 	return (*[256]Value)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(th.stack)), base*int(unsafe.Sizeof(Value{}))))
 }
 
-func (th *Thread) findOrCreateUpval(stackIdx int) *Upvalue {
+func (th *Thread) findOrCreateUpval(s *State, stackIdx int) *Upvalue {
+	if s == nil {
+		s = th.state
+	}
 	n := len(th.openUpvals)
 	i := n
-	for i > 0 && th.openUpvals[i-1].stackIdx > stackIdx {
+	for i > 0 && int(th.openUpvals[i-1].stackIdx) > stackIdx {
 		i--
 	}
-	if i > 0 && th.openUpvals[i-1].stackIdx == stackIdx {
+	if i > 0 && int(th.openUpvals[i-1].stackIdx) == stackIdx {
 		return th.openUpvals[i-1]
 	}
-	uv := &Upvalue{owner: th, stackIdx: stackIdx}
+	uv, err := s.allocOpenUpval(th, stackIdx)
+	if err != nil {
+		return nil
+	}
 	th.openUpvals = append(th.openUpvals, nil)
 	copy(th.openUpvals[i+1:], th.openUpvals[i:n])
 	th.openUpvals[i] = uv
+	if !th.inTwups {
+		th.inTwups = true
+		s.twups = append(s.twups, th.self)
+	}
 	return uv
 }
 
-func (th *Thread) closeUpvals(_ *State, level int) {
+func closeUpvalObj(s *State, uv *Upvalue, val Value) {
+	uv.closed = val
+	uv.ownerRef = arena.NullRef
+	if s != nil && s.collector != nil && val.IsGCObject() && uv.hdr.IsBlack() {
+		s.collector.Barrier(uv.self, val.Ref())
+	}
+}
+
+func (th *Thread) closeUpvals(s *State, level int) {
+	if s == nil {
+		s = th.state
+	}
 	n := len(th.openUpvals)
-	for n > 0 && th.openUpvals[n-1].stackIdx >= level {
+	for n > 0 && int(th.openUpvals[n-1].stackIdx) >= level {
 		n--
 		uv := th.openUpvals[n]
 		th.openUpvals[n] = nil
-		if uv.owner == th {
-			uv.closed = th.stack[uv.stackIdx]
-			uv.owner = nil
+		if uv.ownerRef == th.self {
+			closeUpvalObj(s, uv, th.stack[uv.stackIdx])
 		}
 	}
 	th.openUpvals = th.openUpvals[:n]
 }
 
-// detachOpenUpvals snapshots open upvalues into uv.closed, clears uv.owner = nil, and
-// nils the shadowed stack slot while keeping th.openUpvals intact. Breaking strong
-// uv -> Thread edges (with no sibling uv.next pointers) while a coroutine is suspended
-// or errored lets Go's Tier 0 GC reclaim unreachable coroutines and unrelated locals,
-// arguments, and sibling upvalues even if escaped closures survive.
-func (th *Thread) detachOpenUpvals() {
-	for _, uv := range th.openUpvals {
-		if uv.owner == th {
-			uv.closed = th.stack[uv.stackIdx]
-			th.stack[uv.stackIdx] = NilValue()
-			uv.owner = nil
-		}
-	}
-}
-
-// attachOpenUpvals re-attaches detached open upvalues back to th.stack when a suspended
-// coroutine resumes (or before closing TBC vars), syncing any mutations written to
-// uv.closed while suspended.
-func (th *Thread) attachOpenUpvals() {
-	for _, uv := range th.openUpvals {
-		if uv.owner == nil {
-			th.stack[uv.stackIdx] = uv.closed
-			uv.closed = NilValue()
-			uv.owner = th
-		}
-	}
-}
-
-// localSlotValue reads th.stack[slot], transparently consulting detached open upvalues
-// on suspended or errored coroutines.
+// localSlotValue reads th.stack[slot].
 func (th *Thread) localSlotValue(_ *State, slot int) Value {
-	for i := len(th.openUpvals) - 1; i >= 0; i-- {
-		uv := th.openUpvals[i]
-		if uv.stackIdx < slot {
-			break
-		}
-		if uv.stackIdx == slot {
-			if uv.owner == nil {
-				return uv.closed
-			}
-			break
-		}
-	}
 	return th.stack[slot]
 }
 
-// setLocalSlotValue writes val to th.stack[slot], updating detached open upvalues on
-// suspended or errored coroutines so live escaped closures observe debug.setlocal writes.
+// setLocalSlotValue writes val to th.stack[slot].
 func (th *Thread) setLocalSlotValue(_ *State, slot int, val Value) {
-	for i := len(th.openUpvals) - 1; i >= 0; i-- {
-		uv := th.openUpvals[i]
-		if uv.stackIdx < slot {
-			break
-		}
-		if uv.stackIdx == slot {
-			if uv.owner == nil {
-				uv.closed = val
-				return
-			}
-			break
-		}
-	}
 	th.stack[slot] = val
 }
 
@@ -465,31 +442,26 @@ func (th *Thread) closeAllSync(s *State, level int, errVal Value, hasErr bool) (
 	if s == nil {
 		s = th.state
 	}
-	// Restore any detached open upvalues back onto th.stack before closing so TBC <close>
-	// variables that were also captured by escaped closures remain present in th.stack[idx].
-	th.attachOpenUpvals()
 	th.closeUpvals(s, level)
 	raised := false
-	prevCur := th.state.curThread
+	prevCur := s.cur()
 	var prevStatus ThreadStatus
 	var prevCurRef int
 	if prevCur != nil && prevCur != th {
 		prevStatus = prevCur.status
 		prevCur.status = ThreadNormal
-		// Pin the calling coroutine across synchronous closing on another thread so
-		// GC triggered inside __close cannot collect live values on prevCur's stack.
-		prevCurRef = th.state.Ref(ThreadValue(prevCur))
+		prevCurRef = s.Ref(ThreadValue(prevCur))
 	}
-	th.state.curThread = th
+	s.setCur(th)
 	errSlot := len(th.syncCloseErrs)
 	th.syncCloseErrs = append(th.syncCloseErrs, errVal)
 	defer func() {
 		th.syncCloseErrs[errSlot] = NilValue()
 		th.syncCloseErrs = th.syncCloseErrs[:errSlot]
-		th.state.curThread = prevCur
+		s.setCur(prevCur)
 		if prevCur != nil && prevCur != th {
 			prevCur.status = prevStatus
-			th.state.Unref(prevCurRef)
+			s.Unref(prevCurRef)
 		}
 	}()
 	for len(th.tbc) > 0 && th.tbc[len(th.tbc)-1] >= level {
@@ -561,7 +533,7 @@ func (th *Thread) pushLuaFrame(s *State, cl *Closure, funcIdx, nargs, nresults i
 	if err := th.ensureFrameCap(s, th.nframe+1, limit); err != nil {
 		return err
 	}
-	p := cl.bp.proto
+	p := s.boundProtoOf(cl).proto
 	nparams := int(p.NumParams)
 	base := funcIdx + 1
 
@@ -663,7 +635,10 @@ func (th *Thread) clearDeadRefs(_ *State) {
 // unused frame entries on an errored dead coroutine while keeping live frames, locals,
 // and TBC variables intact for debug.traceback(co), debug.getlocal(co, ...), and
 // deferred coroutine.close(co).
-func (th *Thread) clearUnusedRefs(_ *State) {
+func (th *Thread) clearUnusedRefs(s *State) {
+	if s == nil {
+		s = th.state
+	}
 	if th.nframe < len(th.frames) {
 		clear(th.frames[th.nframe:])
 	}
@@ -671,7 +646,7 @@ func (th *Thread) clearUnusedRefs(_ *State) {
 	for i := range th.nframe {
 		cf := &th.frames[i]
 		if cf.kind == frameLua && cf.cl != nil {
-			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > liveTop {
+			if end := cf.base + int(s.boundProtoOf(cf.cl).maxStack); end > liveTop {
 				liveTop = end
 			}
 		}
@@ -681,15 +656,14 @@ func (th *Thread) clearUnusedRefs(_ *State) {
 			liveTop = idx + 1
 		}
 	}
-	if n := len(th.openUpvals); n > 0 && th.openUpvals[n-1].stackIdx+1 > liveTop {
-		liveTop = th.openUpvals[n-1].stackIdx + 1
+	if n := len(th.openUpvals); n > 0 && int(th.openUpvals[n-1].stackIdx)+1 > liveTop {
+		liveTop = int(th.openUpvals[n-1].stackIdx) + 1
 	}
 	if liveTop < len(th.stack) {
 		fillNil(th.stack[liveTop:])
 	}
 	th.highStack = liveTop
 	th.highFrames = th.nframe
-	th.detachOpenUpvals()
 	th.yieldVals = nil
 	th.yieldedNative = false
 	th.yieldNativeFn = NilValue()
@@ -705,8 +679,11 @@ func (th *Thread) Status() ThreadStatus {
 }
 
 // StatusString returns the Lua 5.5 coroutine.status(co) string.
-func (th *Thread) StatusString(_ *State) string {
-	if th == th.state.curThread {
+func (th *Thread) StatusString(s *State) string {
+	if s == nil {
+		s = th.state
+	}
+	if th.self == s.curRef {
 		return "running"
 	}
 	switch th.status {
@@ -717,7 +694,7 @@ func (th *Thread) StatusString(_ *State) string {
 	default:
 		if th.nframe == 0 && th.status == ThreadOK {
 			// Freshly created coroutine (has initial function on stack[0]) or finished main thread.
-			if th == th.state.mainThreadPtr {
+			if th.self == s.mainThreadRef {
 				return "dead"
 			}
 			if !th.stack[0].IsNil() {

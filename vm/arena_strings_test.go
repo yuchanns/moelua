@@ -17,10 +17,11 @@ import (
 func TestArenaStringsInternSweepAutoPacingAndClose(t *testing.T) {
 	s := vm.NewState()
 
-	// Freshly cloned State should lazily defer Arena allocation until first dynamic string.
+	// Freshly cloned State holds stdlib tables/shapes/mainThread in its per-State Arena,
+	// with zero dynamic short strings and zero large spans.
 	st0 := s.ArenaStats()
-	if st0.AllocBytes != 0 || st0.LiveObjects != 0 || st0.BackingBytes != 0 {
-		t.Fatalf("expected fresh State to have lazy empty Arena, got %+v", st0)
+	if st0.LiveObjects == 0 || st0.DynamicShortStrs != 0 || st0.ActiveLargeSpans != 0 {
+		t.Fatalf("unexpected fresh State ArenaStats: %+v", st0)
 	}
 
 	// Interning a frozen stdlib short string must NOT allocate in the per-State Arena.
@@ -29,8 +30,8 @@ func TestArenaStringsInternSweepAutoPacingAndClose(t *testing.T) {
 		t.Fatalf("expected frozen stdlib string, got short=%v fixed=%v str=%q",
 			frozen.IsShort(), frozen.IsFixed(), frozen.Str())
 	}
-	if st := s.ArenaStats(); st.LiveObjects != 0 {
-		t.Fatalf("frozen stdlib lookup unexpectedly allocated in per-State Arena: %+v", st)
+	if st := s.ArenaStats(); st.LiveObjects != st0.LiveObjects || st.AllocBytes != st0.AllocBytes {
+		t.Fatalf("frozen stdlib lookup unexpectedly allocated in per-State Arena: before=%+v after=%+v", st0, st)
 	}
 
 	// Dynamic short strings deduplicate by pointer equality and live in the per-State Arena.
@@ -49,14 +50,14 @@ func TestArenaStringsInternSweepAutoPacingAndClose(t *testing.T) {
 	big = nil
 
 	stMid := s.ArenaStats()
-	if stMid.ActiveLargeSpans != 1 || stMid.DynamicShortStrs < 1 || stMid.AllocBytes < 40000 {
+	if stMid.ActiveLargeSpans != 1 || stMid.DynamicShortStrs < 1 || stMid.AllocBytes < st0.AllocBytes+40000 {
 		t.Fatalf("unexpected mid ArenaStats: %+v", stMid)
 	}
 
 	// CollectFull sweeps unreachable short and large strings and frees the large span back to Go.
 	s.CollectFull()
 	stAfter := s.ArenaStats()
-	if stAfter.ActiveLargeSpans != 0 || stAfter.DynamicShortStrs != 0 || stAfter.LiveObjects != 0 {
+	if stAfter.ActiveLargeSpans != 0 || stAfter.DynamicShortStrs != 0 {
 		t.Fatalf("expected all unrooted Arena strings swept, got %+v", stAfter)
 	}
 	reclaimed := false
@@ -72,7 +73,7 @@ func TestArenaStringsInternSweepAutoPacingAndClose(t *testing.T) {
 		t.Fatalf("large Arena string span not reclaimed by Go GC after sweep")
 	}
 
-	// Automatic Tier-0 pacing: a loop creating 40,000 ephemeral strings without collectgarbage()
+	// Automatic GC pacing: a loop creating 40,000 ephemeral strings without collectgarbage()
 	// must stay bounded in Arena memory rather than growing unboundedly.
 	cl, err := s.LoadChunk([]byte(`
 		local last
@@ -89,7 +90,7 @@ func TestArenaStringsInternSweepAutoPacingAndClose(t *testing.T) {
 		t.Fatalf("auto-pace loop failed: res=%v err=%v", res, err)
 	}
 	if st := s.ArenaStats(); st.AllocBytes > 1024*1024 {
-		t.Fatalf("expected Tier-0 automatic Arena string sweep to bound AllocBytes <= 1 MiB, got %d", st.AllocBytes)
+		t.Fatalf("expected automatic Arena GC pacing to bound AllocBytes <= 1 MiB, got %d", st.AllocBytes)
 	}
 
 	// State.Close releases all Arena backing memory immediately.
@@ -184,7 +185,7 @@ func TestStateCall1FastPathAndHighWaterCleanup(t *testing.T) {
 	}
 
 	// High-water cleanup must NOT retain a temporary table argument across Call1/Call!
-	var wp weak.Pointer[vm.Table]
+	var wp weak.Pointer[byte]
 	func() {
 		idCl, err := s.LoadChunk([]byte(`return function(x) local y = x; return 1 end`), "=hwm")
 		if err != nil {
@@ -194,13 +195,21 @@ func TestStateCall1FastPathAndHighWaterCleanup(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		buf := make([]byte, 4096)
+		wp = weak.Make(&buf[0])
+		ud, err := s.TryNewUserdata(buf, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
 		tbl := s.NewTable(0, 2)
-		wp = weak.Make(tbl)
+		tbl.RawSetStr(s, s.Intern("payload"), ud)
 		if v, err := s.Call1(idFn, vm.TableValue(tbl)); err != nil || v.Int() != 1 {
 			t.Fatalf("Call1(idFn) failed: %v %v", v, err)
 		}
 		tbl = nil
+		buf = nil
 	}()
+	s.CollectFull()
 	reclaimed := false
 	for range 12 {
 		runtime.GC()
@@ -381,7 +390,7 @@ func TestIOOpenClonesArenaFilename(t *testing.T) {
 	if err != nil || len(res) != 1 || !res[0].IsString() {
 		t.Fatalf("io.open test failed: res=%v err=%v", res, err)
 	}
-	got := vm.FormatValue(res[0])
+	got := s.FormatValue(res[0])
 	if !strings.Contains(got, path) {
 		t.Fatalf("expected file write error to retain real path %q, got %q", path, got)
 	}

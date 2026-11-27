@@ -6,67 +6,61 @@ import (
 	"github.com/yuchanns/moelua/internal/arena"
 )
 
-// Accessor layer decoupling interpreter, debug, and stdlib call sites from
-// Go-heap vs noscan Arena storage layouts. Every helper is kept small so the
-// Go compiler inlines it cleanly on hot execution paths.
+// Accessor layer backing the interpreter, debug, and stdlib call sites (Step 5c:
+// noscan Value, Arena String/Closure/Upvalue/Native/Userdata/Proto + GoRefs, and
+// arena.Collector with thin Arena stubs bridging Table & Thread until Step 5d).
 
 // --- State root & GC pacing accessors ---
 
-func (s *State) cur() *Thread                 { return s.curThread }
-func (s *State) setCur(th *Thread)            { s.curThread = th }
-func (s *State) mainThread() *Thread          { return s.mainThreadPtr }
-func (s *State) isMainThread(th *Thread) bool { return th != nil && th == s.mainThreadPtr }
-func (s *State) ownsThread(th *Thread) bool   { return th != nil && th.state == s }
-func (s *State) registry() *Table             { return s.registryTbl }
-func (s *State) stringMeta() *Table           { return s.stringMetaTbl }
-func (s *State) fileMeta() *Table             { return s.fileMetaTbl }
-func (s *State) setFileMeta(mt *Table)        { s.fileMetaTbl = mt }
+func (s *State) setCur(th *Thread) {
+	if th == nil {
+		s.curRef = arena.NullRef
+		return
+	}
+	s.curRef = th.self
+}
+
+func (s *State) isMainThread(th *Thread) bool {
+	return th != nil && th.self == s.mainThreadRef
+}
+
+func (s *State) ownsThread(th *Thread) bool {
+	return th != nil && th.state == s && th.self != arena.NullRef && s.arena.IsLive(th.self)
+}
+
 func (s *State) setStringMeta(mt *Table) {
-	s.stringMetaTbl = mt
-	s.typeMetas[4] = mt
-}
-func (s *State) addTempBytes(delta int64) { s.gc.tempBytes += delta }
-func (s *State) valueAddr(v Value) uintptr {
-	if v.ptr == tagTokenLightUD {
-		return uintptr(v.bits)
+	if mt == nil {
+		s.stringMetaRef = arena.NullRef
+		s.typeMetaRefs[4] = arena.NullRef
+		return
 	}
-	if v.ptr == tagNullLightUD {
-		return 0
-	}
-	return uintptr(v.ptr)
+	s.stringMetaRef = mt.self
+	s.typeMetaRefs[4] = mt.self
 }
-func (s *State) gcNeedsStep() bool       { return s.gc.tier1 }
-func (s *State) gcCheckStep(liveTop int) { s.gcCheckDebt(liveTop) }
+
 func (s *State) newSmallRecordTable() *Table {
 	t := &Table{shape: s.shapes.root}
 	t.slots = t.inlineSlots[:0]
+	s.allocTableStub(t)
+	s.addTableMem(t, 80)
 	return t
 }
-func (s *State) recordNewTableAlloc(estBytes int64, liveTop int) {
-	if s.gc.tier1 {
-		s.gcRecordAlloc(estBytes, liveTop)
-	} else if s.memLimit > 0 {
-		s.gc.allocBytes += estBytes
-	}
-}
-func (s *State) noteShapeMetaKeyWrite(t *Table, key *LuaString) {
-	if key == s.intern.tms[TMMode] || key == s.intern.tms[TMGC] {
-		s.activateTier1()
-		if key == s.intern.tms[TMGC] && t == s.fileMetaTbl {
-			s.promoteFileFinalizers()
-		}
-	}
-}
-func (s *State) allocStaticNative(nf *NativeFunc) Value { return s.NativeValue(nf) }
-func registerStaticNative(_ *NativeFunc) uint32         { return 0 }
+
+func (s *State) gcNeedsStep() bool { return s.collector.NeedsStep() }
+
+func (s *State) recordNewTableAlloc(_ int64, _ int)          {}
+func (s *State) noteShapeMetaKeyWrite(_ *Table, _ *LuaString) {}
 
 func (s *State) checkPreallocMem(delta int64) error {
-	return s.checkMemAndAccount(delta)
+	if s.memLimit > 0 {
+		return s.checkMem(delta)
+	}
+	return nil
 }
 
 func (s *State) checkPreallocMemWithRoots(delta int64, r1, r2, r3 Value) error {
-	if s.memLimit > 0 || s.gc.tier1 {
-		return s.checkMemAndAccountWithRoots(delta, r1, r2, r3)
+	if s.memLimit > 0 {
+		return s.checkMemWithRoots(delta, r1, r2, r3)
 	}
 	return nil
 }
@@ -74,37 +68,68 @@ func (s *State) checkPreallocMemWithRoots(delta int64, r1, r2, r3 Value) error {
 func (s *State) tableCreateCheckBytes(nseq, nrec int64) int64 {
 	checkBytes := tablePreallocBytes(nseq, nrec)
 	if OptimizeEnabled && nseq > 0 {
-		// Enforce requested sequence capacity up front (matching lua_createtable) even when arrHint is lazy.
-		checkBytes += nseq * 16
+		checkBytes += nseq * 8
 	}
 	return checkBytes
 }
 
-func (s *State) accountTableCreateDebt(checkBytes int64) {
-	s.gc.allocBytes += checkBytes
-	s.gcAddDebt(checkBytes)
-}
+func (s *State) accountTableCreateDebt(_ int64) {}
 
 func (s *State) gmatchPreallocBytes() int64 {
-	// Userdata (64B) is accounted by TryNewUserdata; account NativeFunc + 3 upvals + 2 gcRefs once here.
-	return 48 + 3*16 + 2*16
+	return int64(unsafe.Sizeof(ArenaNative{})) + 3*16 + int64(unsafe.Sizeof(Userdata{})) + 2*16
 }
 
 func (s *State) coroWrapPreallocBytes() int64 {
-	return threadInitMemBytes(128, defaultFrameCap) + 48 + 16
+	return threadInitMemBytes(128, defaultFrameCap) + int64(unsafe.Sizeof(ArenaNative{})) + 16
 }
 
-// --- Write barriers (no-ops under Go GC; active Arena barriers once heap moves into Arena) ---
+// --- Arena GC write barriers ---
 
-func (s *State) barrierTableVal(_ *Table, _ Value) {}
-func (s *State) barrierBackTable(_ *Table)         {}
+func (s *State) barrierTableVal(t *Table, val Value) {
+	if val.IsGCObject() && t.self != arena.NullRef && s.arena.Header(t.self).IsBlack() {
+		s.collector.BarrierBack(t.self)
+	}
+}
 
-// --- Thread slice, frame, & error accessors ---
+func (s *State) barrierBackTable(t *Table) {
+	if t.self != arena.NullRef && s.arena.Header(t.self).IsBlack() {
+		s.collector.BarrierBack(t.self)
+	}
+}
 
-func (th *Thread) framesSlice(_ *arena.Arena) []callFrame { return th.frames }
-func (th *Thread) stackSlice(_ *arena.Arena) []Value      { return th.stack }
-func (th *Thread) framesLen() int                         { return len(th.frames) }
-func (th *Thread) stackSize() int                         { return len(th.stack) }
+// --- Thread storage & lifecycle accessors ---
+
+func (th *Thread) stackSlice(_ *arena.Arena) []Value             { return th.stack }
+func (th *Thread) framesSlice(_ *arena.Arena) []callFrame        { return th.frames }
+func (th *Thread) framesLen() int                                { return len(th.frames) }
+func (th *Thread) stackSize() int                                { return len(th.stack) }
+//go:nocheckptr
+func windowIn(stack []Value, base int) *[256]Value {
+	return (*[256]Value)(unsafe.Pointer(&stack[base]))
+}
+
+func (th *Thread) windowFor(_ *arena.Arena, base int) *[256]Value { return th.window(base) }
+func (th *Thread) openUpvalsCount() int                          { return len(th.openUpvals) }
+func (th *Thread) openUpvalAt(_ *arena.Arena, idx int) *Upvalue  { return th.openUpvals[idx] }
+func (th *Thread) yieldValsSlice(_ *arena.Arena) []Value         { return th.yieldVals }
+func (th *Thread) setYieldVals(_ *State, vals []Value) error {
+	if len(vals) == 0 {
+		th.yieldVals = nil
+		return nil
+	}
+	cp := make([]Value, len(vals))
+	copy(cp, vals)
+	th.yieldVals = cp
+	return nil
+}
+func (th *Thread) clearYieldVals()                     { th.yieldVals = nil }
+func (th *Thread) uncaughtErr(_ *State) error          { return th.uncaughtErrVal }
+func (th *Thread) setUncaughtErr(_ *State, err error)  { th.uncaughtErrVal = err }
+func (th *Thread) callerThread(_ *State) *Thread       { return th.caller }
+func (th *Thread) setCallerThread(_ *State, c *Thread) { th.caller = c }
+func (th *Thread) onSuspend()                          {}
+func (th *Thread) onResume()                           {}
+
 func (th *Thread) popTBCAtOrAbove(_ *arena.Arena, level int) (int, bool) {
 	if len(th.tbc) == 0 {
 		return 0, false
@@ -116,6 +141,7 @@ func (th *Thread) popTBCAtOrAbove(_ *arena.Arena, level int) (int, bool) {
 	th.tbc = th.tbc[:len(th.tbc)-1]
 	return idx, true
 }
+
 func (th *Thread) topTBCIndex(_ *arena.Arena) (int, bool) {
 	if len(th.tbc) == 0 {
 		return 0, false
@@ -123,183 +149,170 @@ func (th *Thread) topTBCIndex(_ *arena.Arena) (int, bool) {
 	return th.tbc[len(th.tbc)-1], true
 }
 
-func windowIn(stack []Value, base int) *[256]Value {
-	return (*[256]Value)(unsafe.Pointer(&stack[base]))
-}
-
-func (th *Thread) uncaughtErr(_ *State) error            { return th.uncaughtErrVal }
-func (th *Thread) setUncaughtErr(_ *State, err error)    { th.uncaughtErrVal = err }
-func (th *Thread) callerThread(_ *State) *Thread       { return th.caller }
-func (th *Thread) setCallerThread(_ *State, c *Thread) { th.caller = c }
-func (th *Thread) yieldValsSlice(_ *arena.Arena) []Value {
-	return th.yieldVals
-}
-func (th *Thread) clearYieldVals() { th.yieldVals = nil }
-func (th *Thread) onSuspend()      { th.detachOpenUpvals() }
-func (th *Thread) onResume()       { th.attachOpenUpvals() }
-func (th *Thread) setYieldVals(_ *State, vals []Value) error {
-	if len(vals) == 0 {
-		th.yieldVals = nil
-		return nil
-	}
-	cp := make([]Value, len(vals))
-	copy(cp, vals)
-	th.yieldVals = cp
-	return nil
-}
-
-func (s *State) newThread(stackCap, _ int) (*Thread, error) {
-	return newThread(s, stackCap), nil
-}
-
 // --- callFrame accessors ---
 
-func (s *State) frameClosure(cf *callFrame) *Closure         { return cf.cl }
-func (s *State) setFrameClosure(cf *callFrame, cl *Closure)  { cf.cl = cl }
-func (s *State) frameVarargTab(cf *callFrame) *Table         { return cf.varargTab }
-func (s *State) setFrameVarargTab(cf *callFrame, t *Table)   { cf.varargTab = t }
-func (cf *callFrame) hasVarargTab() bool                     { return cf.varargTab != nil }
+func (s *State) frameClosure(cf *callFrame) *Closure        { return cf.cl }
+func (s *State) setFrameClosure(cf *callFrame, cl *Closure) { cf.cl = cl }
+func (s *State) frameVarargTab(cf *callFrame) *Table        { return cf.varargTab }
+func (s *State) setFrameVarargTab(cf *callFrame, t *Table)  { cf.varargTab = t }
+func (cf *callFrame) hasVarargTab() bool                    { return cf.varargTab != nil }
 
 // --- Closure & Upvalue accessors ---
 
-func (s *State) boundProtoOf(cl *Closure) *boundProto              { return cl.bp }
-func (s *State) closureUpvalCount(cl *Closure) int                 { return len(cl.upvals) }
-func (s *State) closureUpval(cl *Closure, idx int) *Upvalue        { return cl.upvals[idx] }
-func (s *State) setClosureUpval(cl *Closure, idx int, uv *Upvalue) { cl.upvals[idx] = uv }
-func (s *State) upvalOwner(uv *Upvalue) *Thread                    { return uv.owner }
-func (s *State) setClosedUpvalVal(uv *Upvalue, val Value)          { uv.closed = val }
+func (s *State) closureUpvalCount(cl *Closure) int { return int(cl.nUpvals) }
 
-func (s *State) setChunkEnv(cl *Closure, env Value) error {
-	if len(cl.upvals) == 0 {
+func (s *State) closureUpval(cl *Closure, idx int) *Upvalue {
+	return arena.AsSmall[Upvalue](s.arena, cl.upvalsSlice(s.arena)[idx])
+}
+
+func (s *State) setClosureUpval(cl *Closure, idx int, uv *Upvalue) {
+	uvRef := arena.NullRef
+	if uv != nil {
+		uvRef = uv.self
+	}
+	cl.upvalsSlice(s.arena)[idx] = uvRef
+	if cl.hdr.IsBlack() && uvRef != arena.NullRef {
+		s.collector.Barrier(cl.self, uvRef)
+	}
+}
+
+func (s *State) upvalOwner(uv *Upvalue) *Thread {
+	if uv.ownerRef == arena.NullRef {
 		return nil
 	}
-	cl.upvals[0] = &Upvalue{closed: env}
-	return nil
+	return s.threadByRef(uv.ownerRef)
+}
+
+func (s *State) setClosedUpvalVal(uv *Upvalue, val Value) {
+	uv.closed = val
+	if val.IsGCObject() && uv.hdr.IsBlack() {
+		s.collector.Barrier(uv.self, val.Ref())
+	}
 }
 
 func (s *State) newSubClosure(th *Thread, bp *boundProto, curCl *Closure, base, bx int) (*Closure, int64, error) {
-	sub := bp.proto.Protos[bx]
-	sbp := bp.sub[bx]
-	estBytes := int64(64 + len(sub.Upvalues)*24)
-	if sbp == nil && (s.memLimit > 0 || s.gc.tier1) {
-		estBytes += protoTreeBytes(sub, OptimizeEnabled)
-	}
+	subRef := bp.sub[bx]
+	subAP := s.asProto(subRef)
+	sbp := s.protos[subAP.protoIdx]
+	sub := sbp.proto
 	if s.memLimit > 0 {
+		estBytes := int64(32 + len(sub.Upvalues)*56)
 		if err := s.checkMem(estBytes); err != nil {
 			return nil, 0, err
 		}
 	}
-	if sbp == nil {
-		sbp = s.bindProto(sub)
-		bp.sub[bx] = sbp
+	cl, err := s.allocClosure(subAP, sbp, len(sub.Upvalues))
+	if err != nil {
+		return nil, 0, s.memError()
 	}
-	cl := &Closure{bp: sbp, upvals: make([]*Upvalue, len(sub.Upvalues))}
+	upvals := cl.upvalsSlice(s.arena)
+	curUpvals := curCl.upvalsSlice(s.arena)
 	for i, ud := range sub.Upvalues {
 		if ud.InStack != 0 {
-			cl.upvals[i] = th.findOrCreateUpval(base + int(ud.Idx))
+			uv := th.findOrCreateUpval(s, base+int(ud.Idx))
+			if uv == nil {
+				return nil, 0, s.memError()
+			}
+			upvals[i] = uv.self
 		} else {
-			cl.upvals[i] = curCl.upvals[ud.Idx]
+			upvals[i] = curUpvals[ud.Idx]
 		}
 	}
-	return cl, estBytes, nil
+	return cl, 0, nil
 }
 
 // --- Dynamic NativeFunc & Userdata helpers ---
 
 func (s *State) allocDynNative(nf *NativeFunc) (Value, error) {
-	return s.NativeValue(nf), nil
+	return s.allocArenaNative(nf)
 }
 
 func (s *State) nativeUpvalCount(fn Value) int {
-	if !fn.IsNative() {
-		return 0
+	if fn.IsStaticNative() {
+		nf := lookupStaticNative(fn.staticNativeIdx())
+		if nf == nil {
+			return 0
+		}
+		return max(len(nf.upvals), int(nf.NumUpvals))
 	}
-	nf := s.asNative(fn)
-	return max(len(nf.upvals), int(nf.NumUpvals))
+	if fn.IsDynNative() {
+		an := s.asArenaNative(fn)
+		return max(int(an.nUpvals), int(an.numUpvals))
+	}
+	return 0
 }
 
 func (s *State) nativeUpvalGet(fn Value, idx int) (Value, bool) {
-	if !fn.IsNative() {
+	if !fn.IsDynNative() {
 		return NilValue(), false
 	}
-	nf := s.asNative(fn)
-	if idx < 0 || idx >= len(nf.upvals) {
+	ups := s.asArenaNative(fn).upvalsSlice(s.arena)
+	if idx < 0 || idx >= len(ups) {
 		return NilValue(), false
 	}
-	return nf.upvals[idx], true
+	return ups[idx], true
 }
 
 func (s *State) nativeUpvalSet(fn Value, idx int, val Value) bool {
-	if !fn.IsNative() {
+	if !fn.IsDynNative() {
 		return false
 	}
-	nf := s.asNative(fn)
-	if idx < 0 || idx >= len(nf.upvals) {
+	an := s.asArenaNative(fn)
+	ups := an.upvalsSlice(s.arena)
+	if idx < 0 || idx >= len(ups) {
 		return false
 	}
-	nf.upvals[idx] = val
+	ups[idx] = val
+	if val.IsGCObject() && an.hdr.IsBlack() {
+		s.collector.Barrier(an.self, val.Ref())
+	}
 	return true
 }
 
 func (s *State) nativeUpvalID(fn Value, idx int) uint64 {
-	nf := s.asNative(fn)
-	n := max(len(nf.upvals), int(nf.NumUpvals))
-	if !nf.Collectable {
-		if s.immUpvalTokens == nil {
-			s.immUpvalTokens = make(map[*NativeFunc][]uint64)
-		}
-		ids := s.immUpvalTokens[nf]
-		if len(ids) < n {
-			grown := make([]uint64, n)
-			copy(grown, ids)
-			ids = grown
-			s.immUpvalTokens[nf] = ids
-		}
-		if ids[idx] == 0 {
-			ids[idx] = globalUpvalTokenID.Add(1)
-		}
-		return ids[idx]
+	if fn.IsDynNative() {
+		return s.asArenaNative(fn).upvalID(s, idx)
 	}
-	if len(nf.upvalIDs) < n {
+	n := s.nativeUpvalCount(fn)
+	sidx := fn.staticNativeIdx()
+	if s.immUpvalTokens == nil {
+		s.immUpvalTokens = make(map[uint32][]uint64)
+	}
+	ids := s.immUpvalTokens[sidx]
+	if len(ids) < n {
 		grown := make([]uint64, n)
-		copy(grown, nf.upvalIDs)
-		nf.upvalIDs = grown
+		copy(grown, ids)
+		ids = grown
+		s.immUpvalTokens[sidx] = ids
 	}
-	if nf.upvalIDs[idx] == 0 {
-		nf.upvalIDs[idx] = globalUpvalTokenID.Add(1)
+	if ids[idx] == 0 {
+		ids[idx] = globalUpvalTokenID.Add(1)
 	}
-	return nf.upvalIDs[idx]
+	return ids[idx]
 }
 
-func (s *State) SetUserdataGCRefs(u *Userdata, refs []Value) error {
-	u.gcRefs = refs
-	return nil
-}
-
-func (s *State) userdataUValCount(u *Userdata) int {
-	return len(u.UValues)
-}
+func (s *State) userdataUValCount(u *Userdata) int { return int(u.nUValues) }
 
 func (s *State) userdataUValGet(u *Userdata, idx int) Value {
-	return u.UValues[idx]
-}
-
-func (s *State) SetUserdataUValue(u *Userdata, idx int, val Value) {
-	u.UValues[idx] = val
+	return u.uvalsSlice(s.arena)[idx]
 }
 
 // --- Table, Shape & IC accessors ---
 
-func (t *Table) hasMeta() bool                       { return t.meta != nil }
-func (t *Table) hasHash() bool                       { return t.hash != nil }
-func (t *Table) shapePtr(_ *arena.Arena) *Shape      { return t.shape }
-func (t *Table) slotAt(_ *arena.Arena, i int) Value  { return t.slots[i] }
-func (t *Table) slotPtr(_ *arena.Arena, i int) *Value { return &t.slots[i] }
-func (t *Table) slotsFull() bool                     { return len(t.slots) == cap(t.slots) }
-func (t *Table) slotsCapacity() int                  { return cap(t.slots) }
-func (t *Table) setShape(_ *State, sh *Shape)        { t.shape = sh }
-func (t *Table) appendSlotFor(_ *State, val Value) bool {
+func (t *Table) hasMeta() bool                         { return t.meta != nil }
+func (t *Table) hasHash() bool                         { return t.hash != nil }
+func (t *Table) shapePtr(_ *arena.Arena) *Shape        { return t.shape }
+func (t *Table) setShape(_ *State, sh *Shape)          { t.shape = sh }
+func (t *Table) slotAt(_ *arena.Arena, slot int) Value { return t.slots[slot] }
+func (t *Table) slotPtr(_ *arena.Arena, slot int) *Value {
+	return &t.slots[slot]
+}
+func (t *Table) appendSlotFor(s *State, val Value) bool {
+	oldCap := cap(t.slots)
 	t.appendSlot(val)
+	if cap(t.slots) > oldCap {
+		s.addTableMem(t, int64(cap(t.slots)-oldCap)*16)
+	}
 	return true
 }
 
@@ -345,7 +358,7 @@ func (ic *ICEntry) tryPolyGetField(s *State, t *Table) (Value, bool) {
 			return v, true
 		}
 	} else if ic.kind == icProtoVal && (ic.noMeta || s.protoEpoch == ic.epoch) {
-		return ic.protoValue()
+		return ic.val, true
 	}
 	return NilValue(), false
 }
@@ -354,6 +367,7 @@ func (ic *ICEntry) tryPolySetField(s *State, t *Table, val Value) bool {
 	if ic.kind == icOwnSlot {
 		if !t.slots[ic.slot].IsNil() || ic.noMeta || (ic.protoAbsent && s.protoEpoch == ic.epoch) {
 			t.slots[ic.slot] = val
+			s.barrierTableVal(t, val)
 			return true
 		}
 	} else if ic.kind == icAddSlot && !val.IsNil() && (ic.noMeta || s.protoEpoch == ic.epoch) {
@@ -362,6 +376,7 @@ func (ic *ICEntry) tryPolySetField(s *State, t *Table, val Value) bool {
 			t.slots = t.slots[:slot+1]
 			t.slots[slot] = val
 			t.shape = ts
+			s.barrierBackTable(t)
 			return true
 		}
 	}
@@ -373,17 +388,19 @@ func (s *State) transitionShapeFor(oldSh *Shape, key *LuaString, tblVal, val Val
 }
 
 func (s *State) checkShapeSlotMem(t *Table, next *Shape, key *LuaString, val Value) error {
-	if (s.memLimit > 0 || s.gc.tier1) && t.slotsFull() {
-		prevPinned := s.gc.pinnedShape
-		s.gc.pinnedShape = next
-		err := s.checkMemAndAccountWithRoots(int64(max(t.slotsCapacity(), 4))*16, TableValue(t), StringValue(key), val)
-		s.gc.pinnedShape = prevPinned
+	if s.memLimit > 0 && len(t.slots) == cap(t.slots) {
+		prevPinned := s.pinnedShape
+		s.pinnedShape = next
+		err := s.checkMemWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(key), val)
+		s.pinnedShape = prevPinned
 		return err
 	}
 	return nil
 }
 
 func (s *State) demoteTableToDict(t *Table, key, val Value) error {
-	t.demoteToDict(s, key, val)
-	return s.ConsumeMemErr()
+	if !t.demoteToDict(s, key, val) {
+		return s.ConsumeMemErr()
+	}
+	return nil
 }

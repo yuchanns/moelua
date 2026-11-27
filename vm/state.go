@@ -65,17 +65,17 @@ const (
 	intrPairs
 )
 
-// NativeFunc represents a direct-Value Go builtin or host function.
+// NativeFunc represents a direct-Value Go builtin or host function descriptor.
+// Static stdlib builtins live in the process-wide immutable staticNatives table;
+// dynamic host/C closures are bridged per-State via ArenaNative + GoRefs.
 type NativeFunc struct {
 	Name        string
 	Fn          func(s *State, args []Value) ([]Value, error)
 	FastFn      func(s *State, args []Value) (Value, error) // optional zero-alloc single-return fast path
 	Intrinsic   uint8
 	NumUpvals   uint8   // logical C closure upvalue count (e.g. string.gmatch = 3)
-	Collectable bool     // true for dynamic C closures (coroutine.wrap, gmatch, io.lines, utf8.codes); false for immutable light builtins
-	gcMark      uint64   // Tier 1 GC mark epoch (only mutated when Collectable == true)
-	upvals      []Value  // captured C closure upvalues (traced by Tier 1 GC and exposed to debug.getupvalue/setupvalue)
-	upvalIDs    []uint64 // lazily assigned non-owning debug.upvalueid tokens
+	Collectable bool    // true for dynamic C closures (coroutine.wrap, gmatch, io.lines, utf8.codes)
+	upvals      []Value // initial captured C closure upvalues copied into ArenaNative on allocation
 }
 
 func (nf *NativeFunc) callMulti(s *State, args []Value) ([]Value, error) {
@@ -89,14 +89,22 @@ func (nf *NativeFunc) callMulti(s *State, args []Value) ([]Value, error) {
 	return nf.Fn(s, args)
 }
 
-// Upvalue is a Lua 5.5 open or closed upvalue.
-// An upvalue is open iff owner != nil; closed upvalues store their value in closed with owner == nil.
+// Upvalue is a 48-byte zero-pointer (noscan, ptrdata == 0) Lua 5.5 open or closed upvalue
+// stored inside State.arena. Open iff ownerRef != arena.NullRef.
 type Upvalue struct {
-	owner    *Thread
-	closed   Value
-	stackIdx int
-	id       uint64 // lazily assigned non-owning debug.upvalueid token
+	hdr      arena.GCHeader // 8B: Kind=gcKindUpvalue
+	self     arena.ObjRef   // 4B: own ObjRef in State.arena
+	ownerRef arena.ObjRef   // 4B: owning Thread ObjRef (NullRef when closed)
+	closed   Value          // 16B: value when closed
+	id       uint64         // 8B: lazily assigned non-owning debug.upvalueid token
+	stackIdx int32          // 4B: stack index on owner thread when open
+	_        uint32         // 4B pad -> 48B exact
 }
+
+const (
+	_ = uint(48 - unsafe.Sizeof(Upvalue{}))
+	_ = uint(unsafe.Sizeof(Upvalue{}) - 48)
+)
 
 var globalUpvalTokenID atomic.Uint64
 
@@ -107,43 +115,125 @@ func (u *Upvalue) tokenID() uint64 {
 	return u.id
 }
 
-func (u *Upvalue) Get(_ *State) Value {
-	if ow := u.owner; ow != nil {
-		return ow.stack[u.stackIdx]
+func (u *Upvalue) Get(s *State) Value {
+	if u.ownerRef != arena.NullRef {
+		return s.threadByRef(u.ownerRef).stack[u.stackIdx]
 	}
 	return u.closed
 }
 
-func (u *Upvalue) Set(_ *State, v Value) {
-	if ow := u.owner; ow != nil {
-		ow.stack[u.stackIdx] = v
-	} else {
-		u.closed = v
+func (u *Upvalue) Set(s *State, v Value) {
+	if u.ownerRef != arena.NullRef {
+		s.threadByRef(u.ownerRef).stack[u.stackIdx] = v
+		return
+	}
+	u.closed = v
+	if v.IsGCObject() && u.hdr.IsBlack() {
+		s.collector.Barrier(u.self, v.Ref())
 	}
 }
 
-// boundProto binds an immutable *bytecode.Proto to one State's interned constants and IC slice.
-// Ownership flows strictly from Closure -> boundProto so GC reclaims unused load() chunks cleanly.
-// Hot proto metadata (insns, icSlots, numParams, maxStack, isVararg) is copied directly onto
-// boundProto so OP_CALL avoids a secondary pointer chase through proto.
+// ArenaProto is a 48-byte zero-pointer (noscan, ptrdata == 0) GC-managed prototype header
+// stored inside State.arena. Its constants, inline caches, and child proto refs live in
+// State.arena; the Go *boundProto descriptor lives in State.protos[protoIdx] and is cleared
+// automatically when Collector sweeps this ArenaProto.
+type ArenaProto struct {
+	hdr       arena.GCHeader // 8B: Kind=gcKindProto
+	self      arena.ObjRef   // 4B: own ObjRef in State.arena
+	constsRef arena.ObjRef   // 4B: raw Arena []Value constants
+	icRef     arena.ObjRef   // 4B: raw Arena []ICEntry inline caches
+	subRef    arena.ObjRef   // 4B: raw Arena []arena.ObjRef child ArenaProtos
+	protoIdx  uint32         // 4B: 1-based index into State.protos
+	nConsts   uint32         // 4B
+	nIC       uint32         // 4B
+	nSub      uint32         // 4B
+	_         uint64         // 8B pad -> 48B exact
+}
+
+const (
+	_ = uint(48 - unsafe.Sizeof(ArenaProto{}))
+	_ = uint(unsafe.Sizeof(ArenaProto{}) - 48)
+)
+
+// boundProto binds an immutable *bytecode.Proto to one State's Arena constants and IC slice.
+// Owned strictly by its ArenaProto in State.arena so GC reclaims unused load() chunks cleanly.
 type boundProto struct {
 	proto     *bytecode.Proto
 	insns     codeWords
-	consts    []Value
-	strConsts []*LuaString // parallel to consts; non-nil when ConstString
+	consts    []Value        // slice view directly into ArenaProto.constsRef (noscan!)
 	icSlots   []int32
-	ic        []ICEntry
-	sub       []*boundProto // parallel to proto.Protos (O(1) OP_CLOSURE lookup, zero protoCache leak)
+	ic        []ICEntry      // slice view directly into ArenaProto.icRef (noscan!)
+	sub       []arena.ObjRef // slice view directly into ArenaProto.subRef (noscan!)
+	arenaRef  arena.ObjRef   // owning ArenaProto ObjRef
+	protoIdx  uint32
+	goBytes   int64 // Go-side retained bytecode.Proto bytes accounted in State.extraMemBytes
 	numParams uint8
 	maxStack  uint8
 	isVararg  bool
 }
 
-// Closure is a Lua function closure.
+// Closure is a 32-byte zero-pointer (noscan, ptrdata == 0) Lua function closure stored in State.arena.
 type Closure struct {
-	bp     *boundProto
-	upvals []*Upvalue
-	gcMark uint64
+	hdr       arena.GCHeader // 8B: Kind=gcKindClosure
+	self      arena.ObjRef   // 4B: own ObjRef in State.arena
+	protoRef  arena.ObjRef   // 4B: ArenaProto ObjRef in State.arena
+	upvalsRef arena.ObjRef   // 4B: raw Arena []arena.ObjRef (length == nUpvals)
+	protoIdx  uint32         // 4B: cached ArenaProto.protoIdx for 1-load OP_CALL dispatch
+	nUpvals   uint16         // 2B
+	_         [6]byte        // 6B pad -> 32B exact
+}
+
+const (
+	_ = uint(32 - unsafe.Sizeof(Closure{}))
+	_ = uint(unsafe.Sizeof(Closure{}) - 32)
+)
+
+func (cl *Closure) upvalsSlice(a *arena.Arena) []arena.ObjRef {
+	if cl.upvalsRef == arena.NullRef || cl.nUpvals == 0 {
+		return nil
+	}
+	return arena.SliceFast[arena.ObjRef](a, cl.upvalsRef, 0, int(cl.nUpvals))
+}
+
+func (an *ArenaNative) upvalsSlice(a *arena.Arena) []Value {
+	if an.upvalsRef == arena.NullRef || an.nUpvals == 0 {
+		return nil
+	}
+	return arena.SliceFast[Value](a, an.upvalsRef, 0, int(an.nUpvals))
+}
+
+func (an *ArenaNative) upvalID(s *State, idx int) uint64 {
+	total := max(int(an.nUpvals), int(an.numUpvals))
+	if idx < 0 || idx >= total {
+		return 0
+	}
+	if an.upvalIDsRef == arena.NullRef {
+		ref, err := s.arena.AllocZeroed(total * 8)
+		if err != nil {
+			return 0
+		}
+		s.collector.AddDebt(int64(s.arena.SlotSize(ref)))
+		an.upvalIDsRef = ref
+	}
+	ids := arena.SliceFast[uint64](s.arena, an.upvalIDsRef, 0, total)
+	if ids[idx] == 0 {
+		ids[idx] = globalUpvalTokenID.Add(1)
+	}
+	return ids[idx]
+}
+
+func (u *Userdata) uvalsSlice(a *arena.Arena) []Value {
+	if u.uvalsRef == arena.NullRef || u.nUValues == 0 {
+		return nil
+	}
+	return arena.SliceFast[Value](a, u.uvalsRef, 0, int(u.nUValues))
+}
+
+func (u *Userdata) gcRefsSlice(a *arena.Arena) []Value {
+	if u.gcRefsRef == arena.NullRef || u.nGCRefs == 0 {
+		return nil
+	}
+	return arena.SliceFast[Value](a, u.gcRefsRef, 0, int(u.nGCRefs))
 }
 
 // CompileFunc compiles Lua 5.5 source text into a verified *bytecode.Proto.
@@ -156,16 +246,56 @@ const (
 	ridxMainThread = 3 // LUA_RIDX_MAINTHREAD
 )
 
-// State is a single-goroutine Lua 5.5.1 execution state (multiple States share immutable Protos).
-type State struct {
-	mainThreadPtr *Thread
-	curThread     *Thread // currently executing Thread (mainThread or resumed coroutine)
+// tableStub and threadStub are 16-byte noscan Arena GC headers bridging Go-heap
+// Table and Thread structs into State.collector until Step 5d migrates them into Arena.
+type tableStub struct {
+	hdr  arena.GCHeader // 8B: Kind=gcKindTable
+	self arena.ObjRef   // 4B
+	idx  uint32         // 4B: 1-based index into State.tables
+}
 
-	registryTbl *Table
-	arena       *arena.Arena
-	intern      stringInterner
+type threadStub struct {
+	hdr  arena.GCHeader // 8B: Kind=gcKindThread
+	self arena.ObjRef   // 4B
+	idx  uint32         // 4B: 1-based index into State.threads
+}
+
+// State is a single-goroutine Lua 5.5.1 execution state (multiple States share immutable Protos
+// and frozen stdlib strings, while each State owns an independent noscan Arena & Lua 5.5 Collector).
+type State struct {
+	// Per-State noscan Arena, true PUC-Rio Lua 5.5.1 Collector, and generational GoRefs bridge.
+	arena     *arena.Arena
+	collector *arena.Collector
+	goRefs    *arena.GoRefs
+
+	mainThreadRef arena.ObjRef
+	curRef        arena.ObjRef // currently executing Thread (mainThread or resumed coroutine)
+	registryRef   arena.ObjRef
+
+	intern     stringInterner
 	shapes     shapeRegistry
 	protoEpoch uint64
+
+	// Live boundProto table indexed by 1-based ArenaProto.protoIdx (cleared on ArenaProto sweep).
+	protos       []*boundProto
+	freeProtoIDs []uint32
+
+	// Live Go-heap Table & Thread tables indexed by tableStub.idx / threadStub.idx (cleared on sweep).
+	tables        []*Table
+	freeTableIDs  []uint32
+	threads       []*Thread
+	freeThreadIDs []uint32
+
+	// Weak/auxiliary GC tracking lists (noscan []ObjRef; maintained in PreSweep).
+	hashedTables       []arena.ObjRef
+	twups              []arena.ObjRef
+	hasDeadHashKeys    bool
+	preserveFramesInGC bool
+
+	// Host-pinned references (analog of luaL_ref) & transient GC roots.
+	pinnedRefs  map[int]Value
+	nextRefID   int
+	pinnedShape *Shape
 
 	out       io.Writer
 	errOut    io.Writer
@@ -176,7 +306,7 @@ type State struct {
 	compilerFn       CompileFunc
 	compilerReaderFn func(name string, r io.Reader, opts ...compiler.Option) (*bytecode.Proto, error)
 
-	// Cached builtin identities for TFORCALL / pcall / debug fast paths & standard libs.
+	// Cached immutable stdlib builtin identities for TFORCALL / pcall / debug fast paths.
 	builtinNext           *NativeFunc
 	builtinIPairsIter     *NativeFunc
 	builtinDebugGetInfo   *NativeFunc
@@ -185,26 +315,23 @@ type State struct {
 	builtinDebugSetLocal  *NativeFunc
 	builtinDebugSetHook   *NativeFunc
 	builtinCoroYield      *NativeFunc
-	stringMetaTbl     *Table
-	fileMetaTbl       *Table
-	pkgTbl            *Table
-	typeMetas         [9]*Table // per-type metatables (debug.setmetatable on primitives!)
-	stdinInput        Value
-	defaultInput      Value
-	defaultOutput     Value
-	openFiles         []*fileInner // open non-std file handles flushed on os.exit / closed LIFO on State.Close (does NOT pin *luaFile)
-	coallocTables     []Table      // views into stateAlloc.tables swept on GC when unreachable
-	coallocHashes     []tableHash  // views into stateAlloc.hashes swept on GC when unreachable
-	immUpvalTokens    map[*NativeFunc][]uint64 // lazy debug.upvalueid tokens for shared non-collectable builtins
 
-	// Two-Tier GC controller + per-State noscan Arena & generational GoRefs bridge.
-	gc               gcState
-	goRefs           *arena.GoRefs
-	arenaSweepThresh int64
+	stringMetaRef  arena.ObjRef
+	fileMetaRef    arena.ObjRef
+	pkgRef         arena.ObjRef
+	typeMetaRefs   [9]arena.ObjRef // per-type metatables (debug.setmetatable on primitives!)
+	stdinInput     Value
+	defaultInput   Value
+	defaultOutput  Value
+	openFiles      []*fileInner      // open non-std file handles flushed on os.exit / closed LIFO on State.Close
+	immUpvalTokens map[uint32][]uint64 // lazy debug.upvalueid tokens for shared static builtins
 
-	// Optional per-State soft/hard memory limit in bytes (0 = unlimited).
-	memLimit    int64
-	memExceeded bool
+	// Non-Arena Go-side memory accounting & per-State soft/hard memory limit (0 = unlimited).
+	extraMemBytes int64
+	shapeMemBytes int64
+	tempBytes     int64
+	memLimit      int64
+	memExceeded   bool
 
 	// Optional async interrupt flag, context cancellation, and VM instruction step budget;
 	// zero overhead in fast (*State).run when all are unset!
@@ -229,15 +356,223 @@ func defaultCompileReaderFunc(name string, r io.Reader, opts ...compiler.Option)
 	return compiler.CompileReader(name, r, opts...)
 }
 
-// State-scoped Value dereference and native construction helpers (prepare for Arena ObjRef Values).
-func (s *State) asString(v Value) *LuaString  { return (*LuaString)(v.ptr) }
-func (s *State) asTable(v Value) *Table       { return (*Table)(v.ptr) }
-func (s *State) asClosure(v Value) *Closure   { return (*Closure)(v.ptr) }
-func (s *State) asNative(v Value) *NativeFunc { return (*NativeFunc)(v.ptr) }
-func (s *State) asThread(v Value) *Thread     { return (*Thread)(v.ptr) }
-func (s *State) asUserdata(v Value) *Userdata { return (*Userdata)(v.ptr) }
+// Fast per-State Arena dereference helpers.
+func (s *State) asString(v Value) *LuaString {
+	if v.tag == tagFrozenString {
+		return arena.AsFast[LuaString](s.intern.frozenArena, v.Ref())
+	}
+	return arena.AsFast[LuaString](s.arena, v.Ref())
+}
 
-// AsString returns the *LuaString for a string Value owned by s, or nil if v is not a string.
+func (s *State) tableByRef(ref arena.ObjRef) *Table {
+	if ref == arena.NullRef {
+		return nil
+	}
+	idx := arena.AsSmall[tableStub](s.arena, ref).idx
+	if int(idx) < len(s.tables) {
+		return s.tables[idx]
+	}
+	return nil
+}
+
+func (s *State) threadByRef(ref arena.ObjRef) *Thread {
+	if ref == arena.NullRef {
+		return nil
+	}
+	idx := arena.AsSmall[threadStub](s.arena, ref).idx
+	if int(idx) < len(s.threads) {
+		return s.threads[idx]
+	}
+	return nil
+}
+
+func (s *State) allocTableStub(t *Table) {
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(tableStub{})), gcKindTable)
+	if err != nil {
+		panic(err)
+	}
+	var idx uint32
+	if n := len(s.freeTableIDs); n > 0 {
+		idx = s.freeTableIDs[n-1]
+		s.freeTableIDs = s.freeTableIDs[:n-1]
+		s.tables[idx] = t
+	} else {
+		if len(s.tables) == 0 {
+			s.tables = []*Table{nil}
+		}
+		idx = uint32(len(s.tables))
+		s.tables = append(s.tables, t)
+	}
+	stub := arena.AsSmall[tableStub](s.arena, ref)
+	stub.self = ref
+	stub.idx = idx
+	t.self = ref
+}
+
+func (s *State) allocThreadStub(th *Thread) {
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(threadStub{})), gcKindThread)
+	if err != nil {
+		panic(err)
+	}
+	var idx uint32
+	if n := len(s.freeThreadIDs); n > 0 {
+		idx = s.freeThreadIDs[n-1]
+		s.freeThreadIDs = s.freeThreadIDs[:n-1]
+		s.threads[idx] = th
+	} else {
+		if len(s.threads) == 0 {
+			s.threads = []*Thread{nil}
+		}
+		idx = uint32(len(s.threads))
+		s.threads = append(s.threads, th)
+	}
+	stub := arena.AsSmall[threadStub](s.arena, ref)
+	stub.self = ref
+	stub.idx = idx
+	th.self = ref
+}
+
+func (s *State) addTableMem(t *Table, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	t.memBytes += delta
+	s.extraMemBytes += delta
+	if s.collector != nil {
+		s.collector.AddDebt(delta)
+	}
+}
+
+func (s *State) subTableMem(t *Table, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	if t.memBytes > delta {
+		t.memBytes -= delta
+	} else {
+		delta = t.memBytes
+		t.memBytes = 0
+	}
+	s.subExtraMem(delta)
+}
+
+func (s *State) addThreadMem(th *Thread, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	th.memBytes += delta
+	s.extraMemBytes += delta
+	if s.collector != nil {
+		s.collector.AddDebt(delta)
+	}
+}
+
+func (s *State) subThreadMem(th *Thread, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	if th.memBytes > delta {
+		th.memBytes -= delta
+	} else {
+		delta = th.memBytes
+		th.memBytes = 0
+	}
+	s.subExtraMem(delta)
+}
+
+func (s *State) newThread(stackCap, _ int) (*Thread, error) {
+	return newThread(s, stackCap), nil
+}
+
+func (s *State) allocOpenUpval(th *Thread, stackIdx int) (*Upvalue, error) {
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Upvalue{})), gcKindUpvalue)
+	if err != nil {
+		return nil, err
+	}
+	uv := arena.AsSmall[Upvalue](s.arena, ref)
+	uv.self = ref
+	uv.ownerRef = th.self
+	uv.stackIdx = int32(stackIdx)
+	return uv, nil
+}
+
+func (s *State) asTable(v Value) *Table {
+	return s.tableByRef(v.Ref())
+}
+
+func (s *State) asClosure(v Value) *Closure {
+	return arena.AsSmall[Closure](s.arena, v.Ref())
+}
+
+func (s *State) asThread(v Value) *Thread {
+	return s.threadByRef(v.Ref())
+}
+
+func (s *State) asUserdata(v Value) *Userdata {
+	return arena.AsSmall[Userdata](s.arena, v.Ref())
+}
+
+func (s *State) asArenaNative(v Value) *ArenaNative {
+	return arena.AsSmall[ArenaNative](s.arena, v.Ref())
+}
+
+func (s *State) asNative(v Value) *NativeFunc {
+	if v.tag == tagStaticNative {
+		return lookupStaticNative(v.staticNativeIdx())
+	}
+	an := arena.AsSmall[ArenaNative](s.arena, v.Ref())
+	raw, _ := s.goRefs.Get(an.goRef)
+	nf, _ := raw.(*NativeFunc)
+	return nf
+}
+
+func (s *State) asUpvalue(ref arena.ObjRef) *Upvalue {
+	if ref == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[Upvalue](s.arena, ref)
+}
+
+func (s *State) asProto(ref arena.ObjRef) *ArenaProto {
+	if ref == arena.NullRef {
+		return nil
+	}
+	return arena.AsSmall[ArenaProto](s.arena, ref)
+}
+
+func (s *State) boundProtoOf(cl *Closure) *boundProto {
+	return s.protos[cl.protoIdx]
+}
+
+func (s *State) mainThread() *Thread {
+	return s.threadByRef(s.mainThreadRef)
+}
+
+func (s *State) cur() *Thread {
+	return s.threadByRef(s.curRef)
+}
+
+func (s *State) registry() *Table {
+	return s.tableByRef(s.registryRef)
+}
+
+func (s *State) fileMeta() *Table {
+	return s.tableByRef(s.fileMetaRef)
+}
+
+func (s *State) pkgTbl() *Table {
+	return s.tableByRef(s.pkgRef)
+}
+
+func (s *State) trackHashedTable(ref arena.ObjRef) {
+	t := s.tableByRef(ref)
+	if t != nil && t.flags&tblFlagTrackedHash == 0 {
+		t.flags |= tblFlagTrackedHash
+		s.hashedTables = append(s.hashedTables, ref)
+	}
+}
+
+// Exported State-scoped value dereference helpers for embedding callers.
 func (s *State) AsString(v Value) *LuaString {
 	if !v.IsString() {
 		return nil
@@ -245,7 +580,6 @@ func (s *State) AsString(v Value) *LuaString {
 	return s.asString(v)
 }
 
-// AsTable returns the *Table for a table Value owned by s, or nil if v is not a table.
 func (s *State) AsTable(v Value) *Table {
 	if !v.IsTable() {
 		return nil
@@ -253,7 +587,6 @@ func (s *State) AsTable(v Value) *Table {
 	return s.asTable(v)
 }
 
-// AsClosure returns the *Closure for a closure Value owned by s, or nil if v is not a closure.
 func (s *State) AsClosure(v Value) *Closure {
 	if !v.IsClosure() {
 		return nil
@@ -261,7 +594,6 @@ func (s *State) AsClosure(v Value) *Closure {
 	return s.asClosure(v)
 }
 
-// AsNative returns the *NativeFunc for a native function Value owned by s, or nil if v is not native.
 func (s *State) AsNative(v Value) *NativeFunc {
 	if !v.IsNative() {
 		return nil
@@ -269,7 +601,6 @@ func (s *State) AsNative(v Value) *NativeFunc {
 	return s.asNative(v)
 }
 
-// AsThread returns the *Thread for a thread Value owned by s, or nil if v is not a thread.
 func (s *State) AsThread(v Value) *Thread {
 	if !v.IsThread() {
 		return nil
@@ -277,7 +608,6 @@ func (s *State) AsThread(v Value) *Thread {
 	return s.asThread(v)
 }
 
-// AsUserdata returns the *Userdata for a full userdata Value owned by s, or nil if v is not userdata.
 func (s *State) AsUserdata(v Value) *Userdata {
 	if !v.IsUserdata() {
 		return nil
@@ -285,29 +615,8 @@ func (s *State) AsUserdata(v Value) *Userdata {
 	return s.asUserdata(v)
 }
 
-// NativeValue wraps a Go *NativeFunc as a Lua function Value owned by s.
-func (s *State) NativeValue(f *NativeFunc) Value {
-	return Value{ptr: unsafe.Pointer(f), bits: kindNative}
-}
-
-// UserdataMeta returns the metatable attached to u, or nil.
-func (s *State) UserdataMeta(u *Userdata) *Table {
-	if u == nil {
-		return nil
-	}
-	return u.Meta
-}
-
-// UserdataUValues returns the user-value slice attached to u.
-func (s *State) UserdataUValues(u *Userdata) []Value {
-	if u == nil {
-		return nil
-	}
-	return u.UValues
-}
-
 // NewState creates a new Lua 5.5.1 State with the complete standard library installed,
-// cloned rapidly from the process-wide frozen stdlib template.
+// cloned rapidly via Arena.CloneSnapshot() from the process-wide frozen stdlib template.
 func NewState() *State {
 	return cloneFromStdTemplate(false)
 }
@@ -316,8 +625,6 @@ func NewState() *State {
 func NewStateNoEnv() *State {
 	return cloneFromStdTemplate(true)
 }
-
-const defaultArenaSweepThresh = 256 * 1024
 
 // ArenaStats reports live memory and handle-table diagnostics for a State's noscan Arena.
 type ArenaStats struct {
@@ -333,12 +640,12 @@ type ArenaStats struct {
 // ArenaStats returns a snapshot of this State's per-State noscan Arena and GoRefs usage.
 func (s *State) ArenaStats() ArenaStats {
 	var st ArenaStats
-	if a := s.intern.arena; a != nil {
-		st.AllocBytes = a.AllocBytes()
-		st.LiveObjects = a.LiveObjects()
-		st.ActivePages = a.ActivePages()
-		st.ActiveLargeSpans = a.ActiveLargeSpans()
-		st.BackingBytes = a.BackingBytes()
+	if s.arena != nil {
+		st.AllocBytes = s.arena.AllocBytes()
+		st.LiveObjects = s.arena.LiveObjects()
+		st.ActivePages = s.arena.ActivePages()
+		st.ActiveLargeSpans = s.arena.ActiveLargeSpans()
+		st.BackingBytes = s.arena.BackingBytes()
 	}
 	st.DynamicShortStrs = s.intern.LiveDynamicShort()
 	if s.goRefs != nil {
@@ -347,52 +654,77 @@ func (s *State) ArenaStats() ArenaStats {
 	return st
 }
 
+// IsLive reports whether v refers to a currently live Arena-managed GC object in this State.
+func (s *State) IsLive(v Value) bool {
+	if s.arena == nil || !v.IsGCObject() {
+		return false
+	}
+	return s.arena.IsLive(v.Ref())
+}
+
 // newBootstrapState builds a fresh State from scratch via initStdlib(); used once to construct stdTemplate.
 func newBootstrapState() *State {
+	a := arena.New()
 	s := &State{
-		intern:           newStringInterner(arena.New()),
+		arena:            a,
+		goRefs:           arena.NewGoRefs(),
+		intern:           newBootstrapStringInterner(),
 		shapes:           newShapeRegistry(),
+		protos:           []*boundProto{nil},
+		tables:           []*Table{nil},
+		threads:          []*Thread{nil},
+		nextRefID:        1,
 		out:              os.Stdout,
 		errOut:           os.Stderr,
 		startTime:        time.Now(),
-		gc:               newGCState(),
-		arenaSweepThresh: defaultArenaSweepThresh,
 		compilerFn:       defaultCompileFunc,
 		compilerReaderFn: defaultCompileReaderFunc,
 	}
+	s.initCollector()
 	s.seedRNG(makeRandomSeed(s), 0)
-	s.shapes.root = &s.shapes.rootShape
-	s.mainThreadPtr = newThread(s, initialStackSize)
-	s.mainThreadPtr.nny = 1 // main thread is never yieldable (L->nny = 1)
-	s.curThread = s.mainThreadPtr
+
+	th, err := s.newThread(initFastStackCap, initFastFrameCap)
+	if err != nil {
+		panic(err)
+	}
+	th.nny = 1 // main thread is never yieldable (L->nny = 1)
+	s.mainThreadRef = th.self
+	s.curRef = th.self
+
 	env := s.NewDictTable(64)
-	s.registryTbl = s.NewDictTable(16)
-	s.registryTbl.RawSetInt(s, ridxRef, FalseValue())
-	s.registryTbl.RawSetInt(s, ridxGlobals, TableValue(env))
-	s.registryTbl.RawSetInt(s, ridxMainThread, ThreadValue(s.mainThreadPtr))
+	reg := s.NewDictTable(16)
+	s.registryRef = reg.self
+	reg.RawSetInt(s, ridxRef, FalseValue())
+	reg.RawSetInt(s, ridxGlobals, TableValue(env))
+	reg.RawSetInt(s, ridxMainThread, ThreadValue(th))
 	s.initStdlib()
-	s.gc.tier1 = false // Stdlib internal setup (e.g. fileMeta.__gc) must not activate Tier 1!
+	s.shapes.frozenMaxID = s.shapes.nextID
+	s.shapeMemBytes = 0
 	return s
 }
 
 // SetMemoryLimit sets a per-State VM memory limit in bytes (<= 0 disables the limit).
-// Allocations exceeding the limit trigger one full GC cycle before raising a recoverable
+// Allocations exceeding the limit trigger one emergency GC cycle before raising a recoverable
 // Lua "not enough memory" error.
 func (s *State) SetMemoryLimit(limit int64) {
 	if limit < 0 {
 		limit = 0
 	}
-	wasUnlimited := s.memLimit == 0
 	s.memLimit = limit
 	s.memExceeded = false
-	if limit > 0 && wasUnlimited {
-		s.recountLiveBytes()
-	}
 }
 
 // MemoryUsage returns the current VM-accounted memory usage in bytes.
 func (s *State) MemoryUsage() int64 {
-	return s.gc.allocBytes + s.gc.tempBytes
+	var arenaBytes int64
+	if s.arena != nil {
+		arenaBytes = s.arena.AllocBytes()
+	}
+	n := arenaBytes + s.extraMemBytes + s.shapeMemBytes + s.tempBytes
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func (s *State) memError() *LuaError {
@@ -426,53 +758,46 @@ func (s *State) ConsumeMemErr() error {
 }
 
 // checkMem verifies that allocating delta bytes stays within hard safety bounds and s.memLimit.
-// On limit pressure it runs an emergency GC trace (without invoking __gc finalizers,
+// On limit pressure it runs an emergency GC cycle (without invoking __gc finalizers,
 // matching PUC-Rio Lua's emergency collector).
 func (s *State) checkMem(delta int64) error {
 	const hardSingleAllocLimit = 1 << 30 // 1 GiB single allocation guard against Go OOM fatal
 	if delta < 0 || delta > hardSingleAllocLimit {
 		return s.memError()
 	}
-	if s.memLimit > 0 && s.gc.allocBytes+s.gc.tempBytes+delta > s.memLimit {
+	if s.memLimit > 0 && s.MemoryUsage()+delta > s.memLimit {
+		if delta > s.memLimit {
+			return s.memError()
+		}
 		s.collectEmergency()
 		if s.abortErr != nil {
 			return s.abortErr
 		}
-		if s.gc.allocBytes+s.gc.tempBytes+delta > s.memLimit {
+		if s.MemoryUsage()+delta > s.memLimit {
 			return s.memError()
 		}
 	}
 	return nil
 }
 
-// checkMemAndAccount checks and accounts delta bytes when s.memLimit > 0 (or single-alloc guard).
-func (s *State) checkMemAndAccount(delta int64) error {
-	if err := s.checkMem(delta); err != nil {
-		return err
-	}
-	if s.memLimit > 0 || s.gc.tier1 {
-		s.gc.allocBytes += delta
-		s.gcAddDebt(delta)
-	}
-	return nil
-}
-
-// checkMemAndAccountWithRoots behaves like checkMemAndAccount, temporarily rooting up to three
-// live Values across emergency GC when allocation pressure triggers a recount (so host-held
-// keys/values/tables not yet linked into _G are never under-counted or collected).
-func (s *State) checkMemAndAccountWithRoots(delta int64, r1, r2, r3 Value) error {
-	if s.memLimit > 0 && s.gc.allocBytes+s.gc.tempBytes+delta > s.memLimit {
+// checkMemWithRoots behaves like checkMem, temporarily rooting up to three live Values
+// across emergency GC when allocation pressure triggers a collection.
+func (s *State) checkMemWithRoots(delta int64, r1, r2, r3 Value) error {
+	if s.memLimit > 0 && s.MemoryUsage()+delta > s.memLimit {
+		if delta > s.memLimit {
+			return s.memError()
+		}
 		var id1, id2, id3 int
-		if !r1.IsNil() {
+		if isGCRootable(r1) {
 			id1 = s.Ref(r1)
 		}
-		if !r2.IsNil() {
+		if isGCRootable(r2) {
 			id2 = s.Ref(r2)
 		}
-		if !r3.IsNil() {
+		if isGCRootable(r3) {
 			id3 = s.Ref(r3)
 		}
-		err := s.checkMemAndAccount(delta)
+		err := s.checkMem(delta)
 		if id1 != 0 {
 			s.Unref(id1)
 		}
@@ -484,11 +809,11 @@ func (s *State) checkMemAndAccountWithRoots(delta int64, r1, r2, r3 Value) error
 		}
 		return err
 	}
-	return s.checkMemAndAccount(delta)
+	return s.checkMem(delta)
 }
 
 func isGCRootable(v Value) bool {
-	return !v.IsNil() && !v.IsBool() && !v.IsInt() && !v.IsFloat() && !v.IsLightUD()
+	return v.IsGCObject()
 }
 
 // ensureStackWithRoots grows th.stack to hold need slots while rooting extra and args
@@ -560,7 +885,11 @@ func (s *State) SetWarnings(on bool) { s.warnOn = on }
 func (s *State) EmitWarning(msg string) { s.emitWarning(msg) }
 
 // SetGCGenerational switches this State's GC mode to generational (matching lua.c startup).
-func (s *State) SetGCGenerational() { s.gc.mode = gcModeGenerational }
+func (s *State) SetGCGenerational() {
+	if s.collector != nil {
+		s.collector.SetMode(arena.ModeGenMinor)
+	}
+}
 
 // ToStringValue converts v to a Go string honoring __tostring / __name metamethods
 // (matching PUC-Rio luaL_tolstring without consulting global _G.tostring).
@@ -569,11 +898,12 @@ func (s *State) ToStringValue(v Value) (string, error) { return s.toStringValue(
 // TracebackFromNative formats a Lua 5.5 stack traceback starting just below the given
 // native function (skipping self if a frameNative was pushed by debug hooks).
 func (s *State) TracebackFromNative(msg string, self *NativeFunc) string {
+	th := s.cur()
 	level := 0
-	if s.topFrameIsNative(s.curThread, self) {
+	if s.topFrameIsNative(th, self) {
 		level = 1
 	}
-	return s.formatTraceback(s.curThread, msg, true, level)
+	return s.formatTraceback(th, msg, true, level)
 }
 
 // SetInterruptFlag attaches an atomic interrupt flag polled periodically in runHooked
@@ -584,8 +914,6 @@ func (s *State) SetInterruptFlag(flag *atomic.Bool) { s.intrFlag = flag }
 func (s *State) InChildExec() bool { return s.childExecDepth.Load() > 0 }
 
 // SetContext attaches a context for cooperative VM cancellation / timeout.
-// Passing nil or a non-cancelable context (ctx.Done() == nil, e.g. context.Background())
-// clears the context and keeps the zero-overhead fast dispatch loop active.
 func (s *State) SetContext(ctx context.Context) {
 	if ctx != nil && ctx.Done() == nil {
 		ctx = nil
@@ -596,7 +924,6 @@ func (s *State) SetContext(ctx context.Context) {
 
 // SetInstructionLimit sets the maximum number of Lua VM instructions this State may execute
 // before aborting with ErrInstructionLimit, and resets the instruction counter to 0.
-// Passing limit <= 0 disables the limit and restores the zero-overhead fast dispatch loop.
 func (s *State) SetInstructionLimit(limit int64) {
 	if limit < 0 {
 		limit = 0
@@ -639,10 +966,6 @@ func (s *State) checkNativeCancelStep() error {
 	return nil
 }
 
-// nativeCancelFunc returns nil when no Go context or instruction budget is active (zero allocation),
-// or a cooperative callback polled during potentially long-running native operations
-// (such as string pattern backtracking). CLI SIGINT (intrFlag) intentionally follows PUC-Rio
-// lua.c's two-SIGINT convention for unbreakable native searches (testes/main.lua:580-596).
 func (s *State) nativeCancelFunc() func() error {
 	if s.ctx == nil && s.insnLimit <= 0 {
 		return nil
@@ -650,9 +973,6 @@ func (s *State) nativeCancelFunc() func() error {
 	return s.checkNativeCancelStep
 }
 
-// dynamicNativeCancelFunc returns a cooperative cancellation callback that consults the State's
-// current context and instruction limit on every poll (used by long-lived iterators such as
-// string.gmatch so limits attached after iterator creation are still enforced).
 func (s *State) dynamicNativeCancelFunc() func() error {
 	return func() error {
 		if s.ctx == nil && s.insnLimit <= 0 && s.abortErr == nil {
@@ -662,31 +982,137 @@ func (s *State) dynamicNativeCancelFunc() func() error {
 	}
 }
 
-// FormatValue formats a Lua Value owned by this State for tostring() / print() / host diagnostics.
-// Returned strings are safely cloned copies independent of Arena lifetime.
-func (s *State) FormatValue(v Value) string {
-	return FormatValue(v)
-}
-
-// RawEqual implements Lua 5.5 rawequal(a, b) for Values owned by this State.
-func (s *State) RawEqual(a, b Value) bool {
-	return RawEqual(a, b)
-}
-
-// UserdataData returns the Go host payload stored on userdata u.
+// UserdataData returns the Go host payload stored on userdata u via State.goRefs.
 func (s *State) UserdataData(u *Userdata) any {
+	if u == nil || u.dataRef == arena.NullGoHandle || s.goRefs == nil {
+		return nil
+	}
+	v, _ := s.goRefs.Get(u.dataRef)
+	return v
+}
+
+// SetUserdataData updates the Go host payload stored on userdata u via State.goRefs.
+func (s *State) SetUserdataData(u *Userdata, data any) {
+	if u == nil || s.goRefs == nil {
+		return
+	}
+	if u.dataRef != arena.NullGoHandle {
+		s.goRefs.Free(u.dataRef)
+		u.dataRef = arena.NullGoHandle
+	}
+	if data != nil {
+		u.dataRef = s.goRefs.Alloc(data)
+	}
+}
+
+// UserdataMeta returns the metatable Table of userdata u, or nil.
+func (s *State) UserdataMeta(u *Userdata) *Table {
+	if u == nil || u.metaRef == arena.NullRef {
+		return nil
+	}
+	return s.tableByRef(u.metaRef)
+}
+
+// UserdataUValues returns the Lua user-value slice of userdata u.
+func (s *State) UserdataUValues(u *Userdata) []Value {
 	if u == nil {
 		return nil
 	}
-	return u.Data
+	return u.uvalsSlice(s.arena)
 }
 
-// SetUserdataData updates the Go host payload stored on userdata u.
-func (s *State) SetUserdataData(u *Userdata, data any) {
-	if u == nil {
+// SetUserdataUValue sets user value idx on userdata u with a GC write barrier.
+func (s *State) SetUserdataUValue(u *Userdata, idx int, v Value) {
+	if u == nil || idx < 0 || idx >= int(u.nUValues) {
 		return
 	}
-	u.Data = data
+	u.uvalsSlice(s.arena)[idx] = v
+	if v.IsGCObject() && u.hdr.IsBlack() {
+		s.collector.Barrier(u.self, v.Ref())
+	}
+}
+
+// SetUserdataGCRefs stores internal GC-traced Lua values on userdata u (e.g. io.lines file ref).
+func (s *State) SetUserdataGCRefs(u *Userdata, refs []Value) error {
+	if u == nil {
+		return nil
+	}
+	if u.gcRefsRef != arena.NullRef {
+		s.arena.Free(u.gcRefsRef)
+		u.gcRefsRef = arena.NullRef
+		u.nGCRefs = 0
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	ref, err := s.arena.Alloc(len(refs) * int(unsafe.Sizeof(Value{})))
+	if err != nil {
+		return err
+	}
+	s.collector.AddDebt(int64(s.arena.SlotSize(ref)))
+	copy(arena.SliceFast[Value](s.arena, ref, 0, len(refs)), refs)
+	u.gcRefsRef = ref
+	u.nGCRefs = uint32(len(refs))
+	if u.hdr.IsBlack() {
+		for _, v := range refs {
+			if v.IsGCObject() {
+				s.collector.Barrier(u.self, v.Ref())
+			}
+		}
+	}
+	return nil
+}
+
+// NativeValue wraps a Go *NativeFunc as a Lua Value owned by this State.
+// Stdlib static builtins use the immutable process-wide static table; all other
+// native callbacks allocate a per-State ArenaNative bridged via GoRefs.
+func (s *State) NativeValue(nf *NativeFunc) Value {
+	if nf == nil {
+		return NilValue()
+	}
+	staticNativeMu.Lock()
+	idx, ok := staticNativeBy[nf]
+	staticNativeMu.Unlock()
+	if ok {
+		return staticNativeValue(idx)
+	}
+	v, err := s.allocArenaNative(nf)
+	if err != nil {
+		s.memExceeded = true
+		return NilValue()
+	}
+	return v
+}
+
+// allocStaticNative registers a process-wide immutable stdlib builtin and returns its Value.
+func (s *State) allocStaticNative(nf *NativeFunc) Value {
+	return staticNativeValue(registerStaticNative(nf))
+}
+
+func (s *State) allocArenaNative(nf *NativeFunc) (Value, error) {
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(ArenaNative{})), gcKindNative)
+	if err != nil {
+		return NilValue(), err
+	}
+	an := arena.AsSmall[ArenaNative](s.arena, ref)
+	an.self = ref
+	an.goRef = s.goRefs.Alloc(nf)
+	an.numUpvals = nf.NumUpvals
+	an.intrinsic = nf.Intrinsic
+	if nf.Collectable {
+		an.hdr.Flags |= natFlagCollectable
+	}
+	if len(nf.upvals) > 0 {
+		uref, uerr := s.arena.Alloc(len(nf.upvals) * int(unsafe.Sizeof(Value{})))
+		if uerr != nil {
+			return NilValue(), uerr
+		}
+		s.collector.AddDebt(int64(s.arena.SlotSize(uref)))
+		copy(arena.SliceFast[Value](s.arena, uref, 0, len(nf.upvals)), nf.upvals)
+		an.upvalsRef = uref
+		an.nUpvals = uint16(len(nf.upvals))
+	}
+	return ArenaNativeValue(an), nil
 }
 
 // materializeLuaError caches a cloned Go string message on an uncaught *LuaError when it
@@ -732,10 +1158,11 @@ func (s *State) FormatError(err error) string {
 }
 
 func (s *State) globalEnvValue() Value {
-	if s.registryTbl == nil {
+	reg := s.registry()
+	if reg == nil {
 		return NilValue()
 	}
-	return s.registryTbl.RawGetInt(s, ridxGlobals)
+	return reg.RawGetInt(s, ridxGlobals)
 }
 
 // GlobalEnv returns the current global environment table at registry[LUA_RIDX_GLOBALS],
@@ -748,20 +1175,21 @@ func (s *State) GlobalEnv() *Table {
 }
 
 // Registry returns the State's Lua registry table (LUA_REGISTRYINDEX).
-func (s *State) Registry() *Table { return s.registryTbl }
+func (s *State) Registry() *Table { return s.registry() }
 
 // PreloadTable returns the State's active registry _PRELOAD table, recreating it
 // on the registry if Lua replaced or cleared debug.getregistry()._PRELOAD.
 func (s *State) PreloadTable() *Table {
-	if s.registryTbl == nil {
+	reg := s.registry()
+	if reg == nil {
 		return nil
 	}
 	key := s.intern.Intern("_PRELOAD")
-	if v := s.registryTbl.RawGetStr(s, key); v.IsTable() {
+	if v := reg.RawGetStr(s, key); v.IsTable() {
 		return s.asTable(v)
 	}
 	t := s.NewTable(0, 4)
-	s.registryTbl.RawSetStr(s, key, TableValue(t))
+	reg.RawSetStr(s, key, TableValue(t))
 	return t
 }
 
@@ -769,8 +1197,6 @@ func (s *State) PreloadTable() *Table {
 func (s *State) Intern(str string) *LuaString { return s.intern.Intern(str) }
 
 // LookupString looks up str without populating the short-string intern cache.
-// For short strings (<= 40 bytes) not yet interned in this State, returns (nil, false).
-// For long strings (> 40 bytes), returns a transient *LuaString wrapper suitable for table lookup.
 func (s *State) LookupString(str string) (*LuaString, bool) {
 	if len(str) <= maxShortStringLen {
 		return s.intern.lookupExistingShort(str)
@@ -799,85 +1225,153 @@ func (s *State) GetGlobal(name string) Value {
 	return env.RawGetStr(s, ls)
 }
 
-func (s *State) bindProto(p *bytecode.Proto) *boundProto {
+func (s *State) allocProtoSlot(bp *boundProto) uint32 {
+	if n := len(s.freeProtoIDs); n > 0 {
+		idx := s.freeProtoIDs[n-1]
+		s.freeProtoIDs = s.freeProtoIDs[:n-1]
+		s.protos[idx] = bp
+		return idx
+	}
+	if len(s.protos) == 0 {
+		s.protos = []*boundProto{nil}
+	}
+	idx := uint32(len(s.protos))
+	s.protos = append(s.protos, bp)
+	return idx
+}
+
+func (s *State) bindProto(p *bytecode.Proto) (*ArenaProto, *boundProto, error) {
 	return s.bindProtoWithCache(p, nil)
 }
 
-func (s *State) bindProtoWithCache(p *bytecode.Proto, longStrs map[string]*LuaString) *boundProto {
+func (s *State) bindProtoWithCache(p *bytecode.Proto, longStrs map[string]*LuaString) (*ArenaProto, *boundProto, error) {
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(ArenaProto{})), gcKindProto)
+	if err != nil {
+		return nil, nil, err
+	}
+	ap := arena.AsSmall[ArenaProto](s.arena, ref)
+	ap.self = ref
+
+	var consts []Value
+	if len(p.Consts) > 0 {
+		cref, cerr := s.arena.Alloc(len(p.Consts) * int(unsafe.Sizeof(Value{})))
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		s.collector.AddDebt(int64(s.arena.SlotSize(cref)))
+		ap.constsRef = cref
+		ap.nConsts = uint32(len(p.Consts))
+		consts = arena.SliceFast[Value](s.arena, cref, 0, len(p.Consts))
+		for i, c := range p.Consts {
+			switch c.Kind {
+			case bytecode.ConstNil:
+				consts[i] = NilValue()
+			case bytecode.ConstFalse:
+				consts[i] = FalseValue()
+			case bytecode.ConstTrue:
+				consts[i] = TrueValue()
+			case bytecode.ConstInt:
+				consts[i] = IntValue(c.Int)
+			case bytecode.ConstFloat:
+				consts[i] = FloatValue(c.Float)
+			case bytecode.ConstString:
+				var ls *LuaString
+				if len(c.Str) > maxShortStringLen && longStrs != nil {
+					if cached, ok := longStrs[c.Str]; ok {
+						ls = cached
+					} else {
+						ls = s.intern.Intern(c.Str)
+						longStrs[c.Str] = ls
+					}
+				} else {
+					ls = s.intern.Intern(c.Str)
+				}
+				consts[i] = StringValue(ls)
+			}
+		}
+	}
+
+	var ics []ICEntry
+	var icBytes int64
+	if OptimizeEnabled && p.ICCount > 0 {
+		ics = make([]ICEntry, p.ICCount)
+		ap.nIC = uint32(p.ICCount)
+		icBytes = int64(len(ics)) * int64(unsafe.Sizeof(ICEntry{}))
+	}
+
+	var subs []arena.ObjRef
+	if len(p.Protos) > 0 {
+		sref, serr := s.arena.AllocZeroed(len(p.Protos) * int(unsafe.Sizeof(arena.ObjRef(0))))
+		if serr != nil {
+			return nil, nil, serr
+		}
+		s.collector.AddDebt(int64(s.arena.SlotSize(sref)))
+		ap.subRef = sref
+		ap.nSub = uint32(len(p.Protos))
+		subs = arena.SliceFast[arena.ObjRef](s.arena, sref, 0, len(p.Protos))
+		for i, sub := range p.Protos {
+			subAP, _, berr := s.bindProtoWithCache(sub, longStrs)
+			if berr != nil {
+				return nil, nil, berr
+			}
+			subs[i] = subAP.self
+		}
+	}
+
+	goBytes := protoGoBytes(p) + icBytes
 	bp := &boundProto{
 		proto:     p,
 		insns:     codeOf(p.Code),
-		consts:    make([]Value, len(p.Consts)),
-		strConsts: make([]*LuaString, len(p.Consts)),
+		consts:    consts,
 		icSlots:   p.ICSlot,
+		ic:        ics,
+		sub:       subs,
+		arenaRef:  ref,
+		goBytes:   goBytes,
 		numParams: p.NumParams,
 		maxStack:  p.MaxStackSize,
 		isVararg:  p.IsVararg(),
 	}
-	for i, c := range p.Consts {
-		switch c.Kind {
-		case bytecode.ConstNil:
-			bp.consts[i] = NilValue()
-		case bytecode.ConstFalse:
-			bp.consts[i] = FalseValue()
-		case bytecode.ConstTrue:
-			bp.consts[i] = TrueValue()
-		case bytecode.ConstInt:
-			bp.consts[i] = IntValue(c.Int)
-		case bytecode.ConstFloat:
-			bp.consts[i] = FloatValue(c.Float)
-		case bytecode.ConstString:
-			var ls *LuaString
-			if len(c.Str) > maxShortStringLen && longStrs != nil {
-				if cached, ok := longStrs[c.Str]; ok {
-					ls = cached
-				} else {
-					ls = s.intern.Intern(c.Str)
-					longStrs[c.Str] = ls
-				}
-			} else {
-				ls = s.intern.Intern(c.Str)
-			}
-			bp.consts[i] = StringValue(ls)
-			bp.strConsts[i] = ls
-		}
-	}
-	if OptimizeEnabled && p.ICCount > 0 {
-		bp.ic = make([]ICEntry, p.ICCount)
-	}
-	if len(p.Protos) > 0 {
-		bp.sub = make([]*boundProto, len(p.Protos))
-		for i, sub := range p.Protos {
-			bp.sub[i] = s.bindProtoWithCache(sub, longStrs)
-		}
-	}
-	return bp
+	idx := s.allocProtoSlot(bp)
+	bp.protoIdx = idx
+	ap.protoIdx = idx
+	s.extraMemBytes += goBytes
+	s.collector.AddDebt(goBytes)
+	return ap, bp, nil
 }
 
-// protoOwnBytes estimates the VM-owned retained storage for one Proto and its
-// boundProto wrapper (excluding child protos and interned string payloads).
+// protoGoBytes returns the Go-side retained storage for one immutable *bytecode.Proto
+// (excluding Arena-allocated consts/IC/sub buffers already counted in Arena.AllocBytes).
+func protoGoBytes(p *bytecode.Proto) int64 {
+	if p == nil {
+		return 0
+	}
+	n := int64(192) // Proto + boundProto headers
+	n += int64(len(p.Source))
+	n += int64(len(p.Code)) * 4
+	n += int64(len(p.Consts)) * 24
+	n += int64(len(p.Upvalues)) * 24
+	for _, uv := range p.Upvalues {
+		n += int64(len(uv.Name))
+	}
+	n += int64(len(p.Protos)) * 8
+	n += int64(len(p.LineInfo))
+	n += int64(len(p.AbsLineInfo)) * 8
+	n += int64(len(p.LocVars)) * 24
+	for _, lv := range p.LocVars {
+		n += int64(len(lv.Name))
+	}
+	n += int64(len(p.ICSlot)) * 4
+	return n
+}
+
 func protoOwnBytes(p *bytecode.Proto, withIC bool) int64 {
 	if p == nil {
 		return 0
 	}
-	n := int64(256) // Proto + boundProto headers
-	n += int64(len(p.Source))
-	n += int64(len(p.Code)) * 4        // []Instruction (uint32)
-	n += int64(len(p.Consts)) * 48     // []Constant + boundProto.consts + strConsts
-	n += int64(len(p.Upvalues)) * 24   // []UpvalDesc
-	for _, uv := range p.Upvalues {
-		n += int64(len(uv.Name))
-	}
-	n += int64(len(p.Protos)) * 16     // []*Proto + []*boundProto
-	n += int64(len(p.LineInfo))        // []int8
-	n += int64(len(p.AbsLineInfo)) * 8 // []AbsLineInfo
-	n += int64(len(p.LocVars)) * 24    // []LocVar
-	for _, lv := range p.LocVars {
-		n += int64(len(lv.Name))
-	}
-	n += int64(len(p.ICSlot)) * 4 // []int32
+	n := protoGoBytes(p) + int64(unsafe.Sizeof(ArenaProto{})) + int64(len(p.Consts))*16 + int64(len(p.Protos))*4
 	if withIC && p.ICCount > 0 {
-		n += int64(p.ICCount) * 64 // []ICEntry
+		n += int64(p.ICCount) * int64(unsafe.Sizeof(ICEntry{}))
 	}
 	return n
 }
@@ -899,7 +1393,7 @@ func protoTreeBytes(p *bytecode.Proto, withIC bool) int64 {
 				}
 				if _, ok := seen[c.Str]; !ok {
 					seen[c.Str] = struct{}{}
-					total += 48 + int64(len(c.Str))
+					total += int64(luaStringHeaderSize) + int64(len(c.Str))
 				}
 			}
 		}
@@ -911,31 +1405,68 @@ func protoTreeBytes(p *bytecode.Proto, withIC bool) int64 {
 	return walk(p)
 }
 
+func (s *State) allocClosedUpval(val Value) (*Upvalue, error) {
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Upvalue{})), gcKindUpvalue)
+	if err != nil {
+		return nil, err
+	}
+	uv := arena.AsSmall[Upvalue](s.arena, ref)
+	uv.self = ref
+	uv.closed = val
+	return uv, nil
+}
+
+func (s *State) allocClosure(ap *ArenaProto, bp *boundProto, nUpvals int) (*Closure, error) {
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Closure{})), gcKindClosure)
+	if err != nil {
+		return nil, err
+	}
+	cl := arena.AsSmall[Closure](s.arena, ref)
+	cl.self = ref
+	cl.protoRef = ap.self
+	cl.protoIdx = bp.protoIdx
+	if nUpvals > 0 {
+		uref, uerr := s.arena.AllocZeroed(nUpvals * int(unsafe.Sizeof(arena.ObjRef(0))))
+		if uerr != nil {
+			return nil, uerr
+		}
+		s.collector.AddDebt(int64(s.arena.SlotSize(uref)))
+		cl.upvalsRef = uref
+		cl.nUpvals = uint16(nUpvals)
+	}
+	return cl, nil
+}
+
 // Load instantiates an immutable verified *bytecode.Proto as a top-level Closure with _ENV as upvalue 0.
 func (s *State) Load(p *bytecode.Proto) (*Closure, error) {
-	var chunkBytes int64
-	if s.memLimit > 0 || s.gc.tier1 {
-		chunkBytes = int64(64+len(p.Upvalues)*24) + protoTreeBytes(p, OptimizeEnabled)
-		if s.memLimit > 0 {
-			if err := s.checkMem(chunkBytes); err != nil {
-				return nil, err
+	if s.memLimit > 0 {
+		chunkBytes := int64(unsafe.Sizeof(Closure{})) + int64(len(p.Upvalues))*(int64(unsafe.Sizeof(Upvalue{}))+4) + protoTreeBytes(p, OptimizeEnabled)
+		if err := s.checkMem(chunkBytes); err != nil {
+			return nil, err
+		}
+	}
+	ap, bp, err := s.bindProtoWithCache(p, make(map[string]*LuaString))
+	if err != nil {
+		return nil, err
+	}
+	cl, err := s.allocClosure(ap, bp, len(p.Upvalues))
+	if err != nil {
+		return nil, err
+	}
+	if cl.nUpvals > 0 {
+		ups := cl.upvalsSlice(s.arena)
+		u0, uerr := s.allocClosedUpval(s.globalEnvValue())
+		if uerr != nil {
+			return nil, uerr
+		}
+		ups[0] = u0.self
+		for i := 1; i < len(ups); i++ {
+			ui, uerr := s.allocClosedUpval(NilValue())
+			if uerr != nil {
+				return nil, uerr
 			}
+			ups[i] = ui.self
 		}
-	}
-	bp := s.bindProtoWithCache(p, make(map[string]*LuaString))
-	cl := &Closure{
-		bp:     bp,
-		upvals: make([]*Upvalue, len(p.Upvalues)),
-	}
-	if len(cl.upvals) > 0 {
-		cl.upvals[0] = &Upvalue{closed: s.globalEnvValue()}
-		for i := 1; i < len(cl.upvals); i++ {
-			cl.upvals[i] = &Upvalue{closed: NilValue()}
-		}
-	}
-	if chunkBytes > 0 {
-		s.gc.allocBytes += chunkBytes
-		s.gcAddDebt(chunkBytes)
 	}
 	return cl, nil
 }
@@ -951,24 +1482,23 @@ func (s *State) UndumpAndLoad(chunk []byte) (*Closure, error) {
 
 // Call invokes a Lua closure or native function on the current Thread and returns its results.
 func (s *State) Call(fn Value, args ...Value) ([]Value, error) {
-	return s.callOnThread(s.curThread, fn, args)
+	return s.callOnThread(s.cur(), fn, args)
 }
 
 // Call1 invokes fn(args...) and returns its first result (or NilValue if none) with zero
 // return-slice allocation on the hot Lua/FastFn paths.
 func (s *State) Call1(fn Value, args ...Value) (Value, error) {
-	return s.call1OnThread(s.curThread, fn, args)
+	return s.call1OnThread(s.cur(), fn, args)
 }
 
 // CallProtected invokes fn(args...) in protected mode with message handler msgh
 // (analogous to lua_pcall with a C message handler, without pushing a Lua xpcall wrapper frame).
-// Returns (results, errVal, ok, abortErr).
 func (s *State) CallProtected(fn Value, msgh Value, args ...Value) ([]Value, Value, bool, error) {
 	return s.callProtectedMode(fn, msgh, !msgh.IsNil(), args, true, NilValue())
 }
 
 func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value, topProtected bool, nativeFn Value) ([]Value, Value, bool, error) {
-	th := s.curThread
+	th := s.cur()
 	if s.nCcalls == 0 {
 		s.abortErr = nil
 	}
@@ -1007,10 +1537,11 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 	}()
 	savedTop := th.top
 	base := savedTop
+	frames := th.framesSlice(s.arena)
 	for fi := range th.nframe {
-		cf := &th.frames[fi]
+		cf := &frames[fi]
 		if cf.kind == frameLua && cf.cl != nil {
-			if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > base {
+			if end := cf.base + int(s.boundProtoOf(cf.cl).maxStack); end > base {
 				base = end
 			}
 		}
@@ -1024,10 +1555,11 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 		if err := s.ensureStackWithRoots(th, base+3+len(args)+8, fn, rootArgs); err != nil {
 			return nil, errorToLuaValue(s, err), false, nil
 		}
-		th.stack[base] = nativeFn
-		th.stack[base+1] = fn
-		th.stack[base+2] = msgh
-		copy(th.stack[base+3:base+3+len(args)], args)
+		stack := th.stackSlice(s.arena)
+		stack[base] = nativeFn
+		stack[base+1] = fn
+		stack[base+2] = msgh
+		copy(stack[base+3:base+3+len(args)], args)
 		th.top = base + 3 + len(args)
 		nargs = 2 + len(args)
 	} else {
@@ -1037,9 +1569,10 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 		if err := s.ensureStackWithRoots(th, base+2+len(args)+8, fn, rootArgs); err != nil {
 			return nil, errorToLuaValue(s, err), false, nil
 		}
-		th.stack[base] = nativeFn
-		th.stack[base+1] = fn
-		copy(th.stack[base+2:base+2+len(args)], args)
+		stack := th.stackSlice(s.arena)
+		stack[base] = nativeFn
+		stack[base+1] = fn
+		copy(stack[base+2:base+2+len(args)], args)
 		th.top = base + 2 + len(args)
 		nargs = 1 + len(args)
 	}
@@ -1048,25 +1581,26 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 	entryDepth := th.nframe
 	clearTop := func() {
 		th.nframe = entryDepth
-		if entryDepth == 0 && len(th.openUpvals) == 0 {
-			if end := min(max(th.highStack, th.top, setupEnd), len(th.stack)); base < end {
-				fillNil(th.stack[base:end])
+		stack := th.stackSlice(s.arena)
+		fslice := th.framesSlice(s.arena)
+		if entryDepth == 0 && th.openUpvalsCount() == 0 {
+			if end := min(max(th.highStack, th.top, setupEnd), len(stack)); base < end {
+				fillNil(stack[base:end])
 			}
-			if hf := min(th.highFrames, len(th.frames)); hf > 0 {
-				clear(th.frames[:hf])
+			if hf := min(th.highFrames, len(fslice)); hf > 0 {
+				clear(fslice[:hf])
 			}
 			th.highStack = base
 			th.highFrames = 0
-			th.clearAbandonedInitStorage()
 		} else {
-			if base < len(th.stack) {
-				end := min(max(th.highStack, th.top, setupEnd), len(th.stack))
+			if base < len(stack) {
+				end := min(max(th.highStack, th.top, setupEnd), len(stack))
 				if base < end {
-					fillNil(th.stack[base:end])
+					fillNil(stack[base:end])
 				}
 			}
-			if hf := min(th.highFrames, len(th.frames)); entryDepth < hf {
-				clear(th.frames[entryDepth:hf])
+			if hf := min(th.highFrames, len(fslice)); entryDepth < hf {
+				clear(fslice[entryDepth:hf])
 				th.highFrames = entryDepth
 			}
 		}
@@ -1094,9 +1628,9 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 	}
 	if pushed {
 		runErr := s.runThread(th, entryDepth)
-		if th.uncaughtErrVal != nil {
-			runErr = th.uncaughtErrVal
-			th.uncaughtErrVal = nil
+		if uerr := th.uncaughtErr(s); uerr != nil {
+			runErr = uerr
+			th.setUncaughtErr(s, nil)
 		}
 		if runErr == nil && s.abortErr != nil {
 			runErr = s.abortErr
@@ -1116,7 +1650,7 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 		}
 	}
 	if s.gcNeedsCheck() {
-		s.gcCheckDebt(th.top)
+		s.gcCheckStep(th.top)
 		if s.abortErr != nil {
 			uerr := s.abortErr
 			abortCleanup(uerr)
@@ -1128,10 +1662,11 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 		clearTop()
 		return nil, NilValue(), true, nil
 	}
-	if th.stack[base].IsFalsy() {
+	stack := th.stackSlice(s.arena)
+	if stack[base].IsFalsy() {
 		ev := NilValue()
 		if nres > 1 {
-			ev = th.stack[base+1]
+			ev = stack[base+1]
 		}
 		clearTop()
 		return nil, ev, false, nil
@@ -1139,7 +1674,7 @@ func (s *State) callProtectedMode(fn Value, msgh Value, isXP bool, args []Value,
 	var res []Value
 	if nres > 1 {
 		res = make([]Value, nres-1)
-		copy(res, th.stack[base+1:th.top])
+		copy(res, stack[base+1:th.top])
 	}
 	clearTop()
 	return res, NilValue(), true, nil
@@ -1220,14 +1755,13 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		}
 	}
 	if fn.IsNative() {
-		// Always root native callee and arguments on the active thread stack across the call
-		// so GC / finalizers cannot prematurely collect live arguments even when debug hooks are off.
 		savedTop := th.top
 		base := savedTop
+		frames := th.framesSlice(s.arena)
 		for fi := range th.nframe {
-			cf := &th.frames[fi]
+			cf := &frames[fi]
 			if cf.kind == frameLua && cf.cl != nil {
-				if end := cf.base + int(cf.cl.bp.proto.MaxStackSize); end > base {
+				if end := cf.base + int(s.boundProtoOf(cf.cl).maxStack); end > base {
 					base = end
 				}
 			}
@@ -1235,13 +1769,15 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		if err := s.ensureStackWithRoots(th, base+1+len(args)+8, fn, args); err != nil {
 			return nil, err
 		}
-		th.stack[base] = fn
-		copy(th.stack[base+1:base+1+len(args)], args)
+		stack := th.stackSlice(s.arena)
+		stack[base] = fn
+		copy(stack[base+1:base+1+len(args)], args)
 		th.top = base + 1 + len(args)
 		cleanupEnd := base + 1 + len(args)
 		defer func() {
-			if end := min(cleanupEnd, len(th.stack)); base < end {
-				fillNil(th.stack[base:end])
+			st := th.stackSlice(s.arena)
+			if end := min(cleanupEnd, len(st)); base < end {
+				fillNil(st[base:end])
 			}
 			th.top = savedTop
 		}()
@@ -1254,7 +1790,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			(nf.Intrinsic == intrXPCall && len(args) >= 2 && args[1].IsFunction())
 		if isDirectProtected {
 			if nf.Intrinsic == intrXPCall {
-				pres, errVal, ok, abortErr := s.callProtectedMode(th.stack[base+1], th.stack[base+2], true, th.stack[base+3:base+1+len(args)], false, fn)
+				pres, errVal, ok, abortErr := s.callProtectedMode(stack[base+1], stack[base+2], true, stack[base+3:base+1+len(args)], false, fn)
 				if abortErr != nil {
 					err = abortErr
 				} else if !ok {
@@ -1265,7 +1801,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 					copy(res[1:], pres)
 				}
 			} else {
-				pres, errVal, ok, abortErr := s.callProtectedMode(th.stack[base+1], NilValue(), false, th.stack[base+2:base+1+len(args)], false, fn)
+				pres, errVal, ok, abortErr := s.callProtectedMode(stack[base+1], NilValue(), false, stack[base+2:base+1+len(args)], false, fn)
 				if abortErr != nil {
 					err = abortErr
 				} else if !ok {
@@ -1280,7 +1816,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			prevCB := th.inCCallback
 			th.inCCallback = true
 			th.nativeArgsDepth++
-			res, err = nf.callMulti(s, th.stack[base+1:base+1+len(args)])
+			res, err = nf.callMulti(s, stack[base+1:base+1+len(args)])
 			res = th.finishNativeArgs(s, res)
 			th.inCCallback = prevCB
 		} else {
@@ -1289,39 +1825,37 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			res, _, err = s.callNativeHooked(th, fn, base, len(args), extraDepth, maxFrames+128)
 			th.inCCallback = prevCB
 		}
-		if err == nil && len(res) > 0 && (slicesOverlapValues(res, th.stack) || slicesOverlapValues(res, th.initStack)) {
+		if err == nil && len(res) > 0 && slicesOverlapValues(res, th.stackSlice(s.arena)) {
 			cp := make([]Value, len(res))
 			copy(cp, res)
 			res = cp
 		}
 		if err == nil && s.gcNeedsCheck() {
-			// Clear finished callee/args before growing the stack and root all native return
-			// values across both stack growth (emergency GC) and Tier-1 debt collection.
-			fillNil(th.stack[base:cleanupEnd])
+			st := th.stackSlice(s.arena)
+			fillNil(st[base:min(cleanupEnd, len(st))])
 			th.top = base
 			if len(res) > 0 {
 				if serr := s.ensureStackWithRoots(th, base+len(res)+4, NilValue(), res); serr == nil {
-					copy(th.stack[base:base+len(res)], res)
+					copy(th.stackSlice(s.arena)[base:base+len(res)], res)
 					if end := base + len(res); end > cleanupEnd {
 						cleanupEnd = end
 					}
 					th.top = base + len(res)
-					s.gcCheckDebt(th.top)
+					s.gcCheckStep(th.top)
 				} else if s.abortErr == nil {
-					// Stack growth hit memLimit: pin res transiently via Ref handles.
 					var refs []int
 					for _, v := range res {
 						if isGCRootable(v) {
 							refs = append(refs, s.Ref(v))
 						}
 					}
-					s.gcCheckDebt(th.top)
+					s.gcCheckStep(th.top)
 					for _, id := range refs {
 						s.Unref(id)
 					}
 				}
 			} else {
-				s.gcCheckDebt(th.top)
+				s.gcCheckStep(th.top)
 			}
 			if s.abortErr != nil {
 				return nil, s.abortErr
@@ -1340,27 +1874,26 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	}()
 
 	cl := s.asClosure(fn)
-	p := cl.bp.proto
+	bp := s.boundProtoOf(cl)
 	base := th.top
 	if th.nframe > 0 {
-		prev := &th.frames[th.nframe-1]
+		prev := &th.framesSlice(s.arena)[th.nframe-1]
 		if prev.kind == frameLua && prev.cl != nil {
-			if prevEnd := prev.base + int(prev.cl.bp.proto.MaxStackSize); prevEnd > base {
+			if prevEnd := prev.base + int(s.boundProtoOf(prev.cl).maxStack); prevEnd > base {
 				base = prevEnd
 			}
 		}
 	}
 	funcIdx := base
 	argBase := funcIdx + 1
-	if err := s.ensureStackWithRoots(th, argBase+max(len(args), int(p.MaxStackSize))+8, fn, args); err != nil {
+	if err := s.ensureStackWithRoots(th, argBase+max(len(args), int(bp.maxStack))+8, fn, args); err != nil {
 		return nil, err
 	}
-	th.stack[funcIdx] = fn
-	for i, a := range args {
-		th.stack[argBase+i] = a
-	}
+	stack := th.stackSlice(s.arena)
+	stack[funcIdx] = fn
+	copy(stack[argBase:argBase+len(args)], args)
 	th.top = argBase + len(args)
-	th.noteStack(argBase + max(len(args), int(p.MaxStackSize)))
+	th.noteStack(argBase + max(len(args), int(bp.maxStack)))
 
 	entryDepth := th.nframe
 	if err := th.pushLuaFrame(s, cl, funcIdx, len(args), -1); err != nil {
@@ -1376,22 +1909,23 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	}
 	clearTopStack := func() {
 		th.top = funcIdx
-		if entryDepth == 0 && len(th.openUpvals) == 0 {
-			if end := min(max(th.highStack, th.top), len(th.stack)); funcIdx < end {
-				fillNil(th.stack[funcIdx:end])
+		if entryDepth == 0 && th.openUpvalsCount() == 0 {
+			st := th.stackSlice(s.arena)
+			if end := min(max(th.highStack, th.top), len(st)); funcIdx < end {
+				fillNil(st[funcIdx:end])
 			}
-			if hf := min(th.highFrames, len(th.frames)); hf > 0 {
-				clear(th.frames[:hf])
+			fs := th.framesSlice(s.arena)
+			if hf := min(th.highFrames, len(fs)); hf > 0 {
+				clear(fs[:hf])
 			}
 			th.highStack = funcIdx
 			th.highFrames = 0
-			th.clearAbandonedInitStorage()
 		}
 	}
 	err := s.runThread(th, entryDepth)
-	if th.uncaughtErrVal != nil {
-		err = th.uncaughtErrVal
-		th.uncaughtErrVal = nil
+	if uerr := th.uncaughtErr(s); uerr != nil {
+		err = uerr
+		th.setUncaughtErr(s, nil)
 	}
 	if err == nil && s.abortErr != nil {
 		err = s.abortErr
@@ -1438,7 +1972,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		return nil, le
 	}
 	if s.gcNeedsCheck() {
-		s.gcCheckDebt(th.top)
+		s.gcCheckStep(th.top)
 		if s.abortErr != nil {
 			clearTopStack()
 			return nil, s.abortErr
@@ -1450,7 +1984,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		return nil, nil
 	}
 	res := make([]Value, nres)
-	copy(res, th.stack[funcIdx:th.top])
+	copy(res, th.stackSlice(s.arena)[funcIdx:th.top])
 	clearTopStack()
 	return res, nil
 }
@@ -1460,8 +1994,8 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 	if fn.IsClosure() && s.abortErr == nil && !s.hasInterruptControl() &&
 		s.nCcalls < maxCCalls && th.hookMask == 0 && !th.inHook && !th.suppressHook {
 		cl := s.asClosure(fn)
-		p := cl.bp.proto
-		if !p.IsVararg() {
+		bp := s.boundProtoOf(cl)
+		if !bp.isVararg {
 			s.nCcalls++
 			th.nny++
 			prevCB := th.inCCallback
@@ -1469,32 +2003,35 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 
 			base := th.top
 			if th.nframe > 0 {
-				prev := &th.frames[th.nframe-1]
+				prev := &th.framesSlice(s.arena)[th.nframe-1]
 				if prev.kind == frameLua && prev.cl != nil {
-					if prevEnd := prev.base + int(prev.cl.bp.proto.MaxStackSize); prevEnd > base {
+					if prevEnd := prev.base + int(s.boundProtoOf(prev.cl).maxStack); prevEnd > base {
 						base = prevEnd
 					}
 				}
 			}
 			funcIdx := base
 			argBase := funcIdx + 1
-			need := argBase + max(len(args), int(p.MaxStackSize)) + 8
+			maxStack := int(bp.maxStack)
+			need := argBase + max(len(args), maxStack) + 8
 			if need+stackSlack <= len(th.stack) && th.nframe < len(th.frames) {
-				th.stack[funcIdx] = fn
-				copy(th.stack[argBase:argBase+len(args)], args)
-				nparams := int(p.NumParams)
+				stack := th.stackSlice(s.arena)
+				stack[funcIdx] = fn
+				copy(stack[argBase:argBase+len(args)], args)
+				nparams := int(bp.numParams)
 				if len(args) < nparams {
-					fillNil(th.stack[argBase+len(args) : argBase+nparams])
+					fillNil(stack[argBase+len(args) : argBase+nparams])
 				}
-				if int(p.MaxStackSize) > nparams {
-					fillNil(th.stack[argBase+nparams : argBase+int(p.MaxStackSize)])
+				if maxStack > nparams {
+					fillNil(stack[argBase+nparams : argBase+maxStack])
 				}
-				frameEnd := argBase + int(p.MaxStackSize)
+				frameEnd := argBase + maxStack
 				th.top = frameEnd
 				th.noteStack(max(frameEnd, argBase+len(args)))
 
 				entryDepth := th.nframe
-				nf := &th.frames[entryDepth]
+				frames := th.framesSlice(s.arena)
+				nf := &frames[entryDepth]
 				if nf.dirty {
 					*nf = callFrame{}
 				}
@@ -1510,9 +2047,9 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 				th.noteFrame(th.nframe)
 
 				err := s.run(th, entryDepth)
-				if th.uncaughtErrVal != nil {
-					err = th.uncaughtErrVal
-					th.uncaughtErrVal = nil
+				if uerr := th.uncaughtErr(s); uerr != nil {
+					err = uerr
+					th.setUncaughtErr(s, nil)
 				}
 				if err == nil && s.abortErr != nil {
 					err = s.abortErr
@@ -1520,16 +2057,17 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 
 				clearTop := func() {
 					th.top = funcIdx
-					if entryDepth == 0 && len(th.openUpvals) == 0 {
-						if end := min(max(th.highStack, th.top), len(th.stack)); funcIdx < end {
-							fillNil(th.stack[funcIdx:end])
+					if entryDepth == 0 && th.openUpvalsCount() == 0 {
+						st := th.stackSlice(s.arena)
+						if end := min(max(th.highStack, th.top), len(st)); funcIdx < end {
+							fillNil(st[funcIdx:end])
 						}
-						if hf := min(th.highFrames, len(th.frames)); hf > 0 {
-							clear(th.frames[:hf])
+						fs := th.framesSlice(s.arena)
+						if hf := min(th.highFrames, len(fs)); hf > 0 {
+							clear(fs[:hf])
 						}
 						th.highStack = funcIdx
 						th.highFrames = 0
-						th.clearAbandonedInitStorage()
 					}
 				}
 
@@ -1578,7 +2116,7 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 					}
 				} else {
 					if s.gcNeedsCheck() {
-						s.gcCheckDebt(th.top)
+						s.gcCheckStep(th.top)
 						if s.abortErr != nil {
 							clearTop()
 							retErr = s.abortErr
@@ -1586,7 +2124,7 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 					}
 					if retErr == nil {
 						if th.top > funcIdx {
-							ret = th.stack[funcIdx]
+							ret = th.stackSlice(s.arena)[funcIdx]
 						} else {
 							ret = NilValue()
 						}
@@ -1641,37 +2179,44 @@ func (s *State) getTM(mt *Table, tm TM) Value {
 func (s *State) getMetatableOf(v Value) *Table {
 	switch {
 	case v.IsTable():
-		return s.asTable(v).meta
+		return s.asTable(v).Metatable(s)
 	case v.IsUserdata():
-		return s.asUserdata(v).Meta
+		return s.UserdataMeta(s.asUserdata(v))
 	case v.IsString():
-		return s.stringMetaTbl
+		return s.tableByRef(s.stringMetaRef)
 	default:
-		return s.typeMetas[v.TypeTag()]
+		return s.tableByRef(s.typeMetaRefs[v.TypeTag()])
 	}
 }
 
 func (s *State) setMetatableOf(v Value, mt *Table) {
+	var mtRef arena.ObjRef
+	if mt != nil {
+		mtRef = mt.self
+	}
 	switch {
 	case v.IsTable():
 		s.SetMetatable(s.asTable(v), mt)
 	case v.IsUserdata():
 		u := s.asUserdata(v)
-		u.Meta = mt
+		u.metaRef = mtRef
 		if mt != nil {
 			mt.markProto(s)
-			s.registerFinalizable(v, mt)
+			s.registerFinalizable(u.self, mt)
+			if u.hdr.IsBlack() {
+				s.collector.Barrier(u.self, mtRef)
+			}
 		}
 		s.protoEpoch++
 	case v.IsString():
-		s.stringMetaTbl = mt
-		s.typeMetas[4] = mt
+		s.stringMetaRef = mtRef
+		s.typeMetaRefs[4] = mtRef
 		if mt != nil {
 			mt.markProto(s)
 		}
 		s.protoEpoch++
 	default:
-		s.typeMetas[v.TypeTag()] = mt
+		s.typeMetaRefs[v.TypeTag()] = mtRef
 		if mt != nil {
 			mt.markProto(s)
 		}
@@ -1698,54 +2243,68 @@ func (s *State) GetGlobalMM(name string) (Value, error) {
 	return s.tableGetStrAny(s.globalEnvValue(), s.intern.Intern(name))
 }
 
-// TryIntern interns or wraps str as a *LuaString after checking and accounting for newly
-// allocated string storage against the State's memory limit.
+// TryIntern interns or wraps str as a *LuaString after checking newly allocated string
+// storage against the State's memory limit.
 func (s *State) TryIntern(str string) (*LuaString, error) {
 	if ls, ok := s.intern.lookupExistingShort(str); ok {
 		return ls, nil
 	}
-	if s.memLimit > 0 || s.gc.tier1 {
-		need := int64(len(str)) + 48
-		if s.memLimit > 0 && s.intern.arena != nil && len(str) > 0 && s.gc.allocBytes+s.gc.tempBytes+need > s.memLimit {
+	if s.memLimit > 0 {
+		need := int64(len(str)) + int64(luaStringHeaderSize)
+		if len(str) > 0 && s.MemoryUsage()+need > s.memLimit {
 			// Guard against str aliasing an unrooted Arena slot that emergency GC might sweep.
 			str = strings.Clone(str)
 		}
-		if err := s.checkMemAndAccount(need); err != nil {
+		if err := s.checkMem(need); err != nil {
 			return nil, err
 		}
 	}
 	return s.intern.Intern(str), nil
 }
 
-// TryAllocNative checks and accounts for a dynamically allocated native closure against
-// the State's memory limit and returns it as a Value.
+// TryAllocNative checks a dynamically allocated native closure against the State's memory
+// limit, allocates it in State.arena, and returns it as a Value.
 func (s *State) TryAllocNative(nf *NativeFunc) (Value, error) {
 	if nf == nil {
 		return NilValue(), nil
 	}
-	if s.memLimit > 0 || s.gc.tier1 {
-		if err := s.checkMemAndAccount(48 + int64(len(nf.upvals))*16); err != nil {
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(unsafe.Sizeof(ArenaNative{})) + int64(len(nf.upvals))*16); err != nil {
 			return NilValue(), err
 		}
 	}
-	return s.NativeValue(nf), nil
+	return s.allocArenaNative(nf)
 }
 
-// TryNewUserdata allocates a full Lua userdata carrying data with nUValues user values
-// after checking and accounting for its storage against the State's memory limit.
+// TryNewUserdata allocates a full noscan Lua userdata in State.arena carrying data via
+// State.goRefs with nUValues Lua user values after checking State memory limits.
 func (s *State) TryNewUserdata(data any, nUValues int) (Value, error) {
 	if nUValues < 0 {
 		nUValues = 0
 	}
-	if s.memLimit > 0 || s.gc.tier1 {
-		if err := s.checkMemAndAccount(64 + int64(nUValues)*16); err != nil {
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(unsafe.Sizeof(Userdata{})) + int64(nUValues)*16); err != nil {
 			return NilValue(), err
 		}
 	}
-	u := &Userdata{Data: data}
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Userdata{})), gcKindUserdata)
+	if err != nil {
+		return NilValue(), s.memError()
+	}
+	u := arena.AsSmall[Userdata](s.arena, ref)
+	u.self = ref
+	if data != nil {
+		u.dataRef = s.goRefs.Alloc(data)
+	}
 	if nUValues > 0 {
-		u.UValues = make([]Value, nUValues)
-		fillNil(u.UValues)
+		uref, uerr := s.arena.Alloc(nUValues * int(unsafe.Sizeof(Value{})))
+		if uerr != nil {
+			return NilValue(), s.memError()
+		}
+		s.collector.AddDebt(int64(s.arena.SlotSize(uref)))
+		fillNil(arena.SliceFast[Value](s.arena, uref, 0, nUValues))
+		u.uvalsRef = uref
+		u.nUValues = uint32(nUValues)
 	}
 	return UserdataValue(u), nil
 }
@@ -1764,7 +2323,7 @@ func (s *State) tableSetStr(tblVal Value, keyStr *LuaString, val Value) error {
 		if err := s.ensureLookupStrKeyHash(t, keyStr); err != nil {
 			return err
 		}
-		if !t.RawGetStr(s, keyStr).IsNil() || t.meta == nil || s.getTM(t.meta, TMNewIndex).IsNil() {
+		if !t.RawGetStr(s, keyStr).IsNil() || !t.hasMeta() || s.getTM(t.Metatable(s), TMNewIndex).IsNil() {
 			t.RawSetStr(s, keyStr, val)
 			return s.ConsumeMemErr()
 		}
@@ -1786,7 +2345,7 @@ func (s *State) tableSetStr(tblVal Value, keyStr *LuaString, val Value) error {
 					return s.ConsumeMemErr()
 				}
 			}
-			tm = s.getTM(t.meta, TMNewIndex)
+			tm = s.getTM(t.Metatable(s), TMNewIndex)
 			if tm.IsNil() {
 				if err := t.RawSet(s, key, val); err != nil {
 					return err

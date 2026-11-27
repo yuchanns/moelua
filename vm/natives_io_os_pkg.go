@@ -18,10 +18,10 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-	"weak"
 
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/compiler"
+	"github.com/yuchanns/moelua/internal/arena"
 	"github.com/yuchanns/moelua/internal/luastdlib"
 )
 
@@ -360,6 +360,21 @@ func (s *State) undumpBytes(data []byte) (*bytecode.Proto, error) {
 	return bytecode.Undump(data)
 }
 
+func (s *State) setChunkEnv(cl *Closure, env Value) error {
+	if cl.nUpvals == 0 {
+		return nil
+	}
+	uv, err := s.allocClosedUpval(env)
+	if err != nil {
+		return s.memError()
+	}
+	cl.upvalsSlice(s.arena)[0] = uv.self
+	if cl.hdr.IsBlack() {
+		s.collector.Barrier(cl.self, uv.self)
+	}
+	return nil
+}
+
 func (s *State) loadChunkString(src, chunkName, mode string, env Value, hasEnv, stripFileHeader bool) (Value, error) {
 	cancelFn := s.nativeCancelFunc()
 	isBin := len(src) > 0 && src[0] == 0x1b
@@ -530,7 +545,7 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 	isBin := len(b0) == 1 && b0[0] == 0x1b
 	var streamTempBytes int64
 	defer func() {
-		s.addTempBytes(-streamTempBytes)
+		s.tempBytes -= streamTempBytes
 	}()
 	var checkMem func(int64) error
 	if s.memLimit > 0 {
@@ -543,7 +558,7 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 				return merr
 			}
 			streamTempBytes = n
-			s.addTempBytes(delta)
+			s.tempBytes += delta
 			return nil
 		}
 	}
@@ -560,7 +575,7 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 		if uerr != nil {
 			return NilValue(), uerr
 		}
-		s.addTempBytes(-streamTempBytes)
+		s.tempBytes -= streamTempBytes
 		streamTempBytes = 0
 		cl, lerr := s.Load(p)
 		if lerr != nil {
@@ -607,7 +622,7 @@ func (s *State) loadChunkReader(r io.Reader, chunkName, mode string, env Value, 
 			return NilValue(), err
 		}
 	}
-	s.addTempBytes(-streamTempBytes)
+	s.tempBytes -= streamTempBytes
 	streamTempBytes = 0
 	cl, lerr := s.Load(p)
 	if lerr != nil {
@@ -626,7 +641,7 @@ func (s *State) readBoundedStream(r io.Reader) ([]byte, error) {
 	var readBytes int64
 	var reads int64
 	defer func() {
-		s.addTempBytes(-readBytes)
+		s.tempBytes -= readBytes
 	}()
 	cancelFn := s.nativeCancelFunc()
 	var tmp [4096]byte
@@ -643,7 +658,7 @@ func (s *State) readBoundedStream(r io.Reader) ([]byte, error) {
 			prevStride := readBytes / 4096
 			buf.Write(tmp[:n])
 			readBytes += int64(n)
-			s.addTempBytes(int64(n))
+			s.tempBytes += int64(n)
 			if cancelFn != nil && (readBytes/4096 > prevStride || (reads&63) == 0) {
 				if cerr := cancelFn(); cerr != nil {
 					return nil, cerr
@@ -759,7 +774,7 @@ func (s *State) CompileString(name, src string) (*bytecode.Proto, error) {
 	}
 	var compileTempBytes int64
 	defer func() {
-		s.addTempBytes(-compileTempBytes)
+		s.tempBytes -= compileTempBytes
 	}()
 	var opts []compiler.Option
 	if s.memLimit > 0 {
@@ -772,7 +787,7 @@ func (s *State) CompileString(name, src string) (*bytecode.Proto, error) {
 				return merr
 			}
 			compileTempBytes = n
-			s.addTempBytes(delta)
+			s.tempBytes += delta
 			return nil
 		}))
 	}
@@ -793,7 +808,7 @@ func (s *State) CompileReader(name string, r io.Reader) (*bytecode.Proto, error)
 	}
 	var compileTempBytes int64
 	defer func() {
-		s.addTempBytes(-compileTempBytes)
+		s.tempBytes -= compileTempBytes
 	}()
 	var opts []compiler.Option
 	if s.memLimit > 0 {
@@ -806,7 +821,7 @@ func (s *State) CompileReader(name string, r io.Reader) (*bytecode.Proto, error)
 				return merr
 			}
 			compileTempBytes = n
-			s.addTempBytes(delta)
+			s.tempBytes += delta
 			return nil
 		}))
 	}
@@ -956,7 +971,7 @@ func (s *State) initIOLib() {
 	s.registerFunc(fileMT, "__tostring", intrNone, nativeFileToString)
 	s.registerFunc(fileMT, "__close", intrNone, nativeFileGCClose)
 	s.registerFunc(fileMT, "__gc", intrNone, nativeFileGCClose)
-	s.setFileMeta(fileMT)
+	s.fileMetaRef = fileMT.self
 	fileMT.markProto(s)
 
 	stdinUD := s.newFileUD(&luaFile{f: os.Stdin, isStd: true})
@@ -984,78 +999,73 @@ func (s *State) initIOLib() {
 	s.SetGlobal("io", TableValue(ioTbl))
 }
 
-func (s *State) newFileUD(lf *luaFile) Value {
-	u := &Userdata{Data: lf, Meta: s.fileMeta()}
-	v := UserdataValue(u)
+func (s *State) allocFileUD(lf *luaFile) (Value, error) {
+	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Userdata{})), gcKindUserdata)
+	if err != nil {
+		return NilValue(), s.memError()
+	}
+	u := arena.AsSmall[Userdata](s.arena, ref)
+	u.self = ref
+	u.metaRef = s.fileMetaRef
+	u.dataRef = s.goRefs.Alloc(lf)
 	if !lf.isStd {
 		fi := &fileInner{f: lf.f, w: lf.w, cmd: lf.cmd}
 		lf.inner = fi
 		runtime.AddCleanup(lf, cleanupFileInner, fi)
 		s.openFiles = append(s.openFiles, fi)
-		// Track weakly so Go GC + runtime.AddCleanup automatically reclaims discarded
-		// descriptors in Tier 0, while explicit collectgarbage()/Close() still runs __gc.
-		// Once fileMeta.__gc is customized, retain u strongly so Go GC cannot drop it
-		// before the VM invokes the custom Lua finalizer.
-		s.gc.finalSeq++
-		entry := gcWeakFileEntry{u: weak.Make(u), fi: fi, seq: s.gc.finalSeq}
-		if s.gc.customFileGC {
-			entry.strong = u
-		}
-		s.gc.weakFiles = append(s.gc.weakFiles, entry)
-		if len(s.gc.weakFiles)&63 == 0 {
-			s.compactWeakFiles()
+		if len(s.openFiles)&63 == 0 {
 			s.compactOpenFiles()
 		}
+		extra := lf.memBytes()
+		s.extraMemBytes += extra
+		s.collector.AddDebt(extra)
+	}
+	if mt := s.fileMeta(); mt != nil {
+		s.registerFinalizable(u.self, mt)
+	}
+	return UserdataValue(u), nil
+}
+
+func (s *State) newFileUD(lf *luaFile) Value {
+	v, err := s.allocFileUD(lf)
+	if err != nil {
+		panic(err)
 	}
 	return v
 }
 
 func (s *State) tryNewFileUD(lf *luaFile) (Value, error) {
-	if s.memLimit > 0 || s.gc.tier1 {
-		if err := s.checkMemAndAccount(64 + lf.memBytes()); err != nil {
-			if !lf.isStd {
-				if lf.f != nil {
-					_ = lf.f.Close()
-				}
-				if lf.cmd != nil {
-					if lf.cmd.Process != nil {
-						if lf.cmd.Cancel != nil {
-							_ = lf.cmd.Cancel()
-						} else {
-							_ = lf.cmd.Process.Kill()
-						}
-					}
-					_ = lf.cmd.Wait()
-				}
-				lf.w = nil
-				lf.r = nil
+	closeFailed := func() {
+		if !lf.isStd {
+			if lf.f != nil {
+				_ = lf.f.Close()
 			}
+			if lf.cmd != nil {
+				if lf.cmd.Process != nil {
+					if lf.cmd.Cancel != nil {
+						_ = lf.cmd.Cancel()
+					} else {
+						_ = lf.cmd.Process.Kill()
+					}
+				}
+				_ = lf.cmd.Wait()
+			}
+			lf.w = nil
+			lf.r = nil
+		}
+	}
+	if s.memLimit > 0 {
+		if err := s.checkMem(int64(unsafe.Sizeof(Userdata{})) + lf.memBytes()); err != nil {
+			closeFailed()
 			return NilValue(), err
 		}
 	}
-	return s.newFileUD(lf), nil
-}
-
-func (s *State) compactWeakFiles() {
-	if len(s.gc.weakFiles) == 0 {
-		return
+	v, err := s.allocFileUD(lf)
+	if err != nil {
+		closeFailed()
+		return NilValue(), err
 	}
-	kept := s.gc.weakFiles[:0]
-	for _, wf := range s.gc.weakFiles {
-		u := wf.userdata()
-		if u == nil {
-			if wf.fi != nil {
-				_ = wf.fi.flushAndClose()
-			}
-			continue
-		}
-		if u.gcInFnz || u.gcFnzed {
-			continue
-		}
-		kept = append(kept, wf)
-	}
-	clear(s.gc.weakFiles[len(kept):])
-	s.gc.weakFiles = kept
+	return v, nil
 }
 
 func (s *State) compactOpenFiles() {
@@ -1482,12 +1492,8 @@ func nativeFileClose(s *State, args []Value) ([]Value, error) {
 	freed := lf.memBytes()
 	isPipe := lf.cmd != nil
 	err := lf.closeFile()
-	if (s.memLimit > 0 || s.gc.tier1) && freed > 0 {
-		if s.gc.allocBytes > freed {
-			s.gc.allocBytes -= freed
-		} else {
-			s.gc.allocBytes = 0
-		}
+	if freed > 0 {
+		s.subExtraMem(freed)
 	}
 	if isPipe && s.ctx != nil {
 		if cerr := s.ctx.Err(); cerr != nil {
@@ -1515,12 +1521,8 @@ func nativeFileGCClose(s *State, args []Value) ([]Value, error) {
 	if !lf.closed && !lf.isStd {
 		freed := lf.memBytes()
 		_ = lf.closeFile()
-		if (s.memLimit > 0 || s.gc.tier1) && freed > 0 {
-			if s.gc.allocBytes > freed {
-				s.gc.allocBytes -= freed
-			} else {
-				s.gc.allocBytes = 0
-			}
+		if freed > 0 {
+			s.subExtraMem(freed)
 		}
 	}
 	return nil, nil
@@ -1584,12 +1586,8 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 	case "no":
 		lf.bufMode = bufModeNo
 		lf.w = nil
-		if (s.memLimit > 0 || s.gc.tier1) && oldSz > 0 {
-			if s.gc.allocBytes > oldSz {
-				s.gc.allocBytes -= oldSz
-			} else {
-				s.gc.allocBytes = 0
-			}
+		if oldSz > 0 {
+			s.subExtraMem(oldSz)
 		}
 	case "full", "line":
 		if sz > maxSetVBufSize {
@@ -1599,8 +1597,8 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 			return nil, fmt.Errorf("bad argument #3 to 'setvbuf' (buffer size too large)")
 		}
 		delta := sz - oldSz
-		if delta > 0 {
-			if err := s.checkMemAndAccount(delta); err != nil {
+		if delta > 0 && s.memLimit > 0 {
+			if err := s.checkMem(delta); err != nil {
 				return nil, err
 			}
 		}
@@ -1611,13 +1609,11 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 		}
 		lf.w = nil
 		lf.w = bufio.NewWriterSize(lf.f, int(sz))
-		if (s.memLimit > 0 || s.gc.tier1) && delta < 0 {
-			freed := -delta
-			if s.gc.allocBytes > freed {
-				s.gc.allocBytes -= freed
-			} else {
-				s.gc.allocBytes = 0
-			}
+		if delta > 0 {
+			s.extraMemBytes += delta
+			s.collector.AddDebt(delta)
+		} else if delta < 0 {
+			s.subExtraMem(-delta)
 		}
 	default:
 		return nil, fmt.Errorf("bad argument #2 to 'setvbuf' (invalid option '%s')", mode)
@@ -1631,10 +1627,10 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 }
 
 func (s *State) methodArgNum(n int) int {
-	cur := s.cur()
-	if cur != nil && cur.nframe > 0 {
-		frames := cur.framesSlice(s.arena)
-		idx := cur.nframe - 1
+	th := s.cur()
+	if th != nil && th.nframe > 0 {
+		frames := th.framesSlice(s.arena)
+		idx := th.nframe - 1
 		if frames[idx].kind == frameNative && idx > 0 {
 			idx--
 		}
@@ -1733,7 +1729,7 @@ func (s *State) ReadAllStdin() ([]byte, error) {
 		var buf bytes.Buffer
 		var readBytes int64
 		defer func() {
-			s.addTempBytes(-readBytes)
+			s.tempBytes -= readBytes
 		}()
 		var tmp [4096]byte
 		for {
@@ -1744,7 +1740,7 @@ func (s *State) ReadAllStdin() ([]byte, error) {
 				}
 				buf.Write(tmp[:n])
 				readBytes += int64(n)
-				s.addTempBytes(int64(n))
+				s.tempBytes += int64(n)
 			}
 			if err == io.EOF {
 				return buf.Bytes(), nil
@@ -1794,11 +1790,6 @@ func readBoundedLine(s *State, r *bufio.Reader, keepNL bool) (string, bool, erro
 			if !keepNL {
 				line = strings.TrimSuffix(line, "\n")
 			}
-			if s.memLimit > 0 || s.gc.tier1 {
-				sz := int64(len(line)) + 64
-				s.gc.allocBytes += sz
-				s.gcAddDebt(sz)
-			}
 			return line, true, nil
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {
@@ -1817,11 +1808,6 @@ func readBoundedLine(s *State, r *bufio.Reader, keepNL bool) (string, bool, erro
 			line := buf.String()
 			if !keepNL {
 				line = strings.TrimSuffix(line, "\n")
-			}
-			if s.memLimit > 0 || s.gc.tier1 {
-				sz := int64(len(line)) + 64
-				s.gc.allocBytes += sz
-				s.gcAddDebt(sz)
 			}
 			return line, true, nil
 		}
@@ -1863,13 +1849,7 @@ func readBoundedAll(s *State, r *bufio.Reader) (string, error) {
 					return "", cerr
 				}
 			}
-			res := buf.String()
-			if s.memLimit > 0 || s.gc.tier1 {
-				sz := int64(len(res)) + 64
-				s.gc.allocBytes += sz
-				s.gcAddDebt(sz)
-			}
-			return res, nil
+			return buf.String(), nil
 		}
 		if err != nil {
 			if s.ctx != nil {
@@ -1932,17 +1912,16 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 				}
 				return NilValue(), false, ioReadErr{err}
 			}
-			if s.memLimit > 0 || s.gc.tier1 {
-				sz := int64(got) + 64
-				s.gc.allocBytes += sz
-				s.gcAddDebt(sz)
+			ls, ierr := s.TryIntern(string(buf[:got]))
+			if ierr != nil {
+				return NilValue(), false, ierr
 			}
-			return StringValue(s.intern.Intern(string(buf[:got]))), true, nil
+			return StringValue(ls), true, nil
 		}
 		var out bytes.Buffer
 		var readBytes int64
 		defer func() {
-			s.addTempBytes(-readBytes)
+			s.tempBytes -= readBytes
 		}()
 		var chunk [32768]byte
 		rem := n
@@ -1961,7 +1940,7 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 				}
 				out.Write(chunk[:got])
 				readBytes += int64(got)
-				s.addTempBytes(int64(got))
+				s.tempBytes += int64(got)
 				rem -= int64(got)
 			}
 			if err != nil {
@@ -1983,12 +1962,13 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		if out.Len() == 0 {
 			return NilValue(), false, nil
 		}
-		if s.memLimit > 0 || s.gc.tier1 {
-			sz := int64(out.Len()) + 64
-			s.gc.allocBytes += sz
-			s.gcAddDebt(sz)
+		s.tempBytes -= readBytes
+		readBytes = 0
+		ls, ierr := s.TryIntern(out.String())
+		if ierr != nil {
+			return NilValue(), false, ierr
 		}
-		return StringValue(s.intern.Intern(out.String())), true, nil
+		return StringValue(ls), true, nil
 	}
 	spec := strings.TrimPrefix(s.FormatValue(fmtArg), "*")
 	if len(spec) == 0 {
@@ -2001,7 +1981,11 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 			if err != nil || !ok {
 				return NilValue(), false, err
 			}
-			return StringValue(s.intern.Intern(line)), true, nil
+			ls, ierr := s.TryIntern(line)
+			if ierr != nil {
+				return NilValue(), false, ierr
+			}
+			return StringValue(ls), true, nil
 		}
 		line, err := r.ReadString('\n')
 		if len(line) == 0 && err != nil {
@@ -2013,30 +1997,32 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		if spec[0] == 'l' {
 			line = strings.TrimSuffix(line, "\n")
 		}
-		if s.gc.tier1 {
-			sz := int64(len(line)) + 48
-			s.gc.allocBytes += sz
-			s.gcAddDebt(sz)
+		ls, ierr := s.TryIntern(line)
+		if ierr != nil {
+			return NilValue(), false, ierr
 		}
-		return StringValue(s.intern.Intern(line)), true, nil
+		return StringValue(ls), true, nil
 	case 'a':
 		if s.memLimit > 0 || s.nativeCancelFunc() != nil {
 			all, err := readBoundedAll(s, r)
 			if err != nil {
 				return NilValue(), false, err
 			}
-			return StringValue(s.intern.Intern(all)), true, nil
+			ls, ierr := s.TryIntern(all)
+			if ierr != nil {
+				return NilValue(), false, ierr
+			}
+			return StringValue(ls), true, nil
 		}
 		all, err := io.ReadAll(r)
 		if err != nil {
 			return NilValue(), false, ioReadErr{err}
 		}
-		if s.gc.tier1 {
-			sz := int64(len(all)) + 48
-			s.gc.allocBytes += sz
-			s.gcAddDebt(sz)
+		ls, ierr := s.TryIntern(string(all))
+		if ierr != nil {
+			return NilValue(), false, ierr
 		}
-		return StringValue(s.intern.Intern(string(all))), true, nil
+		return StringValue(ls), true, nil
 	case 'n':
 		return readLuaNumber(s, r)
 	default:
@@ -2207,11 +2193,18 @@ func nativeFileRead(s *State, args []Value) ([]Value, error) {
 	if lf.w != nil && lf.w.Buffered() > 0 {
 		_ = lf.flushWriter()
 	}
-	if lf.r == nil && (s.memLimit > 0 || s.gc.tier1) {
-		if err := s.checkMemAndAccount(4096); err != nil {
-			return nil, err
+	if lf.r == nil {
+		if s.memLimit > 0 {
+			if err := s.checkMem(4096); err != nil {
+				return nil, err
+			}
 		}
 		lf.r = bufio.NewReader(lf.f)
+		if !lf.isStd {
+			rsz := int64(lf.r.Size())
+			s.extraMemBytes += rsz
+			s.collector.AddDebt(rsz)
+		}
 	}
 	fmts := args[1:]
 	if len(fmts) == 0 {
@@ -2380,21 +2373,17 @@ func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) ([]Val
 	upvals[1] = IntValue(int64(len(fmts)))
 	upvals[2] = BoolValue(autoClose)
 	copy(upvals[3:], fmts)
-	if s.memLimit > 0 || s.gc.tier1 {
-		if err := s.checkMemAndAccount(48 + int64(len(upvals))*16); err != nil {
-			return nil, err
-		}
-	}
-	var iter *NativeFunc
-	iter = &NativeFunc{
+	var anRef arena.ObjRef
+	nf := &NativeFunc{
 		Name:        "io.lines_iter",
 		NumUpvals:   uint8(len(upvals)),
 		Collectable: true,
 		upvals:      upvals,
 		Fn: func(s *State, _ []Value) ([]Value, error) {
-			curFileVal := iter.upvals[0]
-			curAutoClose := !iter.upvals[2].IsFalsy()
-			curFmts := iter.upvals[3:]
+			uvs := arena.AsSmall[ArenaNative](s.arena, anRef).upvalsSlice(s.arena)
+			curFileVal := uvs[0]
+			curAutoClose := !uvs[2].IsFalsy()
+			curFmts := uvs[3:]
 			lf, ok := s.asLuaFile(curFileVal)
 			if !ok || lf.closed {
 				return nil, fmt.Errorf("file is already closed")
@@ -2412,18 +2401,26 @@ func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) ([]Val
 			}
 			if len(res) == 0 || res[0].IsNil() {
 				if curAutoClose && !lf.closed && !lf.isStd {
+					freed := lf.memBytes()
 					_ = lf.closeFile()
+					s.subExtraMem(freed)
 				}
 				return []Value{NilValue()}, nil
 			}
 			return res, nil
 		},
 	}
+	iterVal, err := s.TryAllocNative(nf)
+	if err != nil {
+		return nil, err
+	}
+	nf.upvals = nil
+	anRef = iterVal.Ref()
 	closeVar := NilValue()
 	if autoClose {
 		closeVar = fileVal
 	}
-	return []Value{s.NativeValue(iter), NilValue(), NilValue(), closeVar}, nil
+	return []Value{iterVal, NilValue(), NilValue(), closeVar}, nil
 }
 
 func nativeFileLines(s *State, args []Value) ([]Value, error) {
@@ -2470,7 +2467,9 @@ func nativeIOLines(s *State, args []Value) ([]Value, error) {
 	}
 	res, err := makeLinesIter(s, ud, args[1:], true)
 	if err != nil {
+		freed := lf.memBytes()
 		_ = lf.closeFile()
+		s.subExtraMem(freed)
 		return nil, err
 	}
 	return res, nil
@@ -2506,7 +2505,7 @@ func nativeOSTime(s *State, args []Value) ([]Value, error) {
 	readField := func(name string) (Value, error) {
 		k := s.intern.Intern(name)
 		v := t.RawGetStr(s, k)
-		if v.IsNil() && t.meta != nil {
+		if v.IsNil() && t.hasMeta() {
 			return s.finishGet(tblVal, StringValue(k))
 		}
 		return v, nil
@@ -3110,14 +3109,14 @@ func (s *State) initPackageLib() {
 	pkg.RawSetStr(s, s.intern.Intern("config"), StringValue(s.intern.Intern("/\n;\n?\n!\n-\n")))
 
 	// Stateless searchers & require (safe to share across States via frozen stdlib template!).
-	searchers.RawSetInt(s, 1, s.NativeValue(&NativeFunc{Name: "searcher_preload", Fn: nativeSearcherPreload}))
-	searchers.RawSetInt(s, 2, s.NativeValue(&NativeFunc{Name: "searcher_lua", Fn: nativeSearcherLua}))
-	searchers.RawSetInt(s, 3, s.NativeValue(&NativeFunc{Name: "searcher_c", Fn: nativeSearcherC}))
+	searchers.RawSetInt(s, 1, s.allocStaticNative(&NativeFunc{Name: "searcher_preload", Fn: nativeSearcherPreload}))
+	searchers.RawSetInt(s, 2, s.allocStaticNative(&NativeFunc{Name: "searcher_lua", Fn: nativeSearcherLua}))
+	searchers.RawSetInt(s, 3, s.allocStaticNative(&NativeFunc{Name: "searcher_c", Fn: nativeSearcherC}))
 	pkg.RawSetStr(s, s.intern.Intern("searchers"), TableValue(searchers))
 	s.registerFunc(pkg, "searchpath", intrNone, nativePackageSearchPath)
 	s.registerFunc(pkg, "loadlib", intrNone, nativePackageLoadLib)
 
-	s.pkgTbl = pkg
+	s.pkgRef = pkg.self
 	s.SetGlobal("package", TableValue(pkg))
 	reg := s.registry()
 	reg.RawSetStr(s, s.intern.Intern("_LOADED"), TableValue(loaded))
@@ -3127,17 +3126,18 @@ func (s *State) initPackageLib() {
 }
 
 func (s *State) pkgField(name string) (Value, error) {
+	pkg := s.pkgTbl()
 	key := s.intern.Intern(name)
-	v := s.pkgTbl.RawGetStr(s, key)
-	if v.IsNil() && s.pkgTbl.hasMeta() {
-		return s.finishGet(TableValue(s.pkgTbl), StringValue(key))
+	v := pkg.RawGetStr(s, key)
+	if v.IsNil() && pkg.hasMeta() {
+		return s.finishGet(TableValue(pkg), StringValue(key))
 	}
 	return v, nil
 }
 
 func (s *State) registryField(name string) (Value, error) {
-	key := s.intern.Intern(name)
 	reg := s.registry()
+	key := s.intern.Intern(name)
 	v := reg.RawGetStr(s, key)
 	if v.IsNil() && reg.hasMeta() {
 		return s.finishGet(TableValue(reg), StringValue(key))
@@ -3152,7 +3152,7 @@ func (s *State) tableGetStrAny(obj Value, key *LuaString) (Value, error) {
 			return NilValue(), err
 		}
 		v := t.RawGetStr(s, key)
-		if !v.IsNil() || t.meta == nil {
+		if !v.IsNil() || !t.hasMeta() {
 			return v, nil
 		}
 	}
@@ -3304,16 +3304,16 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 	if err := s.ensureStackWithRoots(th, baseTop+5, loadedVal, []Value{StringValue(key)}); err != nil {
 		return nil, err
 	}
-	stack := th.stackSlice(s.arena)
-	stack[baseTop] = loadedVal
-	stack[baseTop+1] = NilValue()
-	stack[baseTop+2] = NilValue()
+	stSlice := th.stackSlice(s.arena)
+	stSlice[baseTop] = loadedVal
+	stSlice[baseTop+1] = NilValue()
+	stSlice[baseTop+2] = NilValue()
 	th.top = baseTop + 3
 	defer func() {
-		st := th.stackSlice(s.arena)
-		st[baseTop] = NilValue()
-		st[baseTop+1] = NilValue()
-		st[baseTop+2] = NilValue()
+		stSlice := th.stackSlice(s.arena)
+		stSlice[baseTop] = NilValue()
+		stSlice[baseTop+1] = NilValue()
+		stSlice[baseTop+2] = NilValue()
 		th.top = savedTop
 	}()
 	existing, err := s.tableGetStrAny(loadedVal, key)
@@ -3396,8 +3396,9 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 			}
 		}
 	}
-	th.stackSlice(s.arena)[baseTop+1] = loader
-	th.stackSlice(s.arena)[baseTop+2] = extra
+	stSlice = th.stackSlice(s.arena)
+	stSlice[baseTop+1] = loader
+	stSlice[baseTop+2] = extra
 	res, err := s.Call(loader, StringValue(key), extra)
 	if err != nil {
 		return nil, err
@@ -3659,10 +3660,11 @@ func nativePackageLoadLib(s *State, args []Value) ([]Value, error) {
 // OS filesystem searchers. Module paths honor package.path templates (with leading "./" stripped)
 // and reject invalid io/fs paths (such as ".." traversal or absolute paths).
 func (s *State) AddFS(fsys fs.FS) {
-	if fsys == nil || s.pkgTbl == nil {
+	pkg := s.pkgTbl()
+	if fsys == nil || pkg == nil {
 		return
 	}
-	sv := s.pkgTbl.RawGetStr(s, s.intern.Intern("searchers"))
+	sv := pkg.RawGetStr(s, s.intern.Intern("searchers"))
 	if !sv.IsTable() {
 		return
 	}
@@ -3711,10 +3713,11 @@ func (s *State) AddFS(fsys fs.FS) {
 
 // AddSearcher appends a custom module searcher function to package.searchers.
 func (s *State) AddSearcher(fn *NativeFunc) {
-	if fn == nil || s.pkgTbl == nil {
+	pkg := s.pkgTbl()
+	if fn == nil || pkg == nil {
 		return
 	}
-	sv := s.pkgTbl.RawGetStr(s, s.intern.Intern("searchers"))
+	sv := pkg.RawGetStr(s, s.intern.Intern("searchers"))
 	if !sv.IsTable() {
 		return
 	}
@@ -3734,8 +3737,10 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 	}
 	name := s.FormatValue(args[0])
 	pathStr := defaultLuaPath
-	if pv := s.pkgTbl.RawGetStr(s, s.intern.Intern("path")); pv.IsString() {
-		pathStr = s.asString(pv).Str()
+	if pkg := s.pkgTbl(); pkg != nil {
+		if pv := pkg.RawGetStr(s, s.intern.Intern("path")); pv.IsString() {
+			pathStr = s.asString(pv).Str()
+		}
 	}
 	cancelFn := s.nativeCancelFunc()
 	if _, err := s.checkedReplaceSize(name, ".", "/"); err != nil {

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"unsafe"
-	"weak"
 
 	"github.com/yuchanns/moelua/internal/arena"
 )
@@ -20,11 +19,10 @@ const (
 )
 
 const (
-	tblFlagIsProto    uint8 = 1 << 0
-	tblFlagGCFnzed    uint8 = 1 << 1
-	tblFlagGCInFnz    uint8 = 1 << 2
-	tblFlagGCWeakCand uint8 = 1 << 3
-	tblFlagGCPending  uint8 = 1 << 4
+	tblFlagIsProto     uint8 = 1 << 0
+	tblFlagGCWeakCand  uint8 = 1 << 1
+	tblFlagTrackedHash uint8 = 1 << 2
+	tblFlagHasDeadKeys uint8 = 1 << 3
 )
 
 // hashNode is a slot in the open-addressing hash table.
@@ -38,83 +36,23 @@ type hashNode struct {
 // tableHash holds the lazily-allocated hash/dict part of a Lua Table.
 // Pure record tables (Shape/slots) and pure dense arrays never allocate a tableHash.
 type tableHash struct {
-	nodes    []hashNode
-	deadKeys map[int]any // lazy weak.Pointer[T] tombstones for deleted collectable keys (reclaimable in Tier 0)
-	dictGen  uint64      // bumped on rehash / structure change for _ENV IC (uint64 prevents 32-bit wraparound)
-	mask     uint32
-	count    int32 // active + dead slots (for load factor)
-	live     int32 // active non-nil entries
+	nodes   []hashNode
+	dictGen uint64 // bumped on rehash / structure change for _ENV IC (uint64 prevents 32-bit wraparound)
+	mask    uint32
+	count   int32 // active + dead slots (for load factor)
+	live    int32 // active non-nil entries
 }
 
-func makeDeadKeyRef(key Value) (any, bool) {
-	switch {
-	case key.IsTable():
-		return weak.Make((*Table)(key.ptr)), true
-	case key.IsClosure():
-		return weak.Make((*Closure)(key.ptr)), true
-	case key.IsNative() && (*NativeFunc)(key.ptr).Collectable:
-		return weak.Make((*NativeFunc)(key.ptr)), true
-	case key.IsUserdata():
-		return weak.Make((*Userdata)(key.ptr)), true
-	case key.IsThread():
-		return weak.Make((*Thread)(key.ptr)), true
-	default:
-		return nil, false
-	}
-}
-
-func deadKeyValue(ref any) (Value, bool) {
-	switch wp := ref.(type) {
-	case weak.Pointer[Table]:
-		if p := wp.Value(); p != nil {
-			return TableValue(p), true
-		}
-	case weak.Pointer[Closure]:
-		if p := wp.Value(); p != nil {
-			return ClosureValue(p), true
-		}
-	case weak.Pointer[NativeFunc]:
-		if p := wp.Value(); p != nil {
-			return Value{ptr: unsafe.Pointer(p), bits: kindNative}, true
-		}
-	case weak.Pointer[Userdata]:
-		if p := wp.Value(); p != nil {
-			return UserdataValue(p), true
-		}
-	case weak.Pointer[Thread]:
-		if p := wp.Value(); p != nil {
-			return ThreadValue(p), true
-		}
-	}
-	return NilValue(), false
-}
-
-// markDead turns slot into a tombstone while dropping any strong Go pointer to a
-// collectable key (storing a weak.Pointer in h.deadKeys so pairs/next still works
-// while the key is live, and Go GC can reclaim deleted keys immediately in Tier 0).
 func (h *tableHash) markDead(slot int) {
 	nd := &h.nodes[slot]
 	nd.val = NilValue()
 	nd.dead = true
 	h.live--
 	h.dictGen++
-	if ref, ok := makeDeadKeyRef(nd.key); ok {
-		nd.key = NilValue()
-		if h.deadKeys == nil {
-			h.deadKeys = make(map[int]any)
-		}
-		h.deadKeys[slot] = ref
-	}
 }
 
-// Table is a Lua 5.5 table supporting both:
-//   - Gate 1 (-tags moeluafaithful): hybrid []Value array + open-addressing hash map
-//   - Gate 2 (default): homogeneous []int64 / []float64 / []bool arrays + Shape/slots for record tables + lazy dict fallback
-//
-// Pointer-bearing fields are packed first (ptrdata = 80B) and scalar metadata sits at the tail
-// so Table fits an exact 112-byte Go size class with minimal GC scan overhead.
+// Table is a Lua 5.5 table (bridged into State.arena's Collector via tableStub until Step 5d).
 type Table struct {
-	// Pointer-bearing fields (ptrdata = 80 bytes: last pointer word is inlineSlots[1].ptr at offset 72..79).
 	shape       *Shape
 	meta        *Table
 	hash        *tableHash
@@ -122,21 +60,15 @@ type Table struct {
 	slots       []Value
 	inlineSlots [2]Value // co-allocates up to 2 record fields inline (1 alloc instead of 2)
 
-	// Non-pointer scalar tail (ZERO Go GC scan).
-	gcMark  uint64  // Tier 1 GC mark epoch (uint64 prevents 32-bit wraparound)
-	arrLen  uint32  // active length of backing array pointed to by arrPtr
-	arrCap  uint32  // capacity of backing array pointed to by arrPtr
-	arrHint int32   // preallocated capacity hint from table.create / NEWTABLE
-	arrKind arrKind // discriminator for arrPtr backing slice type
-	tmFlags uint8   // negative metamethod cache (bits 0..5 for TMIndex..TMEq)
-	flags   uint8   // tblFlag* bitfield
+	memBytes int64
+	self     arena.ObjRef // Arena tableStub ObjRef in State.arena
+	arrLen   uint32       // active length of backing array pointed to by arrPtr
+	arrCap   uint32       // capacity of backing array pointed to by arrPtr
+	arrHint  int32        // preallocated capacity hint from table.create / NEWTABLE
+	arrKind  arrKind      // discriminator for arrPtr backing slice type
+	tmFlags  uint8        // negative metamethod cache (bits 0..5 for TMIndex..TMEq)
+	flags    uint8        // tblFlag* bitfield
 }
-
-// Compile-time assertion: sizeof(Table) == 112 bytes (exact Go size class).
-const (
-	_ = uint(112 - unsafe.Sizeof(Table{}))
-	_ = uint(unsafe.Sizeof(Table{}) - 112)
-)
 
 func (t *Table) isProto() bool { return t.flags&tblFlagIsProto != 0 }
 
@@ -230,20 +162,20 @@ func (s *State) TryNewTable(nseq, nrec int) (*Table, error) {
 		return nil, err
 	}
 	t := s.NewTable(nseq, nrec)
-	if s.memLimit > 0 || s.gc.tier1 {
-		s.gc.allocBytes += checkBytes
-		s.gcAddDebt(checkBytes)
-	}
 	return t, nil
 }
 
 // NewTable allocates a Lua table with sequence/record capacity hints.
 func (s *State) NewTable(nseq, nrec int) *Table {
-	t := &Table{}
+	t := &Table{inlineSlots: [2]Value{NilValue(), NilValue()}}
+	s.allocTableStub(t)
+	// Subtract 16B already accounted in State.arena by tableStub so arena+extra == tablePreallocBytes.
+	s.addTableMem(t, tablePreallocBytes(int64(nseq), int64(nrec))-16)
 	if OptimizeEnabled {
 		t.shape = s.shapes.root
 		if nseq > 0 {
 			t.arrHint = int32(nseq)
+			s.addTableMem(t, int64(nseq)*8)
 		}
 		if nrec <= len(t.inlineSlots) {
 			t.slots = t.inlineSlots[:0]
@@ -252,7 +184,7 @@ func (s *State) NewTable(nseq, nrec int) *Table {
 		} else {
 			// Large record table (e.g. _ENV or big dict) starts directly in dict mode.
 			t.shape = nil
-			t.initHash(nrec)
+			t.initHash(s, nrec)
 		}
 		return t
 	}
@@ -263,18 +195,29 @@ func (s *State) NewTable(nseq, nrec int) *Table {
 		t.setArrVal(arr)
 	}
 	if nrec > 0 {
-		t.initHash(nrec)
+		t.initHash(s, nrec)
 	}
 	return t
+}
+
+func (t *Table) consumeArrHint(s *State) {
+	if t.arrHint > 0 {
+		if s != nil {
+			s.subTableMem(t, int64(t.arrHint)*8)
+		}
+		t.arrHint = 0
+	}
 }
 
 // NewDictTable allocates a table directly in dict mode (ideal for _ENV / globals).
 func (s *State) NewDictTable(nrec int) *Table {
 	t := &Table{}
+	s.allocTableStub(t)
 	if nrec < 16 {
 		nrec = 16
 	}
-	t.initHash(nrec)
+	t.initHash(s, nrec)
+	s.addTableMem(t, 80+int64(len(t.hash.nodes))*40)
 	return t
 }
 
@@ -309,11 +252,14 @@ func (s *State) SetMetatable(t, mt *Table) {
 		if nidx := mt.RawGetStr(s, s.intern.tms[TMNewIndex]); nidx.IsTable() {
 			s.asTable(nidx).markProto(s)
 		}
-		s.registerFinalizable(TableValue(t), mt)
+		s.registerFinalizable(t.self, mt)
 		s.registerWeakCandidate(t, mt)
 	}
 	t.meta = mt
 	t.tmFlags = 0
+	if mt != nil {
+		s.barrierBackTable(t)
+	}
 	if OptimizeEnabled {
 		if newShape != nil {
 			t.shape = newShape
@@ -331,7 +277,7 @@ func (t *Table) markProto(s *State) {
 	}
 }
 
-func (t *Table) initHash(n int) {
+func (t *Table) initHash(s *State, n int) {
 	sz := 4
 	for sz < n*2 {
 		sz <<= 1
@@ -344,15 +290,17 @@ func (t *Table) initHash(n int) {
 	h.nodes = make([]hashNode, sz)
 	h.mask = uint32(sz - 1)
 	h.dictGen++
+	if s != nil && t.self != arena.NullRef {
+		s.trackHashedTable(t.self)
+	}
 }
 
 func (t *Table) checkHashMem(s *State, key, val Value) error {
-	if s == nil || (s.memLimit <= 0 && !s.gc.tier1) {
+	if s == nil || s.memLimit <= 0 {
 		return nil
 	}
 	if t.hash == nil || len(t.hash.nodes) == 0 {
-		// Match initHash(4) which allocates hashCapFor(4) == 8 nodes.
-		return s.checkMemAndAccountWithRoots(hashCapFor(4)*40, TableValue(t), key, val)
+		return s.checkMemWithRoots(hashCapFor(4)*40, TableValue(t), key, val)
 	}
 	curLen := len(t.hash.nodes)
 	curCnt := int(t.hash.count)
@@ -362,13 +310,13 @@ func (t *Table) checkHashMem(s *State, key, val Value) error {
 			growSz = curLen
 		}
 		if growSz > curLen {
-			return s.checkMemAndAccountWithRoots(int64(growSz-curLen)*40, TableValue(t), key, val)
+			return s.checkMemWithRoots(int64(growSz-curLen)*40, TableValue(t), key, val)
 		}
 	}
 	return nil
 }
 
-func (t *Table) growHash() {
+func (t *Table) growHash(s *State) {
 	h := t.hash
 	old := h.nodes
 	newSz := len(old) * 2
@@ -380,21 +328,23 @@ func (t *Table) growHash() {
 		newSz = len(old)
 	}
 	h.nodes = make([]hashNode, newSz)
-	h.deadKeys = nil
 	h.mask = uint32(newSz - 1)
 	h.count = 0
 	h.live = 0
 	h.dictGen++
+	if newSz > len(old) && s != nil {
+		s.addTableMem(t, int64(newSz-len(old))*40)
+	}
 	for i := range old {
 		nd := &old[i]
 		if nd.used && !nd.dead && !nd.val.IsNil() {
-			t.hashPutNoGrow(nd.key, nd.val)
+			t.hashPutNoGrow(s, nd.key, nd.val)
 		}
 	}
 	clear(old)
 }
 
-func hashValue(v Value) uint32 {
+func hashValue(s *State, v Value) uint32 {
 	switch {
 	case v.IsInt():
 		x := uint64(v.Int())
@@ -403,7 +353,7 @@ func hashValue(v Value) uint32 {
 		x ^= x >> 33
 		return uint32(x)
 	case v.IsString():
-		return (*LuaString)(v.ptr).hash()
+		return s.asString(v).hash()
 	case v.IsFloat():
 		f := v.Float()
 		if f == 0 {
@@ -418,67 +368,69 @@ func hashValue(v Value) uint32 {
 			return 1
 		}
 		return 2
-	case v.ptr == tagTokenLightUD:
-		x := v.bits
-		x ^= x >> 33
-		x *= 0xff51afd7ed558ccd
-		return uint32(x ^ (x >> 33))
 	default:
-		p := uint64(uintptr(v.ptr))
+		p := v.bits ^ (v.tag * 0x9e3779b97f4a7c15)
 		p ^= p >> 33
 		p *= 0xff51afd7ed558ccd
 		return uint32(p ^ (p >> 33))
 	}
 }
 
-func (t *Table) hashFindSlot(key Value) (int, bool) {
+func (t *Table) hashFindSlot(s *State, key Value) (int, bool) {
 	h := t.hash
 	if h == nil || len(h.nodes) == 0 {
 		return -1, false
 	}
 	mask := h.mask
-	idx := hashValue(key) & mask
+	idx := hashValue(s, key) & mask
 	for {
 		nd := &h.nodes[idx]
 		if !nd.used {
 			return -1, false
 		}
-		if !nd.dead && RawEqual(nd.key, key) {
+		if !nd.dead && s.RawEqual(nd.key, key) {
 			return int(idx), true
 		}
 		idx = (idx + 1) & mask
 	}
 }
 
-func (t *Table) hashFindStrSlot(_ *State, k *LuaString) (int, bool) {
+func (t *Table) hashFindStrSlot(s *State, k *LuaString) (int, bool) {
 	h := t.hash
 	if h == nil || len(h.nodes) == 0 {
 		return -1, false
 	}
 	mask := h.mask
 	idx := k.hash() & mask
-	kv := StringValue(k)
+	hasRef := k.self != arena.NullRef
+	var kv Value
+	if hasRef {
+		kv = StringValue(k)
+	}
 	for {
 		nd := &h.nodes[idx]
 		if !nd.used {
 			return -1, false
 		}
 		if !nd.dead {
-			if nd.key.ptr == kv.ptr {
+			if hasRef && nd.key == kv {
 				return int(idx), true
 			}
-			if !k.IsShort() && nd.key.IsString() && (*LuaString)(nd.key.ptr).Len == k.Len && (*LuaString)(nd.key.ptr).Str() == k.Str() {
-				return int(idx), true
+			if !k.IsShort() && nd.key.IsString() {
+				ok := s.asString(nd.key)
+				if ok.Len == k.Len && ok.Str() == k.Str() {
+					return int(idx), true
+				}
 			}
 		}
 		idx = (idx + 1) & mask
 	}
 }
 
-func (t *Table) hashPutNoGrow(key, val Value) int {
+func (t *Table) hashPutNoGrow(s *State, key, val Value) int {
 	h := t.hash
 	mask := h.mask
-	idx := hashValue(key) & mask
+	idx := hashValue(s, key) & mask
 	firstDead := -1
 	for {
 		nd := &h.nodes[idx]
@@ -486,9 +438,6 @@ func (t *Table) hashPutNoGrow(key, val Value) int {
 			target := int(idx)
 			if firstDead >= 0 {
 				target = firstDead
-				if h.deadKeys != nil {
-					delete(h.deadKeys, target)
-				}
 				h.dictGen++
 			} else {
 				h.count++
@@ -501,7 +450,7 @@ func (t *Table) hashPutNoGrow(key, val Value) int {
 			if firstDead < 0 {
 				firstDead = int(idx)
 			}
-		} else if RawEqual(nd.key, key) {
+		} else if s.RawEqual(nd.key, key) {
 			nd.val = val
 			return int(idx)
 		}
@@ -509,49 +458,39 @@ func (t *Table) hashPutNoGrow(key, val Value) int {
 	}
 }
 
-func (t *Table) hashSet(key, val Value) int {
-	if val.IsNil() {
-		if slot, ok := t.hashFindSlot(key); ok {
-			t.hash.markDead(slot)
-			return slot
-		}
-		return -1
-	}
-	if slot, ok := t.hashFindSlot(key); ok {
-		t.hash.nodes[slot].val = val
-		return slot
-	}
-	if t.hash == nil || len(t.hash.nodes) == 0 {
-		t.initHash(4)
-	} else if int(t.hash.count+1)*10 >= len(t.hash.nodes)*7 {
-		t.growHash()
-	}
-	return t.hashPutNoGrow(key, val)
-}
-
 // hashSetChecked updates an existing hash entry in place (or deletes on nil) without
 // triggering growth or memory checks, and only checks memory before inserting a new key.
 func (t *Table) hashSetChecked(s *State, key, val Value) (int, error) {
 	if val.IsNil() {
-		if slot, ok := t.hashFindSlot(key); ok {
+		if slot, ok := t.hashFindSlot(s, key); ok {
 			t.hash.markDead(slot)
 			return slot, nil
 		}
 		return -1, nil
 	}
-	if slot, ok := t.hashFindSlot(key); ok {
+	if slot, ok := t.hashFindSlot(s, key); ok {
 		t.hash.nodes[slot].val = val
+		if s != nil {
+			s.barrierTableVal(t, val)
+		}
 		return slot, nil
 	}
 	if err := t.checkHashMem(s, key, val); err != nil {
 		return -1, err
 	}
 	if t.hash == nil || len(t.hash.nodes) == 0 {
-		t.initHash(4)
+		t.initHash(s, 4)
+		if s != nil {
+			s.addTableMem(t, int64(len(t.hash.nodes))*40)
+		}
 	} else if int(t.hash.count+1)*10 >= len(t.hash.nodes)*7 {
-		t.growHash()
+		t.growHash(s)
 	}
-	return t.hashPutNoGrow(key, val), nil
+	slot := t.hashPutNoGrow(s, key, val)
+	if s != nil && (key.IsGCObject() || val.IsGCObject()) {
+		s.barrierBackTable(t)
+	}
+	return slot, nil
 }
 
 // demoteToDict converts a Shape-mode table into a dict-mode hash table.
@@ -565,24 +504,25 @@ func (t *Table) demoteToDict(s *State, key, val Value) bool {
 	if n < 4 {
 		n = 4
 	}
-	if s != nil && (s.memLimit > 0 || s.gc.tier1) {
-		hashBytes := hashCapFor(int64(n)) * 40
-		var oldSlotBytes int64
-		if c := cap(t.slots); c > len(t.inlineSlots) {
-			oldSlotBytes = int64(c) * 16
-		}
-		delta := hashBytes - oldSlotBytes
-		if delta > 0 {
-			if err := s.checkMemAndAccountWithRoots(delta, TableValue(t), key, val); err != nil {
-				s.memExceeded = true
-				return false
-			}
+	hashBytes := hashCapFor(int64(n)) * 40
+	var oldSlotBytes int64
+	if c := cap(t.slots); c > len(t.inlineSlots) {
+		oldSlotBytes = int64(c) * 16
+	}
+	delta := hashBytes - oldSlotBytes
+	if s != nil && s.memLimit > 0 && delta > 0 {
+		if err := s.checkMemWithRoots(delta, TableValue(t), key, val); err != nil {
+			s.memExceeded = true
+			return false
 		}
 	}
-	t.initHash(n)
+	t.initHash(s, n)
+	if s != nil && delta > 0 {
+		s.addTableMem(t, delta)
+	}
 	for i, k := range keys {
 		if i < len(t.slots) && !t.slots[i].IsNil() {
-			t.hashPutNoGrow(StringValue(k), t.slots[i])
+			t.hashPutNoGrow(s, StringValue(k), t.slots[i])
 		}
 	}
 	t.shape = nil
@@ -612,7 +552,7 @@ func (t *Table) appendSlot(val Value) {
 }
 
 // RawGetStr looks up a LuaString key (fast path for GETFIELD/SELF/GETTABUP).
-func (t *Table) RawGetStr(_ *State, k *LuaString) Value {
+func (t *Table) RawGetStr(s *State, k *LuaString) Value {
 	if OptimizeEnabled && t.shape != nil {
 		if k.IsShort() {
 			if idx := t.shape.Lookup(k); idx >= 0 {
@@ -622,7 +562,7 @@ func (t *Table) RawGetStr(_ *State, k *LuaString) Value {
 		}
 		return NilValue()
 	}
-	if slot, ok := t.hashFindStrSlot(nil, k); ok {
+	if slot, ok := t.hashFindStrSlot(s, k); ok {
 		return t.hash.nodes[slot].val
 	}
 	return NilValue()
@@ -632,12 +572,6 @@ func (t *Table) RawGetStr(_ *State, k *LuaString) Value {
 func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 	if err := s.ensureWriteStrKeyHash(t, k, val.IsNil()); err != nil {
 		return
-	}
-	if k == s.intern.tms[TMGC] || k == s.intern.tms[TMMode] {
-		s.activateTier1()
-		if k == s.intern.tms[TMGC] && t == s.fileMetaTbl {
-			s.promoteFileFinalizers()
-		}
 	}
 	if t.isProto() {
 		s.protoEpoch++
@@ -655,6 +589,7 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 			if idx := t.shape.Lookup(k); idx >= 0 {
 				// Assigning nil keeps slot & shape intact (next/pairs stability!).
 				t.slots[idx] = val
+				s.barrierTableVal(t, val)
 				return
 			}
 			if val.IsNil() {
@@ -666,18 +601,23 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 				return
 			}
 			if next != nil {
-				if (s.memLimit > 0 || s.gc.tier1) && len(t.slots) == cap(t.slots) {
-					prevPinned := s.gc.pinnedShape
-					s.gc.pinnedShape = next
-					err := s.checkMemAndAccountWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(k), val)
-					s.gc.pinnedShape = prevPinned
+				if s.memLimit > 0 && len(t.slots) == cap(t.slots) {
+					prevPinned := s.pinnedShape
+					s.pinnedShape = next
+					err := s.checkMemWithRoots(int64(max(cap(t.slots), 4))*16, TableValue(t), StringValue(k), val)
+					s.pinnedShape = prevPinned
 					if err != nil {
 						s.memExceeded = true
 						return
 					}
 				}
 				t.shape = next
+				oldCap := cap(t.slots)
 				t.appendSlot(val)
+				if cap(t.slots) > oldCap {
+					s.addTableMem(t, int64(cap(t.slots)-oldCap)*16)
+				}
+				s.barrierBackTable(t)
 				return
 			}
 		}
@@ -688,18 +628,26 @@ func (t *Table) RawSetStr(s *State, k *LuaString, val Value) {
 			return
 		}
 	}
-	slot, err := t.hashSetChecked(s, StringValue(k), val)
-	if err != nil {
-		s.memExceeded = true
+	if val.IsNil() {
+		// Delete via hashFindStrSlot directly so transient non-Arena long strings
+		// from State.LookupString never enter StringValue(k).
+		if slot, ok := t.hashFindStrSlot(s, k); ok {
+			t.hash.markDead(slot)
+			if s != nil {
+				t.flags |= tblFlagHasDeadKeys
+				s.hasDeadHashKeys = true
+			}
+		}
 		return
 	}
-	if val.IsNil() && slot >= 0 && s != nil {
-		s.gc.hasDeadHashKeys = true
+	if _, err := t.hashSetChecked(s, StringValue(k), val); err != nil {
+		s.memExceeded = true
+		return
 	}
 }
 
 // RawGetInt looks up integer key i (1-based dense array fast path).
-func (t *Table) RawGetInt(_ *State, i int64) Value {
+func (t *Table) RawGetInt(s *State, i int64) Value {
 	if i >= 1 {
 		idx := uint64(i - 1)
 		if idx < uint64(t.arrLen) {
@@ -722,27 +670,28 @@ func (t *Table) RawGetInt(_ *State, i int64) Value {
 	if t.hash == nil {
 		return NilValue()
 	}
-	if slot, ok := t.hashFindSlot(IntValue(i)); ok {
+	if slot, ok := t.hashFindSlot(s, IntValue(i)); ok {
 		return t.hash.nodes[slot].val
 	}
 	return NilValue()
 }
 
 func (t *Table) promoteArrToGeneric(s *State, val Value) bool {
-	if s != nil && (s.memLimit > 0 || s.gc.tier1) {
-		var oldElem int64
-		switch t.arrKind {
-		case arrInt, arrFloat:
-			oldElem = 8
-		case arrBool:
-			oldElem = 1
-		}
-		if oldElem > 0 && t.arrCap > 0 {
-			delta := int64(t.arrCap) * (16 - oldElem)
-			if err := s.checkMemAndAccountWithRoots(delta, TableValue(t), val, NilValue()); err != nil {
-				s.memExceeded = true
-				return false
-			}
+	var oldElem int64
+	switch t.arrKind {
+	case arrInt, arrFloat:
+		oldElem = 8
+	case arrBool:
+		oldElem = 1
+	}
+	var delta int64
+	if oldElem > 0 && t.arrCap > 0 {
+		delta = int64(t.arrCap) * (16 - oldElem)
+	}
+	if s != nil && s.memLimit > 0 && delta > 0 {
+		if err := s.checkMemWithRoots(delta, TableValue(t), val, NilValue()); err != nil {
+			s.memExceeded = true
+			return false
 		}
 	}
 	switch t.arrKind {
@@ -770,13 +719,16 @@ func (t *Table) promoteArrToGeneric(s *State, val Value) bool {
 		}
 		t.setArrVal(g)
 	}
+	if s != nil && delta > 0 {
+		s.addTableMem(t, delta)
+	}
 	return true
 }
 
 func (t *Table) checkGenericArrGrowth(s *State, idx int64, val Value) bool {
-	if s != nil && (s.memLimit > 0 || s.gc.tier1) && int(idx)+1 > int(t.arrCap) {
+	if s != nil && s.memLimit > 0 && int(idx)+1 > int(t.arrCap) {
 		nc := nextCap(int(t.arrCap), int(idx)+1)
-		if err := s.checkMemAndAccountWithRoots(int64(nc-int(t.arrCap))*16, TableValue(t), val, NilValue()); err != nil {
+		if err := s.checkMemWithRoots(int64(nc-int(t.arrCap))*16, TableValue(t), val, NilValue()); err != nil {
 			s.memExceeded = true
 			return false
 		}
@@ -795,11 +747,11 @@ func nextCap(cur, need int) int {
 	return c
 }
 
-func (t *Table) hashDeleteInt(k int64) {
+func (t *Table) hashDeleteInt(s *State, k int64) {
 	if t.hash == nil || t.hash.live == 0 {
 		return
 	}
-	if slot, ok := t.hashFindSlot(IntValue(k)); ok {
+	if slot, ok := t.hashFindSlot(s, IntValue(k)); ok {
 		h := t.hash
 		h.nodes[slot].val = NilValue()
 		h.nodes[slot].dead = true
@@ -811,13 +763,13 @@ func (t *Table) hashDeleteInt(k int64) {
 // migrateHashIntRange moves any active integer keys in (oldLen, newLen] from t.hash into
 // the generic array (deleting them from t.hash so stale hash entries can never resurrect).
 // Key skipIdx+1 is deleted without writing into arr because the caller is overwriting it.
-func (t *Table) migrateHashIntRange(oldLen, newLen int, skipIdx int64) {
+func (t *Table) migrateHashIntRange(s *State, oldLen, newLen int, skipIdx int64) {
 	if t.hash == nil || t.hash.live == 0 {
 		return
 	}
 	arr := t.arrValSlice(nil)
 	for k := oldLen + 1; k <= newLen; k++ {
-		if slot, ok := t.hashFindSlot(IntValue(int64(k))); ok {
+		if slot, ok := t.hashFindSlot(s, IntValue(int64(k))); ok {
 			h := t.hash
 			oldVal := h.nodes[slot].val
 			h.nodes[slot].val = NilValue()
@@ -839,7 +791,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 	// If key already exists in the hash part (outside [1..arrLen]), update it in place
 	// rather than migrating it into the array mid-traversal (matching ltable.c).
 	if t.hash != nil && t.hash.live > 0 && (i < 1 || uint64(i-1) >= uint64(t.arrLen)) {
-		if slot, ok := t.hashFindSlot(IntValue(i)); ok {
+		if slot, ok := t.hashFindSlot(s, IntValue(i)); ok {
 			h := t.hash
 			if val.IsNil() {
 				h.nodes[slot].val = NilValue()
@@ -848,6 +800,7 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				h.dictGen++
 			} else {
 				h.nodes[slot].val = val
+				s.barrierTableVal(t, val)
 			}
 			return
 		}
@@ -860,71 +813,83 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 				if !val.IsNil() && idx == 0 {
 					c := max(int(t.arrHint), 8)
 					if val.IsInt() {
-						if s.memLimit > 0 || s.gc.tier1 {
-							if err := s.checkMemAndAccountWithRoots(int64(c)*8, TableValue(t), val, NilValue()); err != nil {
+						if s.memLimit > 0 {
+							if err := s.checkMemWithRoots(int64(c)*8-int64(t.arrHint)*8, TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
 						}
+						t.consumeArrHint(s)
 						arr := make([]int64, 1, c)
 						arr[0] = val.Int()
 						t.setArrInt(arr)
-						t.hashDeleteInt(1)
+						s.addTableMem(t, int64(c)*8)
+						t.hashDeleteInt(s, 1)
 						return
 					}
 					if val.IsFloat() {
-						if s.memLimit > 0 || s.gc.tier1 {
-							if err := s.checkMemAndAccountWithRoots(int64(c)*8, TableValue(t), val, NilValue()); err != nil {
+						if s.memLimit > 0 {
+							if err := s.checkMemWithRoots(int64(c)*8-int64(t.arrHint)*8, TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
 						}
+						t.consumeArrHint(s)
 						arr := make([]float64, 1, c)
 						arr[0] = val.Float()
 						t.setArrFloat(arr)
-						t.hashDeleteInt(1)
+						s.addTableMem(t, int64(c)*8)
+						t.hashDeleteInt(s, 1)
 						return
 					}
 					if val.IsBool() {
-						if s.memLimit > 0 || s.gc.tier1 {
-							if err := s.checkMemAndAccountWithRoots(int64(c), TableValue(t), val, NilValue()); err != nil {
+						if s.memLimit > 0 {
+							if err := s.checkMemWithRoots(max(int64(c)-int64(t.arrHint)*8, 0), TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
 						}
+						t.consumeArrHint(s)
 						arr := make([]bool, 1, c)
 						arr[0] = val.IsTrue()
 						t.setArrBool(arr)
-						t.hashDeleteInt(1)
+						s.addTableMem(t, int64(c))
+						t.hashDeleteInt(s, 1)
 						return
 					}
-					if s.memLimit > 0 || s.gc.tier1 {
-						if err := s.checkMemAndAccountWithRoots(int64(c)*16, TableValue(t), val, NilValue()); err != nil {
+					if s.memLimit > 0 {
+						if err := s.checkMemWithRoots(int64(c)*16-int64(t.arrHint)*8, TableValue(t), val, NilValue()); err != nil {
 							s.memExceeded = true
 							return
 						}
 					}
+					t.consumeArrHint(s)
 					arr := make([]Value, 1, c)
 					arr[0] = val
 					t.setArrVal(arr)
-					t.hashDeleteInt(1)
+					s.addTableMem(t, int64(c)*16)
+					s.barrierTableVal(t, val)
+					t.hashDeleteInt(s, 1)
 					return
 				}
 				// Allow filling within preallocated hint or small sequential index.
 				if !val.IsNil() && idx < max(int64(t.arrHint), 16) {
 					c := max(int(t.arrHint), int(idx)+1)
 					nc := nextCap(c/2, c)
-					if s.memLimit > 0 || s.gc.tier1 {
-						if err := s.checkMemAndAccountWithRoots(int64(nc)*16, TableValue(t), val, NilValue()); err != nil {
+					if s.memLimit > 0 {
+						if err := s.checkMemWithRoots(int64(nc)*16-int64(t.arrHint)*8, TableValue(t), val, NilValue()); err != nil {
 							s.memExceeded = true
 							return
 						}
 					}
+					t.consumeArrHint(s)
 					arr := make([]Value, int(idx)+1, nc)
 					fillNil(arr)
 					t.setArrVal(arr)
-					t.migrateHashIntRange(0, int(idx)+1, idx)
+					s.addTableMem(t, int64(nc)*16)
+					t.migrateHashIntRange(s, 0, int(idx)+1, idx)
 					arr[idx] = val
+					s.barrierTableVal(t, val)
 					return
 				}
 			case arrInt:
@@ -934,18 +899,19 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						t.arrIntSlice(nil)[idx] = val.Int()
 						return
 					}
-					// Promote on nil (including last element) or type change so next(t, k) never invalidates keys.
 					if !t.promoteArrToGeneric(s, val) {
 						return
 					}
 					t.arrValSlice(nil)[idx] = val
+					s.barrierTableVal(t, val)
 					return
 				}
 				if idx == n && val.IsInt() {
 					if uint32(n) == t.arrCap {
 						nc := nextCap(int(t.arrCap), int(n)+1)
-						if s.memLimit > 0 || s.gc.tier1 {
-							if err := s.checkMemAndAccountWithRoots(int64(nc-int(t.arrCap))*8, TableValue(t), val, NilValue()); err != nil {
+						delta := int64(nc-int(t.arrCap)) * 8
+						if s.memLimit > 0 {
+							if err := s.checkMemWithRoots(delta, TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
@@ -954,18 +920,19 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						copy(grown, t.arrIntSlice(nil))
 						grown[idx] = val.Int()
 						t.setArrInt(grown)
+						s.addTableMem(t, delta)
 					} else {
 						t.arrLen = uint32(n + 1)
 						t.arrIntSlice(nil)[idx] = val.Int()
 					}
-					t.hashDeleteInt(i)
+					t.hashDeleteInt(s, i)
 					return
 				}
 				if !val.IsNil() && idx < n*2 && idx < 1<<24 {
 					if !t.promoteArrToGeneric(s, val) || !t.checkGenericArrGrowth(s, idx, val) {
 						return
 					}
-					t.setArrGeneric(idx, val)
+					t.setArrGeneric(s, idx, val)
 					return
 				}
 			case arrFloat:
@@ -979,13 +946,15 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						return
 					}
 					t.arrValSlice(nil)[idx] = val
+					s.barrierTableVal(t, val)
 					return
 				}
 				if idx == n && val.IsFloat() {
 					if uint32(n) == t.arrCap {
 						nc := nextCap(int(t.arrCap), int(n)+1)
-						if s.memLimit > 0 || s.gc.tier1 {
-							if err := s.checkMemAndAccountWithRoots(int64(nc-int(t.arrCap))*8, TableValue(t), val, NilValue()); err != nil {
+						delta := int64(nc-int(t.arrCap)) * 8
+						if s.memLimit > 0 {
+							if err := s.checkMemWithRoots(delta, TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
@@ -994,18 +963,19 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						copy(grown, t.arrFloatSlice(nil))
 						grown[idx] = val.Float()
 						t.setArrFloat(grown)
+						s.addTableMem(t, delta)
 					} else {
 						t.arrLen = uint32(n + 1)
 						t.arrFloatSlice(nil)[idx] = val.Float()
 					}
-					t.hashDeleteInt(i)
+					t.hashDeleteInt(s, i)
 					return
 				}
 				if !val.IsNil() && idx < n*2 && idx < 1<<24 {
 					if !t.promoteArrToGeneric(s, val) || !t.checkGenericArrGrowth(s, idx, val) {
 						return
 					}
-					t.setArrGeneric(idx, val)
+					t.setArrGeneric(s, idx, val)
 					return
 				}
 			case arrBool:
@@ -1019,13 +989,15 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						return
 					}
 					t.arrValSlice(nil)[idx] = val
+					s.barrierTableVal(t, val)
 					return
 				}
 				if idx == n && val.IsBool() {
 					if uint32(n) == t.arrCap {
 						nc := nextCap(int(t.arrCap), int(n)+1)
-						if s.memLimit > 0 || s.gc.tier1 {
-							if err := s.checkMemAndAccountWithRoots(int64(nc-int(t.arrCap)), TableValue(t), val, NilValue()); err != nil {
+						delta := int64(nc - int(t.arrCap))
+						if s.memLimit > 0 {
+							if err := s.checkMemWithRoots(delta, TableValue(t), val, NilValue()); err != nil {
 								s.memExceeded = true
 								return
 							}
@@ -1034,31 +1006,33 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 						copy(grown, t.arrBoolSlice(nil))
 						grown[idx] = val.IsTrue()
 						t.setArrBool(grown)
+						s.addTableMem(t, delta)
 					} else {
 						t.arrLen = uint32(n + 1)
 						t.arrBoolSlice(nil)[idx] = val.IsTrue()
 					}
-					t.hashDeleteInt(i)
+					t.hashDeleteInt(s, i)
 					return
 				}
 				if !val.IsNil() && idx < n*2 && idx < 1<<24 {
 					if !t.promoteArrToGeneric(s, val) || !t.checkGenericArrGrowth(s, idx, val) {
 						return
 					}
-					t.setArrGeneric(idx, val)
+					t.setArrGeneric(s, idx, val)
 					return
 				}
 			case arrGeneric:
 				n := int64(t.arrLen)
 				if idx < n {
 					t.arrValSlice(nil)[idx] = val
+					s.barrierTableVal(t, val)
 					return
 				}
 				if !val.IsNil() && (idx == n || (idx < max(n*2, 16) && idx < 1<<24)) {
 					if !t.checkGenericArrGrowth(s, idx, val) {
 						return
 					}
-					t.setArrGeneric(idx, val)
+					t.setArrGeneric(s, idx, val)
 					return
 				}
 			}
@@ -1085,17 +1059,18 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 		n := int64(t.arrLen)
 		if idx < n {
 			t.arrValSlice(nil)[idx] = val
+			s.barrierTableVal(t, val)
 			return
 		}
 		if !val.IsNil() && (idx == n || (idx < max(n*2, 16) && idx < 1<<24)) {
-			if int(idx)+1 > int(t.arrCap) && (s.memLimit > 0 || s.gc.tier1) {
+			if int(idx)+1 > int(t.arrCap) && s.memLimit > 0 {
 				nc := nextCap(int(t.arrCap), int(idx)+1)
-				if err := s.checkMemAndAccountWithRoots(int64(nc-int(t.arrCap))*16, TableValue(t), val, NilValue()); err != nil {
+				if err := s.checkMemWithRoots(int64(nc-int(t.arrCap))*16, TableValue(t), val, NilValue()); err != nil {
 					s.memExceeded = true
 					return
 				}
 			}
-			t.setArrGeneric(idx, val)
+			t.setArrGeneric(s, idx, val)
 			return
 		}
 	}
@@ -1105,17 +1080,22 @@ func (t *Table) RawSetInt(s *State, i int64, val Value) {
 	}
 }
 
-func (t *Table) setArrGeneric(idx int64, val Value) {
+func (t *Table) setArrGeneric(s *State, idx int64, val Value) {
 	oldLen := int(t.arrLen)
+	oldCap := int(t.arrCap)
 	newLen := int(idx) + 1
-	if newLen > int(t.arrCap) {
-		grown := make([]Value, newLen, nextCap(int(t.arrCap), newLen))
+	if newLen > oldCap {
+		nc := nextCap(oldCap, newLen)
+		grown := make([]Value, newLen, nc)
 		if oldLen > 0 {
 			old := t.arrValSlice(nil)
 			copy(grown, old)
 			clear(old)
 		}
 		t.setArrVal(grown)
+		if s != nil {
+			s.addTableMem(t, int64(nc-oldCap)*16)
+		}
 	} else {
 		t.arrLen = uint32(newLen)
 	}
@@ -1124,9 +1104,12 @@ func (t *Table) setArrGeneric(idx int64, val Value) {
 		fillNil(arr[oldLen : newLen-1])
 	}
 	if t.hash != nil {
-		t.migrateHashIntRange(oldLen, newLen, idx)
+		t.migrateHashIntRange(s, oldLen, newLen, idx)
 	}
 	arr[idx] = val
+	if s != nil {
+		s.barrierTableVal(t, val)
+	}
 }
 
 // RawGet looks up any Lua Value key.
@@ -1144,14 +1127,14 @@ func (t *Table) RawGet(s *State, key Value) Value {
 		if i, ok := FloatToIntExact(f); ok {
 			return t.RawGetInt(s, i)
 		}
-		if slot, ok := t.hashFindSlot(key); ok {
+		if slot, ok := t.hashFindSlot(s, key); ok {
 			return t.hash.nodes[slot].val
 		}
 		return NilValue()
 	case key.IsNil():
 		return NilValue()
 	default:
-		if slot, ok := t.hashFindSlot(key); ok {
+		if slot, ok := t.hashFindSlot(s, key); ok {
 			return t.hash.nodes[slot].val
 		}
 		return NilValue()
@@ -1216,8 +1199,9 @@ func (t *Table) RawSet(s *State, key, val Value) error {
 		if err != nil {
 			return err
 		}
-		if val.IsNil() && slot >= 0 && s != nil && (key.IsString() || isCollectableWeak(key)) {
-			s.gc.hasDeadHashKeys = true
+		if val.IsNil() && slot >= 0 && s != nil && key.IsGCObject() {
+			t.flags |= tblFlagHasDeadKeys
+			s.hasDeadHashKeys = true
 		}
 		return nil
 	}
@@ -1283,7 +1267,7 @@ func (t *Table) hashBorder(s *State, j int64) int64 {
 }
 
 // hashFindSlotForNext finds key in t.hash.nodes including dead/tombstoned keys (needed by Lua's next()).
-func (t *Table) hashFindSlotForNext(key Value) (int, bool) {
+func (t *Table) hashFindSlotForNext(s *State, key Value) (int, bool) {
 	h := t.hash
 	if h == nil || len(h.nodes) == 0 {
 		return -1, false
@@ -1297,26 +1281,14 @@ func (t *Table) hashFindSlotForNext(key Value) (int, bool) {
 		}
 	}
 	mask := h.mask
-	idx := hashValue(key) & mask
+	idx := hashValue(s, key) & mask
 	for {
 		nd := &h.nodes[idx]
 		if !nd.used {
 			return -1, false
 		}
-		if !nd.dead || !nd.key.IsNil() {
-			if RawEqual(nd.key, key) {
-				return int(idx), true
-			}
-		} else if h.deadKeys != nil {
-			if ref, ok := h.deadKeys[int(idx)]; ok {
-				if dv, alive := deadKeyValue(ref); alive {
-					if RawEqual(dv, key) {
-						return int(idx), true
-					}
-				} else {
-					delete(h.deadKeys, int(idx))
-				}
-			}
+		if !nd.key.IsDeadKey() && s.RawEqual(nd.key, key) {
+			return int(idx), true
 		}
 		idx = (idx + 1) & mask
 	}
@@ -1347,7 +1319,7 @@ func (t *Table) Next(s *State, key Value) (Value, Value, error) {
 			}
 		}
 		if !found {
-			if slot, ok := t.hashFindSlotForNext(key); ok {
+			if slot, ok := t.hashFindSlotForNext(s, key); ok {
 				startPhase = 2
 				startIdx = slot + 1
 				found = true
