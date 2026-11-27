@@ -299,7 +299,7 @@ func nativeDebugTraceback(s *State, args []Value) ([]Value, error) {
 		if !rest[0].IsString() && !rest[0].IsNumber() {
 			return []Value{rest[0]}, nil // non-string error object returned verbatim per Lua spec!
 		}
-		msg = FormatValue(rest[0])
+		msg = s.FormatValue(rest[0])
 		hasMsg = true
 	}
 	level := 1
@@ -1450,7 +1450,7 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 		}
 		return nil, fmt.Errorf("bad argument #2 to 'sethook' (string expected, got %s)", got)
 	}
-	maskStr := FormatValue(rest[1])
+	maskStr := s.FormatValue(rest[1])
 	if !rest[0].IsFunction() {
 		return nil, fmt.Errorf("bad argument #1 to 'sethook' (function expected, got %s)", s.objTypeName(rest[0]))
 	}

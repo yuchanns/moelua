@@ -4043,7 +4043,7 @@ func (s *State) concatYieldable(th *Thread, cf *callFrame, start, n int) (bool, 
 		if v.IsString() {
 			totalLen += len(v.AsString().Str())
 		} else if v.IsNumber() {
-			ns := FormatValue(v)
+			ns := s.FormatValue(v)
 			totalLen += len(ns)
 			numStrs = append(numStrs, ns)
 		} else {
@@ -4110,7 +4110,7 @@ func (s *State) concatStep(th *Thread, cf *callFrame, start, cur int) (bool, err
 		lhs := th.stack[cur-1]
 		rhs := th.stack[cur]
 		if (lhs.IsString() || lhs.IsNumber()) && (rhs.IsString() || rhs.IsNumber()) {
-			ls, rs := FormatValue(lhs), FormatValue(rhs)
+			ls, rs := s.FormatValue(lhs), s.FormatValue(rhs)
 			totalLen := len(ls) + len(rs)
 			if s.memLimit > 0 {
 				if err := s.checkMem(int64(totalLen) + 48); err != nil {

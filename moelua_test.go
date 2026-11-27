@@ -1548,3 +1548,71 @@ func TestCall1AndToStringClonesAcrossClose(t *testing.T) {
 		t.Fatalf("Call1 on closed State = %v, want ErrStateClosed", err)
 	}
 }
+
+func TestStateFormatValueRawEqualAndLuaErrorStability(t *testing.T) {
+	s := moelua.New()
+	if got := s.FormatValue(moelua.Int(123)); got != "123" {
+		t.Fatalf("FormatValue(123) = %q", got)
+	}
+	strVal := s.String("arena_boundary_msg_1")
+	gotStr := s.FormatValue(strVal)
+	if gotStr != "arena_boundary_msg_1" {
+		t.Fatalf("FormatValue(str) = %q", gotStr)
+	}
+	if !s.RawEqual(moelua.Int(7), moelua.Float(7.0)) || s.RawEqual(moelua.Int(7), moelua.Int(8)) {
+		t.Fatalf("RawEqual numeric mismatch")
+	}
+	if !s.RawEqual(s.String("hello"), s.String("hello")) || s.RawEqual(s.String("hello"), s.String("world")) {
+		t.Fatalf("RawEqual string mismatch")
+	}
+
+	// Uncaught LuaError returned from DoString/Call/Call1/Resume must retain a stable Error()
+	// string even after GC sweeps and overwrites the original Arena slot AND after State.Close().
+	_, callErr := s.DoString(`error(string.sub("ZZerr_payload_call_0001", 3), 0)`)
+	if callErr == nil {
+		t.Fatal("expected error from DoString")
+	}
+	fnRes, err := s.DoString(`return function() error(string.sub("YYerr_payload_call1_002", 3), 0) end`)
+	if err != nil || len(fnRes) != 1 {
+		t.Fatalf("setup Call1 error fn failed: %v %v", fnRes, err)
+	}
+	_, call1Err := s.Call1(fnRes[0])
+	if call1Err == nil {
+		t.Fatal("expected error from Call1")
+	}
+	coFnRes, err := s.DoString(`return function() error(string.sub("XXerr_payload_coro_0003", 3), 0) end`)
+	if err != nil || len(coFnRes) != 1 {
+		t.Fatalf("setup coro error fn failed: %v %v", coFnRes, err)
+	}
+	co, err := s.NewThread(coFnRes[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, coroErr := co.Resume()
+	if coroErr == nil {
+		t.Fatal("expected error from Resume")
+	}
+
+	// Sweep unreachable Arena error strings and overwrite slots with fresh 21-byte strings.
+	s.CollectGarbage()
+	for i := range 64 {
+		_ = s.String(fmt.Sprintf("overwrite_slot_x_%04d", i))
+	}
+	if callErr.Error() != "err_payload_call_0001" {
+		t.Fatalf("DoString LuaError corrupted after GC reuse: %q", callErr.Error())
+	}
+	if call1Err.Error() != "err_payload_call1_002" {
+		t.Fatalf("Call1 LuaError corrupted after GC reuse: %q", call1Err.Error())
+	}
+	if coroErr.Error() != "err_payload_coro_0003" {
+		t.Fatalf("Resume LuaError corrupted after GC reuse: %q", coroErr.Error())
+	}
+
+	s.Close()
+	if gotStr != "arena_boundary_msg_1" {
+		t.Fatalf("FormatValue string corrupted after Close: %q", gotStr)
+	}
+	if callErr.Error() != "err_payload_call_0001" || call1Err.Error() != "err_payload_call1_002" || coroErr.Error() != "err_payload_coro_0003" {
+		t.Fatalf("LuaError messages corrupted after Close: %q / %q / %q", callErr.Error(), call1Err.Error(), coroErr.Error())
+	}
+}

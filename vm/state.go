@@ -584,6 +584,47 @@ func (s *State) dynamicNativeCancelFunc() func() error {
 	}
 }
 
+// FormatValue formats a Lua Value owned by this State for tostring() / print() / host diagnostics.
+// Returned strings are safely cloned copies independent of Arena lifetime.
+func (s *State) FormatValue(v Value) string {
+	return FormatValue(v)
+}
+
+// RawEqual implements Lua 5.5 rawequal(a, b) for Values owned by this State.
+func (s *State) RawEqual(a, b Value) bool {
+	return RawEqual(a, b)
+}
+
+// UserdataData returns the Go host payload stored on userdata u.
+func (s *State) UserdataData(u *Userdata) any {
+	if u == nil {
+		return nil
+	}
+	return u.Data
+}
+
+// SetUserdataData updates the Go host payload stored on userdata u.
+func (s *State) SetUserdataData(u *Userdata, data any) {
+	if u == nil {
+		return
+	}
+	u.Data = data
+}
+
+// materializeLuaError caches a cloned Go string message on an uncaught *LuaError when it
+// escapes to the Go host so err.Error() and FormatError(err) remain valid across subsequent
+// Lua GC cycles or State.Close().
+func (s *State) materializeLuaError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if le, ok := err.(*LuaError); ok && !le.hasMsg {
+		le.msg = s.FormatValue(le.Val)
+		le.hasMsg = true
+	}
+	return err
+}
+
 // FormatError formats an error (calling __tostring on non-string error objects per lua.c:msghandler).
 func (s *State) FormatError(err error) string {
 	if err == nil {
@@ -593,10 +634,13 @@ func (s *State) FormatError(err error) string {
 	if errors.As(err, &le) {
 		v := le.Val
 		if v.IsString() {
+			if le.hasMsg {
+				return le.msg
+			}
 			return strings.Clone(v.AsString().Str())
 		}
 		if v.IsNumber() {
-			return FormatValue(v)
+			return s.FormatValue(v)
 		}
 		if tm := s.getTMByObj(v, TMToString); !tm.IsNil() {
 			res, terr := s.Call(tm, v)
@@ -1056,7 +1100,7 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		cLimit = maxCCallsErrHandler
 	}
 	if s.nCcalls >= cLimit {
-		return nil, &LuaError{Val: StringValue(s.intern.Intern("C stack overflow"))}
+		return nil, s.materializeLuaError(&LuaError{Val: StringValue(s.intern.Intern("C stack overflow"))})
 	}
 	s.nCcalls++
 	th.nny++
@@ -1073,7 +1117,11 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		for depth := 1; depth <= 15; depth++ {
 			tm := s.getTMByObj(fn, TMCall)
 			if tm.IsNil() {
-				return nil, &LuaError{Val: StringValue(s.intern.Intern(fmt.Sprintf("attempt to call a %s value", fn.TypeName())))}
+				le := &LuaError{Val: StringValue(s.intern.Intern(fmt.Sprintf("attempt to call a %s value", fn.TypeName())))}
+				if s.nCcalls == 1 {
+					_ = s.materializeLuaError(le)
+				}
+				return nil, le
 			}
 			all := make([]Value, len(args)+1)
 			all[0] = fn
@@ -1086,7 +1134,11 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 			}
 		}
 		if !fn.IsClosure() && !fn.IsNative() {
-			return nil, &LuaError{Val: StringValue(s.intern.Intern("'__call' chain too long"))}
+			le := &LuaError{Val: StringValue(s.intern.Intern("'__call' chain too long"))}
+			if s.nCcalls == 1 {
+				_ = s.materializeLuaError(le)
+			}
+			return nil, le
 		}
 	}
 	if fn.IsNative() {
@@ -1197,6 +1249,9 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 				return nil, s.abortErr
 			}
 		}
+		if s.nCcalls == 1 {
+			err = s.materializeLuaError(err)
+		}
 		return res, err
 	}
 
@@ -1236,6 +1291,9 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 	if herr := s.fireLuaCallHook(th, cl, len(args)); herr != nil {
 		th.nframe = entryDepth
 		th.top = funcIdx
+		if s.nCcalls == 1 {
+			herr = s.materializeLuaError(herr)
+		}
 		return nil, herr
 	}
 	clearTopStack := func() {
@@ -1295,7 +1353,11 @@ func (s *State) callOnThread(th *Thread, fn Value, args []Value) ([]Value, error
 		}
 		th.nframe = entryDepth
 		clearTopStack()
-		return nil, &LuaError{Val: ev, xpHandled: xpHandled, isMemErr: isMem}
+		le := &LuaError{Val: ev, xpHandled: xpHandled, isMemErr: isMem}
+		if s.nCcalls == 1 {
+			_ = s.materializeLuaError(le)
+		}
+		return nil, le
 	}
 	if s.gcNeedsCheck() {
 		s.gcCheckDebt(th.top)
@@ -1429,7 +1491,11 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 						} else {
 							th.nframe = entryDepth
 							clearTop()
-							retErr = &LuaError{Val: ev, xpHandled: xpHandled, isMemErr: isMem}
+							le := &LuaError{Val: ev, xpHandled: xpHandled, isMemErr: isMem}
+							if s.nCcalls == 1 {
+								_ = s.materializeLuaError(le)
+							}
+							retErr = le
 						}
 					}
 				} else {

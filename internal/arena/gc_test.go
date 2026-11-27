@@ -730,3 +730,121 @@ func TestGCRandomizedIncrementalAndGenerationalSoundness(t *testing.T) {
 			vm.a.LiveObjects(), vm.a.AllocBytes(), vm.goRefs.LiveCount())
 	}
 }
+
+func TestGCAtomicHooksAndAuxBytesAccounting(t *testing.T) {
+	a := arena.New()
+	defer a.Close()
+
+	type auxObj struct {
+		hdr    arena.GCHeader
+		bufRef arena.ObjRef
+		auxSz  int64
+	}
+
+	var (
+		rootObj     arena.ObjRef
+		remarkedObj arena.ObjRef
+		deadObj     arena.ObjRef
+		finObj      arena.ObjRef
+		order       []string
+		preSweepSaw struct {
+			rootWhite     bool
+			remarkedWhite bool
+			finWhite      bool
+			deadWhite     bool
+			deadStillLive bool
+		}
+	)
+
+	var c *arena.Collector
+	c = arena.NewCollector(a, arena.Callbacks{
+		MarkRoots: func(c *arena.Collector) {
+			c.MarkObject(rootObj)
+		},
+		AfterGrayAgain: func(c *arena.Collector) {
+			order = append(order, "afterGrayAgain")
+			c.MarkObject(remarkedObj)
+		},
+		PreSweep: func(c *arena.Collector) {
+			order = append(order, "preSweep")
+			preSweepSaw.rootWhite = c.IsWhite(rootObj)
+			preSweepSaw.remarkedWhite = c.IsWhite(remarkedObj)
+			preSweepSaw.finWhite = c.IsWhite(finObj)
+			preSweepSaw.deadWhite = c.IsWhite(deadObj)
+			preSweepSaw.deadStillLive = a.IsLive(deadObj)
+		},
+		AuxBytes: func(a *arena.Arena, ref arena.ObjRef) int64 {
+			return arena.As[auxObj](a, ref).auxSz
+		},
+		FreeObject: func(a *arena.Arena, ref arena.ObjRef) {
+			obj := arena.As[auxObj](a, ref)
+			if obj.bufRef != arena.NullRef {
+				a.Free(obj.bufRef)
+			}
+			a.Free(ref)
+			order = append(order, "free")
+		},
+		RunFinalizer: func(c *arena.Collector, ref arena.ObjRef) {
+			order = append(order, "finalizer")
+		},
+	})
+
+	allocAux := func(bufBytes int) arena.ObjRef {
+		ref, err := c.Alloc(int(unsafe.Sizeof(auxObj{})), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bufBytes > 0 {
+			bufRef, err := a.AllocZeroed(bufBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			obj := arena.As[auxObj](a, ref)
+			obj.bufRef = bufRef
+			obj.auxSz = int64(a.SlotSize(bufRef))
+		}
+		return ref
+	}
+
+	rootObj = allocAux(4096)
+	remarkedObj = allocAux(1024)
+	finObj = allocAux(0)
+	c.RegisterFinalizer(finObj)
+	deadObj = allocAux(2048)
+
+	c.Full(false)
+
+	if preSweepSaw.rootWhite || preSweepSaw.remarkedWhite || preSweepSaw.finWhite {
+		t.Fatalf("PreSweep saw surviving/resurrected object as white: %+v", preSweepSaw)
+	}
+	if !preSweepSaw.deadWhite || !preSweepSaw.deadStillLive {
+		t.Fatalf("PreSweep expected dead object white & still live before sweep: %+v", preSweepSaw)
+	}
+	// Verify order: afterGrayAgain -> preSweep -> free -> finalizer.
+	wantOrder := []string{"afterGrayAgain", "preSweep", "free", "finalizer"}
+	if !slices.Equal(order, wantOrder) {
+		t.Fatalf("hook order = %v, want %v", order, wantOrder)
+	}
+	// Verify MarkedBytes included both GC headers and auxiliary buffer sizes (4096 + 1024).
+	wantMinMarked := int64(a.SlotSize(rootObj)+a.SlotSize(remarkedObj)) + 4096 + 1024
+	if c.MarkedBytes() < wantMinMarked {
+		t.Fatalf("MarkedBytes = %d, want >= %d (including AuxBytes)", c.MarkedBytes(), wantMinMarked)
+	}
+	if a.IsLive(deadObj) {
+		t.Fatalf("deadObj was not freed after PreSweep")
+	}
+
+	// Verify generational minor cycle also invokes PreSweep with dead young objects white and old objects non-white.
+	c.SetMode(arena.ModeGenMinor)
+	order = order[:0]
+	deadObj = allocAux(512)
+	finObj = arena.NullRef
+	c.StepBytes(1)
+	if !preSweepSaw.deadWhite || !preSweepSaw.deadStillLive || preSweepSaw.rootWhite {
+		t.Fatalf("generational PreSweep invariant violated: %+v", preSweepSaw)
+	}
+	if a.IsLive(deadObj) {
+		t.Fatalf("generational deadObj was not freed")
+	}
+	c.FreeAll()
+}

@@ -740,5 +740,8 @@ func errorToLuaValue(s *State, err error) Value {
 }
 
 func (th *Thread) FormatStatusError() error {
+	if th.state != nil {
+		return fmt.Errorf("%s", th.state.FormatValue(th.errObj))
+	}
 	return fmt.Errorf("%s", FormatValue(th.errObj))
 }

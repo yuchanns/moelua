@@ -117,8 +117,24 @@ type Callbacks struct {
 	MarkRoots func(c *Collector)
 
 	// MarkAtomicRoots re-marks roots that may have changed incrementally before atomic
-	// (e.g. active thread, registry, global type metatables, open upvalues of dead threads).
+	// (e.g. active thread, registry, global type metatables).
 	MarkAtomicRoots func(c *Collector)
+
+	// AfterGrayAgain optionally runs during atomic() right after grayAgain propagation
+	// and before ephemeron convergence / weak clearing (e.g. lgc.c:remarkupvals).
+	AfterGrayAgain func(c *Collector)
+
+	// PreSweep optionally runs at the end of atomic() right after resurrection & weak-table
+	// clearing and right before flipping currentWhite and sweeping. At this point every
+	// surviving object (including resurrected finalizables and old-gen objects) is non-White
+	// and every soon-to-be-freed object is White (ideal for pruning inline caches, shape
+	// transition caches, and dead hash keys).
+	PreSweep func(c *Collector)
+
+	// AuxBytes optionally returns the number of auxiliary raw Arena bytes owned exclusively
+	// by ref (e.g. a table's backing array/hash/slots or a thread's stack/frames) so
+	// gcMarked and generational Old1 promotion accounting match Arena.AllocBytes().
+	AuxBytes func(a *Arena, ref ObjRef) int64
 
 	// Traverse marks outgoing ObjRefs from ref (which has already been popped from gray
 	// and turned Black unless it is a thread or weak table). Returns work units (>= 1).
@@ -265,6 +281,11 @@ func (c *Collector) Restart() { c.running = true }
 // IsEmergency reports whether the collector is currently inside an emergency GC cycle.
 func (c *Collector) IsEmergency() bool { return c.emergency }
 
+// IsWhite reports whether ref is currently white (unmarked / dead during atomic weak clearing & PreSweep).
+func (c *Collector) IsWhite(ref ObjRef) bool {
+	return ref != NullRef && c.arena.Header(ref).IsWhite()
+}
+
 // MinorCycles returns the total number of generational minor collections completed.
 func (c *Collector) MinorCycles() uint64 { return c.minorCycles }
 
@@ -365,6 +386,11 @@ func (c *Collector) MarkObject(ref ObjRef) {
 func (c *Collector) reallyMarkObject(ref ObjRef) {
 	hdr := c.arena.Header(ref)
 	c.gcMarked += int64(c.arena.SlotSize(ref))
+	if c.cb.AuxBytes != nil {
+		if aux := c.cb.AuxBytes(c.arena, ref); aux > 0 {
+			c.gcMarked += aux
+		}
+	}
 	if c.cb.MarkLeaf != nil && c.cb.MarkLeaf(c, ref) {
 		if c.cb.IsOpenUpval != nil && c.cb.IsOpenUpval(ref) {
 			hdr.SetGray()
@@ -714,6 +740,11 @@ func (c *Collector) atomic() {
 	c.gray = append(c.gray, savedGrayAgain...)
 	c.propagateAll()
 
+	if c.cb.AfterGrayAgain != nil {
+		c.cb.AfterGrayAgain(c)
+		c.propagateAll()
+	}
+
 	// 1. Converge ephemeron tables before clearing weak values.
 	c.convergeEphemerons()
 
@@ -758,6 +789,10 @@ func (c *Collector) atomic() {
 		for _, ref := range c.allWeak[origAllWeakLen:] {
 			c.cb.ClearByValues(c, ref)
 		}
+	}
+
+	if c.cb.PreSweep != nil {
+		c.cb.PreSweep(c)
 	}
 
 	// Flip current white for the upcoming sweep phase.
@@ -993,6 +1028,11 @@ func (c *Collector) sweepGen(head *ObjRef, startPrev ObjRef, limit ObjRef, first
 			hdr.SetAge(nextAge)
 			if nextAge == AgeOld1 {
 				*addedOld += int64(c.arena.SlotSize(cur))
+				if c.cb.AuxBytes != nil {
+					if aux := c.cb.AuxBytes(c.arena, cur); aux > 0 {
+						*addedOld += aux
+					}
+				}
 				if firstOld1 != nil && *firstOld1 == NullRef {
 					*firstOld1 = cur
 				}

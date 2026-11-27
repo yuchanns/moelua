@@ -256,7 +256,7 @@ func nativeWarn(s *State, args []Value) ([]Value, error) {
 		if a.IsString() {
 			str = a.AsString().Str()
 		} else {
-			str = FormatValue(a)
+			str = s.FormatValue(a)
 		}
 		if err := writeIOStringWithCancel(s.errOut, str, cancelFn, &work); err != nil {
 			return nil, err
@@ -268,9 +268,10 @@ func nativeWarn(s *State, args []Value) ([]Value, error) {
 
 type loadReaderLuaErr struct {
 	val Value
+	msg string
 }
 
-func (e loadReaderLuaErr) Error() string { return FormatValue(e.val) }
+func (e loadReaderLuaErr) Error() string { return e.msg }
 
 type loadFileReadErr struct {
 	err error
@@ -321,7 +322,8 @@ func (r *luaFuncReader) Read(p []byte) (int, error) {
 		if errors.Is(err, errCoroCloseSelf) || isUncatchableErr(err) {
 			return 0, err
 		}
-		return 0, loadReaderLuaErr{val: errorToLuaValue(r.s, err)}
+		ev := errorToLuaValue(r.s, err)
+		return 0, loadReaderLuaErr{val: ev, msg: r.s.FormatValue(ev)}
 	}
 	if len(res) == 0 || res[0].IsNil() {
 		r.eof = true
@@ -331,7 +333,7 @@ func (r *luaFuncReader) Read(p []byte) (int, error) {
 		r.eof = true
 		return 0, fmt.Errorf("reader function must return a string")
 	}
-	piece := FormatValue(res[0])
+	piece := r.s.FormatValue(res[0])
 	if piece == "" {
 		r.eof = true
 		return 0, io.EOF
@@ -666,7 +668,7 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 	isStr := args[0].IsString() || args[0].IsNumber()
 	var strSrc string
 	if isStr {
-		strSrc = FormatValue(args[0])
+		strSrc = s.FormatValue(args[0])
 		chunkName = strSrc
 	} else if !args[0].IsFunction() {
 		return nil, fmt.Errorf("bad argument #1 to 'load' (string or function expected, got %s)", s.objTypeName(args[0]))
@@ -675,14 +677,14 @@ func nativeLoad(s *State, args []Value) ([]Value, error) {
 		if !args[1].IsString() && !args[1].IsNumber() {
 			return nil, fmt.Errorf("bad argument #2 to 'load' (string expected, got %s)", s.objTypeName(args[1]))
 		}
-		chunkName = FormatValue(args[1])
+		chunkName = s.FormatValue(args[1])
 	}
 	mode := "bt"
 	if len(args) >= 3 && !args[2].IsNil() {
 		if !args[2].IsString() && !args[2].IsNumber() {
 			return nil, fmt.Errorf("bad argument #3 to 'load' (string expected, got %s)", s.objTypeName(args[2]))
 		}
-		mode = FormatValue(args[2])
+		mode = s.FormatValue(args[2])
 		// Lua 5.5 rejects fixed-buffer mode 'B' from Lua scripts (lbaselib.c:342-349).
 		hasB, cerr := containsByteWithCancel(mode, 'B', s.nativeCancelFunc())
 		if cerr != nil {
@@ -848,7 +850,7 @@ func nativeLoadFile(s *State, args []Value) ([]Value, error) {
 		if !args[1].IsString() && !args[1].IsNumber() {
 			return nil, fmt.Errorf("bad argument #2 to 'loadfile' (string expected, got %s)", s.objTypeName(args[1]))
 		}
-		mode = FormatValue(args[1])
+		mode = s.FormatValue(args[1])
 		hasB, cerr := containsByteWithCancel(mode, 'B', s.nativeCancelFunc())
 		if cerr != nil {
 			return nil, cerr
@@ -869,7 +871,7 @@ func nativeLoadFile(s *State, args []Value) ([]Value, error) {
 		if !args[0].IsString() && !args[0].IsNumber() {
 			return nil, fmt.Errorf("bad argument #1 to 'loadfile' (string expected, got %s)", s.objTypeName(args[0]))
 		}
-		fname = FormatValue(args[0])
+		fname = s.FormatValue(args[0])
 		chunkName = "@" + fname
 		var err error
 		f, err = os.Open(fname)
@@ -1064,14 +1066,14 @@ func (s *State) flushOpenFiles() {
 	for i := len(s.openFiles) - 1; i >= 0; i-- {
 		_ = s.openFiles[i].flush()
 	}
-	if lf, ok := asLuaFile(s.defaultOutput); ok && !lf.closed {
+	if lf, ok := s.asLuaFile(s.defaultOutput); ok && !lf.closed {
 		_ = lf.flushWriter()
 	}
 	if env := s.GlobalEnv(); env != nil {
 		if ioVal := env.RawGetStr(s.intern.Intern("io")); ioVal.IsTable() {
 			ioTbl := ioVal.AsTable()
 			for _, name := range [...]string{"stdout", "stderr"} {
-				if lf, ok := asLuaFile(ioTbl.RawGetStr(s.intern.Intern(name))); ok && !lf.closed {
+				if lf, ok := s.asLuaFile(ioTbl.RawGetStr(s.intern.Intern(name))); ok && !lf.closed {
 					_ = lf.flushWriter()
 				}
 			}
@@ -1086,11 +1088,11 @@ func (s *State) closeOpenFiles() {
 	s.openFiles = nil
 }
 
-func asLuaFile(v Value) (*luaFile, bool) {
+func (s *State) asLuaFile(v Value) (*luaFile, bool) {
 	if !v.IsUserdata() {
 		return nil, false
 	}
-	lf, ok := v.AsUserdata().Data.(*luaFile)
+	lf, ok := s.UserdataData(v.AsUserdata()).(*luaFile)
 	return lf, ok
 }
 
@@ -1183,7 +1185,7 @@ func nativeIOOpen(s *State, args []Value) ([]Value, error) {
 		if !args[1].IsString() && !args[1].IsNumber() {
 			return nil, fmt.Errorf("bad argument #2 to 'open' (string expected)")
 		}
-		mode = FormatValue(args[1])
+		mode = s.FormatValue(args[1])
 	}
 	if !isValidIOMode(mode) {
 		return nil, fmt.Errorf("bad argument #2 to 'open' (invalid mode)")
@@ -1212,7 +1214,7 @@ func nativeIOInput(s *State, args []Value) ([]Value, error) {
 		return []Value{s.defaultInput}, nil
 	}
 	if args[0].IsString() || args[0].IsNumber() {
-		fname := FormatValue(args[0])
+		fname := s.FormatValue(args[0])
 		lf, err := openFileWithMode(fname, "r")
 		if err != nil {
 			return nil, fmt.Errorf("cannot open file '%s' (%v)", fname, err)
@@ -1224,7 +1226,7 @@ func nativeIOInput(s *State, args []Value) ([]Value, error) {
 		s.defaultInput = ud
 		return []Value{s.defaultInput}, nil
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'input' (FILE* expected, got %s)", s.objTypeName(args[0]))
 	}
@@ -1240,7 +1242,7 @@ func nativeIOOutput(s *State, args []Value) ([]Value, error) {
 		return []Value{s.defaultOutput}, nil
 	}
 	if args[0].IsString() || args[0].IsNumber() {
-		fname := FormatValue(args[0])
+		fname := s.FormatValue(args[0])
 		lf, err := openFileWithMode(fname, "w")
 		if err != nil {
 			return nil, fmt.Errorf("cannot open file '%s' (%v)", fname, err)
@@ -1252,7 +1254,7 @@ func nativeIOOutput(s *State, args []Value) ([]Value, error) {
 		s.defaultOutput = ud
 		return []Value{s.defaultOutput}, nil
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'output' (FILE* expected, got %s)", s.objTypeName(args[0]))
 	}
@@ -1264,7 +1266,7 @@ func nativeIOOutput(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeIORead(s *State, args []Value) ([]Value, error) {
-	if lf, ok := asLuaFile(s.defaultInput); !ok || lf.closed {
+	if lf, ok := s.asLuaFile(s.defaultInput); !ok || lf.closed {
 		return nil, fmt.Errorf("default input file is closed")
 	}
 	all := make([]Value, 1+len(args))
@@ -1274,7 +1276,7 @@ func nativeIORead(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeIOWrite(s *State, args []Value) ([]Value, error) {
-	if lf, ok := asLuaFile(s.defaultOutput); !ok || lf.closed {
+	if lf, ok := s.asLuaFile(s.defaultOutput); !ok || lf.closed {
 		return nil, fmt.Errorf("default output file is closed")
 	}
 	all := make([]Value, 1+len(args))
@@ -1304,7 +1306,7 @@ func nativeIOType(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'io.type'")
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok {
 		return []Value{NilValue()}, nil
 	}
@@ -1368,7 +1370,7 @@ func validPopenMode(mode string) bool {
 }
 
 func nativeIOPopen(s *State, args []Value) ([]Value, error) {
-	prog, err := checkStringArg(args, 0, "popen")
+	prog, err := s.checkStringArg(args, 0, "popen")
 	if err != nil {
 		return nil, err
 	}
@@ -1377,7 +1379,7 @@ func nativeIOPopen(s *State, args []Value) ([]Value, error) {
 		if !args[1].IsString() && !args[1].IsNumber() {
 			return nil, fmt.Errorf("bad argument #2 to 'popen' (string expected, got %s)", s.objTypeName(args[1]))
 		}
-		mode = FormatValue(args[1])
+		mode = s.FormatValue(args[1])
 		if !validPopenMode(mode) {
 			return nil, fmt.Errorf("bad argument #2 to 'popen' (invalid mode)")
 		}
@@ -1442,9 +1444,9 @@ func nativeFileToString(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to '__tostring' (FILE* expected)")
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok {
-		return []Value{StringValue(s.intern.Intern(FormatValue(args[0])))}, nil
+		return []Value{StringValue(s.intern.Intern(s.FormatValue(args[0])))}, nil
 	}
 	if lf.closed {
 		return []Value{StringValue(s.intern.Intern("file (closed)"))}, nil
@@ -1456,7 +1458,7 @@ func nativeFileClose(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'close' (FILE* expected, got no value)")
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to 'close' (FILE* expected)")
 	}
@@ -1496,7 +1498,7 @@ func nativeFileGCClose(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to '__gc' (FILE* expected, got no value)")
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok {
 		return nil, fmt.Errorf("bad argument #1 to '__gc' (FILE* expected, got %s)", s.objTypeName(args[0]))
 	}
@@ -1518,7 +1520,7 @@ func nativeFileFlush(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'flush' (FILE* expected)")
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
@@ -1542,7 +1544,7 @@ func nativeFileSetvbuf(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'setvbuf' (FILE* expected)")
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
@@ -1637,7 +1639,7 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'seek' (FILE* expected, got no value)")
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
@@ -1647,7 +1649,7 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 	whence := io.SeekCurrent
 	offset := int64(0)
 	if len(args) >= 2 && !args[1].IsNil() {
-		opt := FormatValue(args[1])
+		opt := s.FormatValue(args[1])
 		switch opt {
 		case "set":
 			whence = io.SeekStart
@@ -1691,7 +1693,7 @@ func nativeFileSeek(s *State, args []Value) ([]Value, error) {
 // so interactive command reading shares buffering with io.stdin / default stdin reads
 // without being redirected when Lua code calls io.input(file)).
 func (s *State) ReadStdinLine() (string, error) {
-	if lf, ok := asLuaFile(s.stdinInput); ok && !lf.closed && lf.f != nil {
+	if lf, ok := s.asLuaFile(s.stdinInput); ok && !lf.closed && lf.f != nil {
 		return lf.reader().ReadString('\n')
 	}
 	return "", io.EOF
@@ -1701,7 +1703,7 @@ func (s *State) ReadStdinLine() (string, error) {
 // so streaming script loads (`loadfile()`, `moelua -`) share buffering with earlier
 // `io.read` calls without draining all of stdin into memory up front.
 func (s *State) StdinReader() io.Reader {
-	if lf, ok := asLuaFile(s.stdinInput); ok && !lf.closed && lf.f != nil {
+	if lf, ok := s.asLuaFile(s.stdinInput); ok && !lf.closed && lf.f != nil {
 		return lf.reader()
 	}
 	return bytes.NewReader(nil)
@@ -1711,7 +1713,7 @@ func (s *State) StdinReader() io.Reader {
 // so stdin scripts (`moelua -` / piped stdin) consume any bytes buffered by earlier
 // `-e` / `LUA_INIT` stdin reads instead of bypassing them.
 func (s *State) ReadAllStdin() ([]byte, error) {
-	if lf, ok := asLuaFile(s.stdinInput); ok && !lf.closed && lf.f != nil {
+	if lf, ok := s.asLuaFile(s.stdinInput); ok && !lf.closed && lf.f != nil {
 		if s.memLimit <= 0 {
 			return io.ReadAll(lf.reader())
 		}
@@ -1976,7 +1978,7 @@ func readOneItem(s *State, lf *luaFile, fmtArg Value) (Value, bool, error) {
 		}
 		return StringValue(s.intern.Intern(out.String())), true, nil
 	}
-	spec := strings.TrimPrefix(FormatValue(fmtArg), "*")
+	spec := strings.TrimPrefix(s.FormatValue(fmtArg), "*")
 	if len(spec) == 0 {
 		return NilValue(), false, fmt.Errorf("invalid format")
 	}
@@ -2186,7 +2188,7 @@ func nativeFileRead(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'read' (FILE* expected, got no value)")
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
@@ -2278,7 +2280,7 @@ func nativeFileWrite(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'write' (FILE* expected, got no value)")
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
@@ -2325,7 +2327,7 @@ func nativeFileWrite(s *State, args []Value) ([]Value, error) {
 				return nil, err
 			}
 		}
-		str := FormatValue(a)
+		str := s.FormatValue(a)
 		if cancelFn == nil || (len(str) < writeCancelChunk && bytesSincePoll+len(str) < writeCancelChunk) {
 			if cancelFn != nil {
 				bytesSincePoll += len(str)
@@ -2380,7 +2382,7 @@ func makeLinesIter(s *State, fileVal Value, fmts []Value, autoClose bool) ([]Val
 			curFileVal := iter.upvals[0]
 			curAutoClose := !iter.upvals[2].IsFalsy()
 			curFmts := iter.upvals[3:]
-			lf, ok := asLuaFile(curFileVal)
+			lf, ok := s.asLuaFile(curFileVal)
 			if !ok || lf.closed {
 				return nil, fmt.Errorf("file is already closed")
 			}
@@ -2415,7 +2417,7 @@ func nativeFileLines(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'lines' (FILE* expected, got no value)")
 	}
-	lf, ok := asLuaFile(args[0])
+	lf, ok := s.asLuaFile(args[0])
 	if !ok || lf.closed {
 		return nil, fmt.Errorf("attempt to use a closed file")
 	}
@@ -2427,7 +2429,7 @@ func nativeFileLines(s *State, args []Value) ([]Value, error) {
 
 func nativeIOLines(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || args[0].IsNil() {
-		if lf, ok := asLuaFile(s.defaultInput); !ok || lf.closed {
+		if lf, ok := s.asLuaFile(s.defaultInput); !ok || lf.closed {
 			return nil, fmt.Errorf("default input file is closed")
 		}
 		var fmts []Value
@@ -2445,9 +2447,9 @@ func nativeIOLines(s *State, args []Value) ([]Value, error) {
 	if len(args)-1 > 250 {
 		return nil, fmt.Errorf("too many arguments")
 	}
-	lf, err := openFileWithMode(FormatValue(args[0]), "r")
+	lf, err := openFileWithMode(s.FormatValue(args[0]), "r")
 	if err != nil {
-		return nil, fmt.Errorf("cannot open file '%s' (%v)", FormatValue(args[0]), err)
+		return nil, fmt.Errorf("cannot open file '%s' (%v)", s.FormatValue(args[0]), err)
 	}
 	ud, err := s.tryNewFileUD(lf)
 	if err != nil {
@@ -2691,7 +2693,7 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 		if !args[0].IsString() && !args[0].IsNumber() {
 			return nil, fmt.Errorf("bad argument #1 to 'date' (string expected, got %s)", s.objTypeName(args[0]))
 		}
-		fmtStr = FormatValue(args[0])
+		fmtStr = s.FormatValue(args[0])
 	}
 	tm := time.Now()
 	if len(args) >= 2 && !args[1].IsNil() {
@@ -2921,7 +2923,7 @@ func nativeOSDate(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeOSGetEnv(s *State, args []Value) ([]Value, error) {
-	key, err := checkStringArg(args, 0, "getenv")
+	key, err := s.checkStringArg(args, 0, "getenv")
 	if err != nil {
 		return nil, err
 	}
@@ -2937,7 +2939,7 @@ func nativeOSGetEnv(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeOSRemove(s *State, args []Value) ([]Value, error) {
-	fname, err := checkStringArg(args, 0, "remove")
+	fname, err := s.checkStringArg(args, 0, "remove")
 	if err != nil {
 		return nil, err
 	}
@@ -2948,11 +2950,11 @@ func nativeOSRemove(s *State, args []Value) ([]Value, error) {
 }
 
 func nativeOSRename(s *State, args []Value) ([]Value, error) {
-	oldName, err := checkStringArg(args, 0, "rename")
+	oldName, err := s.checkStringArg(args, 0, "rename")
 	if err != nil {
 		return nil, err
 	}
-	newName, err := checkStringArg(args, 1, "rename")
+	newName, err := s.checkStringArg(args, 1, "rename")
 	if err != nil {
 		return nil, err
 	}
@@ -2991,13 +2993,13 @@ func nativeOSSetLocale(s *State, args []Value) ([]Value, error) {
 		if !args[0].IsString() && !args[0].IsNumber() {
 			return nil, fmt.Errorf("bad argument #1 to 'setlocale' (string expected, got %s)", s.objTypeName(args[0]))
 		}
-		loc = FormatValue(args[0])
+		loc = s.FormatValue(args[0])
 	}
 	if len(args) >= 2 && !args[1].IsNil() {
 		if !args[1].IsString() && !args[1].IsNumber() {
 			return nil, fmt.Errorf("bad argument #2 to 'setlocale' (string expected, got %s)", s.objTypeName(args[1]))
 		}
-		cat := FormatValue(args[1])
+		cat := s.FormatValue(args[1])
 		switch cat {
 		case "all", "collate", "ctype", "monetary", "numeric", "time":
 		default:
@@ -3028,7 +3030,7 @@ func nativeOSExecute(s *State, args []Value) ([]Value, error) {
 			return nil, cerr
 		}
 	}
-	cmd := shellCommand(s.ctx, FormatValue(args[0]))
+	cmd := shellCommand(s.ctx, s.FormatValue(args[0]))
 	s.inheritedStdStreams(cmd)
 	s.childExecDepth.Add(1)
 	defer s.childExecDepth.Add(-1)
@@ -3155,7 +3157,7 @@ func nativeSearcherPreload(s *State, args []Value) ([]Value, error) {
 		key = args[0].AsString()
 		name = key.Str()
 	} else {
-		name = FormatValue(args[0])
+		name = s.FormatValue(args[0])
 		key, err = s.TryIntern(name)
 		if err != nil {
 			return nil, err
@@ -3187,7 +3189,7 @@ func nativeSearcherLua(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'searcher_lua' (string expected)")
 	}
-	name := FormatValue(args[0])
+	name := s.FormatValue(args[0])
 	pathVal, err := s.pkgField("path")
 	if err != nil {
 		return nil, err
@@ -3195,7 +3197,7 @@ func nativeSearcherLua(s *State, args []Value) ([]Value, error) {
 	if !pathVal.IsString() && !pathVal.IsNumber() {
 		return nil, fmt.Errorf("'package.path' must be a string")
 	}
-	fname, errmsg, err := s.searchPath(name, FormatValue(pathVal), ".", string(filepath.Separator))
+	fname, errmsg, err := s.searchPath(name, s.FormatValue(pathVal), ".", string(filepath.Separator))
 	if err != nil {
 		return nil, err
 	}
@@ -3215,7 +3217,7 @@ func nativeSearcherLua(s *State, args []Value) ([]Value, error) {
 		return nil, err
 	}
 	if res[0].IsNil() {
-		msg, jerr := s.joinStringsWithCancel("error loading module '", name, "' from file '", fname, "':\n\t", FormatValue(res[1]))
+		msg, jerr := s.joinStringsWithCancel("error loading module '", name, "' from file '", fname, "':\n\t", s.FormatValue(res[1]))
 		if jerr != nil {
 			return nil, jerr
 		}
@@ -3228,7 +3230,7 @@ func nativeSearcherC(s *State, args []Value) ([]Value, error) {
 	if len(args) == 0 || (!args[0].IsString() && !args[0].IsNumber()) {
 		return nil, fmt.Errorf("bad argument #1 to 'searcher_C' (string expected)")
 	}
-	name := FormatValue(args[0])
+	name := s.FormatValue(args[0])
 	cpathVal, err := s.pkgField("cpath")
 	if err != nil {
 		return nil, err
@@ -3236,7 +3238,7 @@ func nativeSearcherC(s *State, args []Value) ([]Value, error) {
 	if !cpathVal.IsString() && !cpathVal.IsNumber() {
 		return nil, fmt.Errorf("'package.cpath' must be a string")
 	}
-	_, errmsg, err := s.searchPath(name, FormatValue(cpathVal), ".", string(filepath.Separator))
+	_, errmsg, err := s.searchPath(name, s.FormatValue(cpathVal), ".", string(filepath.Separator))
 	if err != nil {
 		return nil, err
 	}
@@ -3260,7 +3262,7 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 		key = args[0].AsString()
 		name = key.Str()
 	} else {
-		name = FormatValue(args[0])
+		name = s.FormatValue(args[0])
 		key, err = s.TryIntern(name)
 		if err != nil {
 			return nil, err
@@ -3364,7 +3366,7 @@ func nativeRequire(s *State, args []Value) ([]Value, error) {
 			if cerr := ensureErrPrefix(); cerr != nil {
 				return nil, cerr
 			}
-			smsg := FormatValue(res[0])
+			smsg := s.FormatValue(res[0])
 			if s.memLimit > 0 {
 				if merr := s.checkMem(int64(errs.Len()) + int64(len(smsg)) + 64); merr != nil {
 					return nil, merr
@@ -3592,15 +3594,15 @@ func nativePackageSearchPath(s *State, args []Value) ([]Value, error) {
 	if len(args) < 2 {
 		return nil, fmt.Errorf("bad arguments to 'searchpath'")
 	}
-	name := FormatValue(args[0])
-	path := FormatValue(args[1])
+	name := s.FormatValue(args[0])
+	path := s.FormatValue(args[1])
 	sep := "."
 	if len(args) >= 3 && !args[2].IsNil() {
-		sep = FormatValue(args[2])
+		sep = s.FormatValue(args[2])
 	}
 	rep := string(filepath.Separator)
 	if len(args) >= 4 && !args[3].IsNil() {
-		rep = FormatValue(args[3])
+		rep = s.FormatValue(args[3])
 	}
 	fname, errmsg, err := s.searchPath(name, path, sep, rep)
 	if err != nil {
@@ -3621,10 +3623,10 @@ func nativePackageSearchPath(s *State, args []Value) ([]Value, error) {
 }
 
 func nativePackageLoadLib(s *State, args []Value) ([]Value, error) {
-	if _, err := checkStringArg(args, 0, "loadlib"); err != nil {
+	if _, err := s.checkStringArg(args, 0, "loadlib"); err != nil {
 		return nil, err
 	}
-	if _, err := checkStringArg(args, 1, "loadlib"); err != nil {
+	if _, err := s.checkStringArg(args, 1, "loadlib"); err != nil {
 		return nil, err
 	}
 	return []Value{
@@ -3712,7 +3714,7 @@ func searchFSModule(s *State, fsys fs.FS, args []Value) ([]Value, error) {
 	if len(args) == 0 {
 		return nil, fmt.Errorf("bad argument #1 to 'searcher_fs' (string expected)")
 	}
-	name := FormatValue(args[0])
+	name := s.FormatValue(args[0])
 	pathStr := defaultLuaPath
 	if pv := s.pkgTbl.RawGetStr(s.intern.Intern("path")); pv.IsString() {
 		pathStr = pv.AsString().Str()

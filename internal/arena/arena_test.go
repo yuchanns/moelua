@@ -301,6 +301,113 @@ func TestCloneSnapshotIndependence(t *testing.T) {
 	if rReused != rTemp {
 		t.Fatalf("expected clone free-list reuse of %v, got %v", rTemp, rReused)
 	}
+
+	// Verify fast pointer accessors on cloned Arena match Ptr() and stay isolated from src.
+	if clone.PtrSmall(r1) != clone.Ptr(r1) || clone.PtrFast(r1) != clone.Ptr(r1) {
+		t.Fatalf("clone PtrSmall/PtrFast mismatch on small ref")
+	}
+	if clone.PtrFast(rLarge) != clone.Ptr(rLarge) {
+		t.Fatalf("clone PtrFast mismatch on large ref")
+	}
+	if clone.PtrSmall(r1) == src.PtrSmall(r1) {
+		t.Fatalf("clone PtrSmall aliased src backing page")
+	}
+}
+
+func TestFastPtrAccessorsAndWholePageReclamation(t *testing.T) {
+	a := arena.New()
+	defer a.Close()
+
+	if a.PtrSmall(arena.NullRef) != nil || a.PtrFast(arena.NullRef) != nil {
+		t.Fatalf("expected nil for NullRef")
+	}
+	if arena.SliceFast[uint64](a, arena.NullRef, 0, 0) != nil {
+		t.Fatalf("expected nil for zero-length SliceFast")
+	}
+
+	rSmall, err := a.AllocGC(int(unsafe.Sizeof(testNode{})), 3, arena.MarkWhite0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rLarge, err := a.AllocZeroed(arena.MaxSmallSize + 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if a.PtrSmall(rSmall) != a.Ptr(rSmall) {
+		t.Fatalf("PtrSmall != Ptr for slab ref")
+	}
+	if arena.PtrInPages(a.PagePtrs(), rSmall) != a.Ptr(rSmall) {
+		t.Fatalf("PtrInPages != Ptr for slab ref")
+	}
+	if a.PtrFast(rSmall) != a.Ptr(rSmall) || a.PtrFast(rLarge) != a.Ptr(rLarge) {
+		t.Fatalf("PtrFast mismatch for small/large refs")
+	}
+
+	node := arena.AsSmall[testNode](a, rSmall)
+	node.value = 0x123456789ABCDEF
+	if got := arena.AsFast[testNode](a, rSmall).value; got != node.value {
+		t.Fatalf("AsFast read %x, want %x", got, node.value)
+	}
+
+	arr := arena.SliceFast[uint64](a, rLarge, 8, 128)
+	for i := range arr {
+		arr[i] = uint64(i*7 + 1)
+	}
+	checked := arena.Slice[uint64](a, rLarge, 8, 128)
+	for i, v := range checked {
+		if v != uint64(i*7+1) {
+			t.Fatalf("SliceFast mismatch at %d: got %d want %d", i, v, i*7+1)
+		}
+	}
+
+	// Passing a large ObjRef to PtrSmall must panic via pagePtrs bounds check (never alias a slab page).
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatalf("expected PtrSmall(largeRef) to panic")
+			}
+		}()
+		_ = a.PtrSmall(rLarge)
+	}()
+
+	// Allocate two full pages of 32 KiB slabs (2 slots per page => 4 slots across 2 pages),
+	// free both pages, drop sparePage, and confirm pagePtrs does NOT retain either freed page.
+	a.Free(rSmall)
+	a.Free(rLarge)
+	var wp1, wp2 weak.Pointer[byte]
+	func() {
+		var refs [4]arena.ObjRef
+		for i := range refs {
+			r, err := a.AllocZeroed(arena.MaxSmallSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			refs[i] = r
+		}
+		wp1 = weak.Make((*byte)(a.PtrSmall(refs[0])))
+		wp2 = weak.Make((*byte)(a.PtrSmall(refs[2])))
+		for _, r := range refs {
+			a.Free(r)
+		}
+	}()
+	a.ReleaseSpare()
+	if a.ActivePages() != 0 || a.BackingBytes() != 0 {
+		t.Fatalf("expected 0 active pages after freeing all slabs, got pages=%d backing=%d",
+			a.ActivePages(), a.BackingBytes())
+	}
+	reclaimed := false
+	for range 20 {
+		runtime.GC()
+		if wp1.Value() == nil && wp2.Value() == nil {
+			reclaimed = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !reclaimed {
+		t.Fatalf("pagePtrs retained freed slab pages: wp1=%v wp2=%v", wp1.Value() != nil, wp2.Value() != nil)
+	}
 }
 
 func TestArenaCloseReleasesBackingSlicesWhileReachable(t *testing.T) {
@@ -589,5 +696,62 @@ func BenchmarkMultiVMGoGCScan(b *testing.B) {
 			runtime.GC()
 		}
 		runtime.KeepAlive(roots)
+	})
+}
+
+func BenchmarkArenaPtrDeref(b *testing.B) {
+	a := arena.New()
+	defer a.Close()
+
+	const n = 256
+	refs := make([]arena.ObjRef, n)
+	for i := range n {
+		ref, err := a.AllocGC(int(unsafe.Sizeof(testNode{})), 1, arena.MarkWhite0)
+		if err != nil {
+			b.Fatal(err)
+		}
+		arena.AsSmall[testNode](a, ref).value = int64(i + 1)
+		refs[i] = ref
+	}
+
+	b.Run("Ptr", func(b *testing.B) {
+		var sum int64
+		for i := 0; b.Loop(); i++ {
+			sum += (*testNode)(a.Ptr(refs[i&(n-1)])).value
+		}
+		if sum == 0 {
+			b.Fatal(sum)
+		}
+	})
+
+	b.Run("PtrFast", func(b *testing.B) {
+		var sum int64
+		for i := 0; b.Loop(); i++ {
+			sum += (*testNode)(a.PtrFast(refs[i&(n-1)])).value
+		}
+		if sum == 0 {
+			b.Fatal(sum)
+		}
+	})
+
+	b.Run("PtrSmall", func(b *testing.B) {
+		var sum int64
+		for i := 0; b.Loop(); i++ {
+			sum += arena.AsSmall[testNode](a, refs[i&(n-1)]).value
+		}
+		if sum == 0 {
+			b.Fatal(sum)
+		}
+	})
+
+	b.Run("PtrInPages", func(b *testing.B) {
+		pagePtrs := a.PagePtrs()
+		var sum int64
+		for i := 0; b.Loop(); i++ {
+			sum += (*testNode)(arena.PtrInPages(pagePtrs, refs[i&(n-1)])).value
+		}
+		if sum == 0 {
+			b.Fatal(sum)
+		}
 	})
 }

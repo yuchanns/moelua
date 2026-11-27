@@ -642,7 +642,7 @@ func (tr *gcTracer) mark(v Value) {
 		u.gcMark = tr.epoch
 		tr.unlockEphemDeps(unsafe.Pointer(u))
 		tr.liveBytes += 64 + int64((len(u.UValues)+len(u.gcRefs))*16)
-		if lf, ok := u.Data.(*luaFile); ok {
+		if lf, ok := tr.s.UserdataData(u).(*luaFile); ok {
 			tr.liveBytes += lf.memBytes()
 		}
 		tr.gray = append(tr.gray, v)

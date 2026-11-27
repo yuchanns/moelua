@@ -171,11 +171,11 @@ func lMessage(progName, msg string) {
 	}
 }
 
-func luaToStringErr(err error) string {
+func luaToStringErr(s *vm.State, err error) string {
 	var le *vm.LuaError
 	if errors.As(err, &le) {
 		if le.Val.IsString() || le.Val.IsNumber() {
-			return vm.FormatValue(le.Val)
+			return s.FormatValue(le.Val)
 		}
 		return "(null)"
 	}
@@ -211,7 +211,7 @@ func newCLIState(noEnv bool) *cliState {
 			}
 			var msg string
 			if errVal.IsString() || errVal.IsNumber() {
-				msg = vm.FormatValue(errVal)
+				msg = s.FormatValue(errVal)
 			} else {
 				if mt := s.GetMetatableOf(errVal); mt != nil {
 					tm := mt.RawGetStr(s.Intern("__tostring"))
@@ -245,7 +245,7 @@ func (c *cliState) doCall(progName string, fn vm.Value, args ...vm.Value) ([]vm.
 	if !ok {
 		msg := "(error message not a string)"
 		if errVal.IsString() || errVal.IsNumber() {
-			msg = vm.FormatValue(errVal)
+			msg = c.s.FormatValue(errVal)
 		}
 		lMessage(progName, msg)
 		return nil, false
@@ -513,11 +513,11 @@ func (c *cliState) doREPL(noEnv bool) {
 				}()
 				printFn, gerr := s.GetGlobalMM("print")
 				if gerr != nil {
-					lMessage("", fmt.Sprintf("error calling 'print' (%s)", luaToStringErr(gerr)))
+					lMessage("", fmt.Sprintf("error calling 'print' (%s)", luaToStringErr(s, gerr)))
 					return
 				}
 				if _, perr := s.Call(printFn, res...); perr != nil {
-					lMessage("", fmt.Sprintf("error calling 'print' (%s)", luaToStringErr(perr)))
+					lMessage("", fmt.Sprintf("error calling 'print' (%s)", luaToStringErr(s, perr)))
 				}
 			}()
 		}
