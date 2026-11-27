@@ -802,7 +802,8 @@ func (t *Table) demoteToDict(s *State, key, val Value) bool {
 		return true
 	}
 	sh := arena.AsSmall[Shape](s.arena, t.shapeRef)
-	keys := sh.Keys(s.arena)
+	var keysBuf [maxShapeProps]Value
+	keys := sh.FillKeys(s.arena, keysBuf[:0])
 	n := len(keys)
 	if n < 4 {
 		n = 4
@@ -1745,11 +1746,13 @@ func (t *Table) Next(s *State, key Value) (Value, Value, error) {
 		if OptimizeEnabled && t.shapeRef != arena.NullRef {
 			sh := arena.AsSmall[Shape](s.arena, t.shapeRef)
 			if sh.length > 0 {
-				keys := sh.Keys(s.arena)
 				slots := t.slotsSlice(s.arena)
-				for idx := startIdx; idx < len(keys); idx++ {
-					if idx < len(slots) && !slots[idx].IsNil() {
-						return keys[idx], slots[idx], nil
+				limit := min(int(sh.length), len(slots))
+				for idx := startIdx; idx < limit; idx++ {
+					if !slots[idx].IsNil() {
+						if kv := sh.KeyAt(s.arena, idx); !kv.IsNil() {
+							return kv, slots[idx], nil
+						}
 					}
 				}
 			}

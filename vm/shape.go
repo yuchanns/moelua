@@ -185,12 +185,37 @@ func (sh *Shape) Lookup(s *State, k *LuaString) int32 {
 	return -1
 }
 
-// Keys returns the ordered short-string Values of this shape (slot 0..length-1).
-func (sh *Shape) Keys(a *arena.Arena) []Value {
-	if sh == nil || sh.length == 0 {
-		return nil
+// KeyAt returns the short-string Value at property slot (0 <= slot < sh.length)
+// by walking the immutable Shape parent chain without allocating.
+func (sh *Shape) KeyAt(a *arena.Arena, slot int) Value {
+	if sh == nil || slot < 0 || slot >= int(sh.length) {
+		return NilValue()
 	}
-	out := make([]Value, sh.length)
+	for cur := sh; cur != nil && !cur.keyVal.IsNil(); {
+		if int(cur.slot) == slot {
+			return cur.keyVal
+		}
+		if int(cur.slot) < slot || cur.parentRef == arena.NullRef {
+			return NilValue()
+		}
+		cur = arena.AsSmall[Shape](a, cur.parentRef)
+	}
+	return NilValue()
+}
+
+// FillKeys populates dst[:sh.length] with the ordered short-string Values of this shape
+// (slot 0..length-1) without heap allocation when cap(dst) >= sh.length.
+func (sh *Shape) FillKeys(a *arena.Arena, dst []Value) []Value {
+	if sh == nil || sh.length == 0 {
+		return dst[:0]
+	}
+	n := int(sh.length)
+	out := dst
+	if cap(out) < n {
+		out = make([]Value, n)
+	} else {
+		out = out[:n]
+	}
 	for cur := sh; cur != nil && !cur.keyVal.IsNil(); {
 		out[cur.slot] = cur.keyVal
 		if cur.parentRef == arena.NullRef {
@@ -199,6 +224,14 @@ func (sh *Shape) Keys(a *arena.Arena) []Value {
 		cur = arena.AsSmall[Shape](a, cur.parentRef)
 	}
 	return out
+}
+
+// Keys returns the ordered short-string Values of this shape (slot 0..length-1).
+func (sh *Shape) Keys(a *arena.Arena) []Value {
+	if sh == nil || sh.length == 0 {
+		return nil
+	}
+	return sh.FillKeys(a, nil)
 }
 
 type metaRootKey struct {
@@ -522,7 +555,8 @@ func (sr *shapeRegistry) WithMeta(s *State, shRef, metaRef arena.ObjRef, metaPro
 		return shRef, false
 	}
 	curRef := cur.self
-	keys := sh.Keys(s.arena)
+	var keysBuf [maxShapeProps]Value
+	keys := sh.FillKeys(s.arena, keysBuf[:0])
 	for _, kv := range keys {
 		prevPinned := s.pinnedShapeRef
 		s.pinnedShapeRef = curRef
