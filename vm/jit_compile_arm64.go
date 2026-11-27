@@ -10,6 +10,7 @@ import (
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/internal/jit/arm64"
 	"github.com/yuchanns/moelua/internal/jit/execmem"
+	"github.com/yuchanns/moelua/internal/jit/ir"
 )
 
 // Pinned ARM64 registers across the baseline JIT:
@@ -111,16 +112,19 @@ type a64Baseline struct {
 	needDone    bool
 	exitReload  arm64.Label
 	needReload  bool
+	optLoops    []*a64OptLoopRef
+	optByEntry  map[int]*a64OptLoopRef
+	optByEnd    map[int]*a64OptLoopRef
 }
 
-func compileBaselineNative(bp *boundProto) (*jitFunc, error) {
+func compileBaselineNative(bp *boundProto, fb *ir.Feedback) (*jitFunc, error) {
 	code := bp.proto.Code
 	n := len(code)
 	if n == 0 {
 		return nil, fmt.Errorf("jit/arm64: empty proto")
 	}
 	c := &a64Baseline{
-		a:         arm64.New(max(64, n*12)),
+		a:         arm64.New(max(64, n*14)),
 		bp:        bp,
 		code:      code,
 		pcLabels:  make([]arm64.Label, n+1),
@@ -132,12 +136,38 @@ func compileBaselineNative(bp *boundProto) (*jitFunc, error) {
 		c.pcLabels[i] = c.a.NewLabel()
 	}
 
+	if optRegs := ir.OptimizeProto(bp.proto, fb, a64OptNumGPR, a64OptNumFP, a64OptMaxSpills); len(optRegs) > 0 {
+		c.optByEntry = make(map[int]*a64OptLoopRef, len(optRegs))
+		c.optByEnd = make(map[int]*a64OptLoopRef, len(optRegs))
+		for ipc := 0; ipc < n; ipc++ {
+			if r, ok := optRegs[ipc]; ok {
+				ref := &a64OptLoopRef{
+					reg:       r,
+					entryLbl:  c.a.NewLabel(),
+					resumeLbl: c.a.NewLabel(),
+					baseLbl:   c.a.NewLabel(),
+				}
+				c.optLoops = append(c.optLoops, ref)
+				c.optByEntry[r.EntryPC] = ref
+				if r.Kind == ir.LoopForInt {
+					c.optByEnd[r.EndPC] = ref
+				}
+			}
+		}
+	}
+
 	for ipc := 0; ipc < n; ipc++ {
 		c.pcOffsets[ipc] = c.a.Len()
 		c.a.Bind(c.pcLabels[ipc])
+		if ref, ok := c.optByEntry[ipc]; ok {
+			c.a.B(ref.entryLbl)
+			c.a.Bind(ref.baseLbl)
+		}
 		c.emitOp(ipc, code[ipc])
 	}
 	c.a.Bind(c.pcLabels[n])
+
+	c.emitAllOptLoops()
 
 	if c.needRetRest {
 		c.emitReturnRestoreCaller()
@@ -944,16 +974,28 @@ func (c *a64Baseline) emitLen(ipc int, w bytecode.Instruction) {
 	lDone := c.a.NewLabel()
 	c.a.CMPImm(arm64.X1, uint32(tagTable))
 	c.a.BCond(arm64.NE, lStr)
-	// Fast path for dense non-metatable table without hash part (arrInt/arrFloat/arrBool/arrEmpty).
+	// Fast path for non-metatable table without hash part.
 	c.emitResolveSmall(arm64.X0, arm64.X2, arm64.X3)
 	c.a.LDRW(arm64.X3, arm64.X2, jitTblMetaRef)
 	c.a.CBNZ(arm64.X3, c.cold(ipc))
 	c.a.LDRW(arm64.X3, arm64.X2, jitTblHashRef)
 	c.a.CBNZ(arm64.X3, c.cold(ipc))
-	c.a.LDRB(arm64.X3, arm64.X2, jitTblArrKind)
-	c.a.CMPImm(arm64.X3, uint32(arrGeneric))
-	c.a.BCond(arm64.EQ, c.cold(ipc))
 	c.a.LDRW(arm64.X0, arm64.X2, jitTblArrLen)
+	c.a.LDRB(arm64.X3, arm64.X2, jitTblArrKind)
+	lStoreLen := c.a.NewLabel()
+	c.a.CMPImm(arm64.X3, uint32(arrGeneric))
+	c.a.BCond(arm64.NE, lStoreLen)
+	// For arrGeneric with hashRef==0: #t == arrLen iff arrLen == 0 || !arr[arrLen-1].IsNil().
+	c.a.CBZ(arm64.X0, lStoreLen)
+	c.a.LDRW(arm64.X3, arm64.X2, jitTblArrRef)
+	c.a.CBZ(arm64.X3, c.cold(ipc))
+	c.emitResolveFast(arm64.X3, arm64.X4, arm64.X5)
+	c.a.SUBImm(arm64.X5, arm64.X0, 1)
+	c.a.ADDShift(arm64.X4, arm64.X4, arm64.X5, arm64.ShiftLSL, 4)
+	c.a.LDR(arm64.X5, arm64.X4, jitValTag)
+	c.a.CMPImm(arm64.X5, uint32(tagNil))
+	c.a.BCond(arm64.EQ, c.cold(ipc))
+	c.a.Bind(lStoreLen)
 	c.storeReg(w.A(), arm64.X0, arm64.XZR)
 	c.a.B(lDone)
 
@@ -1273,7 +1315,11 @@ func (c *a64Baseline) emitForLoop(ipc int, w bytecode.Instruction) {
 	c.storeReg(a+2, arm64.X4, arm64.XZR)
 	c.a.SUBSImm(a64Poll, a64Poll, 1)
 	c.a.BCond(arm64.LE, c.poll(bodyTarget))
-	c.a.B(c.pcLabels[bodyTarget])
+	if ref, ok := c.optByEnd[ipc]; ok {
+		c.a.B(ref.resumeLbl)
+	} else {
+		c.a.B(c.pcLabels[bodyTarget])
+	}
 
 	// Float FORLOOP
 	c.a.Bind(lFloat)

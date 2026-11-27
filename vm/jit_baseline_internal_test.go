@@ -41,7 +41,7 @@ func TestJITCompilesAllBenchScripts(t *testing.T) {
 				t.Errorf("%s proto bindProto failed: %v", entry.Name(), err)
 				return
 			}
-			jf, err := compileBaselineNative(bp)
+			jf, err := compileBaselineNative(bp, nil)
 			if err != nil {
 				t.Errorf("%s proto (lines %d-%d, %d insns) failed JIT compile: %v",
 					entry.Name(), p.LineDefined, p.LastLineDefined, len(p.Code), err)

@@ -9,6 +9,7 @@ import (
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/internal/arena"
 	"github.com/yuchanns/moelua/internal/jit/call"
+	"github.com/yuchanns/moelua/internal/jit/ir"
 )
 
 // protoHasLoop reports whether p contains any numeric/generic loop or backward branch.
@@ -48,15 +49,41 @@ func (j *jitState) getOrCompileJIT(bp *boundProto) *jitFunc {
 	if h < jitCompileThreshold && !protoHasLoop(bp.proto) {
 		return nil
 	}
-	f, err := compileBaselineNative(bp)
+	f, err := compileBaselineNative(bp, &ir.Feedback{EnableSIMD: !j.disableSIMD})
 	if err != nil || f == nil || len(f.pcEntries) == 0 {
 		j.entries[idx] = jitEntrySkip
 		return nil
 	}
+	f.tier = 1
+	f.hasFeedbackQ = protoNeedsFeedback(bp.proto)
 	j.funcs[idx] = f
 	j.entries[idx] = f.pcEntries[0]
 	j.pcTables[idx] = uintptr(unsafe.Pointer(&f.pcEntries[0]))
 	return f
+}
+
+// maybeUpgradeTier2 recompiles a Tier-1 proto once with live Shape ICs, table array kinds,
+// and inlinable leaf callee feedback. Safely frees the replaced code region because all
+// native return targets resolve dynamically through pcTables and no native frame is active.
+func (s *State) maybeUpgradeTier2(cl *Closure, bp *boundProto, regs *[256]Value) *jitFunc {
+	j := s.jit
+	idx := bp.protoIdx
+	old := j.funcs[idx]
+	if old == nil || old.tier >= 2 || !old.hasFeedbackQ {
+		return old
+	}
+	fb := collectJITFeedback(s, cl, bp, regs, !j.disableSIMD)
+	f2, err := compileBaselineNative(bp, fb)
+	if err != nil || f2 == nil || len(f2.pcEntries) == 0 {
+		old.tier = 2 // avoid retrying
+		return old
+	}
+	f2.tier = 2
+	j.funcs[idx] = f2
+	j.entries[idx] = f2.pcEntries[0]
+	j.pcTables[idx] = uintptr(unsafe.Pointer(&f2.pcEntries[0]))
+	old.free()
+	return f2
 }
 
 // runJIT executes Lua frames using the native baseline JIT for hot/looping functions,
@@ -126,6 +153,13 @@ reloadFrame:
 		}
 	}
 	jf = s.jit.getOrCompileJIT(ev.bp)
+	if jf != nil && jf.tier == 1 && jf.hasFeedbackQ {
+		idx := ev.bp.protoIdx
+		s.jit.hotness[idx]++
+		if s.jit.hotness[idx] >= 3 {
+			jf = s.maybeUpgradeTier2(ev.cl, ev.bp, regs)
+		}
+	}
 
 	var cachedUpvalCl *Closure
 	var cachedUpvalPages uintptr
@@ -192,7 +226,9 @@ reloadFrame:
 		ctx.jitProtoCap = int64(len(s.jit.entries))
 		ctx.protoEpoch = s.protoEpoch
 		ctx.pc = int64(pc)
-		ctx.poll = jitPollInterval
+		if ctx.poll <= 0 {
+			ctx.poll = jitPollInterval
+		}
 		ctx.ci = int64(ev.ci)
 		ctx.base = int64(ev.base)
 		ctx.deoptID = 0
@@ -234,6 +270,40 @@ reloadFrame:
 			}
 			if jf == nil || pc < 0 || pc >= len(jf.pcEntries) {
 				goto reloadFrame
+			}
+			if jf.tier == 1 && jf.hasFeedbackQ {
+				jf = s.maybeUpgradeTier2(ev.cl, ev.bp, regs)
+			}
+			// Also upgrade a hot Tier-1 callee right before OP_CALL (handles loops calling a
+			// helper like NBody's advance() via native JIT-to-JIT tail-jump that never returns to Go).
+			if pc >= 0 && pc < len(ev.bp.proto.Code) {
+				if cw := ev.bp.proto.Code[pc]; cw.Op() == bytecode.OP_CALL || cw.Op() == bytecode.OP_TAILCALL {
+					if fn := regs[cw.A()]; fn.IsClosure() {
+						if ccl := s.asClosure(fn); ccl != nil {
+							cbp := s.boundProtoOf(ccl)
+							if cbp != nil && int(cbp.protoIdx) < len(s.jit.funcs) {
+								if cjf := s.jit.funcs[cbp.protoIdx]; cjf != nil && cjf.tier == 1 && cjf.hasFeedbackQ {
+									s.maybeUpgradeTier2(ccl, cbp, nil)
+								}
+							}
+						}
+					}
+				}
+			}
+			// Also upgrade any active Tier-1 frame on the call stack (e.g. when poll fired in a callee).
+			for fi := ev.ci - 1; fi >= entryDepth; fi-- {
+				fcf := &ev.frames[fi]
+				if fcf.kind != frameLua {
+					continue
+				}
+				if fcl := s.frameClosure(fcf); fcl != nil {
+					fbp := s.boundProtoOf(fcl)
+					if fbp != nil && int(fbp.protoIdx) < len(s.jit.funcs) {
+						if fjf := s.jit.funcs[fbp.protoIdx]; fjf != nil && fjf.tier == 1 && fjf.hasFeedbackQ {
+							s.maybeUpgradeTier2(fcl, fbp, windowIn(ev.stack, fcf.base))
+						}
+					}
+				}
 			}
 			ctx.poll = jitPollInterval
 			ctx.entryPC = jf.pcEntries[pc]

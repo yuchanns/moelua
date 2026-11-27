@@ -27,33 +27,36 @@ const jitPollInterval = 8192
 // rooted by State, Thread, jitState, and boundProto for the duration of the native call
 // and never moves while native code runs (all allocations exit via jitExitCold).
 type jitExecCtx struct {
-	regs        uintptr // &stack[base] (frame R[0])
-	consts      uintptr // &bp.consts[0]
-	pagePtrs    uintptr // &s.arena.pagePtrs[0]
-	largeSpans  uintptr // &s.arena.largeSpans[0] (24B Go slice headers)
-	stack       uintptr // &th.stack[0]
-	frames      uintptr // &th.frames[0]
-	protos      uintptr // &s.protos[0]
-	ic          uintptr // &bp.ic[0]
-	icSlots     uintptr // &bp.icSlots[0]
-	clUpvals    uintptr // &cl.upvals[0] (0 if nUpvals == 0)
-	curBP       uintptr // uintptr(unsafe.Pointer(bp))
-	th          uintptr // uintptr(unsafe.Pointer(th))
-	entryPC     uintptr // target native PC jumped to by the shared JIT trampoline
-	epilogue    uintptr // shared trampoline epilogue address jumped to on exit
-	jitEntries  uintptr // &s.jit.entries[0] (0 if empty)
-	jitPCTables uintptr // &s.jit.pcTables[0] (0 if empty)
-	jitProtoCap int64   // len(s.jit.entries)
-	protoEpoch  uint64  // s.protoEpoch
-	pc          int64   // current / resume instruction index
-	poll        int64   // countdown budget before jitExitPoll
-	ci          int64   // active frame index (th.nframe - 1)
-	base        int64   // active frame register base
-	entryDepth  int64   // return jitExitDone when th.nframe <= entryDepth
-	thSelf      uint32  // th.self (arena.ObjRef)
-	sqrtIdx     uint32  // staticNative idx for math.sqrt (0 if unregistered)
-	absIdx      uint32  // staticNative idx for math.abs (0 if unregistered)
-	deoptID     uint32  // side-exit / deopt descriptor index (0 for baseline PC exits)
+	regs        uintptr    // &stack[base] (frame R[0])
+	consts      uintptr    // &bp.consts[0]
+	pagePtrs    uintptr    // &s.arena.pagePtrs[0]
+	largeSpans  uintptr    // &s.arena.largeSpans[0] (24B Go slice headers)
+	stack       uintptr    // &th.stack[0]
+	frames      uintptr    // &th.frames[0]
+	protos      uintptr    // &s.protos[0]
+	ic          uintptr    // &bp.ic[0]
+	icSlots     uintptr    // &bp.icSlots[0]
+	clUpvals    uintptr    // &cl.upvals[0] (0 if nUpvals == 0)
+	curBP       uintptr    // uintptr(unsafe.Pointer(bp))
+	th          uintptr    // uintptr(unsafe.Pointer(th))
+	entryPC     uintptr    // target native PC jumped to by the shared JIT trampoline
+	epilogue    uintptr    // shared trampoline epilogue address jumped to on exit
+	jitEntries  uintptr    // &s.jit.entries[0] (0 if empty)
+	jitPCTables uintptr    // &s.jit.pcTables[0] (0 if empty)
+	jitProtoCap int64      // len(s.jit.entries)
+	protoEpoch  uint64     // s.protoEpoch
+	pc          int64      // current / resume instruction index
+	poll        int64      // countdown budget before jitExitPoll
+	ci          int64      // active frame index (th.nframe - 1)
+	base        int64      // active frame register base
+	entryDepth  int64      // return jitExitDone when th.nframe <= entryDepth
+	thSelf      uint32     // th.self (arena.ObjRef)
+	sqrtIdx     uint32     // staticNative idx for math.sqrt (0 if unregistered)
+	absIdx      uint32     // staticNative idx for math.abs (0 if unregistered)
+	deoptID     uint32     // side-exit / deopt descriptor index (0 for baseline PC exits)
+	optOuterRem int64      // strip-mined outer remaining trip count for Tier-2 counted loops
+	optVecTmp   uint64     // dedicated 8-byte scratch slot for SIMD vector loops (e.g. AMD64 pair counter save)
+	optSpill    [16]uint64 // pointer-free scratch spill slots for Tier-2 optimizing loop IR
 }
 
 // Compile-time struct field offset constants consumed directly by the ARM64 and AMD64
@@ -88,6 +91,9 @@ const (
 	jitCtxSqrtIdx     = int32(unsafe.Offsetof(jitExecCtx{}.sqrtIdx))
 	jitCtxAbsIdx      = int32(unsafe.Offsetof(jitExecCtx{}.absIdx))
 	jitCtxDeoptID     = int32(unsafe.Offsetof(jitExecCtx{}.deoptID))
+	jitCtxOptOuterRem = int32(unsafe.Offsetof(jitExecCtx{}.optOuterRem))
+	jitCtxOptVecTmp   = int32(unsafe.Offsetof(jitExecCtx{}.optVecTmp))
+	jitCtxOptSpill    = int32(unsafe.Offsetof(jitExecCtx{}.optSpill))
 
 	// Value layout
 	jitValSize = int32(unsafe.Sizeof(Value{}))
