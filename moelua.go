@@ -44,6 +44,7 @@ type stateConfig struct {
 	insnLimit int64
 	fsList    []fs.FS
 	noEnv     bool
+	jit       bool
 }
 
 // WithOutput redirects Lua print() output to w.
@@ -95,6 +96,20 @@ func WithNoEnv() Option {
 	return func(c *stateConfig) { c.noEnv = true }
 }
 
+// WithJIT opts this State into the optional native JIT execution tier on supported
+// platforms (arm64/amd64 on macOS, Linux, and Windows). When omitted, States run strictly
+// on the default noJIT interpreter with zero JIT memory or dispatch overhead. On
+// unsupported platforms, -tags moeluanojit builds, or OS sandboxes that deny PROT_EXEC,
+// WithJIT gracefully falls back to the interpreter.
+func WithJIT() Option {
+	return func(c *stateConfig) { c.jit = true }
+}
+
+// JITSupported reports whether the current build/platform supports the optional JIT tier.
+func JITSupported() bool {
+	return vm.JITSupported()
+}
+
 // New creates a new Lua 5.5.1 State cloned rapidly from the frozen stdlib template.
 func New(opts ...Option) *State {
 	var cfg stateConfig
@@ -127,7 +142,18 @@ func New(opts ...Option) *State {
 	for _, fsys := range cfg.fsList {
 		raw.AddFS(fsys)
 	}
+	if cfg.jit {
+		raw.SetJITEnabled(true)
+	}
 	return &State{vm: raw}
+}
+
+// JITEnabled reports whether the optional native JIT tier is active on this State.
+func (s *State) JITEnabled() bool {
+	if !s.ready() {
+		return false
+	}
+	return s.vm.JITEnabled()
 }
 
 // Raw returns the underlying *vm.State for advanced low-level integration (nil if closed).
