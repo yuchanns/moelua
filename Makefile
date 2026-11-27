@@ -86,8 +86,12 @@ test-compare: $(BUILD_DIR)/lua55_o2
 
 bench-compare: $(BUILD_DIR)/lua55_o2 $(BUILD_DIR)/lua55_o3
 	cd bench/compare && GOLUA_DIR="$$(go list -m -f '{{.Dir}}' github.com/arnodel/golua)" && \
+		ENG_MAIN='^(C|C-O3|MoeLua-JIT|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|GopherLua|GoLua|DCLua)$$' && \
+		if command -v luajit >/dev/null 2>&1; then \
+			ENG_MAIN='^(C|C-O3|MoeLua-JIT|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|GopherLua|GoLua|DCLua|LuaJIT)$$'; \
+		fi && \
 		( GOMAXPROCS=1 go test -vet=off -timeout 60m -run @ -bench . -benchtime 300ms -count 3 \
-			-engines '^(C|C-O3|MoeLua-JIT|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|GopherLua|GoLua|DCLua)$$' . && \
+			-engines "$$ENG_MAIN" . && \
 		  GOMAXPROCS=1 go test -vet=off -timeout 30m -pgo="$$GOLUA_DIR/default.pgo" -run @ -bench . -benchtime 300ms -count 3 \
 			-engines '^ArnodelGolua$$' . ) | go run benchreport.go
 

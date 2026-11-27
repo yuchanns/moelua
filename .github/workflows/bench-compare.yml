@@ -15,7 +15,7 @@ on:
       engines:
         description: "Engine regex (ArnodelGolua runs in its own PGO build automatically if matched)"
         required: false
-        default: "^(C|C-O3|MoeLua-JIT|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$"
+        default: "^(C|C-O3|MoeLua-JIT|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua|LuaJIT)$"
       programs:
         description: "Optional program regex filter (empty = all 32 programs)"
         required: false
@@ -54,6 +54,7 @@ jobs:
       mode: ${{ steps.plan.outputs.mode }}
       lua_targets: ${{ steps.plan.outputs.lua_targets }}
       engines: ${{ steps.plan.outputs.engines }}
+      install_luajit: ${{ steps.plan.outputs.install_luajit }}
       mem_engines: ${{ steps.plan.outputs.mem_engines }}
       programs: ${{ steps.plan.outputs.programs }}
       benchtime: ${{ steps.plan.outputs.benchtime }}
@@ -83,9 +84,9 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import os, subprocess
+          import os, re, subprocess
 
-          FULL_ENGINES = "^(C|C-O3|MoeLua-JIT|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$"
+          FULL_ENGINES = "^(C|C-O3|MoeLua-JIT|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua|LuaJIT)$"
           PR_ENGINES = "^(C|MoeLua-JIT|MoeLua)$"
           FULL_LUA_TARGETS = "build/lua55_o2 build/lua55_o3 build/clua_mem"
           PR_LUA_TARGETS = "build/lua55_o2 build/clua_mem"
@@ -98,6 +99,7 @@ jobs:
               "mode": "skip",
               "lua_targets": PR_LUA_TARGETS,
               "engines": "",
+              "install_luajit": "false",
               "mem_engines": "",
               "programs": "",
               "benchtime": "300ms",
@@ -185,6 +187,11 @@ jobs:
               else:
                   reason = f"PR changed {len(changed)} file(s), none benchmark-relevant; skipping benchmarks"
 
+          if plan["run"] == "true" and plan["engines"]:
+              eng_re = re.compile(plan["engines"])
+              if eng_re.search("LuaJIT") or eng_re.search("LuaJIT-joff"):
+                  plan["install_luajit"] = "true"
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               for k, v in plan.items():
                   out.write(f"{k}={v}\n")
@@ -220,6 +227,13 @@ jobs:
       - uses: ./.github/actions/setup-lua-ref
         with:
           targets: ${{ needs.plan.outputs.lua_targets }}
+
+      - name: Install LuaJIT reference binary
+        if: needs.plan.outputs.install_luajit == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends luajit
+          luajit -v
 
       - id: bench
         uses: ./.github/actions/bench-compare
