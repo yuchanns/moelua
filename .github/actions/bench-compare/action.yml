@@ -1,0 +1,155 @@
+name: Run Cross-Engine Benchmarks
+description: Run 32/32 output equivalence, high-density multi-VM memory/GC comparison, CPU benchmarks, and optional README SVG chart generation.
+
+inputs:
+  engines:
+    description: Engine regex for CPU benchmarks
+    required: false
+    default: "^(C|MoeLua)$"
+  mem-engines:
+    description: Optional engine regex for memcmp.go (empty = all engines)
+    required: false
+    default: ""
+  programs:
+    description: Optional program regex filter (empty = all 32 programs)
+    required: false
+    default: ""
+  benchtime:
+    description: go test -benchtime value
+    required: false
+    default: "300ms"
+  count:
+    description: go test -count rounds
+    required: false
+    default: "3"
+  run-memcmp:
+    description: Whether to run isolated-process high-density multi-VM memory & Go GC comparison
+    required: false
+    default: "true"
+  generate-charts:
+    description: Whether to regenerate docs/assets/bench-compare.svg and docs/assets/bench-multivm.svg
+    required: false
+    default: "false"
+  require-charts:
+    description: Fail if generate-charts is true but required C-baseline + memcmp data is absent
+    required: false
+    default: "false"
+  commit-sha:
+    description: Optional commit SHA shown in the top-right Updated date badge
+    required: false
+    default: ""
+
+outputs:
+  charts-generated:
+    description: "'true' if both README SVG charts were regenerated, else 'false'"
+    value: ${{ steps.gencharts.outputs.charts-generated }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify 32/32 output equivalence (C vs MoeLua)
+      shell: bash
+      working-directory: bench/compare
+      run: go test -vet=off -timeout 10m -run TestOutputs -engines '^(C|MoeLua)$' .
+
+    - name: Run high-density multi-VM memory & Go GC comparison
+      if: inputs.run-memcmp == 'true'
+      shell: bash
+      working-directory: bench/compare
+      env:
+        MEM_ENGINES: ${{ inputs.mem-engines }}
+      run: |
+        set -euo pipefail
+        go build -o /tmp/memcmp memcmp.go
+        /tmp/memcmp -engines "$MEM_ENGINES" -json memcmp.json | tee memcmp.txt
+        {
+          echo "### High-Density Multi-VM Memory & Go GC Comparison"
+          echo '```text'
+          cat memcmp.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Run cross-engine CPU benchmarks
+      shell: bash
+      working-directory: bench/compare
+      env:
+        INPUT_ENGINES: ${{ inputs.engines }}
+        INPUT_PROGRAMS: ${{ inputs.programs }}
+        INPUT_BENCHTIME: ${{ inputs.benchtime }}
+        INPUT_COUNT: ${{ inputs.count }}
+      run: |
+        set -euo pipefail
+        MAIN_ENGINES="$(python3 -c '
+        import os, re
+        pat = re.compile(os.environ["INPUT_ENGINES"])
+        names = ["C", "C-O3", "MoeLua", "Apogee-JIT", "Apogee-Interp", "CCGO", "GopherLua", "GoLua", "DCLua", "LuaJIT-joff", "LuaJIT"]
+        picked = [n for n in names if pat.search(n)]
+        print("^(" + "|".join(re.escape(n) for n in picked) + ")$" if picked else "")
+        ')"
+        RUN_GOLUA="$(python3 -c '
+        import os, re
+        print("1" if re.compile(os.environ["INPUT_ENGINES"]).search("ArnodelGolua") else "0")
+        ')"
+        : > bench_raw.txt
+        if [ -n "$MAIN_ENGINES" ]; then
+          GOMAXPROCS=1 go test -vet=off -timeout 60m -run @ -bench . \
+            -benchtime "$INPUT_BENCHTIME" -count "$INPUT_COUNT" \
+            -engines "$MAIN_ENGINES" -programs "$INPUT_PROGRAMS" . | tee -a bench_raw.txt
+        fi
+        if [ "$RUN_GOLUA" = "1" ]; then
+          GOLUA_DIR="$(go list -m -f '{{.Dir}}' github.com/arnodel/golua)"
+          PGO_ARGS=()
+          if [ -f "$GOLUA_DIR/default.pgo" ]; then
+            PGO_ARGS=(-pgo="$GOLUA_DIR/default.pgo")
+          fi
+          GOMAXPROCS=1 go test -vet=off -timeout 30m "${PGO_ARGS[@]}" -run @ -bench . \
+            -benchtime "$INPUT_BENCHTIME" -count "$INPUT_COUNT" \
+            -engines '^ArnodelGolua$' -programs "$INPUT_PROGRAMS" . | tee -a bench_raw.txt
+        fi
+        go run benchreport.go -json bench_summary.json < bench_raw.txt > bench_report.txt
+        {
+          echo "### Cross-Engine CPU Benchmarks (relative to C Lua 5.5.1 -O2, lower is faster)"
+          echo '```text'
+          awk '/^are-we-fast-yet,|^Benchmarks Game,|^SciMark|^the Go engines|^micro benchmarks,|^all but micro/{show=1} /^ms\/op, best\/median/{show=0} show{print}' bench_report.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Regenerate README performance chart SVGs
+      id: gencharts
+      if: inputs.generate-charts == 'true'
+      shell: bash
+      working-directory: bench/compare
+      env:
+        REQUIRE_CHARTS: ${{ inputs.require-charts }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+      run: |
+        set -euo pipefail
+        HAS_CHART_DATA="$(python3 -c '
+        import json, os
+        if not (os.path.exists("bench_summary.json") and os.path.exists("memcmp.json")):
+            print("0"); raise SystemExit
+        b = json.load(open("bench_summary.json"))
+        m = json.load(open("memcmp.json"))
+        print("1" if b.get("common_count", 0) > 0 and "C" in b.get("common_geomean", {}) and len(m) > 0 else "0")
+        ')"
+        if [ "$HAS_CHART_DATA" = "1" ]; then
+          CPU_MODEL="$(lscpu 2>/dev/null | awk -F: '/Model name/{gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+          [ -n "$CPU_MODEL" ] || CPU_MODEL="$(uname -m)"
+          GO_VER="$(go env GOVERSION | sed 's/^go//')"
+          SUBTITLE="GitHub Actions (${CPU_MODEL}, $(go env GOOS)/$(go env GOARCH)) · Go ${GO_VER} · GOMAXPROCS=1 · Lower is better"
+          go run genchart.go \
+            -bench bench_summary.json \
+            -mem memcmp.json \
+            -subtitle "$SUBTITLE" \
+            -date "$(date -u +%Y-%m-%d)" \
+            -commit "${COMMIT_SHA::7}" \
+            -out ../../docs/assets/bench-compare.svg \
+            -out-multivm ../../docs/assets/bench-multivm.svg
+          echo "charts-generated=true" >> "$GITHUB_OUTPUT"
+        elif [ "$REQUIRE_CHARTS" = "true" ]; then
+          echo "ERROR: chart regeneration required but C-baseline common_geomean or memcmp.json is missing" >&2
+          exit 1
+        else
+          echo "Skipping chart regeneration (requires both C-baseline common_geomean and memcmp.json)."
+          echo "charts-generated=false" >> "$GITHUB_OUTPUT"
+        fi

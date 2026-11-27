@@ -20,65 +20,16 @@ jobs:
         with:
           submodules: true
 
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/setup-go
         with:
           go-version-file: go.mod
-          cache: false
 
-      - name: Build reference C Lua 5.5.1 tools (from submodule)
-        if: runner.os != 'Windows'
-        run: make build/lua55_o2 build/luac55 build/clua_mem
+      - uses: ./.github/actions/setup-lua-ref
+        with:
+          targets: build/lua55_o2 build/luac55 build/clua_mem
 
-      - name: Pure-Go build (CGO_ENABLED=0)
-        env:
-          CGO_ENABLED: "0"
-        run: go build ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test (default opt + intnil)
-        run: go test -count=1 ./...
-
-      - name: Test (-tags moeluaregcheck)
-        run: go test -tags moeluaregcheck -count=1 ./...
-
-      - name: Test (-tags moeluafloatnil)
-        run: go test -tags moeluafloatnil -count=1 ./...
-
-      - name: Test (-tags moeluafaithful)
-        run: go test -tags moeluafaithful -count=1 ./...
-
-      - name: Test (-race)
-        if: runner.os != 'Windows'
-        run: go test -race -count=1 ./...
-
-      - name: Cross-engine benchmark harness compile check (Windows)
-        if: runner.os == 'Windows'
-        working-directory: bench/compare
-        run: |
-          go test -vet=off -run '^$' .
-          go build -o "$env:RUNNER_TEMP\benchreport.exe" benchreport.go
-          go build -o "$env:RUNNER_TEMP\memcmp.exe" memcmp.go
-          go build -o "$env:RUNNER_TEMP\genchart.exe" genchart.go
-
-      - name: Cross-engine benchmark 32/32 output parity (bench/compare)
-        if: runner.os != 'Windows'
-        working-directory: bench/compare
-        run: |
-          go test -vet=off -timeout 5m -run TestOutputs -engines '^(C|MoeLua)$' .
-          go build -o /dev/null benchreport.go
-          go build -o /dev/null memcmp.go
-          go build -o /dev/null genchart.go
-
-      - name: GC & pointer stress (GOGC=1 gccheckmark/clobberfree + checkptr=2)
-        if: runner.os == 'Linux'
-        env:
-          GOGC: "1"
-          GODEBUG: "gccheckmark=1,clobberfree=1"
-        run: |
-          if [ -d vm ]; then
-            go test -timeout 5m -gcflags=all=-d=checkptr=2 -count=1 ./vm .
-          else
-            go test -timeout 5m -gcflags=all=-d=checkptr=2 -count=1 ./...
-          fi
+      - uses: ./.github/actions/verify-go
+        with:
+          run-race: "true"
+          run-compare: "true"
+          run-gc-stress: "true"

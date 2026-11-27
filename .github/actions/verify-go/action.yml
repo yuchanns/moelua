@@ -1,0 +1,85 @@
+name: Verify MoeLua Go Build and Test Suite
+description: Run pure-Go build, vet, full build-tag test matrix, race detector, bench/compare checks, and optional GC stress.
+
+inputs:
+  run-race:
+    description: Run go test -race on Unix runners
+    required: false
+    default: "true"
+  run-compare:
+    description: Verify bench/compare harness compilation (Windows) or 32/32 C-vs-MoeLua output parity (Unix)
+    required: false
+    default: "true"
+  run-gc-stress:
+    description: Run GOGC=1 gccheckmark/clobberfree + checkptr=2 stress test on Linux
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Pure-Go build (CGO_ENABLED=0)
+      shell: bash
+      env:
+        CGO_ENABLED: "0"
+      run: go build ./...
+
+    - name: Vet
+      shell: bash
+      run: go vet ./...
+
+    - name: Test (default opt + intnil)
+      shell: bash
+      run: go test -count=1 ./...
+
+    - name: Test (-tags moeluaregcheck)
+      shell: bash
+      run: go test -tags moeluaregcheck -count=1 ./...
+
+    - name: Test (-tags moeluafloatnil)
+      shell: bash
+      run: go test -tags moeluafloatnil -count=1 ./...
+
+    - name: Test (-tags moeluafaithful)
+      shell: bash
+      run: go test -tags moeluafaithful -count=1 ./...
+
+    - name: Test (-race)
+      if: inputs.run-race == 'true' && runner.os != 'Windows'
+      shell: bash
+      run: go test -race -count=1 ./...
+
+    - name: Cross-engine benchmark harness compile check (Windows)
+      if: inputs.run-compare == 'true' && runner.os == 'Windows'
+      shell: pwsh
+      working-directory: bench/compare
+      run: |
+        go test -vet=off -run '^$' .
+        go build -o "$env:RUNNER_TEMP\benchreport.exe" benchreport.go
+        go build -o "$env:RUNNER_TEMP\memcmp.exe" memcmp.go
+        go build -o "$env:RUNNER_TEMP\genchart.exe" genchart.go
+
+    - name: Cross-engine benchmark 32/32 output parity (bench/compare)
+      if: inputs.run-compare == 'true' && runner.os != 'Windows'
+      shell: bash
+      working-directory: bench/compare
+      run: |
+        set -euo pipefail
+        go test -vet=off -timeout 5m -run TestOutputs -engines '^(C|MoeLua)$' .
+        go build -o /dev/null benchreport.go
+        go build -o /dev/null memcmp.go
+        go build -o /dev/null genchart.go
+
+    - name: GC & pointer stress (GOGC=1 gccheckmark/clobberfree + checkptr=2)
+      if: inputs.run-gc-stress == 'true' && runner.os == 'Linux'
+      shell: bash
+      env:
+        GOGC: "1"
+        GODEBUG: "gccheckmark=1,clobberfree=1"
+      run: |
+        set -euo pipefail
+        if [ -d vm ]; then
+          go test -timeout 5m -gcflags=all=-d=checkptr=2 -count=1 ./vm .
+        else
+          go test -timeout 5m -gcflags=all=-d=checkptr=2 -count=1 ./...
+        fi
