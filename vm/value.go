@@ -19,22 +19,23 @@ import (
 // closures, upvalues, or inline caches, and writing Values emits zero Go write barriers.
 //
 // Tag encoding:
-//   0, 1: Int / Float (polarity selected by !moeluafloatnil vs moeluafloatnil) -> IsNumber: tag <= 1
-//   2:    Nil         (bits == 0)
-//   3:    False       (bits == 0) -> IsFalsy: tag-2 <= 1
-//   4:    True        (bits == 0) -> IsBool:  tag-3 <= 1
-//   5:    LightUD     (bits == opaque pointer address, 0 for nil light userdata)
-//   6:    TokenLightUD(bits == non-owning debug.upvalueid token)
-//   7:    StaticNative(bits == 1-based index into process-wide immutable staticNatives table)
-//   8:    FrozenString(bits == arena.ObjRef in process-wide read-only stdTemplate.strArena)
-//   --- Per-State Arena GC-managed ObjRefs (tag >= tagFirstGC && tag <= tagLastGC) ---
-//   9:    String      (bits == arena.ObjRef in State.arena, gcKindShortStr / gcKindLongStr)
-//   10:   Closure     (bits == arena.ObjRef in State.arena, gcKindClosure)
-//   11:   Native      (bits == arena.ObjRef in State.arena, gcKindNative)
-//   12:   Table       (bits == arena.ObjRef in State.arena, gcKindTable)
-//   13:   Userdata    (bits == arena.ObjRef in State.arena, gcKindUserdata)
-//   14:   Thread      (bits == arena.ObjRef in State.arena, gcKindThread)
-//   15:   DeadKey     (internal swept hash-tombstone marker; never escapes to Lua)
+//
+//	0, 1: Int / Float (polarity selected by !moeluafloatnil vs moeluafloatnil) -> IsNumber: tag <= 1
+//	2:    Nil         (bits == 0)
+//	3:    False       (bits == 0) -> IsFalsy: tag-2 <= 1
+//	4:    True        (bits == 0) -> IsBool:  tag-3 <= 1
+//	5:    LightUD     (bits == opaque pointer address, 0 for nil light userdata)
+//	6:    TokenLightUD(bits == non-owning debug.upvalueid token)
+//	7:    StaticNative(bits == 1-based index into process-wide immutable staticNatives table)
+//	8:    FrozenString(bits == arena.ObjRef in process-wide read-only stdTemplate.strArena)
+//	--- Per-State Arena GC-managed ObjRefs (tag >= tagFirstGC && tag <= tagLastGC) ---
+//	9:    String      (bits == arena.ObjRef in State.arena, gcKindShortStr / gcKindLongStr)
+//	10:   Closure     (bits == arena.ObjRef in State.arena, gcKindClosure)
+//	11:   Native      (bits == arena.ObjRef in State.arena, gcKindNative)
+//	12:   Table       (bits == arena.ObjRef in State.arena, gcKindTable)
+//	13:   Userdata    (bits == arena.ObjRef in State.arena, gcKindUserdata)
+//	14:   Thread      (bits == arena.ObjRef in State.arena, gcKindThread)
+//	15:   DeadKey     (internal swept hash-tombstone marker; never escapes to Lua)
 type Value struct {
 	bits uint64
 	tag  uint64
@@ -117,6 +118,8 @@ var (
 	staticNatives     atomic.Pointer[[]*NativeFunc]
 	staticNativeBy    = map[*NativeFunc]uint32{}
 	staticNativeByKey = map[staticNativeKey]uint32{}
+	staticMathSqrtIdx atomic.Uint32
+	staticMathAbsIdx  atomic.Uint32
 )
 
 func init() {
@@ -148,6 +151,12 @@ func registerStaticNative(nf *NativeFunc) uint32 {
 	staticNativeBy[nf] = idx
 	if hasKey {
 		staticNativeByKey[key] = idx
+	}
+	switch nf.Intrinsic {
+	case intrMathSqrt:
+		staticMathSqrtIdx.CompareAndSwap(0, idx)
+	case intrMathAbs:
+		staticMathAbsIdx.CompareAndSwap(0, idx)
 	}
 	return idx
 }
@@ -359,8 +368,10 @@ func (v Value) IsNative() bool       { return v.tag == tagStaticNative || v.tag 
 func (v Value) IsThread() bool       { return v.tag == tagThread }
 func (v Value) IsUserdata() bool     { return v.tag == tagUserdata }
 func (v Value) IsLightUD() bool      { return v.tag-tagLightUD <= 1 }
-func (v Value) IsFunction() bool     { return v.tag == tagClosure || v.tag == tagStaticNative || v.tag == tagNative }
-func (v Value) IsDeadKey() bool      { return v.tag == tagDeadKey }
+func (v Value) IsFunction() bool {
+	return v.tag == tagClosure || v.tag == tagStaticNative || v.tag == tagNative
+}
+func (v Value) IsDeadKey() bool { return v.tag == tagDeadKey }
 
 // IsGCObject reports whether v holds a per-State Arena ObjRef managed by State.collector
 // (dynamic String, Closure, DynNative, Table, Userdata, or Thread).
