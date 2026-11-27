@@ -571,6 +571,11 @@ func (a *Assembler) NOTQ(dst Reg) {
 
 func (a *Assembler) emitShiftImm(w bool, ext uint8, dst Reg, count uint8) {
 	if count == 0 {
+		if w {
+			return
+		}
+		// 32-bit shifts with count 0 preserve flags while zero-extending the low 32 bits.
+		a.MOVL(dst, dst)
 		return
 	}
 	a.emitREXRegReg(w, 0, uint8(dst), false)

@@ -66,6 +66,21 @@ func TestEncodeEdgeCasesAndModRMSIB(t *testing.T) {
 			emit: func(a *Assembler) { a.ADDSD(XMM8, XMM9) },
 			want: []byte{0xF2, 0x45, 0x0F, 0x58, 0xC1},
 		},
+		{
+			name: "SHLLImm RAX, 0 zero-extends via MOVL",
+			emit: func(a *Assembler) { a.SHLLImm(RAX, 0) },
+			want: []byte{0x89, 0xC0},
+		},
+		{
+			name: "SHRLImm R8, 0 zero-extends via MOVL",
+			emit: func(a *Assembler) { a.SHRLImm(R8, 0) },
+			want: []byte{0x45, 0x89, 0xC0},
+		},
+		{
+			name: "SHLQImm RAX, 0 is a no-op",
+			emit: func(a *Assembler) { a.SHLQImm(RAX, 0) },
+			want: []byte{},
+		},
 	}
 
 	for _, tc := range tests {

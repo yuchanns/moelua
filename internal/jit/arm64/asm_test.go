@@ -167,3 +167,17 @@ func TestLabelErrorsAndForwardBackwardBranches(t *testing.T) {
 		t.Fatal("expected error for duplicate Bind")
 	}
 }
+
+func TestLargeSpillFramePrologueEpilogue(t *testing.T) {
+	for _, localBytes := range []int32{512, 1024, 4096, 4112} {
+		a := New(32)
+		fl := ComputeFrameLayout(localBytes, []Reg{X19, X20, X21})
+		a.EmitPrologue(fl)
+		a.STR(X0, SP, localBytes-8)
+		a.LDR(X0, SP, localBytes-8)
+		a.EmitEpilogue(fl)
+		if _, err := a.Finish(); err != nil {
+			t.Fatalf("large frame localBytes=%d failed: %v", localBytes, err)
+		}
+	}
+}

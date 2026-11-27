@@ -177,3 +177,21 @@ func TestExecFP64AndIndexedArray(t *testing.T) {
 		t.Fatalf("asInt=%d cmpRes=%d, want 6 / 1", ctx.asInt, ctx.cmpRes)
 	}
 }
+
+func TestExecZeroCount32BitShiftZeroExtends(t *testing.T) {
+	a := amd64.New(32)
+	a.MOVImm64(amd64.RAX, ^uint64(0))
+	a.SHLLImm(amd64.RAX, 0)
+	a.MOVImm64(amd64.RCX, ^uint64(0))
+	a.SHRLImm(amd64.RCX, 0)
+	a.XORQ(amd64.RAX, amd64.RCX) // 0 if both equal 0xFFFFFFFF
+	a.ORQ(amd64.RAX, amd64.RCX)  // returns 0x00000000FFFFFFFF
+	a.RET()
+
+	reg := publishAMD64(t, a)
+	defer reg.Free()
+	var dummy uint64
+	if got := call.Call(reg.Addr(), unsafe.Pointer(&dummy)); got != 0xFFFFFFFF {
+		t.Fatalf("got 0x%x, want 0xffffffff", got)
+	}
+}

@@ -170,3 +170,22 @@ func TestExecFP64AndIndexedArray(t *testing.T) {
 		t.Fatalf("floored=%v asInt=%d, want 6.0 / 6", ctx.floored, ctx.asInt)
 	}
 }
+
+func TestExecLargeSpillFrame(t *testing.T) {
+	a := arm64.New(32)
+	fl := arm64.ComputeFrameLayout(640, []arm64.Reg{arm64.X19, arm64.X20, arm64.X21})
+	a.EmitPrologue(fl)
+	a.MOV(arm64.X19, arm64.X0)
+	a.LDR(arm64.X20, arm64.X19, 0)
+	a.STR(arm64.X20, arm64.SP, 632)
+	a.LDR(arm64.X0, arm64.SP, 632)
+	a.ADDImm(arm64.X0, arm64.X0, 7)
+	a.EmitEpilogue(fl)
+
+	reg := publishARM64(t, a)
+	defer reg.Free()
+	var in uint64 = 35
+	if got := call.Call(reg.Addr(), unsafe.Pointer(&in)); got != 42 {
+		t.Fatalf("large spill frame returned %d, want 42", got)
+	}
+}

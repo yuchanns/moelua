@@ -836,16 +836,50 @@ func ComputeFrameLayout(localBytes int32, savedRegs []Reg) FrameLayout {
 	}
 }
 
-// EmitPrologue allocates the frame, saves (X29, X30) and savedRegs, and sets FP=SP+fpOff.
+func (a *Assembler) emitAdjustSP(bytes int32, sub bool) {
+	if bytes == 0 {
+		return
+	}
+	if bytes < 0 || bytes%16 != 0 || uint32(bytes) >= (1<<24) {
+		a.setErr(fmt.Errorf("arm64: invalid stack frame adjustment %d", bytes))
+		return
+	}
+	lo := uint32(bytes) & 0xFFF
+	hi := uint32(bytes) & 0xFFF000
+	if sub {
+		if hi != 0 {
+			a.SUBImm(SP, SP, hi)
+		}
+		if lo != 0 {
+			a.SUBImm(SP, SP, lo)
+		}
+		return
+	}
+	if lo != 0 {
+		a.ADDImm(SP, SP, lo)
+	}
+	if hi != 0 {
+		a.ADDImm(SP, SP, hi)
+	}
+}
+
+// EmitPrologue allocates the frame, saves (X29, X30) and savedRegs, and sets FP to the saved
+// (X29, X30) pair. Saved registers are stored before allocating LocalBytes so large spill
+// frames (including >= 512 bytes) never exceed STP/LDP's 504-byte immediate range.
 func (a *Assembler) EmitPrologue(fl FrameLayout) {
 	if fl.TotalBytes == 0 {
 		return
 	}
-	a.SUBImm(SP, SP, uint32(fl.TotalBytes))
-	fpOff := fl.TotalBytes - 16
+	savedArea := fl.TotalBytes - fl.LocalBytes
+	if savedArea < 16 || savedArea > 512 || savedArea%16 != 0 {
+		a.setErr(fmt.Errorf("arm64: invalid saved register area %d", savedArea))
+		return
+	}
+	a.SUBImm(SP, SP, uint32(savedArea))
+	fpOff := savedArea - 16
 	a.STP(X29, X30, SP, fpOff)
 	a.ADDImm(X29, SP, uint32(fpOff))
-	off := fl.LocalBytes
+	var off int32
 	for i := 0; i < len(fl.SavedRegs); i += 2 {
 		r1 := fl.SavedRegs[i]
 		r2 := XZR
@@ -859,12 +893,23 @@ func (a *Assembler) EmitPrologue(fl FrameLayout) {
 		}
 		off += 16
 	}
+	if fl.LocalBytes > 0 {
+		a.emitAdjustSP(fl.LocalBytes, true)
+	}
 }
 
-// EmitEpilogue restores savedRegs and (X29, X30), deallocates the frame, and emits RET.
+// EmitEpilogue deallocates LocalBytes, restores savedRegs and (X29, X30), restores SP, and emits RET.
 func (a *Assembler) EmitEpilogue(fl FrameLayout) {
 	if fl.TotalBytes > 0 {
-		off := fl.LocalBytes
+		savedArea := fl.TotalBytes - fl.LocalBytes
+		if savedArea < 16 || savedArea > 512 || savedArea%16 != 0 {
+			a.setErr(fmt.Errorf("arm64: invalid saved register area %d", savedArea))
+			return
+		}
+		if fl.LocalBytes > 0 {
+			a.emitAdjustSP(fl.LocalBytes, false)
+		}
+		var off int32
 		for i := 0; i < len(fl.SavedRegs); i += 2 {
 			r1 := fl.SavedRegs[i]
 			r2 := XZR
@@ -878,9 +923,9 @@ func (a *Assembler) EmitEpilogue(fl FrameLayout) {
 			}
 			off += 16
 		}
-		fpOff := fl.TotalBytes - 16
+		fpOff := savedArea - 16
 		a.LDP(X29, X30, SP, fpOff)
-		a.ADDImm(SP, SP, uint32(fl.TotalBytes))
+		a.ADDImm(SP, SP, uint32(savedArea))
 	}
 	a.RET()
 }
