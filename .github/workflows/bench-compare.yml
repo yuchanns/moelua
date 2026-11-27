@@ -262,43 +262,126 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 1
-
       - name: Download generated chart SVGs
         uses: actions/download-artifact@v4
         with:
           name: bench-charts
           path: /tmp/bench-charts
 
-      - name: Commit updated README performance charts to main
-        run: |
-          set -euo pipefail
-          COMPARE_SVG="$(find /tmp/bench-charts -name bench-compare.svg | head -n 1)"
-          MULTIVM_SVG="$(find /tmp/bench-charts -name bench-multivm.svg | head -n 1)"
-          if [ -z "$COMPARE_SVG" ] || [ -z "$MULTIVM_SVG" ]; then
-            echo "ERROR: missing generated SVG artifact(s)" >&2
-            exit 1
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          for attempt in 1 2 3; do
-            git fetch origin main
-            git reset --hard origin/main
-            cp "$COMPARE_SVG" docs/assets/bench-compare.svg
-            cp "$MULTIVM_SVG" docs/assets/bench-multivm.svg
-            if [ -z "$(git status --porcelain -- docs/assets/bench-compare.svg docs/assets/bench-multivm.svg)" ]; then
-              echo "Charts already match origin/main; skipping commit."
-              exit 0
-            fi
-            git add docs/assets/bench-compare.svg docs/assets/bench-multivm.svg
-            git commit -m "chore(bench): update README performance charts (${GITHUB_SHA::7})"
-            if git push origin HEAD:main; then
-              exit 0
-            fi
-            echo "Push conflict on attempt $attempt; retrying..."
-            sleep 2
-          done
-          exit 1
+      - name: Commit verified README performance charts to main
+        uses: actions/github-script@v9
+        env:
+          BENCH_SHA: ${{ github.sha }}
+        with:
+          script: |
+            const crypto = require('crypto');
+            const fs = require('fs');
+            const path = require('path');
+
+            function findFile(dir, target) {
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                  const hit = findFile(full, target);
+                  if (hit) return hit;
+                } else if (entry.name === target) {
+                  return full;
+                }
+              }
+              return null;
+            }
+
+            function gitBlobSha(buf) {
+              return crypto
+                .createHash('sha1')
+                .update(`blob ${buf.length}\0`)
+                .update(buf)
+                .digest('hex');
+            }
+
+            const files = [
+              { repoPath: 'docs/assets/bench-compare.svg', name: 'bench-compare.svg' },
+              { repoPath: 'docs/assets/bench-multivm.svg', name: 'bench-multivm.svg' },
+            ];
+            const localFiles = new Map();
+            for (const f of files) {
+              const localPath = findFile('/tmp/bench-charts', f.name);
+              if (!localPath) {
+                throw new Error(`Missing generated chart artifact: ${f.name}`);
+              }
+              const buf = fs.readFileSync(localPath);
+              localFiles.set(f.repoPath, { buf, sha: gitBlobSha(buf) });
+            }
+
+            const shortSha = (process.env.BENCH_SHA || '').slice(0, 7);
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              const { data: refData } = await github.rest.git.getRef({
+                ...context.repo,
+                ref: 'heads/main',
+              });
+              const headOid = refData.object.sha;
+
+              const additions = [];
+              for (const f of files) {
+                const { buf, sha } = localFiles.get(f.repoPath);
+                let same = false;
+                try {
+                  const { data: remote } = await github.rest.repos.getContent({
+                    ...context.repo,
+                    path: f.repoPath,
+                    ref: headOid,
+                  });
+                  if (!Array.isArray(remote) && remote.type === 'file' && remote.sha === sha) {
+                    same = true;
+                  }
+                } catch (err) {
+                  if (err.status !== 404) throw err;
+                }
+                if (!same) {
+                  additions.push({
+                    path: f.repoPath,
+                    contents: buf.toString('base64'),
+                  });
+                }
+              }
+
+              if (additions.length === 0) {
+                core.info('Charts already match origin/main; skipping commit.');
+                return;
+              }
+
+              let commit;
+              try {
+                const result = await github.graphql(
+                  `mutation($input: CreateCommitOnBranchInput!) {
+                    createCommitOnBranch(input: $input) {
+                      commit { oid signature { isValid wasSignedByGitHub } }
+                    }
+                  }`,
+                  {
+                    input: {
+                      branch: {
+                        repositoryNameWithOwner: `${context.repo.owner}/${context.repo.repo}`,
+                        branchName: 'main',
+                      },
+                      expectedHeadOid: headOid,
+                      message: {
+                        headline: `chore(bench): update README performance charts (${shortSha})`,
+                      },
+                      fileChanges: { additions },
+                    },
+                  },
+                );
+                commit = result.createCommitOnBranch.commit;
+              } catch (err) {
+                if (attempt === 3) throw err;
+                core.warning(`createCommitOnBranch attempt ${attempt} failed (${err.message}); retrying...`);
+                await new Promise((r) => setTimeout(r, 2000));
+                continue;
+              }
+              if (!commit.signature?.isValid || !commit.signature.wasSignedByGitHub) {
+                throw new Error('Chart commit was not signed and verified by GitHub');
+              }
+              core.info(`Committed verified chart update ${commit.oid}`);
+              return;
+            }
