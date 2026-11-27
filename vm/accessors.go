@@ -359,7 +359,7 @@ func (t *Table) setShape(_ *State, sh *Shape) {
 func (t *Table) appendSlotFor(s *State, val Value) bool { return t.appendSlot(s, val) }
 
 func (sh *Shape) lookupKey(s *State, k *LuaString) int32 { return sh.Lookup(s, k) }
-func (sh *Shape) hasMeta() bool                          { return sh.metaRef != arena.NullRef }
+func (sh *Shape) hasMeta() bool { return sh.metaRef != arena.NullRef || sh.isMetaProxy() }
 
 func (s *State) tableHashValAt(t *Table, slot int) Value {
 	h := arena.AsSmall[tableHash](s.arena, t.hashRef)

@@ -27,7 +27,7 @@ jobs:
 
       - name: Build reference C Lua 5.5.1 tools (from submodule)
         if: runner.os != 'Windows'
-        run: make build/lua55_o2 build/luac55
+        run: make build/lua55_o2 build/luac55 build/clua_mem
 
       - name: Pure-Go build (CGO_ENABLED=0)
         env:
@@ -52,6 +52,24 @@ jobs:
       - name: Test (-race)
         if: runner.os != 'Windows'
         run: go test -race -count=1 ./...
+
+      - name: Cross-engine benchmark harness compile check (Windows)
+        if: runner.os == 'Windows'
+        working-directory: bench/compare
+        run: |
+          go test -vet=off -run '^$' .
+          go build -o "$env:RUNNER_TEMP\benchreport.exe" benchreport.go
+          go build -o "$env:RUNNER_TEMP\memcmp.exe" memcmp.go
+          go build -o "$env:RUNNER_TEMP\genchart.exe" genchart.go
+
+      - name: Cross-engine benchmark 32/32 output parity (bench/compare)
+        if: runner.os != 'Windows'
+        working-directory: bench/compare
+        run: |
+          go test -vet=off -timeout 5m -run TestOutputs -engines '^(C|MoeLua)$' .
+          go build -o /dev/null benchreport.go
+          go build -o /dev/null memcmp.go
+          go build -o /dev/null genchart.go
 
       - name: GC & pointer stress (GOGC=1 gccheckmark/clobberfree + checkptr=2)
         if: runner.os == 'Linux'

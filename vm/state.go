@@ -2055,6 +2055,177 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 	return res[0], nil
 }
 
+// call2OnThread invokes fn(a, b) and returns its first result with zero Go slice allocations
+// on the hot non-vararg Lua closure path (used by table.sort comparators and 2-arg callbacks).
+func (s *State) call2OnThread(th *Thread, fn, a, b Value) (Value, error) {
+	if fn.IsClosure() && s.abortErr == nil && !s.hasInterruptControl() &&
+		s.nCcalls < maxCCalls && th.hookMask == 0 && !th.inHook && !th.suppressHook {
+		cl := s.asClosure(fn)
+		bp := s.boundProtoOf(cl)
+		if !bp.isVararg {
+			s.nCcalls++
+			th.nny++
+			prevCB := th.inCCallback
+			th.inCCallback = false
+
+			base := th.top
+			if th.nframe > 0 {
+				prev := &th.framesSlice(s.arena)[th.nframe-1]
+				if prev.kind == frameLua && prev.clRef != arena.NullRef {
+					prevCL := arena.AsSmall[Closure](s.arena, prev.clRef)
+					if prevEnd := prev.base + int(s.boundProtoOf(prevCL).maxStack); prevEnd > base {
+						base = prevEnd
+					}
+				}
+			}
+			funcIdx := base
+			argBase := funcIdx + 1
+			maxStack := int(bp.maxStack)
+			need := argBase + max(2, maxStack) + 8
+			if need+stackSlack <= th.stackLen && th.nframe < th.framesCap {
+				stack := th.stackSlice(s.arena)
+				stack[funcIdx] = fn
+				nparams := int(bp.numParams)
+				if nparams >= 2 {
+					stack[argBase] = a
+					stack[argBase+1] = b
+					if maxStack > 2 {
+						fillNil(stack[argBase+2 : argBase+maxStack])
+					}
+				} else {
+					if nparams == 1 {
+						stack[argBase] = a
+					}
+					if maxStack > nparams {
+						fillNil(stack[argBase+nparams : argBase+maxStack])
+					}
+				}
+				frameEnd := argBase + maxStack
+				th.top = frameEnd
+				th.noteStack(max(frameEnd, argBase+2))
+
+				entryDepth := th.nframe
+				frames := th.framesSlice(s.arena)
+				nf := &frames[entryDepth]
+				if nf.dirty {
+					*nf = callFrame{}
+				}
+				nf.clRef = cl.self
+				nf.base = argBase
+				nf.funcIdx = funcIdx
+				nf.pc = 0
+				nf.nresults = 1
+				nf.oldPC = -1
+				nf.isFinalizer = th.nextFrameFinalizer
+				th.nextFrameFinalizer = false
+				th.nframe = entryDepth + 1
+				th.noteFrame(th.nframe)
+
+				err := s.run(th, entryDepth)
+				if uerr := th.uncaughtErr(s); uerr != nil {
+					err = uerr
+					th.setUncaughtErr(s, nil)
+				}
+				if err == nil && s.abortErr != nil {
+					err = s.abortErr
+				}
+
+				clearTop := func() {
+					th.top = funcIdx
+					if entryDepth == 0 && th.openUpvalsLen == 0 {
+						st := th.stackSlice(s.arena)
+						if end := min(max(th.highStack, th.top), len(st)); funcIdx < end {
+							fillNil(st[funcIdx:end])
+						}
+						fs := th.framesSlice(s.arena)
+						if hf := min(th.highFrames, len(fs)); hf > 0 {
+							clear(fs[:hf])
+						}
+						th.highStack = funcIdx
+						th.highFrames = 0
+					}
+				}
+
+				var ret Value
+				var retErr error
+				if err != nil {
+					if errors.Is(err, errYieldSentinel) || errors.Is(err, errCoroCloseSelf) {
+						retErr = err
+					} else if isUncatchableErr(err) {
+						s.abortErr = err
+						th.discardTBCAtOrAbove(s, funcIdx)
+						th.closeUpvals(s, funcIdx)
+						th.nframe = entryDepth
+						clearTop()
+						retErr = err
+					} else {
+						var xpHandled bool
+						isMem := isMemError(err)
+						if le, ok := err.(*LuaError); ok && le.xpHandled {
+							xpHandled = true
+						}
+						ev := s.runtimeErrorToValue(th, err)
+						ev, _, raised := th.closeAllSync(s, funcIdx, ev, true)
+						if raised {
+							xpHandled = false
+							isMem = false
+						}
+						if s.abortErr != nil {
+							uerr := s.abortErr
+							if !errors.Is(uerr, errCoroCloseSelf) {
+								th.discardTBCAtOrAbove(s, funcIdx)
+							}
+							th.closeUpvals(s, funcIdx)
+							th.nframe = entryDepth
+							clearTop()
+							retErr = uerr
+						} else {
+							th.nframe = entryDepth
+							clearTop()
+							le := &LuaError{Val: ev, xpHandled: xpHandled, isMemErr: isMem}
+							if s.nCcalls == 1 {
+								_ = s.materializeLuaError(le)
+							}
+							retErr = le
+						}
+					}
+				} else {
+					if s.gcNeedsCheck() {
+						s.gcCheckStep(th.top)
+						if s.abortErr != nil {
+							clearTop()
+							retErr = s.abortErr
+						}
+					}
+					if retErr == nil {
+						if th.top > funcIdx {
+							ret = th.stackSlice(s.arena)[funcIdx]
+						} else {
+							ret = NilValue()
+						}
+						clearTop()
+					}
+				}
+
+				th.inCCallback = prevCB
+				th.nny--
+				s.nCcalls--
+				if s.nCcalls == 0 {
+					s.abortErr = nil
+				}
+				return ret, retErr
+			}
+			th.inCCallback = prevCB
+			th.nny--
+			s.nCcalls--
+		}
+	}
+	var args [2]Value
+	args[0] = a
+	args[1] = b
+	return s.call1OnThread(th, fn, args[:])
+}
+
 // runThread dispatches to the fast loop when no debug hooks or interrupt controls are active,
 // or to the hooked variant when debug.sethook / ctx / instruction limits are active (zero cost in fast path!).
 func (s *State) runThread(th *Thread, entryDepth int) error {

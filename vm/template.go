@@ -51,9 +51,10 @@ type stdTemplate struct {
 
 	nextShapeID   uint64
 	shapesRootRef arena.ObjRef
-	metaRoots     map[arena.ObjRef]arena.ObjRef
+	metaRoots     map[metaRootKey]arena.ObjRef
 	metaTrans     map[metaTransKey]arena.ObjRef
 	transShapes   []arena.ObjRef
+	proxyShapes   []arena.ObjRef
 	hashedTables  []arena.ObjRef
 
 	builtinNext           *NativeFunc
@@ -124,6 +125,7 @@ func buildStdTemplate() *stdTemplate {
 		metaRoots:             maps.Clone(b.shapes.metaRoots),
 		metaTrans:             maps.Clone(b.shapes.metaTrans),
 		transShapes:           slices.Clone(b.shapes.transShapes),
+		proxyShapes:           slices.Clone(b.shapes.proxyShapes),
 		hashedTables:          slices.Clone(b.hashedTables),
 		builtinNext:           b.builtinNext,
 		builtinIPairsIter:     b.builtinIPairsIter,
@@ -164,6 +166,7 @@ func cloneFromStdTemplate(noEnv bool) *State {
 			metaRoots:   maps.Clone(tmpl.metaRoots),
 			metaTrans:   maps.Clone(tmpl.metaTrans),
 			transShapes: slices.Clone(tmpl.transShapes),
+			proxyShapes: slices.Clone(tmpl.proxyShapes),
 		},
 		hashedTables:          slices.Clone(tmpl.hashedTables),
 		nextRefID:             1,

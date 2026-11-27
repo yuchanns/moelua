@@ -9,8 +9,10 @@ import (
 const (
 	maxShapeProps = 64
 
-	shapeFlagTransMask uint8 = 0x07 // bits 0..2: nTrans (0..4)
-	shapeFlagTracked   uint8 = 1 << 3
+	shapeFlagTransMask         uint8 = 0x07 // bits 0..2: nTrans (0..4)
+	shapeFlagTracked           uint8 = 1 << 3
+	shapeFlagMetaProxy         uint8 = 1 << 4 // metaRef is the __index target proto table, not the wrapper metatable
+	shapeFlagMetaProxyPoisoned uint8 = 1 << 5 // proxy shape invalidated by in-place mutation of a proxy metatable
 )
 
 type shapeTrans struct {
@@ -72,6 +74,14 @@ func (sh *Shape) isTracked() bool {
 
 func (sh *Shape) markTracked() {
 	sh.hdr.Flags |= shapeFlagTracked
+}
+
+func (sh *Shape) isMetaProxy() bool {
+	return sh.hdr.Flags&shapeFlagMetaProxy != 0
+}
+
+func (sh *Shape) isMetaProxyPoisoned() bool {
+	return sh.hdr.Flags&shapeFlagMetaProxyPoisoned != 0
 }
 
 func shapeIndexHash(v Value, mask uint32) uint32 {
@@ -191,17 +201,24 @@ func (sh *Shape) Keys(a *arena.Arena) []Value {
 	return out
 }
 
+type metaRootKey struct {
+	metaRef   arena.ObjRef
+	metaProxy bool
+}
+
 type metaTransKey struct {
-	shapeRef arena.ObjRef
-	metaRef  arena.ObjRef
+	shapeRef  arena.ObjRef
+	metaRef   arena.ObjRef
+	metaProxy bool
 }
 
 type shapeRegistry struct {
 	nextID      uint64
 	rootRef     arena.ObjRef
-	metaRoots   map[arena.ObjRef]arena.ObjRef
+	metaRoots   map[metaRootKey]arena.ObjRef
 	metaTrans   map[metaTransKey]arena.ObjRef
 	transShapes []arena.ObjRef // shapes with >= 1 transition; pruned in GC PreSweep
+	proxyShapes []arena.ObjRef // canonical __index-proxy shapes; cleared on poison or GC PreSweep
 }
 
 func (sr *shapeRegistry) init(s *State) {
@@ -228,9 +245,9 @@ func (sr *shapeRegistry) trackTrans(sh *Shape) {
 // pruneDead removes all weak shape cache entries referencing White (soon-to-be-freed)
 // shapes or metatables during GC PreSweep (zero weak.Pointer overhead!).
 func (sr *shapeRegistry) pruneDead(a *arena.Arena, c *arena.Collector) {
-	for metaRef, shRef := range sr.metaRoots {
-		if c.IsWhite(metaRef) || c.IsWhite(shRef) {
-			delete(sr.metaRoots, metaRef)
+	for k, shRef := range sr.metaRoots {
+		if c.IsWhite(k.metaRef) || c.IsWhite(shRef) {
+			delete(sr.metaRoots, k)
 		}
 	}
 	for k, shRef := range sr.metaTrans {
@@ -285,9 +302,47 @@ func (sr *shapeRegistry) pruneDead(a *arena.Arena, c *arena.Collector) {
 		kept++
 	}
 	sr.transShapes = sr.transShapes[:kept]
+	keptProxy := 0
+	for _, shRef := range sr.proxyShapes {
+		if c.IsWhite(shRef) {
+			continue
+		}
+		sh := arena.AsSmall[Shape](a, shRef)
+		if sh.metaRef == arena.NullRef || c.IsWhite(sh.metaRef) {
+			sh.hdr.Flags |= shapeFlagMetaProxyPoisoned
+			sh.metaRef = arena.NullRef
+			continue
+		}
+		sr.proxyShapes[keptProxy] = shRef
+		keptProxy++
+	}
+	sr.proxyShapes = sr.proxyShapes[:keptProxy]
 }
 
-func (sr *shapeRegistry) allocShape(s *State, parentRef, metaRef arena.ObjRef, keyVal Value, slot, length int16) (*Shape, error) {
+// poisonProxyProto releases strong/weak proxy-shape references to protoRef immediately
+// when any wrapper metatable proxying protoRef is mutated in place.
+func (sr *shapeRegistry) poisonProxyProto(a *arena.Arena, protoRef arena.ObjRef) {
+	delete(sr.metaRoots, metaRootKey{metaRef: protoRef, metaProxy: true})
+	for k := range sr.metaTrans {
+		if k.metaProxy && k.metaRef == protoRef {
+			delete(sr.metaTrans, k)
+		}
+	}
+	kept := 0
+	for _, shRef := range sr.proxyShapes {
+		sh := arena.AsSmall[Shape](a, shRef)
+		if sh.metaRef == protoRef {
+			sh.hdr.Flags |= shapeFlagMetaProxyPoisoned
+			sh.metaRef = arena.NullRef
+			continue
+		}
+		sr.proxyShapes[kept] = shRef
+		kept++
+	}
+	sr.proxyShapes = sr.proxyShapes[:kept]
+}
+
+func (sr *shapeRegistry) allocShape(s *State, parentRef, metaRef arena.ObjRef, proxyFlags uint8, keyVal Value, slot, length int16) (*Shape, error) {
 	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Shape{})), gcKindShape)
 	if err != nil {
 		return nil, err
@@ -298,33 +353,42 @@ func (sr *shapeRegistry) allocShape(s *State, parentRef, metaRef arena.ObjRef, k
 	sh.self = ref
 	sh.parentRef = parentRef
 	sh.metaRef = metaRef
+	sh.hdr.Flags |= proxyFlags & (shapeFlagMetaProxy | shapeFlagMetaProxyPoisoned)
 	sh.keyVal = keyVal
 	sh.slot = slot
 	sh.length = length
+	if proxyFlags&shapeFlagMetaProxy != 0 && proxyFlags&shapeFlagMetaProxyPoisoned == 0 && metaRef != arena.NullRef {
+		sr.proxyShapes = append(sr.proxyShapes, ref)
+	}
 	return sh, nil
 }
 
-func (sr *shapeRegistry) Root(s *State, metaRef arena.ObjRef, rootObj Value) *Shape {
+func (sr *shapeRegistry) Root(s *State, metaRef arena.ObjRef, metaProxy bool, rootObj, metaRoot Value) *Shape {
 	if metaRef == arena.NullRef {
 		return arena.AsSmall[Shape](s.arena, sr.rootRef)
 	}
+	rk := metaRootKey{metaRef: metaRef, metaProxy: metaProxy}
 	if sr.metaRoots == nil {
-		sr.metaRoots = make(map[arena.ObjRef]arena.ObjRef, 16)
-	} else if shRef, ok := sr.metaRoots[metaRef]; ok {
+		sr.metaRoots = make(map[metaRootKey]arena.ObjRef, 16)
+	} else if shRef, ok := sr.metaRoots[rk]; ok {
 		return arena.AsSmall[Shape](s.arena, shRef)
 	}
 	if s.memLimit > 0 {
-		if err := s.checkMemWithRoots(128, rootObj, tableRefValue(metaRef), NilValue()); err != nil {
+		if err := s.checkMemWithRoots(128, rootObj, metaRoot, NilValue()); err != nil {
 			s.memExceeded = true
 			return nil
 		}
 	}
-	sh, err := sr.allocShape(s, arena.NullRef, metaRef, NilValue(), -1, 0)
+	var proxyFlags uint8
+	if metaProxy {
+		proxyFlags = shapeFlagMetaProxy
+	}
+	sh, err := sr.allocShape(s, arena.NullRef, metaRef, proxyFlags, NilValue(), -1, 0)
 	if err != nil {
 		s.memExceeded = true
 		return nil
 	}
-	sr.metaRoots[metaRef] = sh.self
+	sr.metaRoots[rk] = sh.self
 	return sh
 }
 
@@ -375,7 +439,7 @@ func (sr *shapeRegistry) Transition(s *State, shRef arena.ObjRef, k *LuaString, 
 	// Reload sh pointer after potential emergency GC (Arena is non-moving, sh stays valid).
 	sh = arena.AsSmall[Shape](s.arena, shRef)
 	n = sh.nTrans()
-	child, err := sr.allocShape(s, sh.self, sh.metaRef, StringValue(k), sh.length, sh.length+1)
+	child, err := sr.allocShape(s, sh.self, sh.metaRef, sh.hdr.Flags&(shapeFlagMetaProxy|shapeFlagMetaProxyPoisoned), StringValue(k), sh.length, sh.length+1)
 	if err != nil {
 		return nil, err
 	}
@@ -421,27 +485,30 @@ func (sr *shapeRegistry) Transition(s *State, shRef arena.ObjRef, k *LuaString, 
 	return child, nil
 }
 
-// WithMeta returns a shape having the exact same ordered keys as shRef, but with metatable metaRef.
-func (sr *shapeRegistry) WithMeta(s *State, shRef, metaRef arena.ObjRef, rootObj Value) (arena.ObjRef, bool) {
+// WithMeta returns a shape having the exact same ordered keys as shRef, but with metatable
+// (or canonical __index proxy prototype when metaProxy is true) metaRef.
+// metaRoot must be the live metatable Value so emergency GC keeps both the wrapper and its
+// target prototype rooted across shape allocation.
+func (sr *shapeRegistry) WithMeta(s *State, shRef, metaRef arena.ObjRef, metaProxy bool, rootObj, metaRoot Value) (arena.ObjRef, bool) {
 	if shRef == arena.NullRef {
-		r := sr.Root(s, metaRef, rootObj)
+		r := sr.Root(s, metaRef, metaProxy, rootObj, metaRoot)
 		if r == nil {
 			return arena.NullRef, false
 		}
 		return r.self, true
 	}
 	sh := arena.AsSmall[Shape](s.arena, shRef)
-	if sh.metaRef == metaRef {
+	if sh.metaRef == metaRef && sh.isMetaProxy() == metaProxy {
 		return shRef, true
 	}
 	if sh.length == 0 {
-		if r := sr.Root(s, metaRef, rootObj); r != nil {
+		if r := sr.Root(s, metaRef, metaProxy, rootObj, metaRoot); r != nil {
 			return r.self, true
 		}
 		s.memExceeded = true
 		return shRef, false
 	}
-	key := metaTransKey{shapeRef: shRef, metaRef: metaRef}
+	key := metaTransKey{shapeRef: shRef, metaRef: metaRef, metaProxy: metaProxy}
 	if sr.metaTrans != nil {
 		if cached, ok := sr.metaTrans[key]; ok {
 			return cached, true
@@ -449,18 +516,17 @@ func (sr *shapeRegistry) WithMeta(s *State, shRef, metaRef arena.ObjRef, rootObj
 	} else {
 		sr.metaTrans = make(map[metaTransKey]arena.ObjRef, 16)
 	}
-	cur := sr.Root(s, metaRef, rootObj)
+	cur := sr.Root(s, metaRef, metaProxy, rootObj, metaRoot)
 	if cur == nil {
 		s.memExceeded = true
 		return shRef, false
 	}
 	curRef := cur.self
-	metaVal := tableRefValue(metaRef)
 	keys := sh.Keys(s.arena)
 	for _, kv := range keys {
 		prevPinned := s.pinnedShapeRef
 		s.pinnedShapeRef = curRef
-		next, err := sr.Transition(s, curRef, s.asString(kv), rootObj, metaVal)
+		next, err := sr.Transition(s, curRef, s.asString(kv), rootObj, metaRoot)
 		s.pinnedShapeRef = prevPinned
 		if err != nil || next == nil {
 			s.memExceeded = true
@@ -542,6 +608,26 @@ func (ic *ICEntry) getTabUpFast(a *arena.Arena, t *Table) (Value, bool) {
 		}
 	}
 	return NilValue(), false
+}
+
+func (ic *ICEntry) setTabUpFast(s *State, t *Table, val Value) bool {
+	if ic.kind == icEnvSlot && ic.holderRef == t.self && !t.isProto() && !val.IsNil() && t.hashRef != arena.NullRef {
+		h := arena.AsSmall[tableHash](s.arena, t.hashRef)
+		if ic.epoch == h.dictGen && h.nodesRef != arena.NullRef {
+			nd := (*hashNode)(unsafe.Add(s.arena.PtrFast(h.nodesRef), uintptr(ic.slot)*unsafe.Sizeof(hashNode{})))
+			if !nd.val.IsNil() {
+				nd.val = val
+				if t.tmFlags != 0 {
+					t.tmFlags = 0
+				}
+				if val.IsGCObject() && t.hdr.IsBlack() {
+					s.barrierBackRef(t.self)
+				}
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (ic *ICEntry) getFieldFast(a *arena.Arena, t *Table, protoEpoch uint64) (Value, bool) {

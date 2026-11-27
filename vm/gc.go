@@ -279,7 +279,7 @@ func (s *State) gcTraverse(c *arena.Collector, ref arena.ObjRef) int64 {
 		if sh.parentRef != arena.NullRef {
 			c.MarkObject(sh.parentRef)
 		}
-		if sh.metaRef != arena.NullRef {
+		if sh.metaRef != arena.NullRef && !sh.isMetaProxy() {
 			c.MarkObject(sh.metaRef)
 		}
 		s.markValue(c, sh.keyVal)

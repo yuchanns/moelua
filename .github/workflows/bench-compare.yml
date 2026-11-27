@@ -1,0 +1,200 @@
+name: Cross-Engine Benchmarks
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/assets/bench-compare.svg"
+      - "docs/assets/bench-multivm.svg"
+      - "docs/benchmarks.md"
+      - "README.md"
+  workflow_dispatch:
+    inputs:
+      engines:
+        description: "Engine regex (ArnodelGolua runs in its own PGO build automatically if matched)"
+        required: false
+        default: "^(C|C-O3|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$"
+      programs:
+        description: "Optional program regex filter (empty = all 32 programs)"
+        required: false
+        default: ""
+      benchtime:
+        description: "go test -benchtime value"
+        required: false
+        default: "300ms"
+      count:
+        description: "go test -count rounds"
+        required: false
+        default: "3"
+      run_memcmp:
+        description: "Run isolated-process 256-VM memory & Go GC comparison"
+        type: boolean
+        default: true
+      commit_chart:
+        description: "Commit regenerated docs/assets/bench-compare.svg to main (only when run on main)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bench-compare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, 'chore(bench):')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bench/compare/go.mod
+          cache: false
+
+      - name: Build reference C Lua 5.5.1 (-O2, -O3, and multi-VM memory helper)
+        run: make build/lua55_o2 build/lua55_o3 build/clua_mem
+
+      - name: Verify 32/32 output equivalence (C vs MoeLua)
+        working-directory: bench/compare
+        run: go test -vet=off -timeout 10m -run TestOutputs -engines '^(C|MoeLua)$' .
+
+      - name: Run high-density multi-VM memory & Go GC comparison
+        if: ${{ github.event_name == 'push' || inputs.run_memcmp }}
+        working-directory: bench/compare
+        run: |
+          go build -o /tmp/memcmp memcmp.go
+          /tmp/memcmp -json memcmp.json | tee memcmp.txt
+          {
+            echo "### High-Density Multi-VM Memory & Go GC Comparison"
+            echo '```text'
+            cat memcmp.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run cross-engine CPU benchmarks
+        working-directory: bench/compare
+        env:
+          INPUT_ENGINES: ${{ inputs.engines || '^(C|C-O3|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$' }}
+          INPUT_PROGRAMS: ${{ inputs.programs || '' }}
+          INPUT_BENCHTIME: ${{ inputs.benchtime || '300ms' }}
+          INPUT_COUNT: ${{ inputs.count || '3' }}
+        run: |
+          set -euo pipefail
+          MAIN_ENGINES="$(python3 -c '
+          import os, re
+          pat = re.compile(os.environ["INPUT_ENGINES"])
+          names = ["C", "C-O3", "MoeLua", "Apogee-JIT", "Apogee-Interp", "CCGO", "GopherLua", "GoLua", "DCLua", "LuaJIT-joff", "LuaJIT"]
+          picked = [n for n in names if pat.search(n)]
+          print("^(" + "|".join(re.escape(n) for n in picked) + ")$" if picked else "")
+          ')"
+          RUN_GOLUA="$(python3 -c '
+          import os, re
+          print("1" if re.compile(os.environ["INPUT_ENGINES"]).search("ArnodelGolua") else "0")
+          ')"
+          : > bench_raw.txt
+          if [ -n "$MAIN_ENGINES" ]; then
+            GOMAXPROCS=1 go test -vet=off -timeout 60m -run @ -bench . \
+              -benchtime "$INPUT_BENCHTIME" -count "$INPUT_COUNT" \
+              -engines "$MAIN_ENGINES" -programs "$INPUT_PROGRAMS" . | tee -a bench_raw.txt
+          fi
+          if [ "$RUN_GOLUA" = "1" ]; then
+            GOLUA_DIR="$(go list -m -f '{{.Dir}}' github.com/arnodel/golua)"
+            PGO_ARGS=()
+            if [ -f "$GOLUA_DIR/default.pgo" ]; then
+              PGO_ARGS=(-pgo="$GOLUA_DIR/default.pgo")
+            fi
+            GOMAXPROCS=1 go test -vet=off -timeout 30m "${PGO_ARGS[@]}" -run @ -bench . \
+              -benchtime "$INPUT_BENCHTIME" -count "$INPUT_COUNT" \
+              -engines '^ArnodelGolua$' -programs "$INPUT_PROGRAMS" . | tee -a bench_raw.txt
+          fi
+          go run benchreport.go -json bench_summary.json < bench_raw.txt > bench_report.txt
+          {
+            echo "### Cross-Engine CPU Benchmarks (relative to C Lua 5.5.1 -O2, lower is faster)"
+            echo '```text'
+            awk '/^are-we-fast-yet,|^Benchmarks Game,|^SciMark|^the Go engines|^micro benchmarks,|^all but micro/{show=1} /^ms\/op, best\/median/{show=0} show{print}' bench_report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Regenerate README performance chart SVGs
+        if: ${{ github.event_name == 'push' || inputs.run_memcmp }}
+        working-directory: bench/compare
+        run: |
+          set -euo pipefail
+          HAS_CHART_DATA="$(python3 -c '
+          import json, os
+          if not (os.path.exists("bench_summary.json") and os.path.exists("memcmp.json")):
+              print("0"); raise SystemExit
+          b = json.load(open("bench_summary.json"))
+          m = json.load(open("memcmp.json"))
+          print("1" if b.get("common_count", 0) > 0 and "C" in b.get("common_geomean", {}) and len(m) > 0 else "0")
+          ')"
+          if [ "$HAS_CHART_DATA" = "1" ]; then
+            CPU_MODEL="$(lscpu 2>/dev/null | awk -F: '/Model name/{gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+            [ -n "$CPU_MODEL" ] || CPU_MODEL="$(uname -m)"
+            GO_VER="$(go env GOVERSION | sed 's/^go//')"
+            SUBTITLE="GitHub Actions (${CPU_MODEL}, $(go env GOOS)/$(go env GOARCH)) · Go ${GO_VER} · GOMAXPROCS=1 · Lower is better"
+            go run genchart.go \
+              -bench bench_summary.json \
+              -mem memcmp.json \
+              -subtitle "$SUBTITLE" \
+              -date "$(date -u +%Y-%m-%d)" \
+              -commit "${GITHUB_SHA::7}" \
+              -out ../../docs/assets/bench-compare.svg \
+              -out-multivm ../../docs/assets/bench-multivm.svg
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "ERROR: push to main did not produce both C-baseline common_geomean and memcmp.json" >&2
+            exit 1
+          else
+            echo "Skipping chart regeneration (requires both C-baseline common_geomean and memcmp.json)."
+          fi
+
+      - name: Commit updated README performance charts to main
+        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.commit_chart) }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain -- docs/assets/bench-compare.svg docs/assets/bench-multivm.svg)" ]; then
+            echo "Charts unchanged; skipping commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp docs/assets/bench-compare.svg /tmp/bench-compare-new.svg
+          cp docs/assets/bench-multivm.svg /tmp/bench-multivm-new.svg
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            cp /tmp/bench-compare-new.svg docs/assets/bench-compare.svg
+            cp /tmp/bench-multivm-new.svg docs/assets/bench-multivm.svg
+            if [ -z "$(git status --porcelain -- docs/assets/bench-compare.svg docs/assets/bench-multivm.svg)" ]; then
+              echo "Charts already match origin/main; skipping commit."
+              exit 0
+            fi
+            git add docs/assets/bench-compare.svg docs/assets/bench-multivm.svg
+            git commit -m "chore(bench): update README performance charts (${GITHUB_SHA::7})"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push conflict on attempt $attempt; retrying..."
+            sleep 2
+          done
+          exit 1
+
+      - name: Upload benchmark report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-compare-report
+          path: |
+            bench/compare/bench_report.txt
+            bench/compare/bench_summary.json
+            bench/compare/memcmp.txt
+            bench/compare/memcmp.json
+            docs/assets/bench-compare.svg
+            docs/assets/bench-multivm.svg
+          if-no-files-found: ignore
