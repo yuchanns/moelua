@@ -55,6 +55,7 @@ type jitExecCtx struct {
 	absIdx      uint32     // staticNative idx for math.abs (0 if unregistered)
 	deoptID     uint32     // side-exit / deopt descriptor index (0 for baseline PC exits)
 	optOuterRem int64      // strip-mined outer remaining trip count for Tier-2 counted loops
+	optVecTmp   uint64     // dedicated 8-byte scratch slot for SIMD vector loops (e.g. AMD64 pair counter save)
 	optSpill    [16]uint64 // pointer-free scratch spill slots for Tier-2 optimizing loop IR
 }
 
@@ -91,6 +92,7 @@ const (
 	jitCtxAbsIdx      = int32(unsafe.Offsetof(jitExecCtx{}.absIdx))
 	jitCtxDeoptID     = int32(unsafe.Offsetof(jitExecCtx{}.deoptID))
 	jitCtxOptOuterRem = int32(unsafe.Offsetof(jitExecCtx{}.optOuterRem))
+	jitCtxOptVecTmp   = int32(unsafe.Offsetof(jitExecCtx{}.optVecTmp))
 	jitCtxOptSpill    = int32(unsafe.Offsetof(jitExecCtx{}.optSpill))
 
 	// Value layout

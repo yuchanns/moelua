@@ -19,7 +19,47 @@ func OptimizeRegion(reg *LoopRegion) bool {
 	markWrittenShapes(reg)
 	runBCE(reg)
 	runDCE(reg)
+	tightenWideningGuards(reg)
 	return verifyOrHoistDeoptSafety(reg)
+}
+
+// tightenWideningGuards downgrades OpUnboxNumFloat (int->float preheader widening)
+// on any written LoopVar to strict OpUnboxFloat whenever the loop body still contains
+// a mid-loop deoptable instruction. This prevents a deopt on iteration 1 from
+// materializing an unexecuted int->float conversion back into Lua registers.
+func tightenWideningGuards(reg *LoopRegion) {
+	hasDeopt := false
+	for _, blk := range reg.Blocks {
+		for i := range blk.Insts {
+			in := &blk.Insts[i]
+			if !in.Dead && canDeoptMidLoop(in) {
+				hasDeopt = true
+				break
+			}
+		}
+		if hasDeopt {
+			break
+		}
+	}
+	if !hasDeopt {
+		return
+	}
+	varInit := make(map[ValID]bool, len(reg.Vars))
+	for i := range reg.Vars {
+		if reg.Vars[i].Written && reg.Vars[i].AcceptIntInit {
+			varInit[reg.Vars[i].InitVal] = true
+			reg.Vars[i].AcceptIntInit = false
+		}
+	}
+	if len(varInit) == 0 {
+		return
+	}
+	for i := range reg.Preheader {
+		in := &reg.Preheader[i]
+		if !in.Dead && in.Op == OpUnboxNumFloat && varInit[in.ID] {
+			in.Op = OpUnboxFloat
+		}
+	}
 }
 
 // markWrittenShapes tags any OpGuardShape whose result is written by OpStoreSlot*
@@ -88,11 +128,9 @@ func verifyOrHoistDeoptSafety(reg *LoopRegion) bool {
 			for i := range blk.Insts {
 				defIdx[blk.Insts[i].ID] = i
 			}
-			type slotKey struct {
-				obj  ValID
-				slot int32
-			}
-			storedSlots := make(map[slotKey]bool)
+			// Track written slot indices across ALL shape objects (two distinct SSA
+			// shape objects may alias the exact same Table at runtime!).
+			storedSlots := make(map[int32]bool)
 			var hoisted []Inst
 			hoistedAt := make(map[int]bool)
 			for i := firstMut; i < len(blk.Insts); i++ {
@@ -101,12 +139,12 @@ func verifyOrHoistDeoptSafety(reg *LoopRegion) bool {
 					continue
 				}
 				if in.Op == OpStoreSlotFloat || in.Op == OpStoreSlotInt {
-					storedSlots[slotKey{in.Args[0], in.AuxIdx}] = true
+					storedSlots[in.AuxIdx] = true
 					continue
 				}
 				if in.Op == OpLoadSlotFloat || in.Op == OpLoadSlotInt {
 					obj := in.Args[0]
-					if di, ok := defIdx[obj]; ok && di < firstMut && !storedSlots[slotKey{obj, in.AuxIdx}] {
+					if di, ok := defIdx[obj]; ok && di < firstMut && !storedSlots[in.AuxIdx] {
 						hoisted = append(hoisted, *in)
 						hoistedAt[i] = true
 					}
@@ -410,7 +448,7 @@ func runDCE(reg *LoopRegion) {
 				if in.Dead {
 					continue
 				}
-				if hasSideEffect(in.Op) || used[in.ID] {
+				if hasSideEffect(in) || used[in.ID] {
 					for k := uint8(0); k < in.NumArgs; k++ {
 						markCh(in.Args[k])
 					}
@@ -422,7 +460,7 @@ func runDCE(reg *LoopRegion) {
 			if in.Dead {
 				continue
 			}
-			if hasSideEffect(in.Op) || used[in.ID] {
+			if hasSideEffect(in) || used[in.ID] {
 				for k := uint8(0); k < in.NumArgs; k++ {
 					markCh(in.Args[k])
 				}
@@ -435,21 +473,24 @@ func runDCE(reg *LoopRegion) {
 	for _, blk := range reg.Blocks {
 		for i := range blk.Insts {
 			in := &blk.Insts[i]
-			if !in.Dead && !hasSideEffect(in.Op) && !used[in.ID] {
+			if !in.Dead && !hasSideEffect(in) && !used[in.ID] {
 				in.Dead = true
 			}
 		}
 	}
 	for i := range reg.Preheader {
 		in := &reg.Preheader[i]
-		if !in.Dead && !hasSideEffect(in.Op) && !used[in.ID] {
+		if !in.Dead && !hasSideEffect(in) && !used[in.ID] {
 			in.Dead = true
 		}
 	}
 }
 
-func hasSideEffect(op Op) bool {
-	switch op {
+func hasSideEffect(in *Inst) bool {
+	if canDeoptMidLoop(in) {
+		return true
+	}
+	switch in.Op {
 	case OpLoopCnt, OpLoopStep, OpLoopIdx,
 		OpSetVar,
 		OpStoreArrInt, OpStoreArrFlt, OpStoreArrBool,

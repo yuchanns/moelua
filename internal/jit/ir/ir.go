@@ -270,11 +270,13 @@ type AliasCheck struct {
 	SrcDel int64
 }
 
-// VecSplat broadcasts a loop-invariant scalar ValID into a 128-bit vector register.
+// VecSplat broadcasts a loop-invariant scalar ValID (or immediate constant) into a 128-bit vector register.
 type VecSplat struct {
 	ScalarVal ValID
 	IsFloat   bool
-	VReg      int // Virtual vector register index
+	IsConst   bool   // true when ScalarVal is a constant; broadcast directly from ConstBits
+	ConstBits uint64 // IEEE-754 bits (float64) or two's-complement bits (int64) when IsConst is true
+	VReg      int    // Virtual vector register index
 }
 
 // VecPtr tracks a contiguous stride-1 array pointer advanced by 16 bytes per SIMD iteration.

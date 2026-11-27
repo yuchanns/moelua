@@ -340,6 +340,102 @@ end
 print(sum, #dense, #empty_gen, #trailing_nil, #mt)
 `,
 		},
+		{
+			name: "codex_aliased_field_load_hoist_safety",
+			src: `
+local t = { x = 1.0, y = 1.0 }
+local objs = { t, t }
+local function step(o)
+  for i = 1, 20000 do
+    local a = o[1]
+    local b = o[2]
+    local av = a.x
+    local bv = b.y
+    a.x = av + 1.0
+    b.y = bv + b.x
+  end
+end
+step(objs)
+print(string.format("%.1f %.1f", t.x, t.y))
+`,
+		},
+		{
+			name: "codex_conditional_float_preserves_int64_and_mathtype",
+			src: `
+local x = 9007199254740993
+for i = 1, 10 do
+  if i < 0 then
+    x = x + 0.5
+  end
+end
+local w = 9007199254740993
+local k = 0
+while k < 0 do
+  w = w + 0.5
+  k = k + 1
+end
+print(x, math.type(x), w, math.type(w))
+`,
+		},
+		{
+			name: "codex_multichunk_simd_neg_and_abs_over_20000",
+			src: `
+local n = 20000
+local a, b, c = {}, {}, {}
+for i = 1, n do
+  a[i] = i * 1.0
+  b[i] = 0.0
+  c[i] = 0.0
+end
+for i = 1, n do b[i] = -a[i] end
+for i = 1, n do c[i] = math.abs(b[i]) end
+print(b[1], b[8191], b[8192], b[8193], b[20000], c[1], c[8192], c[20000])
+`,
+		},
+		{
+			name: "codex_unused_non_bce_array_load_invokes_index_metamethod",
+			src: `
+local calls = 0
+local a = setmetatable({1, 2}, {
+  __index = function(t, k)
+    calls = calls + 1
+    return 10
+  end,
+})
+for i = 1, 10 do
+  local unused = a[i * i]
+end
+print(calls)
+`,
+		},
+		{
+			name: "codex_body_local_constants_in_simd_splats",
+			src: `
+local a, b = {}, {}
+for i = 1, 20 do a[i] = i * 1.0; b[i] = 0.0 end
+for i = 1, 20 do
+  local c = 2.0
+  b[i] = a[i] + c
+end
+local ia, ib = {}, {}
+for i = 1, 20 do ia[i] = i; ib[i] = 0 end
+for i = 1, 20 do
+  local k = 7
+  ib[i] = ia[i] + k
+end
+print(b[1], b[2], b[20], ib[1], ib[2], ib[20])
+`,
+		},
+		{
+			name: "codex_type_changing_loop_var_write_rejected",
+			src: `
+local x = true
+for i = 1, 10 do x = 1 end
+local y = 5
+for i = 1, 10 do y = false end
+print(x, type(x), y, type(y))
+`,
+		},
 	}
 
 	for _, tc := range cases {

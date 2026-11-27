@@ -739,26 +739,18 @@ func (e *a64OptEmit) emitNEONVecLoop(lScalar, lChunkDone arm64.Label) {
 	// Broadcast loop-invariant splats into NEON vector registers.
 	for _, sp := range plan.Splats {
 		vd := vreg(sp.VReg)
+		if sp.IsConst {
+			e.a.MOVImm64(arm64.X12, sp.ConstBits)
+			e.a.DUP2DGPR(vd, arm64.X12)
+			continue
+		}
 		sloc := e.alloc.ValLoc[sp.ScalarVal]
 		if sp.IsFloat {
-			if sloc.Phys >= 0 || sloc.Spill >= 0 {
-				sf := e.loadF(sloc, arm64.D31)
-				e.a.DUP2DElem0(vd, sf)
-			} else {
-				// Body-local constant (e.g. OpConstFloat not allocated a preheader loc)
-				bits := e.findConstBits(sp.ScalarVal)
-				e.a.MOVImm64(arm64.X12, bits)
-				e.a.DUP2DGPR(vd, arm64.X12)
-			}
+			sf := e.loadF(sloc, arm64.D31)
+			e.a.DUP2DElem0(vd, sf)
 		} else {
-			if sloc.Phys >= 0 || sloc.Spill >= 0 {
-				sr := e.loadG(sloc, arm64.X12)
-				e.a.DUP2DGPR(vd, sr)
-			} else {
-				bits := e.findConstBits(sp.ScalarVal)
-				e.a.MOVImm64(arm64.X12, bits)
-				e.a.DUP2DGPR(vd, arm64.X12)
-			}
+			sr := e.loadG(sloc, arm64.X12)
+			e.a.DUP2DGPR(vd, sr)
 		}
 	}
 
@@ -871,28 +863,6 @@ func (e *a64OptEmit) emitVecElemPtr(dst arm64.Reg, arrVal, baseOff ir.ValID, del
 	}
 	baseR := e.loadG(e.alloc.ValLoc[arrVal], dst)
 	e.a.ADDShift(dst, baseR, tmp, arm64.ShiftLSL, 3)
-}
-
-func (e *a64OptEmit) findConstBits(id ir.ValID) uint64 {
-	for i := range e.reg.Preheader {
-		if e.reg.Preheader[i].ID == id {
-			if e.reg.Preheader[i].Op == ir.OpConstFloat {
-				return e.reg.Preheader[i].ImmU
-			}
-			return uint64(e.reg.Preheader[i].ImmI)
-		}
-	}
-	for _, blk := range e.reg.Blocks {
-		for i := range blk.Insts {
-			if blk.Insts[i].ID == id {
-				if blk.Insts[i].Op == ir.OpConstFloat {
-					return blk.Insts[i].ImmU
-				}
-				return uint64(blk.Insts[i].ImmI)
-			}
-		}
-	}
-	return 0
 }
 
 // --- Scalar Body Lowering ---

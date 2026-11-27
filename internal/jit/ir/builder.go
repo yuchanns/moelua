@@ -69,6 +69,7 @@ type loopBuilder struct {
 	// Per-block current SSA map & shape CSE cache
 	curSlot   map[uint8]ValID
 	curShapes map[ValID]shapeCacheEntry
+	failed    bool
 }
 
 type shapeCacheEntry struct {
@@ -153,8 +154,16 @@ func (b *loopBuilder) build() *LoopRegion {
 			case TInt:
 				initVal = b.emitPre(Inst{Op: OpUnboxInt, Type: TInt, Slot: slot})
 			case TFloat:
-				acceptInt = true
-				initVal = b.emitPre(Inst{Op: OpUnboxNumFloat, Type: TFloat, Slot: slot})
+				// Only allow int->float preheader widening when the single loop body is
+				// guaranteed to execute at least once and unconditionally perform the write.
+				// Conditional or while-loop variables require strict tagFloat on entry so an
+				// untouched Lua integer never loses precision or changes math.type().
+				if b.cand.Kind == LoopForInt && singleBlock {
+					acceptInt = true
+					initVal = b.emitPre(Inst{Op: OpUnboxNumFloat, Type: TFloat, Slot: slot})
+				} else {
+					initVal = b.emitPre(Inst{Op: OpUnboxFloat, Type: TFloat, Slot: slot})
+				}
 			case TBool:
 				initVal = b.emitPre(Inst{Op: OpUnboxBool, Type: TBool, Slot: slot})
 			}
@@ -189,7 +198,7 @@ func (b *loopBuilder) build() *LoopRegion {
 		}
 		blk := &Block{ID: bi, StartPC: startPC}
 		b.reg.Blocks[bi] = blk
-		if !b.lowerBlock(blk, startPC, endPC, pcToBlock) {
+		if !b.lowerBlock(blk, startPC, endPC, pcToBlock) || b.failed {
 			return nil
 		}
 	}
@@ -1400,9 +1409,11 @@ func (b *loopBuilder) writeSlot(blk *Block, slot uint8, v ValID, pc int) {
 	if vi, ok := b.varIdx[slot]; ok {
 		lv := b.reg.Vars[vi]
 		cv, ok := b.coerceVal(blk, v, lv.Type, pc)
-		if ok {
-			v = cv
+		if !ok {
+			b.failed = true
+			return
 		}
+		v = cv
 		b.emitBody(blk, Inst{Op: OpSetVar, Type: lv.Type, AuxIdx: int32(vi), Args: [3]ValID{v, NoVal, NoVal}, NumArgs: 1, DeoptPC: pc})
 	}
 	b.curSlot[slot] = v

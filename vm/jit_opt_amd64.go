@@ -747,29 +747,27 @@ func (e *x64OptEmit) emitSSE2VecLoop(lScalar, lChunkDone amd64.Label) {
 	// Broadcast splats.
 	for _, sp := range plan.Splats {
 		vd := vreg(sp.VReg)
+		if sp.IsConst {
+			e.a.MOVImm64(amd64.RAX, sp.ConstBits)
+			e.a.MOVQToX(vd, amd64.RAX)
+			if sp.IsFloat {
+				e.a.UNPCKLPD(vd, vd)
+			} else {
+				e.a.PUNPCKLQDQ(vd, vd)
+			}
+			continue
+		}
 		sloc := e.alloc.ValLoc[sp.ScalarVal]
 		if sp.IsFloat {
-			if sloc.Phys >= 0 || sloc.Spill >= 0 {
-				sf := e.loadF(sloc, amd64.XMM14)
-				if vd != sf {
-					e.a.MOVSD(vd, sf)
-				}
-				e.a.UNPCKLPD(vd, vd)
-			} else {
-				e.a.MOVImm64(amd64.RAX, e.findConstBits(sp.ScalarVal))
-				e.a.MOVQToX(vd, amd64.RAX)
-				e.a.UNPCKLPD(vd, vd)
+			sf := e.loadF(sloc, amd64.XMM14)
+			if vd != sf {
+				e.a.MOVSD(vd, sf)
 			}
+			e.a.UNPCKLPD(vd, vd)
 		} else {
-			if sloc.Phys >= 0 || sloc.Spill >= 0 {
-				sr := e.loadG(sloc, amd64.RAX)
-				e.a.MOVQToX(vd, sr)
-				e.a.PUNPCKLQDQ(vd, vd)
-			} else {
-				e.a.MOVImm64(amd64.RAX, e.findConstBits(sp.ScalarVal))
-				e.a.MOVQToX(vd, amd64.RAX)
-				e.a.PUNPCKLQDQ(vd, vd)
-			}
+			sr := e.loadG(sloc, amd64.RAX)
+			e.a.MOVQToX(vd, sr)
+			e.a.PUNPCKLQDQ(vd, vd)
 		}
 	}
 
@@ -830,10 +828,10 @@ func (e *x64OptEmit) emitSSE2VecLoop(lScalar, lChunkDone amd64.Label) {
 		case ir.VDivF64:
 			emitBinF(vi, func(d, s amd64.XReg) { e.a.DIVPD(d, s) })
 		case ir.VNegF64:
-			e.a.MOVQStore(amd64.BaseDisp(x64Ctx, jitCtxDeoptID), amd64.RCX)
+			e.a.MOVQStore(amd64.BaseDisp(x64Ctx, jitCtxOptVecTmp), amd64.RCX)
 			e.a.MOVImm64(amd64.RCX, 0x8000000000000000)
 			e.a.MOVQToX(amd64.XMM14, amd64.RCX)
-			e.a.MOVQLoad(amd64.RCX, amd64.BaseDisp(x64Ctx, jitCtxDeoptID))
+			e.a.MOVQLoad(amd64.RCX, amd64.BaseDisp(x64Ctx, jitCtxOptVecTmp))
 			e.a.UNPCKLPD(amd64.XMM14, amd64.XMM14)
 			if vreg(vi.Dst) != vreg(vi.Src1) {
 				e.a.MOVAPD(vreg(vi.Dst), vreg(vi.Src1))
@@ -842,10 +840,10 @@ func (e *x64OptEmit) emitSSE2VecLoop(lScalar, lChunkDone amd64.Label) {
 		case ir.VSqrtF64:
 			e.a.SQRTPD(vreg(vi.Dst), vreg(vi.Src1))
 		case ir.VAbsF64:
-			e.a.MOVQStore(amd64.BaseDisp(x64Ctx, jitCtxDeoptID), amd64.RCX)
+			e.a.MOVQStore(amd64.BaseDisp(x64Ctx, jitCtxOptVecTmp), amd64.RCX)
 			e.a.MOVImm64(amd64.RCX, 0x7FFFFFFFFFFFFFFF)
 			e.a.MOVQToX(amd64.XMM14, amd64.RCX)
-			e.a.MOVQLoad(amd64.RCX, amd64.BaseDisp(x64Ctx, jitCtxDeoptID))
+			e.a.MOVQLoad(amd64.RCX, amd64.BaseDisp(x64Ctx, jitCtxOptVecTmp))
 			e.a.UNPCKLPD(amd64.XMM14, amd64.XMM14)
 			if vreg(vi.Dst) != vreg(vi.Src1) {
 				e.a.MOVAPD(vreg(vi.Dst), vreg(vi.Src1))
@@ -933,28 +931,6 @@ func (e *x64OptEmit) emitVecElemPtr(dst amd64.Reg, arrVal, baseOff ir.ValID, del
 	}
 	baseR := e.loadG(e.alloc.ValLoc[arrVal], dst)
 	e.a.LEAQ(dst, amd64.Indexed(baseR, tmp, 8, 0))
-}
-
-func (e *x64OptEmit) findConstBits(id ir.ValID) uint64 {
-	for i := range e.reg.Preheader {
-		if e.reg.Preheader[i].ID == id {
-			if e.reg.Preheader[i].Op == ir.OpConstFloat {
-				return e.reg.Preheader[i].ImmU
-			}
-			return uint64(e.reg.Preheader[i].ImmI)
-		}
-	}
-	for _, blk := range e.reg.Blocks {
-		for i := range blk.Insts {
-			if blk.Insts[i].ID == id {
-				if blk.Insts[i].Op == ir.OpConstFloat {
-					return blk.Insts[i].ImmU
-				}
-				return uint64(blk.Insts[i].ImmI)
-			}
-		}
-	}
-	return 0
 }
 
 // --- Scalar Body Lowering ---

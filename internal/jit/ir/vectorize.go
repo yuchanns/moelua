@@ -218,11 +218,19 @@ func VectorizeRegion(reg *LoopRegion) {
 			}
 			vr := newVReg()
 			splatMap[id] = vr
-			plan.Splats = append(plan.Splats, VecSplat{
+			sp := VecSplat{
 				ScalarVal: id,
 				IsFloat:   pi.Type == TFloat,
 				VReg:      vr,
-			})
+			}
+			if pi.Op == OpConstFloat {
+				sp.IsConst = true
+				sp.ConstBits = pi.ImmU
+			} else if pi.Op == OpConstInt {
+				sp.IsConst = true
+				sp.ConstBits = uint64(pi.ImmI)
+			}
+			plan.Splats = append(plan.Splats, sp)
 			return vr, true
 		}
 		return -1, false
@@ -298,11 +306,17 @@ func VectorizeRegion(reg *LoopRegion) {
 			varGetID[in.ID] = vi
 
 		case OpConstFloat, OpConstInt:
-			// Body-local constant: hoist as splat!
+			// Body-local constant: materialize directly from immediate bits in SIMD preheader!
 			vr := newVReg()
+			bits := uint64(in.ImmI)
+			if in.Op == OpConstFloat {
+				bits = in.ImmU
+			}
 			plan.Splats = append(plan.Splats, VecSplat{
 				ScalarVal: in.ID,
 				IsFloat:   in.Type == TFloat,
+				IsConst:   true,
+				ConstBits: bits,
 				VReg:      vr,
 			})
 			valVReg[in.ID] = vr
