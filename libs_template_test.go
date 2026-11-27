@@ -1174,6 +1174,72 @@ func TestCodexRound5TemplateAndLibsRegressions(t *testing.T) {
 	})
 }
 
+func TestCodexRound6TemplateAndLibsRegressions(t *testing.T) {
+	t.Run("TemplateSetupHonorsLuaPathAndWithNoEnv", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(tmpDir, "envmod.lua"), []byte("return { v = 123 }\n"), 0o600); err != nil {
+			t.Fatalf("write envmod.lua: %v", err)
+		}
+		t.Setenv("LUA_PATH_5_5", filepath.Join(tmpDir, "?.lua"))
+
+		// Default NewTemplate setup honors LUA_PATH_5_5 just like New().
+		tmpl, err := NewTemplate(func(s *State) error {
+			_, err := s.DoString(`env_val = require("envmod").v`)
+			return err
+		})
+		if err != nil {
+			t.Fatalf("NewTemplate setup with LUA_PATH_5_5 failed: %v", err)
+		}
+		s := tmpl.NewState()
+		defer s.Close()
+		if got := s.GetGlobal("env_val").Int(); got != 123 {
+			t.Fatalf("env_val = %d, want 123", got)
+		}
+
+		// Opening LibPackage dynamically inside setup also honors LUA_PATH_5_5.
+		tmplDyn, err := NewTemplate(func(s *State) error {
+			if err := s.OpenLibs(LibPackage); err != nil {
+				return err
+			}
+			_, err := s.DoString(`env_val = require("envmod").v`)
+			return err
+		}, WithLibs(LibBase))
+		if err != nil {
+			t.Fatalf("NewTemplate dynamic OpenLibs(LibPackage) with LUA_PATH_5_5 failed: %v", err)
+		}
+		sd := tmplDyn.NewState()
+		defer sd.Close()
+		if got := sd.GetGlobal("env_val").Int(); got != 123 {
+			t.Fatalf("dynamic env_val = %d, want 123", got)
+		}
+
+		// WithNoEnv suppresses LUA_PATH_5_5 both during setup and in clones.
+		if _, err := NewTemplate(func(s *State) error {
+			_, err := s.DoString(`require("envmod")`)
+			return err
+		}, WithNoEnv()); err == nil {
+			t.Fatalf("expected WithNoEnv template setup to ignore LUA_PATH_5_5")
+		}
+	})
+
+	t.Run("TemplateSetupMemoryLimitCountsBootstrapStrings", func(t *testing.T) {
+		// Exact Codex Round 6 repro: cumulative bootstrap string allocations in setup
+		// must count against WithMemoryLimit so 16 MiB of strings cannot bypass a 1 MiB cap.
+		_, err := NewTemplate(func(s *State) error {
+			_, err := s.DoString(`
+				items = {}
+				for i = 1, 64 do
+					items[i] = string.rep(string.char(i), 256 * 1024)
+				end
+			`)
+			return err
+		}, WithLibs(LibSafe), WithMemoryLimit(1<<20))
+		if err == nil || !strings.Contains(err.Error(), "not enough memory") {
+			t.Fatalf("expected 'not enough memory' for 16 MiB strings under 1 MiB limit, got %v", err)
+		}
+	})
+}
+
 func BenchmarkTemplateNewState(b *testing.B) {
 	tmpl, err := NewTemplate(func(s *State) error {
 		if _, err := s.RequireLib("svc", func(st *State, _ []Value) ([]Value, error) {

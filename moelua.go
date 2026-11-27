@@ -286,6 +286,11 @@ func NewTemplate(setup func(s *State) error, opts ...Option) (*Template, error) 
 	rawTmpl, err := vm.BuildTemplate(mask, func(raw *vm.State) error {
 		st := &State{vm: raw}
 		raw.SetHost(st)
+		if cfg.noEnv {
+			raw.SetNoEnv()
+		} else if setup != nil {
+			raw.ApplyPackageEnv()
+		}
 		if cfg.out != nil {
 			raw.SetOutput(cfg.out)
 		}

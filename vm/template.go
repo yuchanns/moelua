@@ -483,11 +483,30 @@ func (tmpl *Template) Clone(noEnv bool) *State {
 	s.defaultOutput = tmpl.defaultOutput
 
 	if !noEnv {
-		s.applyPackageEnv()
+		if !s.isNoEnv() {
+			s.applyPackageEnv()
+		}
 	} else {
 		s.registry().RawSetStr(s, s.intern.Intern("LUA_NOENV"), TrueValue())
 	}
 	return s
+}
+
+// SetNoEnv marks this State to ignore LUA_PATH/LUA_CPATH environment variables (LUA_NOENV).
+func (s *State) SetNoEnv() {
+	if reg := s.registry(); reg != nil {
+		reg.RawSetStr(s, s.intern.Intern("LUA_NOENV"), TrueValue())
+	}
+}
+
+// ApplyPackageEnv applies LUA_PATH_5_5/LUA_PATH and LUA_CPATH_5_5/LUA_CPATH to package
+// (when OS package searchers are enabled and LUA_NOENV is unset) and enables environment
+// application if LibPackage is subsequently opened during template setup.
+func (s *State) ApplyPackageEnv() {
+	s.applyEnvInSetup = true
+	if !s.isNoEnv() {
+		s.applyPackageEnv()
+	}
 }
 
 func cloneUpvalTokens(src map[uint32][]uint64) map[uint32][]uint64 {

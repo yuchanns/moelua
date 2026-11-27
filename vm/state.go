@@ -330,14 +330,15 @@ type State struct {
 
 	// Optional async interrupt flag, context cancellation, and VM instruction step budget;
 	// zero overhead in fast (*State).run when all are unset!
-	intrFlag       *atomic.Bool
-	intrTicks      uint32
-	ctx            context.Context
-	insnLimit      int64
-	insnCount      int64
-	abortErr       error // pending uncatchable abort error (ctx / instruction limit)
-	fsSearchers    int
-	childExecDepth atomic.Int32 // >0 while os.execute child process is running (ignores CLI SIGINT)
+	intrFlag        *atomic.Bool
+	intrTicks       uint32
+	ctx             context.Context
+	insnLimit       int64
+	insnCount       int64
+	abortErr        error // pending uncatchable abort error (ctx / instruction limit)
+	fsSearchers     int
+	applyEnvInSetup bool
+	childExecDepth  atomic.Int32 // >0 while os.execute child process is running (ignores CLI SIGINT)
 
 	// Lua 5.5 xoshiro256** PRNG state.
 	rng [4]uint64
@@ -631,6 +632,9 @@ func (s *State) MemoryUsage() int64 {
 	var arenaBytes int64
 	if s.arena != nil {
 		arenaBytes = s.arena.AllocBytes()
+	}
+	if s.intern.bootstrapping && s.intern.bootArena != nil {
+		arenaBytes += s.intern.bootArena.AllocBytes()
 	}
 	n := arenaBytes + s.extraMemBytes + s.tempBytes
 	if n < 0 {

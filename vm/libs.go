@@ -136,7 +136,7 @@ func (s *State) OpenLibs(mask LibMask) {
 			return
 		}
 		s.openedLibs = (s.openedLibs &^ LibPackageSafe) | LibPackage
-		if !s.intern.bootstrapping && !s.isNoEnv() {
+		if (!s.intern.bootstrapping || s.applyEnvInSetup) && !s.isNoEnv() {
 			s.applyPackageEnv()
 		}
 	} else if toOpen&LibPackageSafe != 0 && s.openedLibs&LibPackage == 0 {
@@ -283,7 +283,7 @@ func nativePreloadPackage(s *State, _ []Value) ([]Value, error) {
 		return nil, s.memError()
 	}
 	s.openedLibs = (s.openedLibs &^ LibPackageSafe) | LibPackage
-	if !s.intern.bootstrapping && !s.isNoEnv() {
+	if (!s.intern.bootstrapping || s.applyEnvInSetup) && !s.isNoEnv() {
 		s.applyPackageEnv()
 		if err := s.ConsumeMemErr(); err != nil {
 			return nil, err
