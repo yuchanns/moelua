@@ -12,6 +12,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"math"
@@ -53,7 +55,20 @@ func title(e string) string {
 	return e
 }
 
+type reportSummary struct {
+	Baseline      string                        `json:"baseline"`
+	Rounds        int                           `json:"rounds"`
+	CommonCount   int                           `json:"common_count"`
+	Engines       []string                      `json:"engines"`
+	CommonGeomean map[string]float64            `json:"common_geomean"`
+	AllGeomean    map[string]float64            `json:"all_geomean"`
+	SuiteGeomean  map[string]map[string]float64 `json:"suite_geomean"`
+}
+
 func main() {
+	jsonOut := flag.String("json", "", "optional path to write structured JSON summary")
+	flag.Parse()
+
 	b := bytes.NewBuffer(nil)
 	io.Copy(io.MultiWriter(os.Stdout, b), os.Stdin)
 	m := map[string]map[string]map[string][]float64{} // suite: program: engine: ns/op of each round
@@ -100,14 +115,30 @@ func main() {
 	}
 	all := map[string][]float64{}
 	notMicro := map[string][]float64{}
+	summary := reportSummary{
+		Baseline:      refEngine,
+		Engines:       slices.Clone(engines),
+		CommonGeomean: map[string]float64{},
+		AllGeomean:    map[string]float64{},
+		SuiteGeomean:  map[string]map[string]float64{},
+	}
 	if present[refEngine] {
 		for _, s := range suites {
 			if m[s.name] != nil {
+				if r := rounds(m[s.name]); r > summary.Rounds {
+					summary.Rounds = r
+				}
 				acc := []map[string][]float64{all}
 				if s.name != "micro" {
 					acc = append(acc, notMicro)
 				}
-				report(s.name, s.title, m[s.name], acc...)
+				suiteNums := report(s.name, s.title, m[s.name], acc...)
+				summary.SuiteGeomean[s.name] = map[string]float64{}
+				for _, e := range engines {
+					if len(suiteNums[e]) > 0 {
+						summary.SuiteGeomean[s.name][e] = geoMean(suiteNums[e])
+					}
+				}
 			}
 		}
 		fmt.Printf("\n%-24s", "all but micro, geomean")
@@ -115,14 +146,21 @@ func main() {
 			fmt.Printf("%12s", fmtRatio(notMicro[e]))
 		}
 		common, n := commonRatios(m)
+		summary.CommonCount = n
 		fmt.Printf("\n%-24s", "common, geomean")
 		for _, e := range engines {
 			fmt.Printf("%12s", fmtRatio(common[e]))
+			if len(common[e]) > 0 {
+				summary.CommonGeomean[e] = geoMean(common[e])
+			}
 		}
 		fmt.Printf("\ncommon: the %d programs, all but micro, that every engine ran", n)
 		fmt.Printf("\n%-24s", "all, geomean")
 		for _, e := range engines {
 			fmt.Printf("%12s", fmtRatio(all[e]))
+			if len(all[e]) > 0 {
+				summary.AllGeomean[e] = geoMean(all[e])
+			}
 		}
 		fmt.Println()
 	} else {
@@ -132,6 +170,17 @@ func main() {
 	if failed {
 		fmt.Fprintln(os.Stderr, "benchreport: a benchmark failed")
 		os.Exit(1)
+	}
+	if *jsonOut != "" {
+		raw, err := json.MarshalIndent(summary, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "benchreport: marshal json: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(*jsonOut, append(raw, '\n'), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "benchreport: write json %s: %v\n", *jsonOut, err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -157,7 +206,7 @@ func fmtRatio(s []float64) string {
 // report prints the table of suite, the median times of each engine keyed by
 // program, relative to C, and adds them to each of acc. A program an engine
 // did not run is n/a and left out of its geomean, which is marked.
-func report(suite, name string, m map[string]map[string][]float64, acc ...map[string][]float64) {
+func report(suite, name string, m map[string]map[string][]float64, acc ...map[string][]float64) map[string][]float64 {
 	var progs []string
 	for k := range m {
 		progs = append(progs, k)
@@ -207,6 +256,7 @@ func report(suite, name string, m map[string]map[string][]float64, acc ...map[st
 	if len(notes) != 0 {
 		fmt.Printf("* over the programs the engine ran, not run: %s\n", strings.Join(notes, "; "))
 	}
+	return nums
 }
 
 // commonRatios returns the median times relative to C of the programs, all

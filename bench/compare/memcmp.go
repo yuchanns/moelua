@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -193,7 +194,19 @@ func formatKiB(v float64, ok bool) string {
 	return fmt.Sprintf("%.1f KB", v)
 }
 
-func runOne(h vmHarness, n int) {
+type memResult struct {
+	Engine        string  `json:"engine"`
+	VMs           int     `json:"vms"`
+	IdleHeapKiB   float64 `json:"idle_heap_kib"`
+	IdleRSSKiB    float64 `json:"idle_rss_kib"`
+	HasRSS        bool    `json:"has_rss"`
+	IdleGCMs      float64 `json:"idle_gc_ms"`
+	ActiveHeapKiB float64 `json:"active_heap_kib"`
+	ActiveRSSKiB  float64 `json:"active_rss_kib"`
+	ActiveGCMs    float64 `json:"active_gc_ms"`
+}
+
+func runOne(h vmHarness, n int, asJSON bool) {
 	runtime.GOMAXPROCS(1)
 
 	// Warm up one-time package globals.
@@ -232,14 +245,33 @@ func runOne(h vmHarness, n int) {
 	activeRSS := float64(rss2-rss0) / float64(n)
 	activeGC := measureGC(7)
 
-	fmt.Printf("%-15s | %11s | %11s | %8.2f ms | %12s | %12s | %9.2f ms\n",
-		h.name,
-		formatKiB(idleHeap, true),
-		formatKiB(idleRSS, hasRSS),
-		float64(idleGC)/1e6,
-		formatKiB(activeHeap, true),
-		formatKiB(activeRSS, hasRSS),
-		float64(activeGC)/1e6)
+	res := memResult{
+		Engine:        h.name,
+		VMs:           n,
+		IdleHeapKiB:   idleHeap,
+		IdleRSSKiB:    idleRSS,
+		HasRSS:        hasRSS,
+		IdleGCMs:      float64(idleGC) / 1e6,
+		ActiveHeapKiB: activeHeap,
+		ActiveRSSKiB:  activeRSS,
+		ActiveGCMs:    float64(activeGC) / 1e6,
+	}
+	if asJSON {
+		raw, err := json.Marshal(res)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println(string(raw))
+	} else {
+		fmt.Printf("%-15s | %11s | %11s | %8.2f ms | %12s | %12s | %9.2f ms\n",
+			res.Engine,
+			formatKiB(res.IdleHeapKiB, true),
+			formatKiB(res.IdleRSSKiB, res.HasRSS),
+			res.IdleGCMs,
+			formatKiB(res.ActiveHeapKiB, true),
+			formatKiB(res.ActiveRSSKiB, res.HasRSS),
+			res.ActiveGCMs)
+	}
 
 	for i := range n {
 		closes[i]()
@@ -249,6 +281,8 @@ func runOne(h vmHarness, n int) {
 
 func main() {
 	worker := flag.String("worker", "", "run single engine")
+	workerJSON := flag.Bool("worker-json", false, "emit single JSON line from worker")
+	jsonOut := flag.String("json", "", "optional path to write structured JSON results")
 	count := flag.Int("n", 256, "number of live VMs")
 	flag.Parse()
 
@@ -256,7 +290,7 @@ func main() {
 	if *worker != "" {
 		for _, h := range hs {
 			if h.name == *worker {
-				runOne(h, *count)
+				runOne(h, *count, *workerJSON)
 				return
 			}
 		}
@@ -270,12 +304,45 @@ func main() {
 	fmt.Printf("%-15s | %11s | %11s | %11s | %12s | %12s | %12s\n",
 		"Engine", "Idle Heap", "Idle RSS", fmt.Sprintf("%d-Idle GC", *count), "Act Heap/VM", "Act RSS/VM", fmt.Sprintf("%d-Act GC", *count))
 	fmt.Println(strings.Repeat("-", 98))
+	var results []memResult
+	failed := false
 	for _, h := range hs {
-		cmd := exec.Command(self, "-worker", h.name, "-n", strconv.Itoa(*count))
-		cmd.Stdout = os.Stdout
+		cmd := exec.Command(self, "-worker", h.name, "-worker-json", "-n", strconv.Itoa(*count))
 		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		out, err := cmd.Output()
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s failed: %v\n", h.name, err)
+			failed = true
+			continue
+		}
+		var r memResult
+		if err := json.Unmarshal(out, &r); err != nil {
+			fmt.Fprintf(os.Stderr, "%s parse output failed: %v\n", h.name, err)
+			failed = true
+			continue
+		}
+		results = append(results, r)
+		fmt.Printf("%-15s | %11s | %11s | %8.2f ms | %12s | %12s | %9.2f ms\n",
+			r.Engine,
+			formatKiB(r.IdleHeapKiB, true),
+			formatKiB(r.IdleRSSKiB, r.HasRSS),
+			r.IdleGCMs,
+			formatKiB(r.ActiveHeapKiB, true),
+			formatKiB(r.ActiveRSSKiB, r.HasRSS),
+			r.ActiveGCMs)
+	}
+	if failed || len(results) == 0 {
+		os.Exit(1)
+	}
+	if *jsonOut != "" {
+		raw, err := json.MarshalIndent(results, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "memcmp: marshal json: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(*jsonOut, append(raw, '\n'), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "memcmp: write json %s: %v\n", *jsonOut, err)
+			os.Exit(1)
 		}
 	}
 }

@@ -56,12 +56,20 @@ jobs:
       - name: Cross-engine benchmark harness compile check (Windows)
         if: runner.os == 'Windows'
         working-directory: bench/compare
-        run: go test -vet=off -run '^$' .
+        run: |
+          go test -vet=off -run '^$' .
+          go build -o "$env:RUNNER_TEMP\benchreport.exe" benchreport.go
+          go build -o "$env:RUNNER_TEMP\memcmp.exe" memcmp.go
+          go build -o "$env:RUNNER_TEMP\genchart.exe" genchart.go
 
       - name: Cross-engine benchmark 32/32 output parity (bench/compare)
         if: runner.os != 'Windows'
         working-directory: bench/compare
-        run: go test -vet=off -timeout 5m -run TestOutputs -engines '^(C|MoeLua)$' .
+        run: |
+          go test -vet=off -timeout 5m -run TestOutputs -engines '^(C|MoeLua)$' .
+          go build -o /dev/null benchreport.go
+          go build -o /dev/null memcmp.go
+          go build -o /dev/null genchart.go
 
       - name: GC & pointer stress (GOGC=1 gccheckmark/clobberfree + checkptr=2)
         if: runner.os == 'Linux'

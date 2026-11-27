@@ -28,8 +28,11 @@ GOLUA_PGO="$(go list -m -f '{{.Dir}}' github.com/arnodel/golua)/default.pgo"
     -engines '^(C|C-O3|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|GopherLua|GoLua|DCLua)$' . &&
   GOMAXPROCS=1 go test -vet=off -timeout 30m -pgo="$GOLUA_PGO" -run @ -bench . -benchtime 300ms -count 3 \
     -engines '^ArnodelGolua$' .
-) | go run benchreport.go
+) | go run benchreport.go -json bench_summary.json
 
 # Run isolated-process 256-VM memory & Go GC comparison across all Go engines:
-go run memcmp.go
+go run memcmp.go -json memcmp.json
+
+# Regenerate docs/assets/bench-compare.svg from benchreport.go -json and memcmp.go -json outputs:
+go run genchart.go -bench bench_summary.json -mem memcmp.json -out ../../docs/assets/bench-compare.svg
 ```
