@@ -1137,6 +1137,9 @@ func (s *State) gcFreeObject(a *arena.Arena, ref arena.ObjRef) {
 			if bp := s.protos[ap.protoIdx]; bp != nil {
 				s.subExtraMem(bp.goBytes)
 				s.protos[ap.protoIdx] = nil
+				if s.jit != nil {
+					s.jit.invalidateProto(ap.protoIdx)
+				}
 				s.freeProtoIDs = append(s.freeProtoIDs, ap.protoIdx)
 			}
 		}
