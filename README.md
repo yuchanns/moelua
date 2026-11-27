@@ -2,9 +2,9 @@
 
 A very fast pure-Go Lua 5.5 compiler, bytecode dumper/verifier, virtual machine, standard library, and standalone CLI.
 
-MoeLua compiles with `CGO_ENABLED=0`, has **zero third-party dependencies**, uses **zero assembly and zero JIT**, and passes the official PUC-Rio Lua 5.5.1 conformance suite (`testes/`, `main.lua`, and byte-for-byte `luac` binary chunk identity). Across the 27-program standardized cross-engine suite (`Are We Fast Yet`, `Benchmarks Game`, `SciMark 2.0a`, and Go engines' own benchmarks), MoeLua is the fastest pure-Go Lua interpreter (**1.30×** C Lua 5.5.1 `-O2` on Apple M1 Max, 1.45×–7.3× faster than other pure-Go interpreters), while keeping Go GC pauses around **1 ms** across 256 active VMs (**62×–210×** faster Go GC than Go-heap Lua VMs; see [`docs/benchmarks.md`](docs/benchmarks.md)).
-
 ## Performance
+
+Across the 27-program standardized cross-engine suite (`Are We Fast Yet`, `Benchmarks Game`, `SciMark 2.0a`, and Go engines' own benchmarks), MoeLua 5.5 (`noJIT`, Plan 9 direct-threaded interpreter with `CGO_ENABLED=0`) matches native C Lua 5.5.1 `-O2` (**0.99×** on AMD EPYC 7763 / **1.00×** on Apple M1 Max; **1.9×–10×** faster than other Go Lua interpreters) without a JIT, while keeping Go GC pauses around **1 ms** across 256 active VMs (**59×–210×** lower Go GC than Go-heap Lua VMs; see [`docs/benchmarks.md`](docs/benchmarks.md)).
 
 ![MoeLua 5.5 vs Go Lua Engines and C Lua 5.5.1](docs/assets/bench-compare.svg)
 
@@ -18,9 +18,9 @@ Both charts above are automatically regenerated on every merge to `main` by GitH
 
 ## Why MoeLua
 
-- **Pure Go, zero dependencies**: builds with `CGO_ENABLED=0`, cross-compiles cleanly to Linux, macOS, and Windows, works with `pprof` and `-race`, and avoids CGo thread pinning.
+- **`CGO_ENABLED=0`, zero third-party dependencies**: compiles with Go's standard toolchain alone, cross-compiles cleanly to Linux, macOS, and Windows, works with `pprof` and `-race`, and avoids CGo thread pinning. Uses a Plan 9 direct-threaded bytecode dispatch loop on `arm64`/`amd64` with a full pure-Go fallback (`-tags purego` and other architectures).
 - **Noscan Arena & true Lua 5.5.1 GC**: all Lua values (16-byte tagged `Value`, `ptrdata == 0`), tables, shapes, inline caches, strings, closures, upvalues, threads, and frames live in per-`State` noscan `[]byte` slabs managed by a PUC-Rio Lua 5.5.1 incremental + generational GC (`__gc`, weak tables, ephemerons, resurrection). Go's GC performs zero pointer scanning inside Lua heaps — on Apple M1 Max, **1,000 idle VMs take 51.6 MiB total and 0.75 ms Go GC**; **256 active VMs (524K tables) take 0.84 ms Go GC**.
-- **Exact Lua 5.5.1 compatibility**: `global`, `<const>`, `<close>`, named/hidden varargs, stackful yieldable coroutines (across metamethods, `pcall`/`xpcall`, iterators, and `<close>`), full standard library (`base`, `math`, `table`, `string`, `utf8`, `coroutine`, `debug`, `io`, `os`, `package`), and `luac 5.5.1` binary chunk format parity.
+- **Exact Lua 5.5.1 conformance**: passes the official PUC-Rio Lua 5.5.1 conformance suite (`testes/`, `main.lua`, and byte-for-byte `luac` binary chunk identity), including `global`, `<const>`, `<close>`, named/hidden varargs, stackful yieldable coroutines (across metamethods, `pcall`/`xpcall`, iterators, and `<close>`), and the full standard library (`base`, `math`, `table`, `string`, `utf8`, `coroutine`, `debug`, `io`, `os`, `package`).
 - **Built for safe host embedding**: cooperative `context.Context` cancellation and deterministic instruction budgets (uncatchable by Lua `pcall`/`xpcall`, zero overhead on the hot loop when unset), per-`State` memory limits, `io/fs.FS` / `embed.FS` module loading, zero-allocation `Call1` / `RegisterFunc1`, and immutable `*moelua.Chunk` sharing across independent goroutines.
 
 ## Installation
@@ -112,7 +112,7 @@ make bench-compare
 
 MoeLua is written independently in pure Go and draws design inspiration, specifications, or benchmark baselines from the following projects:
 
-- [moejs](https://github.com/MoeForge/moejs): inspiration for the project name, pure-Go no-assembly VM engineering direction, frozen shared stdlib snapshots, and Go embedding design.
+- [moejs](https://github.com/MoeForge/moejs): inspiration for the project name, pure-Go VM engineering direction, frozen shared stdlib snapshots, and Go embedding design.
 - [PUC-Rio Lua 5.5.1](https://www.lua.org/): the Lua 5.5.1 language specification, bytecode format, incremental/generational collector (`lgc.c`), reference C implementation (`third_party/lua`), and official conformance test suite (`testes/`).
 - [V8](https://v8.dev/) and [QuickJS](https://bellard.org/quickjs/): hidden classes (Shapes), inline caches, prototype-epoch invalidation, and compact 16-byte tagged values.
 - [modernc.org/lua](https://pkg.go.dev/modernc.org/lua): the cross-engine comparison harness adapted in [`bench/compare`](bench/compare) (BSD-3-Clause), along with the standardized suites it bundles — [Are We Fast Yet](https://github.com/smarr/are-we-fast-yet), [The Computer Language Benchmarks Game](https://benchmarksgame-team.pages.debian.net/benchmarksgame/), and Mike Pall's Lua SciMark 2.0a.
