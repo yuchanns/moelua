@@ -62,7 +62,7 @@ type rightRow struct {
 	label string
 	val   float64
 	note  string
-	kind  string // "moe", "other"
+	kind  string // "ref", "moe", "other"
 }
 
 func niceAxisMax(v float64, step float64) float64 {
@@ -373,7 +373,7 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 			lblCls = "label-hi"
 			valCls = "val-hi"
 		}
-		barCls := map[string]string{"moe": "bar-moe", "other": "bar-other"}[r.kind]
+		barCls := map[string]string{"moe": "bar-moe", "ref": "bar-ref", "other": "bar-other"}[r.kind]
 		fmt.Fprintf(&sb, "  <text x=\"640\" y=\"%.1f\" class=\"%s\">%s</text>\n", y+13, lblCls, html.EscapeString(r.label))
 		fmt.Fprintf(&sb, "  <rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" rx=\"3\" class=\"%s\"/>\n", rightX0, y, w, barH, barCls)
 		estTextW := float64(len(r.note)) * 7.0
@@ -467,17 +467,19 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 	metaMap := map[string]struct {
 		fullLbl  string
 		shortLbl string
-		isMoe    bool
+		kind     string // "ref", "moe", "other"
+		hasGoGC  bool
 		isDashed bool
 	}{
-		"MoeLua":         {"MoeLua 5.5 (Arena)", "MoeLua", true, false},
-		"CCGO":           {"modernc/lua (mmap)", "modernc/lua", false, true},
-		"arnodel/golua":  {"arnodel/golua", "golua", false, false},
-		"Apogee-JIT":     {"Apogee v1.2.1 (JIT)", "Apogee JIT", false, false},
-		"Apogee-noJIT":   {"Apogee v1.2.1 (noJIT)", "Apogee noJIT", false, false},
-		"DCLua":          {"DCLua", "DCLua", false, false},
-		"Shopify/go-lua": {"Shopify/go-lua", "go-lua", false, false},
-		"GopherLua":      {"yuin/gopher-lua", "gopher-lua", false, false},
+		"C":              {"C Lua 5.5.1 (ref)", "C Lua", "ref", false, false},
+		"MoeLua":         {"MoeLua 5.5 (Arena)", "MoeLua", "moe", true, false},
+		"CCGO":           {"modernc/lua (mmap)", "modernc/lua", "other", true, true},
+		"arnodel/golua":  {"arnodel/golua", "golua", "other", true, false},
+		"Apogee-JIT":     {"Apogee v1.2.1 (JIT)", "Apogee JIT", "other", true, false},
+		"Apogee-noJIT":   {"Apogee v1.2.1 (noJIT)", "Apogee noJIT", "other", true, false},
+		"DCLua":          {"DCLua", "DCLua", "other", true, false},
+		"Shopify/go-lua": {"Shopify/go-lua", "go-lua", "other", true, false},
+		"GopherLua":      {"yuin/gopher-lua", "gopher-lua", "other", true, false},
 	}
 
 	var curves []*curveSpec
@@ -501,19 +503,29 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 		pts := slices.Clone(r.Scale)
 		slices.SortFunc(pts, func(a, b scalePoint) int { return cmp.Compare(a.VMs, b.VMs) })
 		last := pts[len(pts)-1]
-		if last.VMs > maxVMs {
-			maxVMs = last.VMs
-		}
-		if minVMs == 0 || pts[0].VMs < minVMs {
-			minVMs = pts[0].VMs
-		}
-		for _, pt := range pts {
-			if pt.ActiveGCMs > maxMs {
-				maxMs = pt.ActiveGCMs
+		if meta.hasGoGC {
+			if last.VMs > maxVMs {
+				maxVMs = last.VMs
 			}
-			if !slices.Contains(xTicks, pt.VMs) {
-				xTicks = append(xTicks, pt.VMs)
+			if minVMs == 0 || pts[0].VMs < minVMs {
+				minVMs = pts[0].VMs
 			}
+			for _, pt := range pts {
+				if pt.ActiveGCMs > maxMs {
+					maxMs = pt.ActiveGCMs
+				}
+				if !slices.Contains(xTicks, pt.VMs) {
+					xTicks = append(xTicks, pt.VMs)
+				}
+			}
+			curves = append(curves, &curveSpec{
+				engine:   r.Engine,
+				shortLbl: meta.shortLbl,
+				isMoe:    meta.kind == "moe",
+				isDashed: meta.isDashed,
+				points:   pts,
+				endMs:    last.ActiveGCMs,
+			})
 		}
 		if r.HasRSS && last.ActiveRSSKiB > 0 {
 			hasAnyRSS = true
@@ -534,21 +546,12 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 				apogeeIdleKiB = r.IdleHeapKiB
 			}
 		}
-		curves = append(curves, &curveSpec{
-			engine:   r.Engine,
-			shortLbl: meta.shortLbl,
-			isMoe:    meta.isMoe,
-			isDashed: meta.isDashed,
-			points:   pts,
-			endMs:    last.ActiveGCMs,
-		})
 		memVal := last.ActiveHeapKiB
 		if r.HasRSS && last.ActiveRSSKiB > 0 {
 			memVal = last.ActiveRSSKiB
-		}
-		kind := "other"
-		if meta.isMoe {
-			kind = "moe"
+		} else if meta.kind == "ref" {
+			// Skip C reference bar on platforms without OS RSS measurement (e.g. Windows).
+			continue
 		}
 		note := formatMemSize(memVal)
 		if r.NewStateUs > 0 {
@@ -558,7 +561,7 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 			label: meta.fullLbl,
 			val:   memVal,
 			note:  note,
-			kind:  kind,
+			kind:  meta.kind,
 		})
 	}
 	if len(curves) == 0 || maxVMs == 0 {
@@ -630,6 +633,10 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, `<svg xmlns="http://www.w3.org/2000/svg" width="960" height="450" viewBox="0 0 960 450" role="img" aria-label="MoeLua 5.5 high-density multi-VM scalability: Go GC pause from %d to %d active VMs and per-VM memory and cold start">
   <defs>
+    <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="6" height="6" fill="#e2e8f0"/>
+      <line x1="0" y1="0" x2="0" y2="6" stroke="#94a3b8" stroke-width="2"/>
+    </pattern>
 %s
   </defs>
 
@@ -637,7 +644,7 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
   <rect x="0.5" y="0.5" width="959" height="449" rx="10" class="border"/>
 
   <!-- Header -->
-  <text x="24" y="30" class="title">High-Density Multi-VM Scalability (%d to %d Live VMs)</text>
+  <text x="24" y="30" class="title">High-Density Active Multi-VM Scalability (%d to %d Active VMs)</text>
   <text x="24" y="48" class="subtitle">%s</text>
 `, minVMs, maxVMs, commonCSS, minVMs, maxVMs, html.EscapeString(subtitle))
 	writeBadge(&sb, badge)
@@ -724,11 +731,11 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 
 	// Right Panel: Active OS RSS/VM + NewState cold start
 	fmt.Fprintf(&sb, `
-  <!-- RIGHT PANEL: Per-VM Memory & Cold Start -->
-  <text x="512" y="78" class="panel-title">Memory Footprint &amp; Cold Start (%d VMs)</text>
-  <text x="512" y="94" class="panel-sub">Active %s at %d VMs · NewState init latency · lower is better</text>
+  <!-- RIGHT PANEL: Active Memory & Cold Start -->
+  <text x="512" y="78" class="panel-title">Active Memory &amp; Cold Start (%d Active VMs)</text>
+  <text x="512" y="94" class="panel-sub">Active %s (2,047 tables/VM) · NewState init latency · lower is better</text>
 
-`, maxVMs, memKindTitle, maxVMs)
+`, maxVMs, memKindTitle)
 
 	fmt.Fprintf(&sb, "  <line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" class=\"axis\"/>\n", rX0, plotTop, rX0, plotBottom)
 	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"393\" class=\"tick\">0</text>\n", rX0)
@@ -761,7 +768,7 @@ func renderMultiVMSVG(mems []memResult, subtitle, badge string) (string, error) 
 			lblCls = "label-hi"
 			valCls = "val-hi"
 		}
-		barCls := map[string]string{"moe": "bar-moe", "other": "bar-other"}[r.kind]
+		barCls := map[string]string{"moe": "bar-moe", "ref": "bar-ref", "other": "bar-other"}[r.kind]
 		fmt.Fprintf(&sb, "  <text x=\"640\" y=\"%.1f\" class=\"%s\">%s</text>\n", y+13, lblCls, html.EscapeString(r.label))
 		fmt.Fprintf(&sb, "  <rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" rx=\"3\" class=\"%s\"/>\n", rX0, y, w, barH, barCls)
 		estTextW := float64(len([]rune(r.note))) * 7.0

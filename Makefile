@@ -18,7 +18,7 @@ endif
 
 .PHONY: tools generate test test-compare pgo bench bench-pgo bench-compare cli clean
 
-tools: $(BUILD_DIR)/lua55_o2 $(BUILD_DIR)/lua55_o3 $(BUILD_DIR)/lua55_o3_m1 $(BUILD_DIR)/luac55
+tools: $(BUILD_DIR)/lua55_o2 $(BUILD_DIR)/lua55_o3 $(BUILD_DIR)/lua55_o3_m1 $(BUILD_DIR)/luac55 $(BUILD_DIR)/clua_mem
 
 cli: $(BUILD_DIR)/moelua
 
@@ -50,6 +50,10 @@ $(BUILD_DIR)/lua55_o3: | $(BUILD_DIR)
 $(BUILD_DIR)/lua55_o3_m1: | $(BUILD_DIR)
 	$(check_lua_src)
 	cc -O3 $(LUA_O3_MCPU) $(LUA_PLAT_CFLAGS) -DMAKE_LUA -I$(LUA55_SRC) $(LUA55_SRC)/onelua.c $(LUA_PLAT_LIBS) -o $@
+
+$(BUILD_DIR)/clua_mem: bench/compare/clua_mem/clua_mem.c | $(BUILD_DIR)
+	$(check_lua_src)
+	cc -O2 $(LUA_PLAT_CFLAGS) -DMAKE_LIB -I$(LUA55_SRC) $(LUA55_SRC)/onelua.c bench/compare/clua_mem/clua_mem.c $(LUA_PLAT_LIBS) -o $@
 
 $(BUILD_DIR)/luac55: $(BUILD_DIR)/lua55_o2 | $(BUILD_DIR)
 	printf '#!/bin/sh\nset -e\nSTRIP=false\nOUT=luac.out\nwhile [ "$$#" -gt 0 ]; do\n  case "$$1" in\n    -s) STRIP=true; shift ;;\n    -o) OUT="$$2"; shift 2 ;;\n    *) IN="$$1"; shift ;;\n  esac\ndone\nLUAC_IN="$$IN" LUAC_OUT="$$OUT" LUAC_STRIP="$$STRIP" exec "$$(dirname "$$0")/lua55_o2" -e "local f=assert(loadfile(os.getenv('\''LUAC_IN'\''))); local o=assert(io.open(os.getenv('\''LUAC_OUT'\''), '\''wb'\'')); o:write(string.dump(f, os.getenv('\''LUAC_STRIP'\'')=='\''true'\'')); o:close()"\n' > $@

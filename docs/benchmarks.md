@@ -194,16 +194,17 @@ Measured via the isolated nested Go module [`bench/compare`](../bench/compare) (
 
 Each engine runs in its own isolated OS subprocess (`GOMAXPROCS=1`): 256 idle full-stdlib VMs (measuring average `NewState` cold creation, heap, OS RSS, and Go GC), followed by scaling active VMs from `64 → 256 → 512 → 1,000` with a 2,047-table binary tree inside every VM (up to **2,047,000 live Lua tables** at 1,000 VMs).
 
-| Engine | `NewState` (256 live) | Idle Heap / VM | Idle RSS / VM | 256-Idle GC | Active RSS / VM (256) | 64-Act GC | 256-Act GC | 512-Act GC | **1,000-Act GC (2.05M tables)** |
+| Engine | `NewState` (256 live) | Idle Heap / VM | Idle RSS / VM | 256-Idle GC | Active RSS / VM | 64-Act GC | 256-Act GC | 512-Act GC | **1,000-Act GC (2.05M tables)** |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **MoeLua** | **22.6 µs** | **52.9 KiB** | **53.2 KiB** | **0.50 ms** | **331.5 KiB** | **0.40 ms** | **0.96 ms** | **1.83 ms** | **3.66 ms** |
-| `modernc.org/lua` (`CCGO`) | 32.6 µs | 1.6 KiB *(off-heap mmap)* | 32.4 KiB | 0.20 ms | 276.0 KiB | 0.20 ms | 0.23 ms | 0.31 ms | 0.44 ms |
-| Apogee v1.2.1 (`WithoutJIT`) | 218.9 µs | 174.6 KiB | 191.8 KiB | 19.83 ms | 515.9 KiB | 12.15 ms | 54.47 ms | 110.14 ms | 216.82 ms |
-| Apogee v1.2.1 (JIT) | 221.2 µs | 174.6 KiB | 191.4 KiB | 20.14 ms | 573.3 KiB | 12.86 ms | 54.41 ms | 112.39 ms | 218.16 ms |
-| `arnodel/golua` | 68.1 µs | 113.7 KiB | 61.8 KiB | 3.45 ms | 636.5 KiB | 14.32 ms | 54.65 ms | 110.55 ms | 218.29 ms |
-| `milochristiansen/lua` (`DCLua`) | 39.5 µs | 66.5 KiB | 77.7 KiB | 4.00 ms | 1,120.9 KiB | 17.40 ms | 75.46 ms | 153.59 ms | 301.65 ms |
-| `Shopify/go-lua` | 31.0 µs | 17.2 KiB | 24.1 KiB | 2.41 ms | 1,024.8 KiB | 21.83 ms | 87.39 ms | 177.56 ms | 344.93 ms |
-| `yuin/gopher-lua` | 79.0 µs | 162.4 KiB | 178.1 KiB | 9.87 ms | 2,024.2 KiB | 44.49 ms | 181.16 ms | 366.89 ms | 717.33 ms |
+| C Lua 5.5.1 *(ref)* | 13.7 µs | n/a | 20.8 KiB | n/a | 264.3 KiB | n/a | n/a | n/a | n/a |
+| **MoeLua** | **24.7 µs** | **52.9 KiB** | **54.2 KiB** | **0.77 ms** | **331.4 KiB** | **0.37 ms** | **0.97 ms** | **1.98 ms** | **3.66 ms** |
+| `modernc.org/lua` (`CCGO`) | 33.3 µs | 1.6 KiB *(off-heap mmap)* | 31.4 KiB | 0.22 ms | 275.3 KiB | 0.17 ms | 0.24 ms | 0.30 ms | 0.44 ms |
+| Apogee v1.2.1 (`WithoutJIT`) | 206.7 µs | 174.6 KiB | 192.1 KiB | 20.12 ms | 516.2 KiB | 12.52 ms | 55.06 ms | 111.06 ms | 217.70 ms |
+| Apogee v1.2.1 (JIT) | 213.1 µs | 174.6 KiB | 192.0 KiB | 21.58 ms | 548.4 KiB | 12.65 ms | 56.05 ms | 112.16 ms | 220.04 ms |
+| `arnodel/golua` | 68.2 µs | 113.7 KiB | 63.0 KiB | 3.61 ms | 625.5 KiB | 12.51 ms | 54.86 ms | 116.63 ms | 219.05 ms |
+| `milochristiansen/lua` (`DCLua`) | 41.9 µs | 66.5 KiB | 80.1 KiB | 3.94 ms | 1,121.1 KiB | 18.25 ms | 75.07 ms | 151.96 ms | 299.43 ms |
+| `Shopify/go-lua` | 31.0 µs | 17.2 KiB | 24.2 KiB | 2.38 ms | 1,025.1 KiB | 20.32 ms | 87.97 ms | 175.59 ms | 346.81 ms |
+| `yuin/gopher-lua` | 77.9 µs | 162.4 KiB | 177.9 KiB | 9.53 ms | 2,025.2 KiB | 43.84 ms | 182.53 ms | 366.73 ms | 718.09 ms |
 
 ---
 

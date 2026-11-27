@@ -10,7 +10,7 @@ MoeLua compiles with `CGO_ENABLED=0`, has **zero third-party dependencies**, use
 
 ### High-Density Multi-VM Scalability
 
-Most Go Lua engines (including JIT-compiled ones) store Lua tables and values as pointer-rich Go heap objects, so Go's garbage collector must scan every live Lua object across every tenant VM — causing **O(VMs × objects)** GC pauses that grow past **217–717 ms** at **1,000 active VMs (>2M live tables)**. MoeLua keeps all Lua values (`ptrdata == 0`), tables, shapes, strings, and stacks in per-`State` noscan `[]byte` Arenas with a true PUC-Rio Lua 5.5.1 GC, keeping Go GC pauses near-flat (~**3.66 ms** at 1,000 active VMs — **59×–196×** lower than Go-heap Lua VMs) with **~53 KiB** idle RSS, **~332 KiB** active RSS, and the fastest cold `NewState` (**~23 µs** across 256 concurrent live VMs).
+Most Go Lua engines (including JIT-compiled ones) store Lua tables and values as pointer-rich Go heap objects, so Go's garbage collector must scan every live Lua object across every tenant VM — causing **O(VMs × objects)** GC pauses that grow past **218–718 ms** at **1,000 active VMs (>2M live tables)**. MoeLua keeps all Lua values (`ptrdata == 0`), tables, shapes, strings, and stacks in per-`State` noscan `[]byte` Arenas with a true PUC-Rio Lua 5.5.1 GC, keeping Go GC pauses near-flat (~**3.66 ms** at 1,000 active VMs — **59×–196×** lower than Go-heap Lua VMs) with **~54 KiB** idle RSS, **~331 KiB** active RSS (**1.25×** reference C Lua 5.5.1), and the fastest Go cold `NewState` (**~25 µs** across 256 concurrent live VMs).
 
 ![MoeLua 5.5 High-Density Multi-VM Scalability](docs/assets/bench-multivm.svg)
 

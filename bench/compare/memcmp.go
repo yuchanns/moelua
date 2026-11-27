@@ -215,6 +215,46 @@ type memResult struct {
 	Scale         []scalePoint `json:"scale,omitempty"`
 }
 
+func runCLuaRef(bin string, idleCount, activeCount int) (*memResult, error) {
+	if _, err := os.Stat(bin); err != nil {
+		return nil, nil
+	}
+	idleCmd := exec.Command(bin, "idle", strconv.Itoa(idleCount))
+	idleCmd.Stderr = os.Stderr
+	idleOut, err := idleCmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("clua_mem idle failed: %w", err)
+	}
+	var idleRes memResult
+	if err := json.Unmarshal(idleOut, &idleRes); err != nil {
+		return nil, fmt.Errorf("clua_mem parse idle failed: %w", err)
+	}
+
+	actCmd := exec.Command(bin, "active", strconv.Itoa(activeCount))
+	actCmd.Stderr = os.Stderr
+	actOut, err := actCmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("clua_mem active failed: %w", err)
+	}
+	var actRes memResult
+	if err := json.Unmarshal(actOut, &actRes); err != nil {
+		return nil, fmt.Errorf("clua_mem parse active failed: %w", err)
+	}
+
+	res := &memResult{
+		Engine:       "C",
+		VMs:          idleCount,
+		NewStateUs:   idleRes.NewStateUs,
+		IdleRSSKiB:   idleRes.IdleRSSKiB,
+		HasRSS:       idleRes.HasRSS && actRes.HasRSS,
+		ActiveRSSKiB: actRes.ActiveRSSKiB,
+		Scale: []scalePoint{
+			{VMs: activeCount, ActiveRSSKiB: actRes.ActiveRSSKiB},
+		},
+	}
+	return res, nil
+}
+
 func parseScaleList(raw string) ([]int, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -345,6 +385,7 @@ func main() {
 	worker := flag.String("worker", "", "run single engine")
 	workerMode := flag.String("worker-mode", "idle", "worker mode: idle or active-scale")
 	jsonOut := flag.String("json", "", "optional path to write structured JSON results")
+	cluaMemBin := flag.String("clua-mem", "../../build/clua_mem", "optional path to compiled C Lua 5.5.1 memory reference helper")
 	count := flag.Int("n", 256, "primary VM count for summary table")
 	scaleFlag := flag.String("scale", "64,256,512,1000", "comma-separated active VM counts for scaling curve")
 	flag.Parse()
@@ -449,6 +490,27 @@ func main() {
 		os.Exit(1)
 	}
 
+	if *cluaMemBin != "" {
+		maxScale := scaleCounts[len(scaleCounts)-1]
+		cRes, err := runCLuaRef(*cluaMemBin, *count, maxScale)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if cRes != nil {
+			results = append(results, *cRes)
+			fmt.Printf("%-15s | %6.1f us | %11s | %11s | %11s | %12s | %12s | %12s\n",
+				"C Lua 5.5.1",
+				cRes.NewStateUs,
+				"n/a",
+				formatKiB(cRes.IdleRSSKiB, cRes.HasRSS),
+				"n/a",
+				"n/a",
+				formatKiB(cRes.ActiveRSSKiB, cRes.HasRSS),
+				"n/a")
+		}
+	}
+
 	fmt.Printf("\nHigh-Density Active Go GC Scaling (2,047 tables/VM):\n%-15s", "Engine")
 	for _, c := range scaleCounts {
 		fmt.Printf(" | %10s", fmt.Sprintf("%d VMs", c))
@@ -456,6 +518,9 @@ func main() {
 	fmt.Println()
 	fmt.Println(strings.Repeat("-", 15+13*len(scaleCounts)))
 	for _, r := range results {
+		if r.Engine == "C" {
+			continue
+		}
 		fmt.Printf("%-15s", r.Engine)
 		for _, pt := range r.Scale {
 			fmt.Printf(" | %7.2f ms", pt.ActiveGCMs)

@@ -27,7 +27,7 @@ jobs:
 
       - name: Build reference C Lua 5.5.1 tools (from submodule)
         if: runner.os != 'Windows'
-        run: make build/lua55_o2 build/luac55
+        run: make build/lua55_o2 build/luac55 build/clua_mem
 
       - name: Pure-Go build (CGO_ENABLED=0)
         env:

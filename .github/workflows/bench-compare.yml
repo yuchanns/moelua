@@ -58,8 +58,8 @@ jobs:
           go-version-file: bench/compare/go.mod
           cache: false
 
-      - name: Build reference C Lua 5.5.1 (-O2 and -O3)
-        run: make build/lua55_o2 build/lua55_o3
+      - name: Build reference C Lua 5.5.1 (-O2, -O3, and multi-VM memory helper)
+        run: make build/lua55_o2 build/lua55_o3 build/clua_mem
 
       - name: Verify 32/32 output equivalence (C vs MoeLua)
         working-directory: bench/compare

@@ -111,30 +111,30 @@
   <text x="858.0" y="393" class="tick">200ms</text>
   <text x="640" y="131.0" class="label">modernc/lua (mmap)</text>
   <rect x="648.0" y="118.0" width="3.0" height="17.0" rx="3" class="bar-other"/>
-  <text x="657.0" y="131.0" class="val">0.23 ms (276 KiB)</text>
+  <text x="657.0" y="131.0" class="val">0.24 ms (275 KiB)</text>
   <text x="640" y="163.5" class="label-hi">MoeLua 5.5 (Arena)</text>
   <rect x="648.0" y="150.5" width="3.0" height="17.0" rx="3" class="bar-moe"/>
-  <text x="657.0" y="163.5" class="val-hi">0.96 ms (332 KiB)</text>
-  <text x="640" y="196.0" class="label">Apogee v1.2.1 (JIT)</text>
-  <rect x="648.0" y="183.0" width="57.1" height="17.0" rx="3" class="bar-other"/>
-  <text x="711.1" y="196.0" class="val">54.4 ms (573 KiB)</text>
+  <text x="657.0" y="163.5" class="val-hi">0.97 ms (331 KiB)</text>
+  <text x="640" y="196.0" class="label">arnodel/golua</text>
+  <rect x="648.0" y="183.0" width="57.6" height="17.0" rx="3" class="bar-other"/>
+  <text x="711.6" y="196.0" class="val">54.9 ms (626 KiB)</text>
   <text x="640" y="228.5" class="label">Apogee v1.2.1 (noJIT)</text>
-  <rect x="648.0" y="215.5" width="57.2" height="17.0" rx="3" class="bar-other"/>
-  <text x="711.2" y="228.5" class="val">54.5 ms (516 KiB)</text>
-  <text x="640" y="261.0" class="label">arnodel/golua</text>
-  <rect x="648.0" y="248.0" width="57.4" height="17.0" rx="3" class="bar-other"/>
-  <text x="711.4" y="261.0" class="val">54.6 ms (636 KiB)</text>
+  <rect x="648.0" y="215.5" width="57.8" height="17.0" rx="3" class="bar-other"/>
+  <text x="711.8" y="228.5" class="val">55.1 ms (516 KiB)</text>
+  <text x="640" y="261.0" class="label">Apogee v1.2.1 (JIT)</text>
+  <rect x="648.0" y="248.0" width="58.8" height="17.0" rx="3" class="bar-other"/>
+  <text x="712.8" y="261.0" class="val">56.0 ms (548 KiB)</text>
   <text x="640" y="293.5" class="label">DCLua</text>
-  <rect x="648.0" y="280.5" width="79.2" height="17.0" rx="3" class="bar-other"/>
-  <text x="733.2" y="293.5" class="val">75.5 ms (1.1 MiB)</text>
+  <rect x="648.0" y="280.5" width="78.8" height="17.0" rx="3" class="bar-other"/>
+  <text x="732.8" y="293.5" class="val">75.1 ms (1.1 MiB)</text>
   <text x="640" y="326.0" class="label">Shopify/go-lua</text>
-  <rect x="648.0" y="313.0" width="91.8" height="17.0" rx="3" class="bar-other"/>
-  <text x="745.8" y="326.0" class="val">87.4 ms (1.0 MiB)</text>
+  <rect x="648.0" y="313.0" width="92.4" height="17.0" rx="3" class="bar-other"/>
+  <text x="746.4" y="326.0" class="val">88.0 ms (1.0 MiB)</text>
   <text x="640" y="358.5" class="label">yuin/gopher-lua</text>
-  <rect x="648.0" y="345.5" width="190.2" height="17.0" rx="3" class="bar-other"/>
-  <text x="832.2" y="358.5" class="val" style="fill:#ffffff;text-anchor:end">181.2 ms (2.0 MiB)</text>
+  <rect x="648.0" y="345.5" width="191.7" height="17.0" rx="3" class="bar-other"/>
+  <text x="833.7" y="358.5" class="val" style="fill:#ffffff;text-anchor:end">182.5 ms (2.0 MiB)</text>
 
   <!-- Footer notes -->
   <text x="24" y="422" class="foot">Left: median of 3 rounds via bench/compare (32/32 byte-exact output vs C Lua 5.5.1). LuaJIT on the same suite: 0.16x (see docs/benchmarks.md).</text>
-  <text x="24" y="438" class="foot">Right: active OS RSS/VM in parentheses. modernc/lua uses off-heap mmap (1.9 KiB Go heap). MoeLua uses noscan Arenas + Lua 5.5 GC (53 KiB idle/VM).</text>
+  <text x="24" y="438" class="foot">Right: active OS RSS/VM in parentheses. modernc/lua uses off-heap mmap (1.9 KiB Go heap). MoeLua uses noscan Arenas + Lua 5.5 GC (54 KiB idle/VM).</text>
 </svg>
