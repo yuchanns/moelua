@@ -1,8 +1,8 @@
 //go:build ignore
 
 // genchart renders the README SVG performance charts:
-//   - docs/assets/bench-compare.svg (execution time + 256-VM Go GC pause)
-//   - docs/assets/bench-multivm.svg (high-density 32..512-VM Go GC scaling + per-VM memory & cold start)
+//   - docs/assets/bench-compare.svg (execution time + highest-scale active-VM Go GC pause)
+//   - docs/assets/bench-multivm.svg (high-density 64..1,000-VM Go GC scaling + per-VM memory & cold start)
 //
 // Inputs are JSON summaries produced by benchreport.go -json and memcmp.go -json.
 package main
@@ -91,6 +91,33 @@ func formatMsShort(ms float64) string {
 		return fmt.Sprintf("%.1fms", ms)
 	}
 	return fmt.Sprintf("%.0fms", ms)
+}
+
+func formatIntComma(n int) string {
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var out strings.Builder
+	rem := len(s) % 3
+	if rem > 0 {
+		out.WriteString(s[:rem])
+	}
+	for i := rem; i < len(s); i += 3 {
+		if out.Len() > 0 {
+			out.WriteByte(',')
+		}
+		out.WriteString(s[i : i+3])
+	}
+	return out.String()
+}
+
+func formatTablesCount(vms int) string {
+	total := vms * 2047
+	if total >= 1_000_000 {
+		return fmt.Sprintf("%.2fM", float64(total)/1_000_000.0)
+	}
+	return fmt.Sprintf("%dK", total/1000)
 }
 
 func formatUs(us float64) string {
@@ -192,17 +219,69 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		"Shopify/go-lua": {"Shopify/go-lua", "other"},
 		"GopherLua":      {"yuin/gopher-lua", "other"},
 	}
+	// Prefer the highest active VM count present across all recognized engines' scaling curves
+	// (e.g., 1,000 VMs / 2.05M tables) so bench-compare.svg aligns with bench-multivm.svg and
+	// README.md; fall back to the top-level summary count (r.VMs) when Scale is absent.
+	var commonScaleVMs map[int]int
+	recognizedWithScale := 0
+	recognizedTotal := 0
+	for _, r := range mems {
+		if _, ok := rightLabels[r.Engine]; !ok {
+			continue
+		}
+		recognizedTotal++
+		if len(r.Scale) == 0 {
+			continue
+		}
+		recognizedWithScale++
+		if commonScaleVMs == nil {
+			commonScaleVMs = make(map[int]int, len(r.Scale))
+		}
+		seen := make(map[int]struct{}, len(r.Scale))
+		for _, sp := range r.Scale {
+			if sp.VMs > 0 {
+				if _, dup := seen[sp.VMs]; !dup {
+					seen[sp.VMs] = struct{}{}
+					commonScaleVMs[sp.VMs]++
+				}
+			}
+		}
+	}
+	targetScaleVMs := 0
+	if recognizedTotal > 0 && recognizedWithScale == recognizedTotal {
+		for vms, cnt := range commonScaleVMs {
+			if cnt == recognizedTotal && vms > targetScaleVMs {
+				targetScaleVMs = vms
+			}
+		}
+	}
+
 	var rightRows []rightRow
 	var moeIdleKiB float64
 	var ccgoActHeapKiB float64
 	hasCCGO := false
 	hasAnyRSS := false
 	vmCount := 256
+	if targetScaleVMs > 0 {
+		vmCount = targetScaleVMs
+	}
 	for _, r := range mems {
-		if r.VMs > 0 {
+		gcVal := r.ActiveGCMs
+		heapVal := r.ActiveHeapKiB
+		rssVal := r.ActiveRSSKiB
+		if targetScaleVMs > 0 {
+			for _, sp := range r.Scale {
+				if sp.VMs == targetScaleVMs {
+					gcVal = sp.ActiveGCMs
+					heapVal = sp.ActiveHeapKiB
+					rssVal = sp.ActiveRSSKiB
+					break
+				}
+			}
+		} else if r.VMs > 0 {
 			vmCount = r.VMs
 		}
-		if r.HasRSS && r.ActiveRSSKiB > 0 {
+		if r.HasRSS && rssVal > 0 {
 			hasAnyRSS = true
 		}
 		if r.Engine == "MoeLua" {
@@ -214,20 +293,20 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		}
 		if r.Engine == "CCGO" {
 			hasCCGO = true
-			ccgoActHeapKiB = r.ActiveHeapKiB
+			ccgoActHeapKiB = heapVal
 		}
 		meta, ok := rightLabels[r.Engine]
 		if !ok {
 			continue
 		}
-		memVal := r.ActiveHeapKiB
-		if r.HasRSS && r.ActiveRSSKiB > 0 {
-			memVal = r.ActiveRSSKiB
+		memVal := heapVal
+		if r.HasRSS && rssVal > 0 {
+			memVal = rssVal
 		}
 		rightRows = append(rightRows, rightRow{
 			label: meta.label,
-			val:   r.ActiveGCMs,
-			note:  fmt.Sprintf("%s (%s)", formatMs(r.ActiveGCMs), formatMemSize(memVal)),
+			val:   gcVal,
+			note:  fmt.Sprintf("%s (%s)", formatMs(gcVal), formatMemSize(memVal)),
 			kind:  meta.kind,
 		})
 	}
@@ -263,9 +342,18 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		}
 	}
 	rightStep := 50.0
-	if maxRightMs <= 60 {
+	switch {
+	case maxRightMs <= 60:
 		rightStep = 20.0
-	} else if maxRightMs > 250 {
+	case maxRightMs > 1800:
+		rightStep = 500.0
+	case maxRightMs > 1200:
+		rightStep = 400.0
+	case maxRightMs > 800:
+		rightStep = 300.0
+	case maxRightMs > 450:
+		rightStep = 200.0
+	case maxRightMs > 250:
 		rightStep = 100.0
 	}
 	rightAxisMax := niceAxisMax(maxRightMs, rightStep)
@@ -356,10 +444,10 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 
 	fmt.Fprintf(&sb, `
   <!-- RIGHT PANEL -->
-  <text x="512" y="78" class="panel-title">Go GC Pause with %d Active VMs</text>
-  <text x="512" y="94" class="panel-sub">runtime.GC() median (ms) · 2,047 tables/VM (%dK live Lua tables) · isolated process</text>
+  <text x="512" y="78" class="panel-title">Go GC Pause with %s Active VMs</text>
+  <text x="512" y="94" class="panel-sub">runtime.GC() median (ms) · 2,047 tables/VM (%s live Lua tables) · isolated process</text>
 
-`, vmCount, (vmCount*2047)/1000)
+`, formatIntComma(vmCount), formatTablesCount(vmCount))
 
 	fmt.Fprintf(&sb, "  <line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" class=\"axis\"/>\n", rightX0, plotTop, rightX0, plotBottom)
 	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"413\" class=\"tick\">0</text>\n", rightX0)
