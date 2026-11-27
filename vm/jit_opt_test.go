@@ -553,6 +553,42 @@ end
 print(s)
 `,
 		},
+		{
+			name: "codex_r4_dead_arithmetic_retains_preheader_type_guards",
+			src: `
+local function run(x)
+  for i = 1, 10 do
+    local unused = x + i
+  end
+end
+local ok = pcall(run, true)
+local calls = 0
+local mt = setmetatable({}, {
+  __add = function(a, b)
+    calls = calls + 1
+    return b
+  end,
+})
+run(mt)
+print(ok, calls)
+`,
+		},
+		{
+			name: "codex_r4_int_overflow_before_float_widening_in_same_iteration",
+			src: `
+local x = 0x7fffffffffffffff
+for i = 1, 1 do
+  x = x + 1
+  x = x + 0.5
+end
+-- Also verify OSR re-entry still optimizes iterations 2..N for standard 'local sum = 0' float reduction:
+local a = {}
+for i = 1, 200 do a[i] = i * 0.25 end
+local sum = 0
+for i = 1, 200 do sum = sum + a[i] end
+print(string.format("%.17g", x), string.format("%.17g", sum), math.type(sum))
+`,
+		},
 	}
 
 	for _, tc := range cases {

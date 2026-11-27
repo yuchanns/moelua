@@ -148,22 +148,16 @@ func (b *loopBuilder) build() *LoopRegion {
 			continue
 		}
 		var initVal ValID
-		acceptInt := false
 		if needsInit {
 			switch t {
 			case TInt:
 				initVal = b.emitPre(Inst{Op: OpUnboxInt, Type: TInt, Slot: slot})
 			case TFloat:
-				// Only allow int->float preheader widening when the single loop body is
-				// guaranteed to execute at least once and unconditionally perform the write.
-				// Conditional or while-loop variables require strict tagFloat on entry so an
-				// untouched Lua integer never loses precision or changes math.type().
-				if b.cand.Kind == LoopForInt && singleBlock {
-					acceptInt = true
-					initVal = b.emitPre(Inst{Op: OpUnboxNumFloat, Type: TFloat, Slot: slot})
-				} else {
-					initVal = b.emitPre(Inst{Op: OpUnboxFloat, Type: TFloat, Slot: slot})
-				}
+				// Always require strict tagFloat on preheader entry so an incoming Lua integer
+				// (e.g. `local sum = 0` or `local x = math.maxinteger; x = x + 1; x = x + 0.5`)
+				// runs iteration 1 in baseline with exact Lua integer semantics before OSR
+				// re-entry on OP_FORLOOP takes over iterations 2..N in the optimized loop.
+				initVal = b.emitPre(Inst{Op: OpUnboxFloat, Type: TFloat, Slot: slot})
 			case TBool:
 				initVal = b.emitPre(Inst{Op: OpUnboxBool, Type: TBool, Slot: slot})
 			}
@@ -180,13 +174,12 @@ func (b *loopBuilder) build() *LoopRegion {
 		}
 		b.varIdx[slot] = len(b.reg.Vars)
 		b.reg.Vars = append(b.reg.Vars, LoopVar{
-			Slot:          slot,
-			Type:          t,
-			InitVal:       initVal,
-			LiveOut:       b.liveOut[slot],
-			Written:       true,
-			AcceptIntInit: acceptInt,
-			ZeroInit:      !needsInit,
+			Slot:     slot,
+			Type:     t,
+			InitVal:  initVal,
+			LiveOut:  b.liveOut[slot],
+			Written:  true,
+			ZeroInit: !needsInit,
 		})
 	}
 

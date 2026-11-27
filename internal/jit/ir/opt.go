@@ -19,47 +19,7 @@ func OptimizeRegion(reg *LoopRegion) bool {
 	markWrittenShapes(reg)
 	runBCE(reg)
 	runDCE(reg)
-	tightenWideningGuards(reg)
 	return verifyOrHoistDeoptSafety(reg)
-}
-
-// tightenWideningGuards downgrades OpUnboxNumFloat (int->float preheader widening)
-// on any written LoopVar to strict OpUnboxFloat whenever the loop body still contains
-// a mid-loop deoptable instruction. This prevents a deopt on iteration 1 from
-// materializing an unexecuted int->float conversion back into Lua registers.
-func tightenWideningGuards(reg *LoopRegion) {
-	hasDeopt := false
-	for _, blk := range reg.Blocks {
-		for i := range blk.Insts {
-			in := &blk.Insts[i]
-			if !in.Dead && canDeoptMidLoop(in) {
-				hasDeopt = true
-				break
-			}
-		}
-		if hasDeopt {
-			break
-		}
-	}
-	if !hasDeopt {
-		return
-	}
-	varInit := make(map[ValID]bool, len(reg.Vars))
-	for i := range reg.Vars {
-		if reg.Vars[i].Written && reg.Vars[i].AcceptIntInit {
-			varInit[reg.Vars[i].InitVal] = true
-			reg.Vars[i].AcceptIntInit = false
-		}
-	}
-	if len(varInit) == 0 {
-		return
-	}
-	for i := range reg.Preheader {
-		in := &reg.Preheader[i]
-		if !in.Dead && in.Op == OpUnboxNumFloat && varInit[in.ID] {
-			in.Op = OpUnboxFloat
-		}
-	}
 }
 
 // markWrittenShapes tags any OpGuardShape whose result is written by OpStoreSlot*
@@ -504,6 +464,8 @@ func hasSideEffect(in *Inst) bool {
 	}
 	switch in.Op {
 	case OpLoopCnt, OpLoopStep, OpLoopIdx,
+		OpUnboxInt, OpUnboxFloat, OpUnboxNumFloat, OpUnboxBool,
+		OpGuardTableArr, OpGuardUpvalInt, OpGuardUpvalFlt,
 		OpSetVar,
 		OpStoreArrInt, OpStoreArrFlt, OpStoreArrBool,
 		OpStoreSlotFloat, OpStoreSlotInt,
