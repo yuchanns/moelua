@@ -1409,12 +1409,10 @@ func (b *loopBuilder) coerceVal(blk *Block, v ValID, want Type, pc int) (ValID, 
 func (b *loopBuilder) writeSlot(blk *Block, slot uint8, v ValID, pc int) {
 	if vi, ok := b.varIdx[slot]; ok {
 		lv := b.reg.Vars[vi]
-		cv, ok := b.coerceVal(blk, v, lv.Type, pc)
-		if !ok {
+		if b.valType(v) != lv.Type {
 			b.failed = true
 			return
 		}
-		v = cv
 		b.emitBody(blk, Inst{Op: OpSetVar, Type: lv.Type, AuxIdx: int32(vi), Args: [3]ValID{v, NoVal, NoVal}, NumArgs: 1, DeoptPC: pc})
 	}
 	b.curSlot[slot] = v

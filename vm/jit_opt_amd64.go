@@ -472,23 +472,12 @@ func (e *x64OptEmit) emitPreheader(fail amd64.Label) {
 			}
 		case ir.OpGuardUpvalFlt:
 			e.emitLoadUpvalPre(int(in.AuxIdx), amd64.RAX, amd64.RCX, fail)
-			lFloat := e.a.NewLabel()
-			lDone := e.a.NewLabel()
 			e.a.CMPQImm(amd64.RCX, int32(tagFloat))
-			e.a.JCC(amd64.E, lFloat)
-			e.a.TESTQ(amd64.RCX, amd64.RCX)
 			e.a.JCC(amd64.NE, fail)
-			if hasLoc {
-				e.a.CVTSI2SDQ(amd64.XMM12, amd64.RAX)
-				e.storeF(loc, amd64.XMM12)
-			}
-			e.a.JMP(lDone)
-			e.a.Bind(lFloat)
 			if hasLoc {
 				e.a.MOVQToX(amd64.XMM12, amd64.RAX)
 				e.storeF(loc, amd64.XMM12)
 			}
-			e.a.Bind(lDone)
 		case ir.OpGuardUpvalSqrt:
 			e.emitLoadUpvalPre(int(in.AuxIdx), amd64.RAX, amd64.RCX, fail)
 			e.a.CMPQImm(amd64.RCX, int32(tagStaticNative))
@@ -1312,19 +1301,10 @@ func (e *x64OptEmit) emitBlockInsts(blk *ir.Block) {
 		case ir.OpLoadSlotFloat:
 			baseR := e.loadG(e.alloc.ValLoc[in.Args[0]], amd64.RAX)
 			off := in.AuxIdx * 16
-			e.a.MOVQLoad(amd64.RCX, amd64.BaseDisp(baseR, off+jitValTag))
-			lFloat := e.a.NewLabel()
-			lDone := e.a.NewLabel()
-			e.a.CMPQImm(amd64.RCX, int32(tagFloat))
-			e.a.JCC(amd64.E, lFloat)
-			e.a.TESTQ(amd64.RCX, amd64.RCX)
+			// Require strict tagFloat (deopt on tagInt so plain field copies preserve integer values).
+			e.a.CMPQMemImm(amd64.BaseDisp(baseR, off+jitValTag), int32(tagFloat))
 			e.a.JCC(amd64.NE, e.deopt)
-			e.a.MOVQLoad(amd64.RDX, amd64.BaseDisp(baseR, off+jitValBits))
-			e.a.CVTSI2SDQ(amd64.XMM12, amd64.RDX)
-			e.a.JMP(lDone)
-			e.a.Bind(lFloat)
 			e.a.MOVSDLoad(amd64.XMM12, amd64.BaseDisp(baseR, off+jitValBits))
-			e.a.Bind(lDone)
 			e.storeF(loc, amd64.XMM12)
 
 		case ir.OpLoadSlotInt:

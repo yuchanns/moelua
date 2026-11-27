@@ -515,6 +515,44 @@ end
 print(table.concat(seen, ","), x)
 `,
 		},
+		{
+			name: "codex_r3_shape_field_copy_preserves_int64",
+			src: `
+local t = { x = 9007199254740993, y = 0.0 }
+local objs = { t }
+for i = 1, 20000 do
+  local a = objs[1]
+  a.y = a.x
+end
+print(t.y, math.type(t.y))
+`,
+		},
+		{
+			name: "codex_r3_loopvar_int_rhs_assignment_preserves_int64",
+			src: `
+local x = 0.0
+for i = 1, 10 do
+  x = 9007199254740993
+end
+local u = 9007199254740993
+local function copy_uv()
+  local y = 0.0
+  for i = 1, 10 do y = u end
+  return y, math.type(y)
+end
+print(x, math.type(x), copy_uv())
+`,
+		},
+		{
+			name: "codex_r3_minint64_const_for_step",
+			src: `
+local s = 0
+for i = 0, 0x8000000000000000, 0x8000000000000000 do
+  s = s ~ i
+end
+print(s)
+`,
+		},
 	}
 
 	for _, tc := range cases {

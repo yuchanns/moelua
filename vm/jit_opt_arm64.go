@@ -496,24 +496,13 @@ func (e *a64OptEmit) emitPreheader(fail arm64.Label) {
 			}
 		case ir.OpGuardUpvalFlt:
 			e.emitLoadUpvalPre(int(in.AuxIdx), arm64.X12, arm64.X13, fail)
-			lFloat := e.a.NewLabel()
-			lDone := e.a.NewLabel()
 			e.a.CMPImm(arm64.X13, uint32(tagFloat))
-			e.a.BCond(arm64.EQ, lFloat)
-			e.a.CBNZ(arm64.X13, fail)
-			if hasLoc {
-				d := e.dstF(loc, arm64.D24)
-				e.a.SCVTF(d, arm64.X12)
-				e.storeF(loc, d)
-			}
-			e.a.B(lDone)
-			e.a.Bind(lFloat)
+			e.a.BCond(arm64.NE, fail)
 			if hasLoc {
 				d := e.dstF(loc, arm64.D24)
 				e.a.FMOVToF(d, arm64.X12)
 				e.storeF(loc, d)
 			}
-			e.a.Bind(lDone)
 		case ir.OpGuardUpvalSqrt:
 			e.emitLoadUpvalPre(int(in.AuxIdx), arm64.X12, arm64.X13, fail)
 			e.a.CMPImm(arm64.X13, uint32(tagStaticNative))
@@ -859,7 +848,7 @@ func (e *a64OptEmit) emitVecElemPtr(dst arm64.Reg, arrVal, baseOff ir.ValID, del
 	adj := delta - 1
 	if adj > 0 && adj < 4096 {
 		e.a.ADDImm(tmp, tmp, uint32(adj))
-	} else if adj < 0 && -adj < 4096 {
+	} else if adj < 0 && adj > -4096 {
 		e.a.SUBImm(tmp, tmp, uint32(-adj))
 	} else if adj != 0 {
 		e.a.MOVImm64(dst, uint64(adj))
@@ -935,7 +924,7 @@ func (e *a64OptEmit) emitBlockInsts(blk *ir.Block) {
 			d := e.dstG(loc, arm64.X14)
 			if in.ImmI >= 0 && in.ImmI < 4096 {
 				e.a.ADDImm(d, l, uint32(in.ImmI))
-			} else if in.ImmI < 0 && -in.ImmI < 4096 {
+			} else if in.ImmI < 0 && in.ImmI > -4096 {
 				e.a.SUBImm(d, l, uint32(-in.ImmI))
 			} else {
 				e.a.MOVImm64(arm64.X13, uint64(in.ImmI))
@@ -1205,17 +1194,11 @@ func (e *a64OptEmit) emitBlockInsts(blk *ir.Block) {
 				e.a.ADDImm(arm64.X15, baseR, uint32(off))
 				e.a.LDP(arm64.X13, arm64.X14, arm64.X15, 0)
 			}
-			lFloat := e.a.NewLabel()
-			lDone := e.a.NewLabel()
-			d := e.dstF(loc, arm64.D24)
+			// Require strict tagFloat (deopt on tagInt so plain field copies preserve integer values).
 			e.a.CMPImm(arm64.X14, uint32(tagFloat))
-			e.a.BCond(arm64.EQ, lFloat)
-			e.a.CBNZ(arm64.X14, e.deopt)
-			e.a.SCVTF(d, arm64.X13)
-			e.a.B(lDone)
-			e.a.Bind(lFloat)
+			e.a.BCond(arm64.NE, e.deopt)
+			d := e.dstF(loc, arm64.D24)
 			e.a.FMOVToF(d, arm64.X13)
-			e.a.Bind(lDone)
 			e.storeF(loc, d)
 
 		case ir.OpLoadSlotInt:
@@ -1311,7 +1294,7 @@ func (e *a64OptEmit) emitBlockTerm(blk *ir.Block, blockLabels []arm64.Label, lLo
 			st := e.reg.ConstStep
 			if st >= 0 && st < 4096 {
 				e.a.ADDImm(idxR, idxR, uint32(st))
-			} else if st < 0 && -st < 4096 {
+			} else if st < 0 && st > -4096 {
 				e.a.SUBImm(idxR, idxR, uint32(-st))
 			} else {
 				e.a.MOVImm64(arm64.X13, uint64(st))
