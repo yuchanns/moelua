@@ -194,38 +194,74 @@ func formatKiB(v float64, ok bool) string {
 	return fmt.Sprintf("%.1f KB", v)
 }
 
-type memResult struct {
-	Engine        string  `json:"engine"`
+type scalePoint struct {
 	VMs           int     `json:"vms"`
-	IdleHeapKiB   float64 `json:"idle_heap_kib"`
-	IdleRSSKiB    float64 `json:"idle_rss_kib"`
-	HasRSS        bool    `json:"has_rss"`
-	IdleGCMs      float64 `json:"idle_gc_ms"`
 	ActiveHeapKiB float64 `json:"active_heap_kib"`
 	ActiveRSSKiB  float64 `json:"active_rss_kib"`
 	ActiveGCMs    float64 `json:"active_gc_ms"`
 }
 
-func runOne(h vmHarness, n int, asJSON bool) {
-	runtime.GOMAXPROCS(1)
+type memResult struct {
+	Engine        string       `json:"engine"`
+	VMs           int          `json:"vms"`
+	NewStateUs    float64      `json:"new_state_us"`
+	IdleHeapKiB   float64      `json:"idle_heap_kib"`
+	IdleRSSKiB    float64      `json:"idle_rss_kib"`
+	HasRSS        bool         `json:"has_rss"`
+	IdleGCMs      float64      `json:"idle_gc_ms"`
+	ActiveHeapKiB float64      `json:"active_heap_kib"`
+	ActiveRSSKiB  float64      `json:"active_rss_kib"`
+	ActiveGCMs    float64      `json:"active_gc_ms"`
+	Scale         []scalePoint `json:"scale,omitempty"`
+}
 
-	// Warm up one-time package globals.
+func parseScaleList(raw string) ([]int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var out []int
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("invalid scale count %q", part)
+		}
+		out = append(out, n)
+	}
+	slices.Sort(out)
+	out = slices.Compact(out)
+	return out, nil
+}
+
+func warmupHarness(h vmHarness) {
 	w, wc := h.newIdle()
 	wc()
 	runtime.KeepAlive(w)
 	w = nil
 	runtime.GC()
 	debug.FreeOSMemory()
+}
 
-	var m0, m1, m2 runtime.MemStats
+func runIdleWorker(h vmHarness, n int) {
+	runtime.GOMAXPROCS(1)
+	warmupHarness(h)
+
+	var m0, m1 runtime.MemStats
 	runtime.ReadMemStats(&m0)
 	rss0, hasRSS := currentRSSKiB()
 
 	vms := make([]any, n)
 	closes := make([]func(), n)
+	t0 := time.Now()
 	for i := range n {
 		vms[i], closes[i] = h.newIdle()
 	}
+	createDur := time.Since(t0)
+
 	runtime.GC()
 	runtime.ReadMemStats(&m1)
 	rss1, _ := currentRSSKiB()
@@ -233,45 +269,20 @@ func runOne(h vmHarness, n int, asJSON bool) {
 	idleRSS := float64(rss1-rss0) / float64(n)
 	idleGC := measureGC(7)
 
-	for i := range n {
-		if err := h.runInit(vms[i], activeLua); err != nil {
-			panic(fmt.Sprintf("%s active init failed: %v", h.name, err))
-		}
-	}
-	runtime.GC()
-	runtime.ReadMemStats(&m2)
-	rss2, _ := currentRSSKiB()
-	activeHeap := float64(int64(m2.HeapAlloc)-int64(m0.HeapAlloc)) / float64(n) / 1024.0
-	activeRSS := float64(rss2-rss0) / float64(n)
-	activeGC := measureGC(7)
-
 	res := memResult{
-		Engine:        h.name,
-		VMs:           n,
-		IdleHeapKiB:   idleHeap,
-		IdleRSSKiB:    idleRSS,
-		HasRSS:        hasRSS,
-		IdleGCMs:      float64(idleGC) / 1e6,
-		ActiveHeapKiB: activeHeap,
-		ActiveRSSKiB:  activeRSS,
-		ActiveGCMs:    float64(activeGC) / 1e6,
+		Engine:      h.name,
+		VMs:         n,
+		NewStateUs:  float64(createDur.Microseconds()) / float64(n),
+		IdleHeapKiB: idleHeap,
+		IdleRSSKiB:  idleRSS,
+		HasRSS:      hasRSS,
+		IdleGCMs:    float64(idleGC) / 1e6,
 	}
-	if asJSON {
-		raw, err := json.Marshal(res)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Println(string(raw))
-	} else {
-		fmt.Printf("%-15s | %11s | %11s | %8.2f ms | %12s | %12s | %9.2f ms\n",
-			res.Engine,
-			formatKiB(res.IdleHeapKiB, true),
-			formatKiB(res.IdleRSSKiB, res.HasRSS),
-			res.IdleGCMs,
-			formatKiB(res.ActiveHeapKiB, true),
-			formatKiB(res.ActiveRSSKiB, res.HasRSS),
-			res.ActiveGCMs)
+	raw, err := json.Marshal(res)
+	if err != nil {
+		panic(err)
 	}
+	fmt.Println(string(raw))
 
 	for i := range n {
 		closes[i]()
@@ -279,18 +290,93 @@ func runOne(h vmHarness, n int, asJSON bool) {
 	}
 }
 
+func runActiveScaleWorker(h vmHarness, counts []int) {
+	runtime.GOMAXPROCS(1)
+	warmupHarness(h)
+
+	var m0, mCur runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	rss0, hasRSS := currentRSSKiB()
+
+	maxN := counts[len(counts)-1]
+	vms := make([]any, 0, maxN)
+	closes := make([]func(), 0, maxN)
+
+	points := make([]scalePoint, 0, len(counts))
+	for _, target := range counts {
+		for len(vms) < target {
+			v, c := h.newIdle()
+			if err := h.runInit(v, activeLua); err != nil {
+				panic(fmt.Sprintf("%s active init failed at VM %d: %v", h.name, len(vms), err))
+			}
+			vms = append(vms, v)
+			closes = append(closes, c)
+		}
+		runtime.GC()
+		runtime.ReadMemStats(&mCur)
+		rssCur, _ := currentRSSKiB()
+		gcDur := measureGC(5)
+		points = append(points, scalePoint{
+			VMs:           target,
+			ActiveHeapKiB: float64(int64(mCur.HeapAlloc)-int64(m0.HeapAlloc)) / float64(target) / 1024.0,
+			ActiveRSSKiB:  float64(rssCur-rss0) / float64(target),
+			ActiveGCMs:    float64(gcDur) / 1e6,
+		})
+	}
+
+	res := memResult{
+		Engine: h.name,
+		HasRSS: hasRSS,
+		Scale:  points,
+	}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(raw))
+
+	for i := range vms {
+		closes[i]()
+		vms[i] = nil
+	}
+}
+
 func main() {
 	worker := flag.String("worker", "", "run single engine")
-	workerJSON := flag.Bool("worker-json", false, "emit single JSON line from worker")
+	workerMode := flag.String("worker-mode", "idle", "worker mode: idle or active-scale")
 	jsonOut := flag.String("json", "", "optional path to write structured JSON results")
-	count := flag.Int("n", 256, "number of live VMs")
+	count := flag.Int("n", 256, "primary VM count for summary table")
+	scaleFlag := flag.String("scale", "32,128,256,512", "comma-separated active VM counts for scaling curve")
 	flag.Parse()
+
+	scaleCounts, err := parseScaleList(*scaleFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "memcmp: %v\n", err)
+		os.Exit(2)
+	}
+	if !slices.Contains(scaleCounts, *count) {
+		scaleCounts = append(scaleCounts, *count)
+		slices.Sort(scaleCounts)
+	}
+	var scaleStrs []string
+	for _, c := range scaleCounts {
+		scaleStrs = append(scaleStrs, strconv.Itoa(c))
+	}
+	scaleArg := strings.Join(scaleStrs, ",")
 
 	hs := allHarnesses()
 	if *worker != "" {
 		for _, h := range hs {
 			if h.name == *worker {
-				runOne(h, *count, *workerJSON)
+				switch *workerMode {
+				case "idle":
+					runIdleWorker(h, *count)
+				case "active-scale":
+					runActiveScaleWorker(h, scaleCounts)
+				default:
+					fmt.Fprintf(os.Stderr, "memcmp: unknown worker-mode %q\n", *workerMode)
+					os.Exit(2)
+				}
 				return
 			}
 		}
@@ -301,29 +387,57 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("%-15s | %11s | %11s | %11s | %12s | %12s | %12s\n",
-		"Engine", "Idle Heap", "Idle RSS", fmt.Sprintf("%d-Idle GC", *count), "Act Heap/VM", "Act RSS/VM", fmt.Sprintf("%d-Act GC", *count))
-	fmt.Println(strings.Repeat("-", 98))
+	fmt.Printf("%-15s | %9s | %11s | %11s | %11s | %12s | %12s | %12s\n",
+		"Engine", "NewState", "Idle Heap", "Idle RSS", fmt.Sprintf("%d-Idle GC", *count), "Act Heap/VM", "Act RSS/VM", fmt.Sprintf("%d-Act GC", *count))
+	fmt.Println(strings.Repeat("-", 110))
 	var results []memResult
 	failed := false
 	for _, h := range hs {
-		cmd := exec.Command(self, "-worker", h.name, "-worker-json", "-n", strconv.Itoa(*count))
-		cmd.Stderr = os.Stderr
-		out, err := cmd.Output()
+		idleCmd := exec.Command(self, "-worker", h.name, "-worker-mode", "idle", "-n", strconv.Itoa(*count), "-scale", scaleArg)
+		idleCmd.Stderr = os.Stderr
+		idleOut, err := idleCmd.Output()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s failed: %v\n", h.name, err)
+			fmt.Fprintf(os.Stderr, "%s idle worker failed: %v\n", h.name, err)
 			failed = true
 			continue
 		}
-		var r memResult
-		if err := json.Unmarshal(out, &r); err != nil {
-			fmt.Fprintf(os.Stderr, "%s parse output failed: %v\n", h.name, err)
+		var idleRes memResult
+		if err := json.Unmarshal(idleOut, &idleRes); err != nil {
+			fmt.Fprintf(os.Stderr, "%s parse idle output failed: %v\n", h.name, err)
 			failed = true
 			continue
+		}
+
+		scaleCmd := exec.Command(self, "-worker", h.name, "-worker-mode", "active-scale", "-n", strconv.Itoa(*count), "-scale", scaleArg)
+		scaleCmd.Stderr = os.Stderr
+		scaleOut, err := scaleCmd.Output()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s active-scale worker failed: %v\n", h.name, err)
+			failed = true
+			continue
+		}
+		var scaleRes memResult
+		if err := json.Unmarshal(scaleOut, &scaleRes); err != nil {
+			fmt.Fprintf(os.Stderr, "%s parse active-scale output failed: %v\n", h.name, err)
+			failed = true
+			continue
+		}
+
+		r := idleRes
+		r.HasRSS = idleRes.HasRSS && scaleRes.HasRSS
+		r.Scale = scaleRes.Scale
+		for _, pt := range scaleRes.Scale {
+			if pt.VMs == *count {
+				r.ActiveHeapKiB = pt.ActiveHeapKiB
+				r.ActiveRSSKiB = pt.ActiveRSSKiB
+				r.ActiveGCMs = pt.ActiveGCMs
+				break
+			}
 		}
 		results = append(results, r)
-		fmt.Printf("%-15s | %11s | %11s | %8.2f ms | %12s | %12s | %9.2f ms\n",
+		fmt.Printf("%-15s | %6.1f us | %11s | %11s | %8.2f ms | %12s | %12s | %9.2f ms\n",
 			r.Engine,
+			r.NewStateUs,
 			formatKiB(r.IdleHeapKiB, true),
 			formatKiB(r.IdleRSSKiB, r.HasRSS),
 			r.IdleGCMs,
@@ -334,6 +448,21 @@ func main() {
 	if failed || len(results) == 0 {
 		os.Exit(1)
 	}
+
+	fmt.Printf("\nHigh-Density Active Go GC Scaling (2,047 tables/VM):\n%-15s", "Engine")
+	for _, c := range scaleCounts {
+		fmt.Printf(" | %10s", fmt.Sprintf("%d VMs", c))
+	}
+	fmt.Println()
+	fmt.Println(strings.Repeat("-", 15+13*len(scaleCounts)))
+	for _, r := range results {
+		fmt.Printf("%-15s", r.Engine)
+		for _, pt := range r.Scale {
+			fmt.Printf(" | %7.2f ms", pt.ActiveGCMs)
+		}
+		fmt.Println()
+	}
+
 	if *jsonOut != "" {
 		raw, err := json.MarshalIndent(results, "", "  ")
 		if err != nil {

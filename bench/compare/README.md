@@ -30,9 +30,11 @@ GOLUA_PGO="$(go list -m -f '{{.Dir}}' github.com/arnodel/golua)/default.pgo"
     -engines '^ArnodelGolua$' .
 ) | go run benchreport.go -json bench_summary.json
 
-# Run isolated-process 256-VM memory & Go GC comparison across all Go engines:
+# Run isolated-process high-density multi-VM memory & Go GC comparison (32/128/256/512 VMs) across all Go engines:
 go run memcmp.go -json memcmp.json
 
-# Regenerate docs/assets/bench-compare.svg from benchreport.go -json and memcmp.go -json outputs:
-go run genchart.go -bench bench_summary.json -mem memcmp.json -out ../../docs/assets/bench-compare.svg
+# Regenerate both README SVG charts from benchreport.go -json and memcmp.go -json outputs:
+go run genchart.go -bench bench_summary.json -mem memcmp.json \
+  -out ../../docs/assets/bench-compare.svg \
+  -out-multivm ../../docs/assets/bench-multivm.svg
 ```

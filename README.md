@@ -8,7 +8,13 @@ MoeLua compiles with `CGO_ENABLED=0`, has **zero third-party dependencies**, use
 
 ![MoeLua 5.5 vs Go Lua Engines and C Lua 5.5.1](docs/assets/bench-compare.svg)
 
-This chart is automatically regenerated on every merge to `main` by GitHub Actions ([`bench-compare.yml`](.github/workflows/bench-compare.yml)) using the standalone [`bench/compare`](bench/compare) nested module, where every engine (including `Apogee JIT`) runs identical Lua 5.1-compatible source and is verified byte-for-byte against C Lua 5.5.1. Full per-program tables, `LuaJIT` baselines, Peak RSS, embedding microbenchmarks (`NewState` 4.8 µs, `Call1` 39 ns / 0 allocs, `RegisterFunc1` ~30 ns / 0 allocs), and Apple M1 Max reference numbers are in [`docs/benchmarks.md`](docs/benchmarks.md).
+### High-Density Multi-VM Scalability
+
+Most Go Lua engines (including JIT-compiled ones) store Lua tables and values as pointer-rich Go heap objects, so Go's garbage collector must scan every live Lua object across every tenant VM — causing **O(VMs × objects)** GC pauses that grow past **110–365 ms** at 512 active VMs (>1M live tables). MoeLua keeps all Lua values (`ptrdata == 0`), tables, shapes, strings, and stacks in per-`State` noscan `[]byte` Arenas with a true PUC-Rio Lua 5.5.1 GC, keeping Go GC pauses near-flat (~**1.95 ms** at 512 active VMs — **57×–187×** lower than Go-heap Lua VMs) with **~54 KiB** idle RSS, **~329 KiB** active RSS, and the fastest cold `NewState` (**~31 µs** across 256 concurrent live VMs).
+
+![MoeLua 5.5 High-Density Multi-VM Scalability](docs/assets/bench-multivm.svg)
+
+Both charts above are automatically regenerated on every merge to `main` by GitHub Actions ([`bench-compare.yml`](.github/workflows/bench-compare.yml)) using the standalone [`bench/compare`](bench/compare) nested module, where every engine (including `Apogee JIT`) runs identical Lua 5.1-compatible source and is verified byte-for-byte against C Lua 5.5.1. Full per-program tables, `LuaJIT` baselines, Peak RSS, embedding microbenchmarks (`NewState` 4.8 µs, `Call1` 39 ns / 0 allocs, `RegisterFunc1` ~30 ns / 0 allocs), and Apple M1 Max reference numbers are in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Why MoeLua
 

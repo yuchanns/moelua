@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths-ignore:
       - "docs/assets/bench-compare.svg"
+      - "docs/assets/bench-multivm.svg"
       - "docs/benchmarks.md"
       - "README.md"
   workflow_dispatch:
@@ -64,14 +65,14 @@ jobs:
         working-directory: bench/compare
         run: go test -vet=off -timeout 10m -run TestOutputs -engines '^(C|MoeLua)$' .
 
-      - name: Run 256-VM memory & Go GC comparison
+      - name: Run high-density multi-VM memory & Go GC comparison
         if: ${{ github.event_name == 'push' || inputs.run_memcmp }}
         working-directory: bench/compare
         run: |
           go build -o /tmp/memcmp memcmp.go
           /tmp/memcmp -json memcmp.json | tee memcmp.txt
           {
-            echo "### 256-VM Memory & Go GC Comparison"
+            echo "### High-Density Multi-VM Memory & Go GC Comparison"
             echo '```text'
             cat memcmp.txt
             echo '```'
@@ -121,7 +122,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Regenerate README performance chart SVG
+      - name: Regenerate README performance chart SVGs
         if: ${{ github.event_name == 'push' || inputs.run_memcmp }}
         working-directory: bench/compare
         run: |
@@ -138,12 +139,15 @@ jobs:
             CPU_MODEL="$(lscpu 2>/dev/null | awk -F: '/Model name/{gsub(/^[ \t]+/,"",$2); print $2; exit}')"
             [ -n "$CPU_MODEL" ] || CPU_MODEL="$(uname -m)"
             GO_VER="$(go env GOVERSION | sed 's/^go//')"
-            SUBTITLE="GitHub Actions (${CPU_MODEL}, $(go env GOOS)/$(go env GOARCH)) · Go ${GO_VER} · GOMAXPROCS=1 · $(date -u +%Y-%m-%d) · Lower is better"
+            SUBTITLE="GitHub Actions (${CPU_MODEL}, $(go env GOOS)/$(go env GOARCH)) · Go ${GO_VER} · GOMAXPROCS=1 · Lower is better"
             go run genchart.go \
               -bench bench_summary.json \
               -mem memcmp.json \
               -subtitle "$SUBTITLE" \
-              -out ../../docs/assets/bench-compare.svg
+              -date "$(date -u +%Y-%m-%d)" \
+              -commit "${GITHUB_SHA::7}" \
+              -out ../../docs/assets/bench-compare.svg \
+              -out-multivm ../../docs/assets/bench-multivm.svg
           elif [ "${{ github.event_name }}" = "push" ]; then
             echo "ERROR: push to main did not produce both C-baseline common_geomean and memcmp.json" >&2
             exit 1
@@ -151,28 +155,29 @@ jobs:
             echo "Skipping chart regeneration (requires both C-baseline common_geomean and memcmp.json)."
           fi
 
-      - name: Commit updated README performance chart to main
+      - name: Commit updated README performance charts to main
         if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.commit_chart) }}
         run: |
           set -euo pipefail
-          if git diff --quiet docs/assets/bench-compare.svg; then
-            echo "Chart unchanged; skipping commit."
+          if [ -z "$(git status --porcelain -- docs/assets/bench-compare.svg docs/assets/bench-multivm.svg)" ]; then
+            echo "Charts unchanged; skipping commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           cp docs/assets/bench-compare.svg /tmp/bench-compare-new.svg
+          cp docs/assets/bench-multivm.svg /tmp/bench-multivm-new.svg
           for attempt in 1 2 3; do
-            git checkout -- docs/assets/bench-compare.svg
             git fetch origin main
             git reset --hard origin/main
             cp /tmp/bench-compare-new.svg docs/assets/bench-compare.svg
-            if git diff --quiet docs/assets/bench-compare.svg; then
-              echo "Chart already matches origin/main; skipping commit."
+            cp /tmp/bench-multivm-new.svg docs/assets/bench-multivm.svg
+            if [ -z "$(git status --porcelain -- docs/assets/bench-compare.svg docs/assets/bench-multivm.svg)" ]; then
+              echo "Charts already match origin/main; skipping commit."
               exit 0
             fi
-            git add docs/assets/bench-compare.svg
-            git commit -m "chore(bench): update README performance chart (${GITHUB_SHA::7})"
+            git add docs/assets/bench-compare.svg docs/assets/bench-multivm.svg
+            git commit -m "chore(bench): update README performance charts (${GITHUB_SHA::7})"
             if git push origin HEAD:main; then
               exit 0
             fi
@@ -191,4 +196,5 @@ jobs:
             bench/compare/memcmp.txt
             bench/compare/memcmp.json
             docs/assets/bench-compare.svg
+            docs/assets/bench-multivm.svg
           if-no-files-found: ignore

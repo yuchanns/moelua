@@ -7,6 +7,8 @@
     <style>
       .bg { fill: #ffffff; }
       .border { fill: none; stroke: #e2e8f0; stroke-width: 1; }
+      .badge-bg { fill: #f8fafc; stroke: #e2e8f0; stroke-width: 1; }
+      .badge-txt { font: 500 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #475569; text-anchor: middle; }
       .title { font: 700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #0f172a; }
       .subtitle { font: 400 11.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #475569; }
       .panel-title { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #0f172a; }
@@ -15,10 +17,14 @@
       .label-hi { font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #047857; text-anchor: end; }
       .val { font: 600 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #334155; }
       .val-hi { font: 700 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #047857; }
+      .end-lbl { font: 500 10.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #475569; }
+      .end-lbl-hi { font: 700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #047857; }
       .grid { stroke: #f1f5f9; stroke-width: 1; }
       .axis { stroke: #cbd5e1; stroke-width: 1; }
       .refline { stroke: #64748b; stroke-width: 1; stroke-dasharray: 3 3; }
+      .leader { stroke: #cbd5e1; stroke-width: 1; fill: none; }
       .tick { font: 400 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #64748b; text-anchor: middle; }
+      .tick-y { font: 400 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #64748b; text-anchor: end; }
       .foot { font: 400 10.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #64748b; }
       .bar-moe { fill: #10b981; }
       .bar-other { fill: #64748b; }
@@ -31,7 +37,9 @@
 
   <!-- Header -->
   <text x="24" y="30" class="title">MoeLua 5.5 vs Go Lua Engines &amp; C Lua 5.5.1</text>
-  <text x="24" y="48" class="subtitle">Apple M1 Max (darwin/arm64) · Go 1.27.4 · GOMAXPROCS=1 · Lower is better in both panels</text>
+  <text x="24" y="48" class="subtitle">Apple M1 Max (darwin/arm64) · Go 1.27.4 · GOMAXPROCS=1 · Lower is better</text>
+  <rect x="801.0" y="14" width="135.0" height="22" rx="6" class="badge-bg"/>
+  <text x="868.5" y="29" class="badge-txt">Updated 2026-11-27</text>
 
   <!-- Divider -->
   <line x1="490" y1="68" x2="490" y2="404" stroke="#e2e8f0" stroke-width="1"/>
@@ -103,28 +111,28 @@
   <text x="858.0" y="393" class="tick">200ms</text>
   <text x="640" y="131.0" class="label">modernc/lua (mmap)</text>
   <rect x="648.0" y="118.0" width="3.0" height="17.0" rx="3" class="bar-other"/>
-  <text x="657.0" y="131.0" class="val">0.21 ms (277 KiB)</text>
+  <text x="657.0" y="131.0" class="val">0.23 ms (276 KiB)</text>
   <text x="640" y="163.5" class="label-hi">MoeLua 5.5 (Arena)</text>
   <rect x="648.0" y="150.5" width="3.0" height="17.0" rx="3" class="bar-moe"/>
-  <text x="657.0" y="163.5" class="val-hi">1.08 ms (332 KiB)</text>
+  <text x="657.0" y="163.5" class="val-hi">0.98 ms (329 KiB)</text>
   <text x="640" y="196.0" class="label">arnodel/golua</text>
-  <rect x="648.0" y="183.0" width="56.7" height="17.0" rx="3" class="bar-other"/>
-  <text x="710.7" y="196.0" class="val">54.0 ms (629 KiB)</text>
-  <text x="640" y="228.5" class="label">Apogee v1.2.1 (JIT)</text>
-  <rect x="648.0" y="215.5" width="57.1" height="17.0" rx="3" class="bar-other"/>
-  <text x="711.1" y="228.5" class="val">54.3 ms (577 KiB)</text>
-  <text x="640" y="261.0" class="label">Apogee v1.2.1 (noJIT)</text>
-  <rect x="648.0" y="248.0" width="58.2" height="17.0" rx="3" class="bar-other"/>
-  <text x="712.2" y="261.0" class="val">55.4 ms (516 KiB)</text>
+  <rect x="648.0" y="183.0" width="57.2" height="17.0" rx="3" class="bar-other"/>
+  <text x="711.2" y="196.0" class="val">54.5 ms (631 KiB)</text>
+  <text x="640" y="228.5" class="label">Apogee v1.2.1 (noJIT)</text>
+  <rect x="648.0" y="215.5" width="58.1" height="17.0" rx="3" class="bar-other"/>
+  <text x="712.1" y="228.5" class="val">55.3 ms (514 KiB)</text>
+  <text x="640" y="261.0" class="label">Apogee v1.2.1 (JIT)</text>
+  <rect x="648.0" y="248.0" width="59.0" height="17.0" rx="3" class="bar-other"/>
+  <text x="713.0" y="261.0" class="val">56.2 ms (564 KiB)</text>
   <text x="640" y="293.5" class="label">DCLua</text>
-  <rect x="648.0" y="280.5" width="78.6" height="17.0" rx="3" class="bar-other"/>
-  <text x="732.6" y="293.5" class="val">74.8 ms (1.1 MiB)</text>
+  <rect x="648.0" y="280.5" width="79.7" height="17.0" rx="3" class="bar-other"/>
+  <text x="733.7" y="293.5" class="val">75.9 ms (1.0 MiB)</text>
   <text x="640" y="326.0" class="label">Shopify/go-lua</text>
-  <rect x="648.0" y="313.0" width="91.2" height="17.0" rx="3" class="bar-other"/>
-  <text x="745.2" y="326.0" class="val">86.8 ms (1021 KiB)</text>
+  <rect x="648.0" y="313.0" width="91.4" height="17.0" rx="3" class="bar-other"/>
+  <text x="745.4" y="326.0" class="val">87.0 ms (1023 KiB)</text>
   <text x="640" y="358.5" class="label">yuin/gopher-lua</text>
-  <rect x="648.0" y="345.5" width="193.9" height="17.0" rx="3" class="bar-other"/>
-  <text x="835.9" y="358.5" class="val" style="fill:#ffffff;text-anchor:end">184.7 ms (2.0 MiB)</text>
+  <rect x="648.0" y="345.5" width="190.4" height="17.0" rx="3" class="bar-other"/>
+  <text x="832.4" y="358.5" class="val" style="fill:#ffffff;text-anchor:end">181.3 ms (2.0 MiB)</text>
 
   <!-- Footer notes -->
   <text x="24" y="422" class="foot">Left: median of 3 rounds via bench/compare (32/32 byte-exact output vs C Lua 5.5.1). LuaJIT on the same suite: 0.16x (see docs/benchmarks.md).</text>
