@@ -53,6 +53,13 @@ checkout("true\n")`
 	if patched == src {
 		t.Fatalf("could not locate C shared library block in main.lua")
 	}
+	// MoeLua prints its own copyright banner ("MoeLua Contributors") rather than claiming PUC-Rio copyright.
+	const bannerCheck = `assert(string.find(t, "PUC%-Rio\nhello"))`
+	patched2 := strings.Replace(patched, bannerCheck, `assert(string.find(t, "MoeLua Contributors\nhello"))`, 1)
+	if patched2 == patched {
+		t.Fatalf("could not locate -v banner assertion in main.lua")
+	}
+	patched = patched2
 
 	patchedPath := filepath.Join(t.TempDir(), "main_purego.lua")
 	if err := os.WriteFile(patchedPath, []byte(patched), 0o644); err != nil {
@@ -403,13 +410,13 @@ func TestCLIFlagsREPLAndStdinParity(t *testing.T) {
 		}
 	})
 
-	// 19. -v banner matches Lua 5.5.1 copyright year (1994-2026).
+	// 19. -v banner identifies MoeLua and MoeLua Contributors copyright.
 	t.Run("version_banner_2026", func(t *testing.T) {
 		out, stderr, err := run("", "", nil, "-v")
 		if err != nil {
 			t.Fatalf("err=%v stderr=%s", err, stderr)
 		}
-		const want = "Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio"
+		const want = "MoeLua (Lua 5.5.1)  Copyright (C) 2026 MoeLua Contributors"
 		if strings.TrimSpace(out) != want {
 			t.Fatalf("expected %q, got %q", want, out)
 		}

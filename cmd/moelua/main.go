@@ -14,7 +14,7 @@ import (
 	"github.com/yuchanns/moelua/vm"
 )
 
-const luaReleaseBanner = "Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio"
+const luaReleaseBanner = "MoeLua (Lua 5.5.1)  Copyright (C) 2026 MoeLua Contributors"
 
 type cliFlags struct {
 	hasE    bool
