@@ -677,6 +677,19 @@ func GMatchWithCancel(s, pattern string, init int, checkCancel func() error) *GM
 	return it
 }
 
+// CloneWithCancel returns an independent copy of it at its current iteration position
+// with cloned subject/pattern strings and a fresh cancellation callback.
+func (it *GMatchIter) CloneWithCancel(checkCancel func() error) *GMatchIter {
+	if it == nil {
+		return nil
+	}
+	cp := *it
+	cp.ms.src = strings.Clone(it.ms.src)
+	cp.ms.pat = strings.Clone(it.ms.pat)
+	cp.ms.checkCancel = checkCancel
+	return &cp
+}
+
 // Next advances the iterator to the next match.
 func (it *GMatchIter) Next() (captures []CaptureVal, ok bool, err error) {
 	for src := it.srcPos; src <= len(it.ms.src); src++ {

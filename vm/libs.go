@@ -148,7 +148,7 @@ func (s *State) OpenLibs(mask LibMask) {
 }
 
 func (s *State) pinRuntime(v Value) int {
-	if s.intern.bootstrapping || !v.IsGCObject() {
+	if !v.IsGCObject() {
 		return 0
 	}
 	return s.Ref(v)

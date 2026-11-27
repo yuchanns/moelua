@@ -153,11 +153,26 @@ func (g *GoRefs) LiveCount() int {
 // generations (used by Template.Clone so cloned States share immutable Go callbacks
 // without sharing mutable handle-table state).
 func (g *GoRefs) Clone() *GoRefs {
+	return g.CloneWith(nil)
+}
+
+// CloneWith returns an independent copy of g preserving all active GoHandle indices and
+// generations. When cloneVal is non-nil, it is invoked on each live slot's Go value to
+// independently clone mutable built-in payloads.
+func (g *GoRefs) CloneWith(cloneVal func(any) any) *GoRefs {
 	if g == nil || len(g.slots) <= 1 {
 		return NewGoRefs()
 	}
+	slots := slices.Clone(g.slots)
+	if cloneVal != nil {
+		for i := 1; i < len(slots); i++ {
+			if slots[i].live {
+				slots[i].val = cloneVal(slots[i].val)
+			}
+		}
+	}
 	return &GoRefs{
-		slots:     slices.Clone(g.slots),
+		slots:     slots,
 		freeHead:  g.freeHead,
 		liveCount: g.liveCount,
 	}

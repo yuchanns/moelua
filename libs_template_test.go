@@ -854,6 +854,108 @@ func TestCodexRound1TemplateAndLibsRegressions(t *testing.T) {
 	})
 }
 
+func TestCodexRound2TemplateAndLibsRegressions(t *testing.T) {
+	t.Run("GMatchIteratorIsolatedAcrossClones", func(t *testing.T) {
+		tmpl, err := NewTemplate(func(s *State) error {
+			_, err := s.DoString(`iter = string.gmatch("abc", ".")`)
+			return err
+		}, WithLibs(LibSafe))
+		if err != nil {
+			t.Fatalf("NewTemplate with gmatch iterator failed: %v", err)
+		}
+
+		// Run concurrent clones advancing the same snapshotted gmatch iterator under -race.
+		const workers = 8
+		var wg sync.WaitGroup
+		errCh := make(chan error, workers)
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s := tmpl.NewState()
+				defer s.Close()
+				res, err := s.DoString(`local a, b, c, d = iter(), iter(), iter(), iter(); return a, b, c, d`)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				a, _ := s.ToString(res[0])
+				b, _ := s.ToString(res[1])
+				c, _ := s.ToString(res[2])
+				if len(res) != 4 || a != "a" || b != "b" || c != "c" || !res[3].IsNil() {
+					errCh <- errors.New("gmatch iterator state leaked across clones: " + a + b + c)
+				}
+			}()
+		}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			t.Fatal(err)
+		}
+
+		// Verify cloned gmatch iterator also honors per-clone context cancellation.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		sc := tmpl.NewState(WithContext(ctx))
+		defer sc.Close()
+		if _, err := sc.DoString(`return iter()`); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cloned gmatch iterator expected context.Canceled, got %v", err)
+		}
+	})
+
+	t.Run("TemplateSetupOpenLibsStringUnderTightMemLimit", func(t *testing.T) {
+		// Exact Codex Round 2 repro: opening LibString inside NewTemplate setup under a tight
+		// memory limit must keep strTbl rooted across strMeta allocation so ("abc"):upper() works.
+		for _, headroom := range []int64{1024, 2048, 2688, 3072, 4096, 8192} {
+			tmpl, err := NewTemplate(func(s *State) error {
+				s.SetMemoryLimit(s.MemoryUsage() + headroom)
+				return s.OpenLibs(LibString)
+			}, WithLibs(LibNone))
+			if err != nil {
+				continue // OOM cleanly rejected during setup is fine
+			}
+			s := tmpl.NewState()
+			res, err := s.DoString(`return ("abc"):upper()`)
+			if err != nil {
+				s.Close()
+				t.Fatalf("cloned state failed on ('abc'):upper() (headroom=%d): %v", headroom, err)
+			}
+			if got, ok := s.ToString(res[0]); !ok || got != "ABC" {
+				s.Close()
+				t.Fatalf("('abc'):upper() = (%q, %v), want (ABC, true)", got, ok)
+			}
+			s.Close()
+		}
+	})
+
+	t.Run("TemplateDeferredArrHintMemoryAccounting", func(t *testing.T) {
+		// Exact Codex Round 2 repro: table created with large unused sequence capacity in setup
+		// must preserve its extraMemBytes reservation in clones so materializing cannot bypass memLimit.
+		const bigSeq = 1 << 20 // 8 MiB array reservation
+		tmpl, err := NewTemplate(func(s *State) error {
+			tbl, err := s.TryNewTable(bigSeq, 0)
+			if err != nil {
+				return err
+			}
+			return s.TrySetGlobal("big", tbl.Value())
+		}, WithLibs(LibSafe))
+		if err != nil {
+			t.Fatalf("NewTemplate with pre-sized table failed: %v", err)
+		}
+
+		s := tmpl.NewState()
+		defer s.Close()
+		if usage := s.MemoryUsage(); usage < bigSeq*8 {
+			t.Fatalf("cloned State MemoryUsage = %d, want >= %d (preserved arrHint reservation)", usage, bigSeq*8)
+		}
+		// Setting a limit below the reserved 8 MiB must reject materializing big[1] = 1.
+		s.SetMemoryLimit(64 << 10)
+		if _, err := s.DoString(`big[1] = 1`); err == nil {
+			t.Fatalf("expected memory limit error when materializing big[1] above cap, got nil (usage=%d)", s.MemoryUsage())
+		}
+	})
+}
+
 func BenchmarkTemplateNewState(b *testing.B) {
 	tmpl, err := NewTemplate(func(s *State) error {
 		if _, err := s.RequireLib("svc", func(st *State, _ []Value) ([]Value, error) {

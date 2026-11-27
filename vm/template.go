@@ -51,9 +51,10 @@ type Template struct {
 	nextStrID     uint64
 
 	// Read-only Arena & GoRefs snapshots cloned per State.
-	arena  *arena.Arena
-	goRefs *arena.GoRefs
-	gcSnap arena.CollectorSnapshot
+	arena            *arena.Arena
+	goRefs           *arena.GoRefs
+	hasMutableGoRefs bool
+	gcSnap           arena.CollectorSnapshot
 
 	// Snapshot metadata copied into each cloned State (all ObjRefs remain identical!).
 	mainThreadRef arena.ObjRef
@@ -69,6 +70,7 @@ type Template struct {
 	pkgAllowOS    bool
 	fsSearchers   int
 	protoEpoch    uint64
+	extraMemBytes int64
 
 	protos       []*tmplProtoDesc
 	freeProtoIDs []uint32
@@ -198,31 +200,48 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 
 	// Clear template GoRefs handles on std file Userdatas so each cloned State binds fresh
 	// os.Stdin/os.Stdout/os.Stderr handles without retaining template-owned *luaFile wrappers.
-	var stdinRef, stdoutRef, stderrRef arena.ObjRef
-	if b.stdinRef != arena.NullRef && b.arena.IsLive(b.stdinRef) {
-		stdinRef = b.stdinRef
-		u := arena.AsSmall[Userdata](b.arena, stdinRef)
+	clearStdFileRef := func(ref arena.ObjRef) arena.ObjRef {
+		if ref == arena.NullRef || !b.arena.IsLive(ref) {
+			return arena.NullRef
+		}
+		u := arena.AsSmall[Userdata](b.arena, ref)
 		if !u.dataRef.IsNull() {
+			if v, ok := b.goRefs.Get(u.dataRef); ok {
+				if lf, ok := v.(*luaFile); ok && lf != nil && lf.w != nil {
+					_ = lf.flushWriter()
+					b.subExtraMem(int64(lf.w.Size()))
+				}
+			}
 			b.goRefs.Free(u.dataRef)
 			u.dataRef = arena.NullGoHandle
 		}
+		return ref
 	}
-	if b.stdoutRef != arena.NullRef && b.arena.IsLive(b.stdoutRef) {
-		stdoutRef = b.stdoutRef
-		u := arena.AsSmall[Userdata](b.arena, stdoutRef)
-		if !u.dataRef.IsNull() {
-			b.goRefs.Free(u.dataRef)
-			u.dataRef = arena.NullGoHandle
+	stdinRef := clearStdFileRef(b.stdinRef)
+	stdoutRef := clearStdFileRef(b.stdoutRef)
+	stderrRef := clearStdFileRef(b.stderrRef)
+
+	// Snapshot GoRefs, detaching bootstrap State references from mutable built-in payloads
+	// (such as *gmatchState) and recording whether Clone() must clone per-State payloads.
+	hasMutableGoRefs := false
+	tmplGoRefs := b.goRefs.CloneWith(func(v any) any {
+		switch x := v.(type) {
+		case *gmatchState:
+			hasMutableGoRefs = true
+			if x == nil {
+				return nil
+			}
+			return &gmatchState{
+				it:     x.it.CloneWithCancel(nil),
+				srcLen: x.srcLen,
+			}
+		case *luaFile:
+			hasMutableGoRefs = true
+			return &luaFile{closed: true}
+		default:
+			return v
 		}
-	}
-	if b.stderrRef != arena.NullRef && b.arena.IsLive(b.stderrRef) {
-		stderrRef = b.stderrRef
-		u := arena.AsSmall[Userdata](b.arena, stderrRef)
-		if !u.dataRef.IsNull() {
-			b.goRefs.Free(u.dataRef)
-			u.dataRef = arena.NullGoHandle
-		}
-	}
+	})
 
 	// Capture surviving boundProto descriptors (non-empty when setup defined Lua closures).
 	var protos []*tmplProtoDesc
@@ -261,7 +280,8 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 		tms:                   tms,
 		nextStrID:             b.intern.nextID,
 		arena:                 b.arena,
-		goRefs:                b.goRefs.Clone(),
+		goRefs:                tmplGoRefs,
+		hasMutableGoRefs:      hasMutableGoRefs,
 		gcSnap:                b.collector.Snapshot(),
 		mainThreadRef:         b.mainThreadRef,
 		registryRef:           b.registryRef,
@@ -276,6 +296,7 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 		pkgAllowOS:            b.pkgAllowOS,
 		fsSearchers:           b.fsSearchers,
 		protoEpoch:            b.protoEpoch,
+		extraMemBytes:         b.extraMemBytes,
 		protos:                protos,
 		freeProtoIDs:          slices.Clone(b.freeProtoIDs),
 		nextShapeID:           b.shapes.nextID,
@@ -304,12 +325,8 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 // Safe to call concurrently from multiple goroutines.
 func (tmpl *Template) Clone(noEnv bool) *State {
 	a := tmpl.arena.CloneSnapshot()
-	goRefs := tmpl.goRefs.Clone()
 
-	var (
-		protos        []*boundProto
-		extraMemBytes int64
-	)
+	var protos []*boundProto
 	if len(tmpl.protos) > 1 {
 		protos = make([]*boundProto, len(tmpl.protos))
 		for i := 1; i < len(tmpl.protos); i++ {
@@ -345,7 +362,6 @@ func (tmpl *Template) Clone(noEnv bool) *State {
 				maxStack:  tp.proto.MaxStackSize,
 				isVararg:  tp.proto.IsVararg(),
 			}
-			extraMemBytes += tp.goBytes
 		}
 	} else {
 		protos = []*boundProto{nil}
@@ -353,7 +369,6 @@ func (tmpl *Template) Clone(noEnv bool) *State {
 
 	s := &State{
 		arena:         a,
-		goRefs:        goRefs,
 		mainThreadRef: tmpl.mainThreadRef,
 		curRef:        tmpl.mainThreadRef,
 		registryRef:   tmpl.registryRef,
@@ -370,7 +385,7 @@ func (tmpl *Template) Clone(noEnv bool) *State {
 		protoEpoch:    tmpl.protoEpoch,
 		protos:        protos,
 		freeProtoIDs:  slices.Clone(tmpl.freeProtoIDs),
-		extraMemBytes: extraMemBytes,
+		extraMemBytes: tmpl.extraMemBytes,
 		intern: stringInterner{
 			seed:          globalStrSeed,
 			nextID:        tmpl.nextStrID,
@@ -407,6 +422,29 @@ func (tmpl *Template) Clone(noEnv bool) *State {
 		builtinDebugSetHook:   tmpl.builtinDebugSetHook,
 		builtinCoroYield:      tmpl.builtinCoroYield,
 	}
+	var goRefs *arena.GoRefs
+	if tmpl.hasMutableGoRefs {
+		goRefs = tmpl.goRefs.CloneWith(func(v any) any {
+			switch x := v.(type) {
+			case *gmatchState:
+				if x == nil {
+					return nil
+				}
+				return &gmatchState{
+					it:     x.it.CloneWithCancel(s.dynamicNativeCancelFunc()),
+					srcLen: x.srcLen,
+				}
+			case *luaFile:
+				return &luaFile{closed: true}
+			default:
+				return v
+			}
+		})
+	} else {
+		goRefs = tmpl.goRefs.Clone()
+	}
+	s.goRefs = goRefs
+
 	s.initCollector()
 	s.collector.RestoreSnapshot(tmpl.gcSnap)
 	s.seedRNG(makeRandomSeed(s), 0)
