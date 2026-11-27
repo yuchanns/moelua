@@ -42,14 +42,14 @@ type memResult struct {
 type leftRow struct {
 	label string
 	val   float64
-	kind  string // "ref", "jit", "moe", "ccgo", "other"
+	kind  string // "ref", "moe", "other"
 }
 
 type rightRow struct {
 	label string
 	ms    float64
 	note  string
-	kind  string // "jit", "moe", "ccgo", "other"
+	kind  string // "moe", "other"
 }
 
 func niceAxisMax(v float64, step float64) float64 {
@@ -115,15 +115,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build left panel rows: reference C rows first, then all Go engines (including JIT) sorted fastest-to-slowest.
+	// Build left panel rows: all engines (C refs + Go engines including JIT) strictly sorted fastest-to-slowest.
 	leftNames := map[string]struct {
 		label string
 		kind  string
 	}{
-		"Apogee-JIT":    {"Apogee v1.2.1 (JIT)", "jit"},
+		"C-O3":          {"C Lua 5.5.1 -O3 (ref)", "ref"},
+		"C":             {"C Lua 5.5.1 -O2 (ref)", "ref"},
+		"Apogee-JIT":    {"Apogee v1.2.1 (JIT)", "other"},
 		"MoeLua":        {"MoeLua 5.5 (Pure Go)", "moe"},
 		"Apogee-Interp": {"Apogee v1.2.1 (noJIT)", "other"},
-		"CCGO":          {"modernc/lua (CCGO)", "ccgo"},
+		"CCGO":          {"modernc/lua (CCGO)", "other"},
 		"ArnodelGolua":  {"arnodel/golua (PGO)", "other"},
 		"GopherLua":     {"yuin/gopher-lua", "other"},
 		"GoLua":         {"Shopify/go-lua", "other"},
@@ -131,34 +133,27 @@ func main() {
 	}
 
 	var leftRows []leftRow
-	if v, ok := bench.CommonGeomean["C-O3"]; ok {
-		leftRows = append(leftRows, leftRow{label: "C Lua 5.5.1 -O3 (ref)", val: v, kind: "ref"})
-	}
-	leftRows = append(leftRows, leftRow{label: "C Lua 5.5.1 -O2 (ref)", val: bench.CommonGeomean["C"], kind: "ref"})
-
-	var goRows []leftRow
 	for key, meta := range leftNames {
 		if v, ok := bench.CommonGeomean[key]; ok {
-			goRows = append(goRows, leftRow{label: meta.label, val: v, kind: meta.kind})
+			leftRows = append(leftRows, leftRow{label: meta.label, val: v, kind: meta.kind})
 		}
 	}
-	slices.SortFunc(goRows, func(a, b leftRow) int {
+	slices.SortFunc(leftRows, func(a, b leftRow) int {
 		if c := cmp.Compare(a.val, b.val); c != 0 {
 			return c
 		}
 		return cmp.Compare(a.label, b.label)
 	})
-	leftRows = append(leftRows, goRows...)
 
-	// Build right panel rows: all Go engines (including Apogee-JIT) sorted by GC pause.
+	// Build right panel rows: all Go engines (including Apogee-JIT) strictly sorted by GC pause.
 	rightLabels := map[string]struct {
 		label string
 		kind  string
 	}{
 		"MoeLua":         {"MoeLua 5.5 (Arena)", "moe"},
-		"CCGO":           {"modernc/lua (mmap)", "ccgo"},
+		"CCGO":           {"modernc/lua (mmap)", "other"},
 		"arnodel/golua":  {"arnodel/golua", "other"},
-		"Apogee-JIT":     {"Apogee v1.2.1 (JIT)", "jit"},
+		"Apogee-JIT":     {"Apogee v1.2.1 (JIT)", "other"},
 		"Apogee-noJIT":   {"Apogee v1.2.1 (noJIT)", "other"},
 		"DCLua":          {"DCLua", "other"},
 		"Shopify/go-lua": {"Shopify/go-lua", "other"},
@@ -213,10 +208,6 @@ func main() {
 		}
 		return cmp.Compare(a.label, b.label)
 	})
-	// Keep MoeLua as the top row when both MoeLua and CCGO are sub-millisecond so readers spot it immediately.
-	if len(rightRows) >= 2 && rightRows[0].kind == "ccgo" && rightRows[1].kind == "moe" && rightRows[1].ms < 2.0 {
-		rightRows[0], rightRows[1] = rightRows[1], rightRows[0]
-	}
 
 	maxLeftVal := 2.0
 	for _, r := range leftRows {
@@ -284,9 +275,7 @@ func main() {
       .tick { font: 400 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #64748b; text-anchor: middle; }
       .foot { font: 400 10.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #64748b; }
       .bar-moe { fill: #10b981; }
-      .bar-jit { fill: #8b5cf6; }
       .bar-other { fill: #64748b; }
-      .bar-ccgo { fill: #3b82f6; }
       .bar-ref { fill: url(#hatch); stroke: #94a3b8; stroke-width: 1; }
     </style>
   </defs>
@@ -336,7 +325,7 @@ func main() {
 			lblCls = "label-hi"
 			valCls = "val-hi"
 		}
-		barCls := map[string]string{"moe": "bar-moe", "jit": "bar-jit", "ref": "bar-ref", "ccgo": "bar-ccgo", "other": "bar-other"}[r.kind]
+		barCls := map[string]string{"moe": "bar-moe", "ref": "bar-ref", "other": "bar-other"}[r.kind]
 		fmt.Fprintf(&sb, "  <text x=\"157\" y=\"%.1f\" class=\"%s\">%s</text>\n", y+13, lblCls, html.EscapeString(r.label))
 		fmt.Fprintf(&sb, "  <rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" rx=\"3\" class=\"%s\"/>\n", leftX0, y, w, barH, barCls)
 		valX := leftX0 + w + 6
@@ -376,7 +365,7 @@ func main() {
 			lblCls = "label-hi"
 			valCls = "val-hi"
 		}
-		barCls := map[string]string{"moe": "bar-moe", "jit": "bar-jit", "ccgo": "bar-ccgo", "other": "bar-other"}[r.kind]
+		barCls := map[string]string{"moe": "bar-moe", "other": "bar-other"}[r.kind]
 		fmt.Fprintf(&sb, "  <text x=\"640\" y=\"%.1f\" class=\"%s\">%s</text>\n", y+13, lblCls, html.EscapeString(r.label))
 		fmt.Fprintf(&sb, "  <rect x=\"%.1f\" y=\"%.1f\" width=\"%.1f\" height=\"%.1f\" rx=\"3\" class=\"%s\"/>\n", rightX0, y, w, barH, barCls)
 		// Place note inside bar if it would cross the right card border (~945px).
@@ -390,9 +379,9 @@ func main() {
 	}
 
 	// Footer notes
-	leftFoot := fmt.Sprintf("Left: median of %d rounds via bench/compare (32/32 byte-exact output vs C Lua 5.5.1). Purple = native JIT; green = MoeLua (pure-Go interpreter).", max(bench.Rounds, 1))
+	leftFoot := fmt.Sprintf("Left: median of %d rounds via bench/compare (32/32 byte-exact output vs C Lua 5.5.1).", max(bench.Rounds, 1))
 	if v, ok := bench.CommonGeomean["LuaJIT"]; ok {
-		leftFoot += fmt.Sprintf(" LuaJIT: %.2fx.", v)
+		leftFoot += fmt.Sprintf(" LuaJIT on the same suite: %.2fx (see docs/benchmarks.md).", v)
 	}
 	memMetric := "active Go heap/VM"
 	if hasAnyRSS {
