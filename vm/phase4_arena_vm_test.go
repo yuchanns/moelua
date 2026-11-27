@@ -8,7 +8,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 	"weak"
+
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
 func assertTypeContainsNoGoPointers(t *testing.T, typ reflect.Type, path string) {
@@ -413,5 +416,98 @@ func TestPhase4HighDensityMultiVMGoGCIsolation(t *testing.T) {
 	defer sCheck.Close()
 	if !strings.HasPrefix(sCheck.FormatValue(sCheck.GetGlobal("_VERSION")), "Lua 5.5") {
 		t.Fatalf("unexpected _VERSION: %s", sCheck.FormatValue(sCheck.GetGlobal("_VERSION")))
+	}
+}
+
+func TestPhase4ShapeTransitionCacheCapsWithoutOverflow(t *testing.T) {
+	s := NewState()
+	defer s.Close()
+
+	// Disable automatic GC while creating 33,000 tables with distinct first short-string keys
+	// sharing the root shape; transition cache must cap cleanly instead of overflowing uint16.
+	s.collector.Stop()
+	const n = 33000
+	holder := s.NewTable(n, 0)
+	s.SetGlobal("HOLDER", TableValue(holder))
+	for i := range n {
+		tbl := s.NewTable(0, 0)
+		k := s.Intern(fmt.Sprintf("k%d", i))
+		tbl.RawSetStr(s, k, IntValue(int64(i+1)))
+		holder.RawSetInt(s, int64(i+1), TableValue(tbl))
+	}
+
+	rootSh := arena.AsSmall[Shape](s.arena, s.shapes.rootRef)
+	if int(rootSh.transCap) > maxShapeTransCap || int(rootSh.transLen) > maxShapeTransCap {
+		t.Fatalf("root shape transition cache exceeded cap: len=%d cap=%d max=%d",
+			rootSh.transLen, rootSh.transCap, maxShapeTransCap)
+	}
+	// Spot-check early, boundary, and late tables to ensure every uncached child shape works properly.
+	for _, idx := range []int{0, 3, 4, maxShapeTransCap - 1, maxShapeTransCap, maxShapeTransCap + 1, n - 1} {
+		tv := holder.RawGetInt(s, int64(idx+1))
+		if !tv.IsTable() {
+			t.Fatalf("holder[%d] is not a table: %v", idx+1, tv)
+		}
+		got := s.asTable(tv).RawGetStr(s, s.Intern(fmt.Sprintf("k%d", idx)))
+		if !got.IsInt() || got.Int() != int64(idx+1) {
+			t.Fatalf("table %d key k%d = %v, want %d", idx, idx, got, idx+1)
+		}
+	}
+}
+
+func TestPhase4LoadChunkICMemoryPreflightAccountsArenaRounding(t *testing.T) {
+	if !OptimizeEnabled {
+		t.Skip("IC tables are only allocated when OptimizeEnabled is true")
+	}
+	s := NewState()
+	defer s.Close()
+
+	var sb strings.Builder
+	sb.WriteString("local n = 0\n")
+	for range 47 {
+		sb.WriteString("n = n + math.pi\n")
+	}
+	sb.WriteString("return n\n")
+
+	p, err := s.compilerFn("=ic_preflight", sb.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ICCount < 94 {
+		t.Fatalf("expected >= 94 IC entries for 47 math.pi ops, got %d", p.ICCount)
+	}
+
+	s.CollectFull()
+	base := s.MemoryUsage()
+
+	// Unrounded logical IC size (4,512B for 94 entries) is strictly smaller than its 6,144B Arena slot;
+	// loading under a limit equal to the unrounded estimate must fail rather than overshooting the limit.
+	unroundedICBytes := int64(p.ICCount) * int64(unsafe.Sizeof(ICEntry{}))
+	roundedICBytes := arenaAllocSize(unroundedICBytes)
+	if roundedICBytes <= unroundedICBytes {
+		t.Fatalf("expected Arena rounding gap for ICCount=%d: unrounded=%d rounded=%d",
+			p.ICCount, unroundedICBytes, roundedICBytes)
+	}
+	preflight := loadPreflightBytes(p, true)
+	unroundedLimit := base + preflight - (roundedICBytes - unroundedICBytes)
+	s.SetMemoryLimit(unroundedLimit)
+	if _, err := s.Load(p); err == nil {
+		t.Fatalf("Load unexpectedly succeeded under unrounded limit=%d (usage=%d, preflight=%d)",
+			unroundedLimit, s.MemoryUsage(), preflight)
+	}
+	if usage := s.MemoryUsage(); usage > unroundedLimit {
+		t.Fatalf("MemoryUsage=%d exceeded limit=%d after rejected Load", usage, unroundedLimit)
+	}
+
+	// Setting the limit to base + preflight must succeed and stay within budget.
+	s.SetMemoryLimit(base + preflight)
+	cl, err := s.Load(p)
+	if err != nil {
+		t.Fatalf("Load failed at exact preflight budget=%d: %v", base+preflight, err)
+	}
+	if cl == nil {
+		t.Fatal("Load returned nil closure")
+	}
+	if usage := s.MemoryUsage(); usage > base+preflight {
+		t.Fatalf("Load succeeded while exceeding limit: usage=%d > limit=%d", usage, base+preflight)
 	}
 }

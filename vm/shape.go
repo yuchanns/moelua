@@ -328,6 +328,12 @@ func (sr *shapeRegistry) Root(s *State, metaRef arena.ObjRef, rootObj Value) *Sh
 	return sh
 }
 
+const (
+	// maxShapeTransCap caps per-shape overflow transition cache entries so uint16
+	// transLen/transCap never overflow and linear transition scans stay bounded.
+	maxShapeTransCap = 1024
+)
+
 // Transition returns the child shape adding key k (assumed absent from sh), or (nil, nil) if maxShapeProps exceeded.
 func (sr *shapeRegistry) Transition(s *State, shRef arena.ObjRef, k *LuaString, r1, r2 Value) (*Shape, error) {
 	sh := arena.AsSmall[Shape](s.arena, shRef)
@@ -350,9 +356,9 @@ func (sr *shapeRegistry) Transition(s *State, shRef arena.ObjRef, k *LuaString, 
 		}
 	}
 	if s.memLimit > 0 {
-		est := int64(128)
-		if n >= 4 && int(sh.transLen) >= int(sh.transCap) {
-			newCap := max(int(sh.transCap)*2, 8)
+		est := arenaAllocSize(int64(unsafe.Sizeof(Shape{})))
+		if n >= 4 && int(sh.transLen) >= int(sh.transCap) && int(sh.transCap) < maxShapeTransCap {
+			newCap := min(max(int(sh.transCap)*2, 8), maxShapeTransCap)
 			_, newSlot := arena.SizeClassFor(newCap * int(unsafe.Sizeof(shapeTrans{})))
 			var oldSlot int
 			if sh.transRef != arena.NullRef {
@@ -378,10 +384,10 @@ func (sr *shapeRegistry) Transition(s *State, shRef arena.ObjRef, k *LuaString, 
 		sh.setNTrans(n + 1)
 	} else {
 		if int(sh.transLen) >= int(sh.transCap) {
-			newCap := int(sh.transCap) * 2
-			if newCap < 8 {
-				newCap = 8
+			if int(sh.transCap) >= maxShapeTransCap {
+				return child, nil // transition cache full; child shape remains valid without caching
 			}
+			newCap := min(max(int(sh.transCap)*2, 8), maxShapeTransCap)
 			byteLen := newCap * int(unsafe.Sizeof(shapeTrans{}))
 			if s.memLimit > 0 {
 				_, newSlot := arena.SizeClassFor(byteLen)

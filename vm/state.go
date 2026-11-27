@@ -1245,9 +1245,12 @@ func protoOwnBytes(p *bytecode.Proto, withIC bool) int64 {
 	if p == nil {
 		return 0
 	}
-	n := protoGoBytes(p) + int64(unsafe.Sizeof(ArenaProto{})) + int64(len(p.Consts))*16 + int64(len(p.Protos))*4
+	n := protoGoBytes(p) +
+		arenaAllocSize(int64(unsafe.Sizeof(ArenaProto{}))) +
+		arenaAllocSize(int64(len(p.Consts))*int64(unsafe.Sizeof(Value{}))) +
+		arenaAllocSize(int64(len(p.Protos))*int64(unsafe.Sizeof(arena.ObjRef(0))))
 	if withIC && p.ICCount > 0 {
-		n += int64(p.ICCount) * int64(unsafe.Sizeof(ICEntry{}))
+		n += arenaAllocSize(int64(p.ICCount) * int64(unsafe.Sizeof(ICEntry{})))
 	}
 	return n
 }
@@ -1269,7 +1272,7 @@ func protoTreeBytes(p *bytecode.Proto, withIC bool) int64 {
 				}
 				if _, ok := seen[c.Str]; !ok {
 					seen[c.Str] = struct{}{}
-					total += int64(luaStringHeaderSize) + int64(len(c.Str))
+					total += arenaAllocSize(int64(luaStringHeaderSize) + int64(len(c.Str)))
 				}
 			}
 		}
@@ -1279,6 +1282,16 @@ func protoTreeBytes(p *bytecode.Proto, withIC bool) int64 {
 		return total
 	}
 	return walk(p)
+}
+
+func loadPreflightBytes(p *bytecode.Proto, withIC bool) int64 {
+	if p == nil {
+		return 0
+	}
+	return arenaAllocSize(int64(unsafe.Sizeof(Closure{}))) +
+		arenaAllocSize(int64(len(p.Upvalues))*int64(unsafe.Sizeof(arena.ObjRef(0)))) +
+		int64(len(p.Upvalues))*arenaAllocSize(int64(unsafe.Sizeof(Upvalue{}))) +
+		protoTreeBytes(p, withIC)
 }
 
 func (s *State) allocClosedUpval(val Value) (*Upvalue, error) {
@@ -1316,7 +1329,7 @@ func (s *State) allocClosure(ap *ArenaProto, bp *boundProto, nUpvals int) (*Clos
 // Load instantiates an immutable verified *bytecode.Proto as a top-level Closure with _ENV as upvalue 0.
 func (s *State) Load(p *bytecode.Proto) (*Closure, error) {
 	if s.memLimit > 0 {
-		chunkBytes := int64(unsafe.Sizeof(Closure{})) + int64(len(p.Upvalues))*(int64(unsafe.Sizeof(Upvalue{}))+4) + protoTreeBytes(p, OptimizeEnabled)
+		chunkBytes := loadPreflightBytes(p, OptimizeEnabled)
 		if err := s.checkMem(chunkBytes); err != nil {
 			return nil, err
 		}
