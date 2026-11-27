@@ -432,13 +432,15 @@ func (s *State) pureIndexProxyProto(mt *Table) *Table {
 	return proto
 }
 
-// poisonIndexProxy marks mt's target prototype as proxy-poisoned before mt is mutated,
-// preventing stale proxy-shape IC reuse across distinct metatables.
+// poisonIndexProxy marks mt's target prototype as proxy-poisoned and immediately releases
+// metaRef edges on all live proxy Shapes targeting that prototype before mt is mutated.
 func (s *State) poisonIndexProxy(mt *Table) {
 	mt.hdr.Flags &^= tblFlagIndexProxy
 	if mt.shapeRef != arena.NullRef && mt.slotsLen == 1 {
 		if v := mt.slotAt(s.arena, 0); v.IsTable() {
-			s.asTable(v).hdr.Flags |= tblFlagProxyPoisoned
+			proto := s.asTable(v)
+			proto.hdr.Flags |= tblFlagProxyPoisoned
+			s.shapes.poisonProxyProto(s.arena, proto.self)
 		}
 	}
 }

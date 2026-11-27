@@ -216,6 +216,47 @@ func TestProxyIndexMetatableShapeSharingAndPoisoning(t *testing.T) {
 			t.Fatalf("expected memExceeded to stay cleared after optional proxy migration skip")
 		}
 	})
+
+	t.Run("clearing_proxy_index_releases_prototype_for_weak_tables_without_reaccessing_instances", func(t *testing.T) {
+		s := NewState()
+		defer s.Close()
+
+		cl, err := s.LoadChunk([]byte(`
+			local weak = setmetatable({}, { __mode = "v" })
+			local function getX(o) return o.x end
+			local mt, instIdle, instOwn
+			do
+				local proto = { method = function() return 42 end }
+				weak[1] = proto
+				mt = { __index = proto }
+				instIdle = setmetatable({ x = 1 }, mt)
+				instOwn = setmetatable({ x = 2 }, { __index = proto })
+				-- Warm own-slot IC on instOwn; leave instIdle untouched after construction.
+				assert(getX(instOwn) == 2)
+				-- Replace/clear __index on both metatables without touching instIdle or slow-accessing instOwn.
+				mt.__index = nil
+				getmetatable(instOwn).__index = nil
+			end
+
+			-- Even with instIdle idle and instOwn only hitting own-slot IC, proto must be collected!
+			assert(getX(instOwn) == 2)
+			collectgarbage("collect")
+			collectgarbage("collect")
+			assert(weak[1] == nil, "stale proxy Shape retained old prototype across GC")
+
+			-- Both instances remain completely valid afterward (and no longer see old proto method).
+			assert(instIdle.x == 1 and instIdle.method == nil)
+			assert(instOwn.x == 2 and instOwn.method == nil)
+			return "ok"
+		`), "=proxy_weak_release")
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.Call(cl)
+		if err != nil || len(res) != 1 || s.FormatValue(res[0]) != "ok" {
+			t.Fatalf("unexpected result: res=%v err=%v", res, err)
+		}
+	})
 }
 
 func TestTableSortCustomComparatorAndSetTabUpIC(t *testing.T) {

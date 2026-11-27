@@ -22,8 +22,10 @@ import (
 	"strings"
 )
 
+const refEngine = "C"
+
 var (
-	// The engines in the order of the columns. The first is the reference.
+	// The engines in the order of the columns. refEngine ("C") is always the ratio baseline.
 	engines = []string{"C", "C-O3", "MoeLua", "Apogee-JIT", "Apogee-Interp", "CCGO", "ArnodelGolua", "GopherLua", "GoLua", "DCLua", "LuaJIT-joff", "LuaJIT"}
 	// The column titles of the engines whose benchmark names say less.
 	titles = map[string]string{"GoLua": "go-lua", "ArnodelGolua": "golua", "Apogee-Interp": "Apogee-noJIT"}
@@ -98,30 +100,34 @@ func main() {
 	}
 	all := map[string][]float64{}
 	notMicro := map[string][]float64{}
-	for _, s := range suites {
-		if m[s.name] != nil {
-			acc := []map[string][]float64{all}
-			if s.name != "micro" {
-				acc = append(acc, notMicro)
+	if present[refEngine] {
+		for _, s := range suites {
+			if m[s.name] != nil {
+				acc := []map[string][]float64{all}
+				if s.name != "micro" {
+					acc = append(acc, notMicro)
+				}
+				report(s.name, s.title, m[s.name], acc...)
 			}
-			report(s.name, s.title, m[s.name], acc...)
 		}
+		fmt.Printf("\n%-24s", "all but micro, geomean")
+		for _, e := range engines {
+			fmt.Printf("%12s", fmtRatio(notMicro[e]))
+		}
+		common, n := commonRatios(m)
+		fmt.Printf("\n%-24s", "common, geomean")
+		for _, e := range engines {
+			fmt.Printf("%12s", fmtRatio(common[e]))
+		}
+		fmt.Printf("\ncommon: the %d programs, all but micro, that every engine ran", n)
+		fmt.Printf("\n%-24s", "all, geomean")
+		for _, e := range engines {
+			fmt.Printf("%12s", fmtRatio(all[e]))
+		}
+		fmt.Println()
+	} else {
+		fmt.Printf("\n(skipping C-relative ratio tables: no %q baseline samples in input; showing raw ms/op below)\n", refEngine)
 	}
-	fmt.Printf("\n%-24s", "all but micro, geomean")
-	for _, e := range engines {
-		fmt.Printf("%12s", fmtRatio(notMicro[e]))
-	}
-	common, n := commonRatios(m)
-	fmt.Printf("\n%-24s", "common, geomean")
-	for _, e := range engines {
-		fmt.Printf("%12s", fmtRatio(common[e]))
-	}
-	fmt.Printf("\ncommon: the %d programs, all but micro, that every engine ran", n)
-	fmt.Printf("\n%-24s", "all, geomean")
-	for _, e := range engines {
-		fmt.Printf("%12s", fmtRatio(all[e]))
-	}
-	fmt.Println()
 	times(m)
 	if failed {
 		fmt.Fprintln(os.Stderr, "benchreport: a benchmark failed")
@@ -166,7 +172,7 @@ func report(suite, name string, m map[string]map[string][]float64, acc ...map[st
 	nums := map[string][]float64{}
 	for _, p := range progs {
 		fmt.Printf("%-24s", p)
-		ref, ok := m[p][engines[0]]
+		ref, ok := m[p][refEngine]
 		for _, e := range engines {
 			t, ok2 := m[p][e]
 			if !ok || !ok2 {
@@ -213,13 +219,15 @@ func commonRatios(m map[string]map[string]map[string][]float64) (r map[string][]
 		}
 
 		for _, p := range m[s.name] {
-			if slices.ContainsFunc(engines, func(e string) bool { return len(p[e]) == 0 }) {
+			ref, hasRef := p[refEngine]
+			if !hasRef || slices.ContainsFunc(engines, func(e string) bool { return len(p[e]) == 0 }) {
 				continue
 			}
 
 			n++
+			refMed := median(ref)
 			for _, e := range engines {
-				r[e] = append(r[e], median(p[e])/median(p[engines[0]]))
+				r[e] = append(r[e], median(p[e])/refMed)
 			}
 		}
 	}

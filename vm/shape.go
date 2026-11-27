@@ -9,9 +9,10 @@ import (
 const (
 	maxShapeProps = 64
 
-	shapeFlagTransMask uint8 = 0x07 // bits 0..2: nTrans (0..4)
-	shapeFlagTracked   uint8 = 1 << 3
-	shapeFlagMetaProxy uint8 = 1 << 4 // metaRef is the __index target proto table, not the wrapper metatable
+	shapeFlagTransMask         uint8 = 0x07 // bits 0..2: nTrans (0..4)
+	shapeFlagTracked           uint8 = 1 << 3
+	shapeFlagMetaProxy         uint8 = 1 << 4 // metaRef is the __index target proto table, not the wrapper metatable
+	shapeFlagMetaProxyPoisoned uint8 = 1 << 5 // proxy shape invalidated by in-place mutation of a proxy metatable
 )
 
 type shapeTrans struct {
@@ -77,6 +78,10 @@ func (sh *Shape) markTracked() {
 
 func (sh *Shape) isMetaProxy() bool {
 	return sh.hdr.Flags&shapeFlagMetaProxy != 0
+}
+
+func (sh *Shape) isMetaProxyPoisoned() bool {
+	return sh.hdr.Flags&shapeFlagMetaProxyPoisoned != 0
 }
 
 func shapeIndexHash(v Value, mask uint32) uint32 {
@@ -213,6 +218,7 @@ type shapeRegistry struct {
 	metaRoots   map[metaRootKey]arena.ObjRef
 	metaTrans   map[metaTransKey]arena.ObjRef
 	transShapes []arena.ObjRef // shapes with >= 1 transition; pruned in GC PreSweep
+	proxyShapes []arena.ObjRef // canonical __index-proxy shapes; cleared on poison or GC PreSweep
 }
 
 func (sr *shapeRegistry) init(s *State) {
@@ -296,9 +302,47 @@ func (sr *shapeRegistry) pruneDead(a *arena.Arena, c *arena.Collector) {
 		kept++
 	}
 	sr.transShapes = sr.transShapes[:kept]
+	keptProxy := 0
+	for _, shRef := range sr.proxyShapes {
+		if c.IsWhite(shRef) {
+			continue
+		}
+		sh := arena.AsSmall[Shape](a, shRef)
+		if sh.metaRef == arena.NullRef || c.IsWhite(sh.metaRef) {
+			sh.hdr.Flags |= shapeFlagMetaProxyPoisoned
+			sh.metaRef = arena.NullRef
+			continue
+		}
+		sr.proxyShapes[keptProxy] = shRef
+		keptProxy++
+	}
+	sr.proxyShapes = sr.proxyShapes[:keptProxy]
 }
 
-func (sr *shapeRegistry) allocShape(s *State, parentRef, metaRef arena.ObjRef, metaProxy bool, keyVal Value, slot, length int16) (*Shape, error) {
+// poisonProxyProto releases strong/weak proxy-shape references to protoRef immediately
+// when any wrapper metatable proxying protoRef is mutated in place.
+func (sr *shapeRegistry) poisonProxyProto(a *arena.Arena, protoRef arena.ObjRef) {
+	delete(sr.metaRoots, metaRootKey{metaRef: protoRef, metaProxy: true})
+	for k := range sr.metaTrans {
+		if k.metaProxy && k.metaRef == protoRef {
+			delete(sr.metaTrans, k)
+		}
+	}
+	kept := 0
+	for _, shRef := range sr.proxyShapes {
+		sh := arena.AsSmall[Shape](a, shRef)
+		if sh.metaRef == protoRef {
+			sh.hdr.Flags |= shapeFlagMetaProxyPoisoned
+			sh.metaRef = arena.NullRef
+			continue
+		}
+		sr.proxyShapes[kept] = shRef
+		kept++
+	}
+	sr.proxyShapes = sr.proxyShapes[:kept]
+}
+
+func (sr *shapeRegistry) allocShape(s *State, parentRef, metaRef arena.ObjRef, proxyFlags uint8, keyVal Value, slot, length int16) (*Shape, error) {
 	ref, err := s.collector.Alloc(int(unsafe.Sizeof(Shape{})), gcKindShape)
 	if err != nil {
 		return nil, err
@@ -309,12 +353,13 @@ func (sr *shapeRegistry) allocShape(s *State, parentRef, metaRef arena.ObjRef, m
 	sh.self = ref
 	sh.parentRef = parentRef
 	sh.metaRef = metaRef
-	if metaProxy {
-		sh.hdr.Flags |= shapeFlagMetaProxy
-	}
+	sh.hdr.Flags |= proxyFlags & (shapeFlagMetaProxy | shapeFlagMetaProxyPoisoned)
 	sh.keyVal = keyVal
 	sh.slot = slot
 	sh.length = length
+	if proxyFlags&shapeFlagMetaProxy != 0 && proxyFlags&shapeFlagMetaProxyPoisoned == 0 && metaRef != arena.NullRef {
+		sr.proxyShapes = append(sr.proxyShapes, ref)
+	}
 	return sh, nil
 }
 
@@ -334,7 +379,11 @@ func (sr *shapeRegistry) Root(s *State, metaRef arena.ObjRef, metaProxy bool, ro
 			return nil
 		}
 	}
-	sh, err := sr.allocShape(s, arena.NullRef, metaRef, metaProxy, NilValue(), -1, 0)
+	var proxyFlags uint8
+	if metaProxy {
+		proxyFlags = shapeFlagMetaProxy
+	}
+	sh, err := sr.allocShape(s, arena.NullRef, metaRef, proxyFlags, NilValue(), -1, 0)
 	if err != nil {
 		s.memExceeded = true
 		return nil
@@ -390,7 +439,7 @@ func (sr *shapeRegistry) Transition(s *State, shRef arena.ObjRef, k *LuaString, 
 	// Reload sh pointer after potential emergency GC (Arena is non-moving, sh stays valid).
 	sh = arena.AsSmall[Shape](s.arena, shRef)
 	n = sh.nTrans()
-	child, err := sr.allocShape(s, sh.self, sh.metaRef, sh.isMetaProxy(), StringValue(k), sh.length, sh.length+1)
+	child, err := sr.allocShape(s, sh.self, sh.metaRef, sh.hdr.Flags&(shapeFlagMetaProxy|shapeFlagMetaProxyPoisoned), StringValue(k), sh.length, sh.length+1)
 	if err != nil {
 		return nil, err
 	}

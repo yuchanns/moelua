@@ -750,10 +750,7 @@ func (s *State) getTabUpSlow(th *Thread, ev *frameEnv, ipc int, w bytecode.Instr
 // if its target prototype was proxy-poisoned by an in-place mutation to any proxy metatable.
 // Returns (activeShape, canCacheIC).
 func (s *State) resolvePoisonedProxyShape(t *Table, sh *Shape) (*Shape, bool) {
-	if !sh.isMetaProxy() {
-		return sh, true
-	}
-	if arena.AsSmall[Table](s.arena, sh.metaRef).hdr.Flags&tblFlagProxyPoisoned == 0 {
+	if !sh.isMetaProxyPoisoned() {
 		return sh, true
 	}
 	if newRef, ok := s.shapes.WithMeta(s, t.shapeRef, t.metaRef, false, TableValue(t), tableRefValue(t.metaRef)); ok {
