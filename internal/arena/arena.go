@@ -86,15 +86,46 @@ func SizeClassFor(size int) (uint8, int) {
 
 // pageMeta tracks per-page allocation state.
 type pageMeta struct {
-	liveBits  []uint64 // 1 bit per slot (noscan []uint64); prevents double-free & free-list cycles
-	freeHead  ObjRef   // head of per-page intrusive free list (NullRef if empty)
-	prevAvail uint32   // doubly-linked list of pages in classAvail[class] with free space
-	nextAvail uint32
-	bumpOff   uint16 // next unallocated 8-byte word offset in [0..pageWords]
-	liveCount uint16 // number of live objects in this page
-	class     uint8  // size class index (0..NumClasses-1)
-	inAvail   bool   // true while linked into classAvail[class]
-	active    bool   // true while pages[pid] != nil
+	liveBits   []uint64 // 1 bit per slot (noscan []uint64); prevents double-free & free-list cycles
+	freeHead   ObjRef   // head of per-page intrusive free list (NullRef if empty)
+	prevAvail  uint32   // doubly-linked list of pages in classAvail[class] with free space
+	nextAvail  uint32
+	bumpOff    uint16 // next unallocated 8-byte word offset in [0..capWords]
+	capWords   uint16 // backed page capacity in 8-byte words (<= pageWords)
+	liveCount  uint16 // number of live objects in this page
+	class      uint8  // size class index (0..NumClasses-1)
+	inAvail    bool   // true while linked into classAvail[class]
+	active     bool   // true while pages[pid] != nil
+	sharedSlab bool   // true while pages[pid] is a sub-slice of a compacted/cloned flat slab
+}
+
+// nextPageBytes computes the progressive non-moving slab page size for size class cls.
+// Small VMs start with compact pages (2 KiB..32 KiB) and ramp smoothly up to PageSize (64 KiB)
+// by the 4th page in that class so allocation-heavy workloads still run on full 64 KiB slabs.
+func nextPageBytes(cls uint8, opened uint8) int {
+	sz := int(classSizes[cls])
+	var target int
+	switch opened {
+	case 0:
+		target = max(4*sz, 2048)
+	case 1:
+		target = max(8*sz, 8192)
+	case 2:
+		target = max(16*sz, 32768)
+	default:
+		return PageSize
+	}
+	if target >= PageSize {
+		return PageSize
+	}
+	slots := target / sz
+	if slots < 1 {
+		slots = 1
+	}
+	if n := slots * sz; n <= PageSize {
+		return n
+	}
+	return PageSize
 }
 
 // Arena is a per-State noscan []byte memory allocator designed to keep Lua VM heaps
@@ -104,24 +135,28 @@ type pageMeta struct {
 // own completely independent Arenas and may execute concurrently across goroutines.
 type Arena struct {
 	// 1-based slab page table (pages[0] == nil sentinel so page ObjRefs are always != NullRef).
-	// Every element is a noscan []byte of length PageSize (64 KiB).
+	// Every element is a noscan []byte of length <= PageSize (64 KiB), aligned to 8 bytes.
 	// pagePtrs mirrors pages with cached base pointers for hot-path slab dereferencing.
 	pages       [][]byte
 	pagePtrs    []unsafe.Pointer
 	pageMeta    []pageMeta
 	freePageIDs []uint32
 	classAvail  [NumClasses]uint32 // head pid of pages with >= 1 free slot per class
-	sparePage   []byte             // 1-page hysteresis cache to avoid empty-page thrashing
+	classOpened [NumClasses]uint8  // saturating page-open count per class for progressive sizing
+	sparePage   []byte             // 1-page hysteresis cache (always PageSize) to avoid thrashing
 
 	// 1-based dedicated large-object spans (> MaxSmallSize); every element is a noscan []byte.
 	largeSpans   [][]byte
 	freeLargeIDs []uint32
 
-	allocBytes  int64 // exact live bytes currently allocated across slabs and large spans
-	limit       int64 // optional hard byte limit (<= 0 disables limit)
-	liveObjects int64 // exact count of live allocations
-	activePages int   // number of non-nil 64 KiB slab pages
-	activeLarge int   // number of non-nil large spans
+	allocBytes       int64 // exact live bytes currently allocated across slabs and large spans
+	backingSlabBytes int64 // exact bytes currently backed by standalone active slab pages
+	sharedSlabBytes  int64 // exact bytes of the shared compacted/cloned flat slab while >= 1 sub-page lives
+	sharedSlabPages  int   // number of active pages currently referencing the shared flat slab
+	limit            int64 // optional hard byte limit (<= 0 disables limit)
+	liveObjects      int64 // exact count of live allocations
+	activePages      int   // number of non-nil slab pages
+	activeLarge      int   // number of non-nil large spans
 }
 
 // New creates an empty noscan Arena with no memory limit (limit <= 0).
@@ -158,9 +193,9 @@ func (a *Arena) ActivePages() int { return a.activePages }
 func (a *Arena) ActiveLargeSpans() int { return a.activeLarge }
 
 // BackingBytes returns the total []byte memory currently backed by Go for this Arena
-// (active slab pages + cached spare page + active large spans).
+// (standalone active slab pages + retained shared flat slab + cached spare page + active large spans).
 func (a *Arena) BackingBytes() int64 {
-	total := int64(a.activePages) * PageSize
+	total := a.backingSlabBytes + a.sharedSlabBytes
 	if a.sparePage != nil {
 		total += int64(len(a.sparePage))
 	}
@@ -297,7 +332,7 @@ func (a *Arena) allocSmall(cls uint8, need int) (ObjRef, error) {
 	a.liveObjects++
 
 	// Unlink from classAvail once the page has neither free slots nor bump room left.
-	if meta.freeHead == NullRef && uint32(meta.bumpOff)+uint32(classWords[cls]) > pageWords {
+	if meta.freeHead == NullRef && uint32(meta.bumpOff)+uint32(classWords[cls]) > uint32(meta.capWords) {
 		a.unlinkAvail(pid)
 	}
 	return ref, nil
@@ -316,20 +351,26 @@ func (a *Arena) allocPage(cls uint8) (uint32, error) {
 		}
 		pid = uint32(len(a.pages))
 	}
+	pageBytes := nextPageBytes(cls, a.classOpened[cls])
 	var buf []byte
-	if a.sparePage != nil {
+	if pageBytes == PageSize && len(a.sparePage) == PageSize {
 		buf = a.sparePage
 		a.sparePage = nil
 	} else {
-		buf = make([]byte, PageSize)
+		buf = make([]byte, pageBytes)
 		if uintptr(unsafe.Pointer(unsafe.SliceData(buf)))%Align != 0 {
 			panic("arena: slab page not 8-byte aligned")
 		}
 	}
+	if a.classOpened[cls] < 3 {
+		a.classOpened[cls]++
+	}
 	basePtr := unsafe.Pointer(unsafe.SliceData(buf))
-	bitWords := (int(classSlotsPerPg[cls]) + 63) >> 6
+	slots := len(buf) / int(classSizes[cls])
+	bitWords := (slots + 63) >> 6
 	pm := pageMeta{
 		liveBits: make([]uint64, bitWords),
+		capWords: uint16(len(buf) >> alignShift),
 		class:    cls,
 		active:   true,
 	}
@@ -343,6 +384,7 @@ func (a *Arena) allocPage(cls uint8) (uint32, error) {
 		a.pageMeta = append(a.pageMeta, pm)
 	}
 	a.activePages++
+	a.backingSlabBytes += int64(len(buf))
 	a.linkAvail(pid)
 	return pid, nil
 }
@@ -431,13 +473,22 @@ func (a *Arena) Free(ref ObjRef) {
 	if meta.liveCount == 0 {
 		a.unlinkAvail(pid)
 		buf := a.pages[pid]
+		shared := meta.sharedSlab
 		a.pages[pid] = nil
 		a.pagePtrs[pid] = nil
 		*meta = pageMeta{}
 		a.freePageIDs = append(a.freePageIDs, pid)
 		a.activePages--
-		if a.sparePage == nil {
-			a.sparePage = buf
+		if shared {
+			a.sharedSlabPages--
+			if a.sharedSlabPages == 0 {
+				a.sharedSlabBytes = 0
+			}
+		} else {
+			a.backingSlabBytes -= int64(len(buf))
+			if a.sparePage == nil && len(buf) == PageSize {
+				a.sparePage = buf
+			}
 		}
 		return
 	}
@@ -523,7 +574,7 @@ func (a *Arena) Bytes(ref ObjRef, n int) []byte {
 		panic("arena: invalid slab Bytes ref")
 	}
 	byteOff := int(wordOff) << alignShift
-	if n > int(classSizes[a.pageMeta[pid].class]) || byteOff+n > PageSize {
+	if n > int(classSizes[a.pageMeta[pid].class]) || byteOff+n > len(a.pages[pid]) {
 		panic("arena: Bytes length exceeds slot size")
 	}
 	return a.pages[pid][byteOff : byteOff+n : byteOff+n]
@@ -658,19 +709,107 @@ func (a *Arena) Close() {
 	a.pageMeta = nil
 	a.freePageIDs = nil
 	a.classAvail = [NumClasses]uint32{}
+	a.classOpened = [NumClasses]uint8{}
 	a.sparePage = nil
 	a.largeSpans = nil
 	a.freeLargeIDs = nil
 	a.allocBytes = 0
+	a.backingSlabBytes = 0
+	a.sharedSlabBytes = 0
+	a.sharedSlabPages = 0
 	a.liveObjects = 0
 	a.activePages = 0
 	a.activeLarge = 0
 }
 
+// CompactSnapshot shrinks every active slab page to its exact bumped prefix (meta.bumpOff
+// words), packs all compacted pages into one contiguous 8-byte-aligned noscan []byte slab
+// and all live bitmaps into one contiguous []uint64 slice, releases any spare page, resets
+// progressive page-size ramps, and unlinks pages with no remaining free slots from classAvail.
+// All live ObjRefs remain bitwise identical (zero pointer relocation).
+//
+// Calling CompactSnapshot once on a frozen read-only template Arena minimizes both idle
+// per-State memory footprint and CloneSnapshot allocation count/latency.
+func (a *Arena) CompactSnapshot() {
+	a.ReleaseSpare()
+	a.classOpened = [NumClasses]uint8{}
+	if len(a.pages) <= 1 {
+		return
+	}
+	var totalBytes int
+	var totalBitWords int
+	var packedPages int
+	for pid := 1; pid < len(a.pages); pid++ {
+		meta := &a.pageMeta[pid]
+		if !meta.active || a.pages[pid] == nil {
+			continue
+		}
+		usedBytes := int(meta.bumpOff) << alignShift
+		totalBytes += usedBytes
+		slots := int(meta.bumpOff / classWords[meta.class])
+		totalBitWords += (slots + 63) >> 6
+		packedPages++
+	}
+	if totalBytes == 0 {
+		a.backingSlabBytes = 0
+		a.sharedSlabBytes = 0
+		a.sharedSlabPages = 0
+		return
+	}
+	flatSlab := make([]byte, totalBytes)
+	if uintptr(unsafe.Pointer(unsafe.SliceData(flatSlab)))%Align != 0 {
+		panic("arena: compact slab not 8-byte aligned")
+	}
+	var flatBits []uint64
+	if totalBitWords > 0 {
+		flatBits = make([]uint64, totalBitWords)
+	}
+	shared := packedPages > 1
+	byteOff := 0
+	bitOff := 0
+	for pid := 1; pid < len(a.pages); pid++ {
+		meta := &a.pageMeta[pid]
+		if !meta.active || a.pages[pid] == nil {
+			continue
+		}
+		usedBytes := int(meta.bumpOff) << alignShift
+		sub := flatSlab[byteOff : byteOff+usedBytes : byteOff+usedBytes]
+		copy(sub, a.pages[pid][:usedBytes])
+		byteOff += usedBytes
+
+		slots := int(meta.bumpOff / classWords[meta.class])
+		bitWords := (slots + 63) >> 6
+		var subBits []uint64
+		if bitWords > 0 {
+			subBits = flatBits[bitOff : bitOff+bitWords : bitOff+bitWords]
+			copy(subBits, meta.liveBits[:bitWords])
+			bitOff += bitWords
+		}
+
+		a.pages[pid] = sub
+		a.pagePtrs[pid] = unsafe.Pointer(unsafe.SliceData(sub))
+		meta.liveBits = subBits
+		meta.capWords = meta.bumpOff
+		meta.sharedSlab = shared
+		if meta.freeHead == NullRef {
+			a.unlinkAvail(uint32(pid))
+		}
+	}
+	if shared {
+		a.backingSlabBytes = 0
+		a.sharedSlabBytes = int64(totalBytes)
+		a.sharedSlabPages = packedPages
+	} else {
+		a.backingSlabBytes = int64(totalBytes)
+		a.sharedSlabBytes = 0
+		a.sharedSlabPages = 0
+	}
+}
+
 // CloneSnapshot produces a completely independent deep copy of this Arena by copying
-// active noscan []byte pages and large spans directly. Because all internal links use
-// ObjRef handles rather than Go pointers, every ObjRef remains identical with zero
-// pointer relocation.
+// active noscan []byte pages into a single contiguous flat slab and copying active large
+// spans directly. Because all internal links use ObjRef handles rather than Go pointers,
+// every ObjRef remains identical with zero pointer relocation.
 func (a *Arena) CloneSnapshot() *Arena {
 	if len(a.pages) == 0 && len(a.largeSpans) == 0 {
 		cp := New()
@@ -683,6 +822,7 @@ func (a *Arena) CloneSnapshot() *Arena {
 		pagePtrs:    make([]unsafe.Pointer, pageLen),
 		pageMeta:    make([]pageMeta, max(len(a.pageMeta), 1)),
 		classAvail:  a.classAvail,
+		classOpened: a.classOpened,
 		largeSpans:  make([][]byte, max(len(a.largeSpans), 1)),
 		allocBytes:  a.allocBytes,
 		limit:       a.limit,
@@ -699,19 +839,58 @@ func (a *Arena) CloneSnapshot() *Arena {
 		cp.freeLargeIDs = make([]uint32, len(a.freeLargeIDs))
 		copy(cp.freeLargeIDs, a.freeLargeIDs)
 	}
+
+	var totalSlabBytes int
+	var totalBitWords int
+	var packedPages int
 	for pid := 1; pid < len(a.pages); pid++ {
 		if src := a.pages[pid]; src != nil {
-			dst := make([]byte, len(src))
-			copy(dst, src)
-			cp.pages[pid] = dst
-			cp.pagePtrs[pid] = unsafe.Pointer(unsafe.SliceData(dst))
+			totalSlabBytes += len(src)
+			packedPages++
 		}
 		if srcBits := a.pageMeta[pid].liveBits; len(srcBits) > 0 {
-			dstBits := make([]uint64, len(srcBits))
+			totalBitWords += len(srcBits)
+		}
+	}
+	var flatSlab []byte
+	if totalSlabBytes > 0 {
+		flatSlab = make([]byte, totalSlabBytes)
+		if uintptr(unsafe.Pointer(unsafe.SliceData(flatSlab)))%Align != 0 {
+			panic("arena: cloned slab not 8-byte aligned")
+		}
+	}
+	var flatBits []uint64
+	if totalBitWords > 0 {
+		flatBits = make([]uint64, totalBitWords)
+	}
+	shared := packedPages > 1
+	byteOff := 0
+	bitOff := 0
+	for pid := 1; pid < len(a.pages); pid++ {
+		if src := a.pages[pid]; src != nil {
+			n := len(src)
+			dst := flatSlab[byteOff : byteOff+n : byteOff+n]
+			copy(dst, src)
+			byteOff += n
+			cp.pages[pid] = dst
+			cp.pagePtrs[pid] = unsafe.Pointer(unsafe.SliceData(dst))
+			cp.pageMeta[pid].sharedSlab = shared
+		}
+		if srcBits := a.pageMeta[pid].liveBits; len(srcBits) > 0 {
+			nb := len(srcBits)
+			dstBits := flatBits[bitOff : bitOff+nb : bitOff+nb]
 			copy(dstBits, srcBits)
+			bitOff += nb
 			cp.pageMeta[pid].liveBits = dstBits
 		}
 	}
+	if shared {
+		cp.sharedSlabBytes = int64(totalSlabBytes)
+		cp.sharedSlabPages = packedPages
+	} else {
+		cp.backingSlabBytes = int64(totalSlabBytes)
+	}
+
 	for idx := 1; idx < len(a.largeSpans); idx++ {
 		if src := a.largeSpans[idx]; src != nil {
 			dst := make([]byte, len(src))

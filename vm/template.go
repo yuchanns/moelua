@@ -97,9 +97,11 @@ func buildStdTemplate() *stdTemplate {
 	arena.AsSmall[Userdata](b.arena, stdoutRef).dataRef = arena.NullGoHandle
 	arena.AsSmall[Userdata](b.arena, stderrRef).dataRef = arena.NullGoHandle
 
-	// Freeze all bootstrap strings into the process-wide read-only string arena.
+	// Freeze all bootstrap strings into the process-wide read-only string arena and compact
+	// both snapshot arenas so NewState() clones one flat ~48 KiB slab with zero relocation.
 	strArena, frozenBuckets, frozenMask := b.intern.FreezeBootstrap()
-	b.arena.ReleaseSpare()
+	strArena.CompactSnapshot()
+	b.arena.CompactSnapshot()
 
 	return &stdTemplate{
 		strArena:              strArena,

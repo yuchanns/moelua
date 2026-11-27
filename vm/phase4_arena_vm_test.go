@@ -511,3 +511,44 @@ func TestPhase4LoadChunkICMemoryPreflightAccountsArenaRounding(t *testing.T) {
 		t.Fatalf("Load succeeded while exceeding limit: usage=%d > limit=%d", usage, base+preflight)
 	}
 }
+
+func TestPhase4FreshStateCompactedFootprint(t *testing.T) {
+	s := NewState()
+	defer s.Close()
+
+	st := s.ArenaStats()
+	if st.BackingBytes <= 0 || st.BackingBytes > 64*1024 {
+		t.Fatalf("fresh NewState() Arena BackingBytes = %d, want (0, 65536] (compacted snapshot)", st.BackingBytes)
+	}
+	if st.AllocBytes > st.BackingBytes {
+		t.Fatalf("fresh NewState() AllocBytes=%d > BackingBytes=%d", st.AllocBytes, st.BackingBytes)
+	}
+
+	// Verify frozen string arena is also compacted and shared read-only.
+	tmpl := getStdTemplate()
+	if fb := tmpl.strArena.BackingBytes(); fb <= 0 || fb > 32*1024 {
+		t.Fatalf("frozen stdlib strArena BackingBytes = %d, want (0, 32768]", fb)
+	}
+
+	// Verify mutating the cloned State allocates into fresh progressive runtime pages cleanly.
+	cl, err := s.LoadChunk([]byte(`
+		local t = {}
+		for i = 1, 200 do
+			t[i] = { x = i, y = i * 2, label = "item_" .. i }
+		end
+		local sum = 0
+		for i = 1, #t do sum = sum + t[i].x + t[i].y end
+		return sum
+	`), "=compact_mutate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := s.Call1(cl)
+	if err != nil || !v.IsInt() || v.Int() != 3*200*201/2 {
+		t.Fatalf("compact_mutate returned (%v, %v), want %d", v, err, 3*200*201/2)
+	}
+	// Progressive runtime pages should keep small-script backing well below legacy 64 KiB-per-class overhead.
+	if after := s.ArenaStats().BackingBytes; after > 256*1024 {
+		t.Fatalf("small script Arena BackingBytes=%d unexpectedly high (> 256 KiB)", after)
+	}
+}
