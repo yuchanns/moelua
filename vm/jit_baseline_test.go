@@ -235,6 +235,22 @@ return bump(500)
 `,
 		},
 		{
+			name: "large_span_strings_len_and_eqk",
+			src: `
+local big1 = string.rep("x", 40000)
+local big2 = string.rep("x", 40000)
+local big3 = string.rep("y", 40000)
+local n, eqShort, eqSame, eqDiff = 0, 0, 0, 0
+for i = 1, 10 do
+  n = #big1
+  if big1 == "short" then eqShort = eqShort + 1 end
+  if big1 == big2 then eqSame = eqSame + 1 end
+  if big1 == big3 then eqDiff = eqDiff + 1 end
+end
+return n, eqShort, eqSame, eqDiff
+`,
+		},
+		{
 			name: "coroutines_pcall_and_metamethods",
 			src: `
 local mt = {

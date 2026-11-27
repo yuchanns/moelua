@@ -960,7 +960,7 @@ func (c *a64Baseline) emitLen(ipc int, w bytecode.Instruction) {
 	c.a.Bind(lStr)
 	c.a.CMPImm(arm64.X1, uint32(tagString))
 	c.a.BCond(arm64.NE, c.cold(ipc))
-	c.emitResolveSmall(arm64.X0, arm64.X2, arm64.X3)
+	c.emitResolveFast(arm64.X0, arm64.X2, arm64.X3)
 	c.a.LDRW(arm64.X0, arm64.X2, jitStrLen)
 	c.storeReg(w.A(), arm64.X0, arm64.XZR)
 	c.a.Bind(lDone)
@@ -1099,8 +1099,11 @@ func (c *a64Baseline) emitEQK(ipc int, w bytecode.Instruction) {
 		c.emitFusedCond(ipc, w, arm64.EQ)
 		c.a.Bind(lDiffBits)
 		// If both are interned short strings (kind == gcKindShortStr), different ObjRef means unequal!
+		// Large-span strings (>32 KiB) are never short strings and must exit before small-slab deref.
 		c.a.CMPImm(arm64.X1, uint32(tagString))
 		c.a.BCond(arm64.NE, c.cold(ipc))
+		c.branchBitSet(arm64.X0, jitArenaLargeBit, c.cold(ipc))
+		c.branchBitSet(arm64.X2, jitArenaLargeBit, c.cold(ipc))
 		c.emitResolveSmall(arm64.X0, arm64.X4, arm64.X5)
 		c.a.LDRB(arm64.X4, arm64.X4, jitStrKind)
 		c.a.CMPImm(arm64.X4, uint32(gcKindShortStr))
