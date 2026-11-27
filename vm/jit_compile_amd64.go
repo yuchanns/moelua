@@ -10,6 +10,7 @@ import (
 	"github.com/yuchanns/moelua/bytecode"
 	"github.com/yuchanns/moelua/internal/jit/amd64"
 	"github.com/yuchanns/moelua/internal/jit/execmem"
+	"github.com/yuchanns/moelua/internal/jit/ir"
 )
 
 // Pinned AMD64 registers across the baseline JIT:
@@ -92,16 +93,19 @@ type x64Baseline struct {
 	needDone    bool
 	exitReload  amd64.Label
 	needReload  bool
+	optLoops    []*x64OptLoopRef
+	optByEntry  map[int]*x64OptLoopRef
+	optByEnd    map[int]*x64OptLoopRef
 }
 
-func compileBaselineNative(bp *boundProto) (*jitFunc, error) {
+func compileBaselineNative(bp *boundProto, fb *ir.Feedback) (*jitFunc, error) {
 	code := bp.proto.Code
 	n := len(code)
 	if n == 0 {
 		return nil, fmt.Errorf("jit/amd64: empty proto")
 	}
 	c := &x64Baseline{
-		a:         amd64.New(max(256, n*48)),
+		a:         amd64.New(max(256, n*56)),
 		bp:        bp,
 		code:      code,
 		pcLabels:  make([]amd64.Label, n+1),
@@ -113,12 +117,38 @@ func compileBaselineNative(bp *boundProto) (*jitFunc, error) {
 		c.pcLabels[i] = c.a.NewLabel()
 	}
 
+	if optRegs := ir.OptimizeProto(bp.proto, fb, x64OptNumGPR, x64OptNumFP, x64OptMaxSpills); len(optRegs) > 0 {
+		c.optByEntry = make(map[int]*x64OptLoopRef, len(optRegs))
+		c.optByEnd = make(map[int]*x64OptLoopRef, len(optRegs))
+		for ipc := 0; ipc < n; ipc++ {
+			if r, ok := optRegs[ipc]; ok {
+				ref := &x64OptLoopRef{
+					reg:       r,
+					entryLbl:  c.a.NewLabel(),
+					resumeLbl: c.a.NewLabel(),
+					baseLbl:   c.a.NewLabel(),
+				}
+				c.optLoops = append(c.optLoops, ref)
+				c.optByEntry[r.EntryPC] = ref
+				if r.Kind == ir.LoopForInt {
+					c.optByEnd[r.EndPC] = ref
+				}
+			}
+		}
+	}
+
 	for ipc := 0; ipc < n; ipc++ {
 		c.pcOffsets[ipc] = c.a.Len()
 		c.a.Bind(c.pcLabels[ipc])
+		if ref, ok := c.optByEntry[ipc]; ok {
+			c.a.JMP(ref.entryLbl)
+			c.a.Bind(ref.baseLbl)
+		}
 		c.emitOp(ipc, code[ipc])
 	}
 	c.a.Bind(c.pcLabels[n])
+
+	c.emitAllOptLoops()
 
 	if c.needRetRest {
 		c.emitReturnRestoreCaller()
@@ -947,9 +977,22 @@ func (c *x64Baseline) emitLen(ipc int, w bytecode.Instruction) {
 	c.a.JCC(amd64.NE, c.cold(ipc))
 	c.a.CMPLMemImm(amd64.BaseDisp(amd64.RCX, jitTblHashRef), 0)
 	c.a.JCC(amd64.NE, c.cold(ipc))
-	c.a.CMPBMemImm(amd64.BaseDisp(amd64.RCX, jitTblArrKind), uint8(arrGeneric))
-	c.a.JCC(amd64.E, c.cold(ipc))
 	c.a.MOVLLoad(amd64.RAX, amd64.BaseDisp(amd64.RCX, jitTblArrLen))
+	lStoreLen := c.a.NewLabel()
+	c.a.CMPBMemImm(amd64.BaseDisp(amd64.RCX, jitTblArrKind), uint8(arrGeneric))
+	c.a.JCC(amd64.NE, lStoreLen)
+	// For arrGeneric with hashRef==0: #t == arrLen iff arrLen == 0 || !arr[arrLen-1].IsNil().
+	c.a.TESTQ(amd64.RAX, amd64.RAX)
+	c.a.JCC(amd64.E, lStoreLen)
+	c.a.MOVLLoad(amd64.RDX, amd64.BaseDisp(amd64.RCX, jitTblArrRef))
+	c.a.TESTL(amd64.RDX, amd64.RDX)
+	c.a.JCC(amd64.E, c.cold(ipc))
+	c.emitResolveFast(amd64.RDX, amd64.RCX, amd64.RSI)
+	c.a.LEAQ(amd64.RSI, amd64.BaseDisp(amd64.RAX, -1))
+	c.a.SHLQImm(amd64.RSI, 4)
+	c.a.CMPQMemImm(amd64.Indexed(amd64.RCX, amd64.RSI, 1, jitValTag), int32(tagNil))
+	c.a.JCC(amd64.E, c.cold(ipc))
+	c.a.Bind(lStoreLen)
 	c.storeRegTagImm(w.A(), amd64.RAX, int32(tagInt))
 	c.a.JMP(lDone)
 
@@ -1294,7 +1337,11 @@ func (c *x64Baseline) emitForLoop(ipc int, w bytecode.Instruction) {
 	c.a.MOVQStore(c.regBits(a+2), amd64.RDX)
 	c.a.SUBQImm(x64Poll, 1)
 	c.a.JCC(amd64.LE, c.poll(bodyTarget))
-	c.a.JMP(c.pcLabels[bodyTarget])
+	if ref, ok := c.optByEnd[ipc]; ok {
+		c.a.JMP(ref.resumeLbl)
+	} else {
+		c.a.JMP(c.pcLabels[bodyTarget])
+	}
 
 	// Float FORLOOP
 	c.a.Bind(lFloat)

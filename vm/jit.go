@@ -60,9 +60,11 @@ func JITSupported() bool {
 // jitFunc owns the sealed executable code region and per-bytecode-PC native entry table
 // for one compiled *bytecode.Proto.
 type jitFunc struct {
-	proto     *bytecode.Proto
-	region    *execmem.Region
-	pcEntries []uintptr // len == len(proto.Code); pcEntries[pc] is the native resume address
+	proto        *bytecode.Proto
+	region       *execmem.Region
+	pcEntries    []uintptr // len == len(proto.Code); pcEntries[pc] is the native resume address
+	tier         uint8     // 1 = baseline + static SSA loops; 2 = recompiled with live IC/callee feedback
+	hasFeedbackQ bool      // true when proto contains loops with GETFIELD/SETFIELD/CALL that benefit from Tier-2 feedback
 }
 
 func (f *jitFunc) free() {
@@ -81,11 +83,12 @@ func (f *jitFunc) free() {
 // It stays nil unless a caller opts in via SetJITEnabled(true) / moelua.WithJIT(),
 // keeping idle and noJIT States at zero extra memory and zero dispatch overhead.
 type jitState struct {
-	enabled  bool
-	entries  []uintptr  // indexed by protoIdx: 0=cold, 1=skip, >=4096=pcEntries[0]
-	pcTables []uintptr  // indexed by protoIdx: &funcs[i].pcEntries[0] (0 if uncompiled)
-	hotness  []uint16   // indexed by protoIdx: call count for loop-free functions
-	funcs    []*jitFunc // indexed by protoIdx
+	enabled     bool
+	disableSIMD bool       // optional toggle for scalar-vs-SIMD A/B benchmarking
+	entries     []uintptr  // indexed by protoIdx: 0=cold, 1=skip, >=4096=pcEntries[0]
+	pcTables    []uintptr  // indexed by protoIdx: &funcs[i].pcEntries[0] (0 if uncompiled)
+	hotness     []uint16   // indexed by protoIdx: call count for loop-free functions & Tier-2 feedback trigger
+	funcs       []*jitFunc // indexed by protoIdx
 }
 
 func (j *jitState) ensureIdx(idx uint32) {
@@ -164,6 +167,18 @@ func (s *State) SetJITEnabled(enabled bool) {
 // JITEnabled reports whether the native JIT tier is currently active on this State.
 func (s *State) JITEnabled() bool {
 	return s.jit != nil && s.jit.enabled
+}
+
+// SetJITSIMDEnabled controls whether the optimizing JIT auto-vectorizes eligible stride-1
+// loops using ARM64 NEON / AMD64 SSE2 (enabled by default when JIT is enabled).
+func (s *State) SetJITSIMDEnabled(enabled bool) {
+	if s.jit == nil {
+		if !enabled {
+			s.jit = &jitState{disableSIMD: true}
+		}
+		return
+	}
+	s.jit.disableSIMD = !enabled
 }
 
 func (s *State) closeJIT() {
