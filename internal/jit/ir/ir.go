@@ -214,6 +214,7 @@ type LoopVar struct {
 	LiveOut       bool  // Must be written back to regs[Slot] on loop exit
 	Written       bool  // Written inside the loop body
 	AcceptIntInit bool  // For TFloat accumulators initialized to int 0 (e.g. local sum = 0)
+	ZeroInit      bool  // True when written-before-read and initialized with synthetic 0 instead of unboxing regs[Slot]
 	IsForIdx      bool  // True for R[forBase+2] loop induction variable
 }
 

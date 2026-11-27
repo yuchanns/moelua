@@ -186,6 +186,7 @@ func (b *loopBuilder) build() *LoopRegion {
 			LiveOut:       b.liveOut[slot],
 			Written:       true,
 			AcceptIntInit: acceptInt,
+			ZeroInit:      !needsInit,
 		})
 	}
 
@@ -1142,7 +1143,7 @@ func (b *loopBuilder) lowerBlock(blk *Block, startPC, endPC int, pcToBlock map[i
 			}
 
 		case bytecode.OP_UNM:
-			v, ok := b.readSlot(blk, uint8(w.B()), b.slotType[a], pc)
+			v, ok := b.readSlot(blk, uint8(w.B()), TUnknown, pc)
 			if !ok {
 				return false
 			}
@@ -1383,7 +1384,7 @@ func (b *loopBuilder) readSlot(blk *Block, slot uint8, want Type, pc int) (ValID
 	case TInt:
 		v = b.emitPre(Inst{Op: OpUnboxInt, Type: TInt, Slot: slot})
 	case TFloat:
-		v = b.emitPre(Inst{Op: OpUnboxNumFloat, Type: TFloat, Slot: slot})
+		v = b.emitPre(Inst{Op: OpUnboxFloat, Type: TFloat, Slot: slot})
 	case TBool:
 		v = b.emitPre(Inst{Op: OpUnboxBool, Type: TBool, Slot: slot})
 	default:
@@ -1684,7 +1685,12 @@ func (b *loopBuilder) lowerBitK(blk *Block, op bytecode.OpCode, a, bSlot uint8, 
 		irOp = OpShrI
 	}
 	rhs := b.emitPre(Inst{Op: OpConstInt, Type: TInt, ImmI: imm})
-	res := b.emitBody(blk, Inst{Op: irOp, Type: TInt, Args: [3]ValID{lhs, rhs, NoVal}, NumArgs: 2, DeoptPC: pc})
+	args := [3]ValID{lhs, rhs, NoVal}
+	if op == bytecode.OP_SHLI {
+		// Lua 5.5 OP_SHLI computes SC << R[B] (constant on the left, register on the right).
+		args = [3]ValID{rhs, lhs, NoVal}
+	}
+	res := b.emitBody(blk, Inst{Op: irOp, Type: TInt, Args: args, NumArgs: 2, DeoptPC: pc})
 	b.writeSlot(blk, a, res, pc)
 	return true
 }
@@ -1748,13 +1754,12 @@ func (b *loopBuilder) lowerArrSet(blk *Block, tblSlot uint8, idxVal ValID, w byt
 			}
 			valV = b.emitPre(Inst{Op: OpConstInt, Type: TInt, ImmI: k.Int})
 		case TFloat:
-			if k.Kind == bytecode.ConstFloat {
-				valV = b.emitPre(Inst{Op: OpConstFloat, Type: TFloat, ImmU: math.Float64bits(k.Float)})
-			} else if k.Kind == bytecode.ConstInt {
-				valV = b.emitPre(Inst{Op: OpConstFloat, Type: TFloat, ImmU: math.Float64bits(float64(k.Int))})
-			} else {
+			// Never coerce integer constants into a float array: Lua preserves integer
+			// type by promoting the backing array to generic storage.
+			if k.Kind != bytecode.ConstFloat {
 				return false
 			}
+			valV = b.emitPre(Inst{Op: OpConstFloat, Type: TFloat, ImmU: math.Float64bits(k.Float)})
 		case TBool:
 			if k.Kind == bytecode.ConstTrue {
 				valV = b.emitPre(Inst{Op: OpConstBool, Type: TBool, ImmI: 1})
@@ -1766,8 +1771,8 @@ func (b *loopBuilder) lowerArrSet(blk *Block, tblSlot uint8, idxVal ValID, w byt
 		}
 	} else {
 		var rok bool
-		valV, rok = b.readSlot(blk, uint8(w.C()), elemT, pc)
-		if !rok {
+		valV, rok = b.readSlot(blk, uint8(w.C()), TUnknown, pc)
+		if !rok || b.valType(valV) != elemT {
 			return false
 		}
 	}
@@ -2105,21 +2110,27 @@ func (b *loopBuilder) inlineLeafProto(blk *Block, lp *bytecode.Proto, args []Val
 				return NoVal, false
 			}
 			sc := int64(w.SC())
-			if b.valType(v) == TInt {
+			vt := b.valType(v)
+			if vt == TInt {
 				slots[a] = b.emitBody(blk, Inst{Op: OpAddIImm, Type: TInt, Args: [3]ValID{v, NoVal, NoVal}, NumArgs: 1, ImmI: sc, DeoptPC: callPC})
-			} else {
+			} else if vt == TFloat {
 				kc := b.emitPre(Inst{Op: OpConstFloat, Type: TFloat, ImmU: math.Float64bits(float64(sc))})
 				slots[a] = b.emitBody(blk, Inst{Op: OpAddF, Type: TFloat, Args: [3]ValID{v, kc, NoVal}, NumArgs: 2, DeoptPC: callPC})
+			} else {
+				return NoVal, false
 			}
 		case bytecode.OP_UNM:
 			v, ok := slots[uint8(w.B())]
 			if !ok {
 				return NoVal, false
 			}
-			if b.valType(v) == TInt {
+			vt := b.valType(v)
+			if vt == TInt {
 				slots[a] = b.emitBody(blk, Inst{Op: OpNegI, Type: TInt, Args: [3]ValID{v, NoVal, NoVal}, NumArgs: 1, DeoptPC: callPC})
-			} else {
+			} else if vt == TFloat {
 				slots[a] = b.emitBody(blk, Inst{Op: OpNegF, Type: TFloat, Args: [3]ValID{v, NoVal, NoVal}, NumArgs: 1, DeoptPC: callPC})
+			} else {
+				return NoVal, false
 			}
 		case bytecode.OP_ADDK, bytecode.OP_SUBK, bytecode.OP_MULK, bytecode.OP_DIVK:
 			lhs, ok := slots[uint8(w.B())]
@@ -2127,7 +2138,14 @@ func (b *loopBuilder) inlineLeafProto(blk *Block, lp *bytecode.Proto, args []Val
 				return NoVal, false
 			}
 			k := lp.Consts[w.C()]
-			isF := op == bytecode.OP_DIVK || k.Kind == bytecode.ConstFloat || b.valType(lhs) == TFloat
+			if k.Kind != bytecode.ConstInt && k.Kind != bytecode.ConstFloat {
+				return NoVal, false
+			}
+			lt := b.valType(lhs)
+			if lt != TInt && lt != TFloat {
+				return NoVal, false
+			}
+			isF := op == bytecode.OP_DIVK || k.Kind == bytecode.ConstFloat || lt == TFloat
 			if isF {
 				lf, ok := b.coerceVal(blk, lhs, TFloat, callPC)
 				if !ok {
@@ -2149,7 +2167,11 @@ func (b *loopBuilder) inlineLeafProto(blk *Block, lp *bytecode.Proto, args []Val
 			if !ok1 || !ok2 {
 				return NoVal, false
 			}
-			isF := op == bytecode.OP_DIV || b.valType(lhs) == TFloat || b.valType(rhs) == TFloat
+			lt, rt := b.valType(lhs), b.valType(rhs)
+			if (lt != TInt && lt != TFloat) || (rt != TInt && rt != TFloat) {
+				return NoVal, false
+			}
+			isF := op == bytecode.OP_DIV || lt == TFloat || rt == TFloat
 			if isF {
 				lf, ok1 := b.coerceVal(blk, lhs, TFloat, callPC)
 				rf, ok2 := b.coerceVal(blk, rhs, TFloat, callPC)
@@ -2264,8 +2286,10 @@ func (b *loopBuilder) lowerCondBranch(blk *Block, w, jmp bytecode.Instruction, p
 		if k.Kind == bytecode.ConstInt {
 			condVal = b.emitCmpI(blk, bytecode.OP_EQI, a, k.Int, w.K(), pc)
 		} else if k.Kind == bytecode.ConstFloat {
-			lhs, ok := b.readSlot(blk, a, TFloat, pc)
-			if !ok {
+			// Only compare against a float constant when lhs is already float64
+			// (avoid rounding int64 values > 2^53 into equal float64 values).
+			lhs, ok := b.readSlot(blk, a, TUnknown, pc)
+			if !ok || b.valType(lhs) != TFloat {
 				return false
 			}
 			rhs := b.emitPre(Inst{Op: OpConstFloat, Type: TFloat, ImmU: math.Float64bits(k.Float)})
@@ -2345,9 +2369,15 @@ func (b *loopBuilder) emitCmpI(blk *Block, op bytecode.OpCode, a uint8, imm int6
 	case bytecode.OP_GEI:
 		cc = CmpGE
 	}
-	if b.slotType[a] == TFloat {
-		lhs, ok := b.readSlot(blk, a, TFloat, pc)
-		if !ok {
+	lhs, ok := b.readSlot(blk, a, TUnknown, pc)
+	if !ok {
+		return NoVal
+	}
+	lt := b.valType(lhs)
+	if lt == TFloat {
+		// Only compare float64 against an integer immediate when the integer is
+		// exactly representable in IEEE-754 float64 (|imm| <= 2^53).
+		if imm < -(1<<53) || imm > (1<<53) {
 			return NoVal
 		}
 		rhs := b.emitPre(Inst{Op: OpConstFloat, Type: TFloat, ImmU: math.Float64bits(float64(imm))})
@@ -2357,8 +2387,7 @@ func (b *loopBuilder) emitCmpI(blk *Block, op bytecode.OpCode, a uint8, imm int6
 		}
 		return v
 	}
-	lhs, ok := b.readSlot(blk, a, TInt, pc)
-	if !ok {
+	if lt != TInt {
 		return NoVal
 	}
 	rhs := b.emitPre(Inst{Op: OpConstInt, Type: TInt, ImmI: imm})

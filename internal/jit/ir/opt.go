@@ -166,6 +166,16 @@ func verifyOrHoistDeoptSafety(reg *LoopRegion) bool {
 
 	// Verify globally: in block 0, no mid-loop deopt after first mutation; in blocks > 0,
 	// no mid-loop deopt if any prior block (or earlier in same block) mutated state.
+	// Also reject loops that have BOTH a mid-loop deoptable instruction AND a ZeroInit LoopVar
+	// (materializing a synthetic 0 on iteration-1 deopt would overwrite the incoming Lua value
+	// observable by a metamethod before the first write commits).
+	hasZeroInitVar := false
+	for _, lv := range reg.Vars {
+		if lv.ZeroInit {
+			hasZeroInitVar = true
+			break
+		}
+	}
 	mutatedBefore := false
 	for bi, blk := range reg.Blocks {
 		seenMut := mutatedBefore
@@ -174,8 +184,10 @@ func verifyOrHoistDeoptSafety(reg *LoopRegion) bool {
 			if in.Dead {
 				continue
 			}
-			if canDeoptMidLoop(in) && seenMut {
-				return false
+			if canDeoptMidLoop(in) {
+				if seenMut || hasZeroInitVar {
+					return false
+				}
 			}
 			if mutatesState(in.Op) {
 				seenMut = true

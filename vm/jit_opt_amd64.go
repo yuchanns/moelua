@@ -204,6 +204,10 @@ func (e *x64OptEmit) emitForIntLoop() {
 
 	// Common preheader: RAX=cnt, R8=step, RSI=idx
 	e.a.Bind(lCommon)
+	// Ensure at least 1 poll unit before entering iteration 1 so pollLbl can never
+	// materialize ZeroInit LoopVars before the first iteration executes.
+	e.a.CMPQImm(x64Poll, 0)
+	e.a.JCC(amd64.LE, e.preFail)
 	if e.reg.HasConstStep {
 		e.a.MOVImm64(amd64.RCX, uint64(e.reg.ConstStep))
 		e.a.CMPQ(amd64.R8, amd64.RCX)

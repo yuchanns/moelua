@@ -436,6 +436,85 @@ for i = 1, 10 do y = false end
 print(x, type(x), y, type(y))
 `,
 		},
+		{
+			name: "codex_shli_operand_order",
+			src: `
+local x, y = 0, 0
+for i = 1, 10 do
+  x = x + (1 << i)
+  y = y + (1024 >> (i - 1))
+end
+print(x, y)
+`,
+		},
+		{
+			name: "codex_int_store_into_float_array_preserves_integer",
+			src: `
+local a, b = {}, {}
+for i = 1, 100 do a[i] = 1.0; b[i] = 1.0 end
+for i = 1, 100 do a[i] = 9007199254740993 end
+local v = 9007199254740993
+for i = 1, 100 do b[i] = v end
+print(a[100], math.type(a[100]), b[100], math.type(b[100]))
+`,
+		},
+		{
+			name: "codex_mixed_int64_float_const_equality_no_rounding",
+			src: `
+local x = 9007199254740993
+local f = 9007199254740992.0
+local s1, s2, s3 = 0, 0, 0
+for i = 1, 10 do
+  if x == 9007199254740992.0 then s1 = s1 + 1 end
+  if f == 9007199254740993 then s2 = s2 + 1 end
+  local dummy = x + 0.5
+  if x == 9007199254740992.0 then s3 = s3 + 1 end
+end
+print(s1, s2, s3)
+`,
+		},
+		{
+			name: "codex_leaf_inline_rejects_non_numeric_bool_args",
+			src: `
+local function f(x, y)
+  return x + y
+end
+local function neg(x)
+  return -x
+end
+local function run_add(n)
+  local s = 0
+  for i = 1, n do s = s + f(true, 1) end
+  return s
+end
+local function run_neg(n)
+  local s = 0
+  for i = 1, n do s = s + neg(true) end
+  return s
+end
+for _ = 1, 6 do run_add(0); run_neg(0) end
+local ok1 = pcall(run_add, 10)
+local ok2 = pcall(run_neg, 10)
+print(ok1, ok2)
+`,
+		},
+		{
+			name: "codex_zero_init_var_preserved_on_deopt_before_first_write",
+			src: `
+local x = 42
+local seen = {}
+local a = setmetatable({1}, {
+  __index = function(t, k)
+    seen[#seen + 1] = x
+    return 1
+  end,
+})
+for i = 1, 10 do
+  x = a[i * i + 1]
+end
+print(table.concat(seen, ","), x)
+`,
+		},
 	}
 
 	for _, tc := range cases {

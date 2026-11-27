@@ -220,6 +220,10 @@ func (e *a64OptEmit) emitForIntLoop() {
 
 	// Common preheader: X13=cnt, X16=step, X12=idx
 	e.a.Bind(lCommon)
+	// Ensure at least 1 poll unit before entering iteration 1 so pollLbl can never
+	// materialize ZeroInit LoopVars before the first iteration executes.
+	e.a.CMPImm(a64Poll, 0)
+	e.a.BCond(arm64.LE, e.preFail)
 	if e.reg.HasConstStep {
 		e.a.MOVImm64(arm64.X14, uint64(e.reg.ConstStep))
 		e.a.CMP(arm64.X16, arm64.X14)
