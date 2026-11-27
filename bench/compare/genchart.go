@@ -151,6 +151,7 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		label string
 		kind  string
 	}{
+		"LuaJIT":        {"LuaJIT 2.1 (ref)", "ref"},
 		"C-O3":          {"C Lua 5.5.1 -O3 (ref)", "ref"},
 		"C":             {"C Lua 5.5.1 -O2 (ref)", "ref"},
 		"MoeLua-JIT":    {"MoeLua 5.5 (JIT)", "moe-jit"},
@@ -276,12 +277,17 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		rightX0    = 648.0
 		rightPlotW = 210.0
 		plotTop    = 108.0
-		plotBottom = 378.0
+		plotBottom = 398.0
 		barH       = 15.0
 	)
 
+	title := "MoeLua 5.5 vs Go Lua Engines &amp; C Lua 5.5.1"
+	if _, hasLuaJIT := bench.CommonGeomean["LuaJIT"]; hasLuaJIT {
+		title = "MoeLua 5.5 vs Go Lua Engines, C Lua 5.5.1 &amp; LuaJIT"
+	}
+
 	var sb strings.Builder
-	fmt.Fprintf(&sb, `<svg xmlns="http://www.w3.org/2000/svg" width="960" height="450" viewBox="0 0 960 450" role="img" aria-label="MoeLua 5.5 cross-engine benchmark: %d-program execution time relative to C Lua 5.5.1 -O2 and %d-VM Go GC pause">
+	fmt.Fprintf(&sb, `<svg xmlns="http://www.w3.org/2000/svg" width="960" height="470" viewBox="0 0 960 470" role="img" aria-label="MoeLua 5.5 cross-engine benchmark: %d-program execution time relative to C Lua 5.5.1 -O2 and %d-VM Go GC pause">
   <defs>
     <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
       <rect width="6" height="6" fill="#e2e8f0"/>
@@ -290,18 +296,18 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 %s
   </defs>
 
-  <rect x="0.5" y="0.5" width="959" height="449" rx="10" class="bg"/>
-  <rect x="0.5" y="0.5" width="959" height="449" rx="10" class="border"/>
+  <rect x="0.5" y="0.5" width="959" height="469" rx="10" class="bg"/>
+  <rect x="0.5" y="0.5" width="959" height="469" rx="10" class="border"/>
 
   <!-- Header -->
-  <text x="24" y="30" class="title">MoeLua 5.5 vs Go Lua Engines &amp; C Lua 5.5.1</text>
+  <text x="24" y="30" class="title">%s</text>
   <text x="24" y="48" class="subtitle">%s</text>
-`, bench.CommonCount, vmCount, commonCSS, html.EscapeString(subtitle))
+`, bench.CommonCount, vmCount, commonCSS, title, html.EscapeString(subtitle))
 	writeBadge(&sb, badge)
 
 	fmt.Fprintf(&sb, `
   <!-- Divider -->
-  <line x1="490" y1="68" x2="490" y2="404" stroke="#e2e8f0" stroke-width="1"/>
+  <line x1="490" y1="68" x2="490" y2="424" stroke="#e2e8f0" stroke-width="1"/>
 
   <!-- LEFT PANEL -->
   <text x="24" y="78" class="panel-title">Execution Time (%d-Program Geomean)</text>
@@ -312,15 +318,15 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 	fmt.Fprintf(&sb, "  <line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" class=\"axis\"/>\n", leftX0, plotTop, leftX0, plotBottom)
 	refX := leftX0 + (1.0/leftAxisMax)*leftPlotW
 	fmt.Fprintf(&sb, "  <line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" class=\"refline\"/>\n", refX, plotTop, refX, plotBottom)
-	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"393\" class=\"tick\">0x</text>\n", leftX0)
+	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"413\" class=\"tick\">0x</text>\n", leftX0)
 	if refX-leftX0 >= 18 {
-		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"393\" class=\"tick\">1x</text>\n", refX)
+		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"413\" class=\"tick\">1x</text>\n", refX)
 	}
 	for tick := leftStep; tick <= leftAxisMax+1e-6; tick += leftStep {
 		x := leftX0 + (tick/leftAxisMax)*leftPlotW
 		fmt.Fprintf(&sb, "  <line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" class=\"grid\"/>\n", x, plotTop, x, plotBottom)
 		if x-refX >= 18 {
-			fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"393\" class=\"tick\">%.0fx</text>\n", x, tick)
+			fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"413\" class=\"tick\">%.0fx</text>\n", x, tick)
 		}
 	}
 
@@ -356,11 +362,11 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 `, vmCount, (vmCount*2047)/1000)
 
 	fmt.Fprintf(&sb, "  <line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" class=\"axis\"/>\n", rightX0, plotTop, rightX0, plotBottom)
-	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"393\" class=\"tick\">0</text>\n", rightX0)
+	fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"413\" class=\"tick\">0</text>\n", rightX0)
 	for tick := rightStep; tick <= rightAxisMax+1e-6; tick += rightStep {
 		x := rightX0 + (tick/rightAxisMax)*rightPlotW
 		fmt.Fprintf(&sb, "  <line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" class=\"grid\"/>\n", x, plotTop, x, plotBottom)
-		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"393\" class=\"tick\">%.0fms</text>\n", x, tick)
+		fmt.Fprintf(&sb, "  <text x=\"%.1f\" y=\"413\" class=\"tick\">%.0fms</text>\n", x, tick)
 	}
 
 	rightRowH := (plotBottom - plotTop - 10) / float64(max(len(rightRows), 1))
@@ -388,10 +394,7 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		y += rightRowH
 	}
 
-	leftFoot := fmt.Sprintf("Left: median of %d rounds via bench/compare (32/32 byte-exact output vs C Lua 5.5.1).", max(bench.Rounds, 1))
-	if v, ok := bench.CommonGeomean["LuaJIT"]; ok {
-		leftFoot += fmt.Sprintf(" LuaJIT on the same suite: %.2fx (see docs/benchmarks.md).", v)
-	}
+	leftFoot := fmt.Sprintf("Left: median of %d rounds via bench/compare (32/32 byte-exact output vs C Lua 5.5.1). Hatched bars = native C/asm references.", max(bench.Rounds, 1))
 	memMetric := "active Go heap/VM"
 	if hasAnyRSS {
 		memMetric = "active OS RSS/VM"
@@ -408,8 +411,8 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 
 	fmt.Fprintf(&sb, `
   <!-- Footer notes -->
-  <text x="24" y="422" class="foot">%s</text>
-  <text x="24" y="438" class="foot">%s</text>
+  <text x="24" y="442" class="foot">%s</text>
+  <text x="24" y="458" class="foot">%s</text>
 </svg>
 `, html.EscapeString(leftFoot), html.EscapeString(rightFoot))
 
