@@ -179,7 +179,7 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 		if s.hasInterruptControl() {
 			err = s.runHooked(th, entryDepth)
 		} else {
-			err = s.run(th, entryDepth)
+			err = s.runFast(th, entryDepth)
 		}
 		if err != nil {
 			if errors.Is(err, errCoroCloseSelf) {

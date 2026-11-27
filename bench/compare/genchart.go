@@ -153,7 +153,7 @@ func renderCompareSVG(bench reportSummary, mems []memResult, subtitle, badge str
 		"C-O3":          {"C Lua 5.5.1 -O3 (ref)", "ref"},
 		"C":             {"C Lua 5.5.1 -O2 (ref)", "ref"},
 		"Apogee-JIT":    {"Apogee v1.2.1 (JIT)", "other"},
-		"MoeLua":        {"MoeLua 5.5 (Pure Go)", "moe"},
+		"MoeLua":        {"MoeLua 5.5 (noJIT)", "moe"},
 		"Apogee-Interp": {"Apogee v1.2.1 (noJIT)", "other"},
 		"CCGO":          {"modernc/lua (CCGO)", "other"},
 		"ArnodelGolua":  {"arnodel/golua (PGO)", "other"},

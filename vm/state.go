@@ -160,7 +160,7 @@ const (
 type boundProto struct {
 	proto     *bytecode.Proto
 	insns     codeWords
-	consts    []Value        // slice view directly into ArenaProto.constsRef (noscan!)
+	consts    []Value // slice view directly into ArenaProto.constsRef (noscan!)
 	icSlots   []int32
 	ic        []ICEntry      // slice view directly into ArenaProto.icRef (noscan!)
 	sub       []arena.ObjRef // slice view directly into ArenaProto.subRef (noscan!)
@@ -310,7 +310,7 @@ type State struct {
 	stdinInput     Value
 	defaultInput   Value
 	defaultOutput  Value
-	openFiles      []*fileInner      // open non-std file handles flushed on os.exit / closed LIFO on State.Close
+	openFiles      []*fileInner        // open non-std file handles flushed on os.exit / closed LIFO on State.Close
 	immUpvalTokens map[uint32][]uint64 // lazy debug.upvalueid tokens for shared static builtins
 
 	// Non-Arena Go-side memory accounting & per-State soft/hard memory limit (0 = unlimited).
@@ -1949,7 +1949,7 @@ func (s *State) call1OnThread(th *Thread, fn Value, args []Value) (Value, error)
 				th.nframe = entryDepth + 1
 				th.noteFrame(th.nframe)
 
-				err := s.run(th, entryDepth)
+				err := s.runFast(th, entryDepth)
 				if uerr := th.uncaughtErr(s); uerr != nil {
 					err = uerr
 					th.setUncaughtErr(s, nil)
@@ -2121,7 +2121,7 @@ func (s *State) call2OnThread(th *Thread, fn, a, b Value) (Value, error) {
 				th.nframe = entryDepth + 1
 				th.noteFrame(th.nframe)
 
-				err := s.run(th, entryDepth)
+				err := s.runFast(th, entryDepth)
 				if uerr := th.uncaughtErr(s); uerr != nil {
 					err = uerr
 					th.setUncaughtErr(s, nil)
@@ -2232,7 +2232,7 @@ func (s *State) runThread(th *Thread, entryDepth int) error {
 	if (th.hookMask != 0 && !th.inHook && !th.suppressHook) || s.hasInterruptControl() {
 		return s.runHooked(th, entryDepth)
 	}
-	return s.run(th, entryDepth)
+	return s.runFast(th, entryDepth)
 }
 
 // getTM checks a table's metatable for metamethod tm using the 6-bit negative cache.

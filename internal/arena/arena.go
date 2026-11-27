@@ -609,6 +609,13 @@ func (a *Arena) PagePtrs() []unsafe.Pointer {
 	return a.pagePtrs
 }
 
+// LargeSpans returns the backing large-span table for hot-loop dereferencing.
+// Callers caching the returned slice header must reload it after any allocation that may
+// append a new large span or after Close.
+func (a *Arena) LargeSpans() [][]byte {
+	return a.largeSpans
+}
+
 // PtrInPages resolves a live non-large slab ObjRef directly against a cached PagePtrs slice.
 // Caller must guarantee ref != NullRef, !ref.IsLarge(), and that ref addresses a live slab slot.
 func PtrInPages(pagePtrs []unsafe.Pointer, ref ObjRef) unsafe.Pointer {
