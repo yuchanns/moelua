@@ -1,6 +1,7 @@
 name: Cross-Engine Benchmarks
 
 on:
+  pull_request:
   push:
     branches: [main]
     paths-ignore:
@@ -8,6 +9,7 @@ on:
       - "docs/assets/bench-multivm.svg"
       - "docs/benchmarks.md"
       - "README.md"
+      - "CHANGELOG.md"
   workflow_dispatch:
     inputs:
       engines:
@@ -27,164 +29,220 @@ on:
         required: false
         default: "3"
       run_memcmp:
-        description: "Run isolated-process 256-VM memory & Go GC comparison"
+        description: "Run isolated-process high-density multi-VM memory & Go GC comparison"
         type: boolean
         default: true
       commit_chart:
-        description: "Commit regenerated docs/assets/bench-compare.svg to main (only when run on main)"
+        description: "Commit regenerated docs/assets/bench-*.svg to main (only when run on main)"
         type: boolean
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: bench-compare-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  compare:
-    if: github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, 'chore(bench):')
+  plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+      mode: ${{ steps.plan.outputs.mode }}
+      lua_targets: ${{ steps.plan.outputs.lua_targets }}
+      engines: ${{ steps.plan.outputs.engines }}
+      mem_engines: ${{ steps.plan.outputs.mem_engines }}
+      programs: ${{ steps.plan.outputs.programs }}
+      benchtime: ${{ steps.plan.outputs.benchtime }}
+      count: ${{ steps.plan.outputs.count }}
+      run_memcmp: ${{ steps.plan.outputs.run_memcmp }}
+      generate_charts: ${{ steps.plan.outputs.generate_charts }}
+      commit_charts: ${{ steps.plan.outputs.commit_charts }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+
+      - name: Compute benchmark execution plan
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_REF: ${{ github.ref }}
+          HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          INPUT_ENGINES: ${{ inputs.engines }}
+          INPUT_PROGRAMS: ${{ inputs.programs }}
+          INPUT_BENCHTIME: ${{ inputs.benchtime }}
+          INPUT_COUNT: ${{ inputs.count }}
+          INPUT_RUN_MEMCMP: ${{ inputs.run_memcmp }}
+          INPUT_COMMIT_CHART: ${{ inputs.commit_chart }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, subprocess
+
+          FULL_ENGINES = "^(C|C-O3|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$"
+          PR_ENGINES = "^(C|MoeLua)$"
+          FULL_LUA_TARGETS = "build/lua55_o2 build/lua55_o3 build/clua_mem"
+          PR_LUA_TARGETS = "build/lua55_o2 build/clua_mem"
+
+          event = os.environ["EVENT_NAME"]
+          ref = os.environ["TARGET_REF"]
+
+          plan = {
+              "run": "false",
+              "mode": "skip",
+              "lua_targets": PR_LUA_TARGETS,
+              "engines": "",
+              "mem_engines": "",
+              "programs": "",
+              "benchtime": "300ms",
+              "count": "3",
+              "run_memcmp": "false",
+              "generate_charts": "false",
+              "commit_charts": "false",
+          }
+          reason = ""
+
+          def is_bench_relevant(path: str) -> bool:
+              if path.endswith(".md") or path.startswith(("docs/", ".github/ISSUE_TEMPLATE/")):
+                  return False
+              if path in (".gitignore", ".gitattributes", "LICENSE"):
+                  return False
+              if path.endswith(".go") or path in ("go.mod", "go.sum", "Makefile"):
+                  return True
+              if path.startswith(("vm/", "compiler/", "bytecode/", "internal/", "cmd/", "bench/", "third_party/lua", ".github/actions/")):
+                  return True
+              if path == ".github/workflows/bench-compare.yml":
+                  return True
+              return False
+
+          if event == "workflow_dispatch":
+              run_memcmp = os.environ.get("INPUT_RUN_MEMCMP", "true").lower() == "true"
+              commit_chart = os.environ.get("INPUT_COMMIT_CHART", "false").lower() == "true"
+              plan.update({
+                  "run": "true",
+                  "mode": "dispatch",
+                  "lua_targets": FULL_LUA_TARGETS,
+                  "engines": os.environ.get("INPUT_ENGINES") or FULL_ENGINES,
+                  "mem_engines": "",
+                  "programs": os.environ.get("INPUT_PROGRAMS") or "",
+                  "benchtime": os.environ.get("INPUT_BENCHTIME") or "300ms",
+                  "count": os.environ.get("INPUT_COUNT") or "3",
+                  "run_memcmp": "true" if run_memcmp else "false",
+                  "generate_charts": "true" if run_memcmp else "false",
+                  "commit_charts": "true" if (ref == "refs/heads/main" and commit_chart and run_memcmp) else "false",
+              })
+              reason = "manual workflow_dispatch"
+          elif event == "push":
+              msg = os.environ.get("HEAD_COMMIT_MSG", "")
+              if msg.startswith(("chore(bench):", "Release ")):
+                  reason = "skipping bot benchmark/release metadata commit"
+              else:
+                  plan.update({
+                      "run": "true",
+                      "mode": "full",
+                      "lua_targets": FULL_LUA_TARGETS,
+                      "engines": FULL_ENGINES,
+                      "mem_engines": "",
+                      "run_memcmp": "true",
+                      "generate_charts": "true",
+                      "commit_charts": "true" if ref == "refs/heads/main" else "false",
+                  })
+                  reason = "push to main (full cross-engine suite + chart regeneration)"
+          elif event == "pull_request":
+              has_merge_parent = subprocess.run(
+                  ["git", "rev-parse", "--verify", "HEAD^2"],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              ).returncode == 0
+              if has_merge_parent:
+                  diff_range = "HEAD^1...HEAD^2"
+              else:
+                  base_sha = os.environ.get("PR_BASE_SHA", "")
+                  diff_range = f"{base_sha}...HEAD" if base_sha else "HEAD~1...HEAD"
+              changed = subprocess.check_output(
+                  ["git", "diff", "--name-only", diff_range],
+                  text=True,
+              ).splitlines()
+              matched = [p for p in changed if is_bench_relevant(p)]
+              if matched:
+                  plan.update({
+                      "run": "true",
+                      "mode": "pr",
+                      "lua_targets": PR_LUA_TARGETS,
+                      "engines": PR_ENGINES,
+                      "mem_engines": PR_ENGINES,
+                      "run_memcmp": "true",
+                      "generate_charts": "false",
+                      "commit_charts": "false",
+                  })
+                  reason = f"PR changed {len(matched)} benchmark-relevant file(s); running MoeLua + C baseline only"
+              else:
+                  reason = f"PR changed {len(changed)} file(s), none benchmark-relevant; skipping benchmarks"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              for k, v in plan.items():
+                  out.write(f"{k}={v}\n")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("### Benchmark Execution Plan\n\n")
+              summary.write(f"- **Mode**: `{plan['mode']}` (`run={plan['run']}`)\n")
+              summary.write(f"- **Reason**: {reason}\n")
+              if plan["run"] == "true":
+                  summary.write(f"- **CPU Engines**: `{plan['engines']}`\n")
+                  summary.write(f"- **Multi-VM Engines**: `{plan['mem_engines'] or 'all'}`\n")
+                  summary.write(f"- **Regenerate & Commit Charts**: `generate={plan['generate_charts']}`, `commit={plan['commit_charts']}`\n")
+          PY
+
+  compare:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 90
+    outputs:
+      charts_generated: ${{ steps.bench.outputs.charts-generated }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-          fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: ./.github/actions/setup-go
         with:
           go-version-file: bench/compare/go.mod
-          cache: false
 
-      - name: Build reference C Lua 5.5.1 (-O2, -O3, and multi-VM memory helper)
-        run: make build/lua55_o2 build/lua55_o3 build/clua_mem
+      - uses: ./.github/actions/setup-lua-ref
+        with:
+          targets: ${{ needs.plan.outputs.lua_targets }}
 
-      - name: Verify 32/32 output equivalence (C vs MoeLua)
-        working-directory: bench/compare
-        run: go test -vet=off -timeout 10m -run TestOutputs -engines '^(C|MoeLua)$' .
+      - id: bench
+        uses: ./.github/actions/bench-compare
+        with:
+          engines: ${{ needs.plan.outputs.engines }}
+          mem-engines: ${{ needs.plan.outputs.mem_engines }}
+          programs: ${{ needs.plan.outputs.programs }}
+          benchtime: ${{ needs.plan.outputs.benchtime }}
+          count: ${{ needs.plan.outputs.count }}
+          run-memcmp: ${{ needs.plan.outputs.run_memcmp }}
+          generate-charts: ${{ needs.plan.outputs.generate_charts }}
+          require-charts: ${{ github.event_name == 'push' }}
+          commit-sha: ${{ github.sha }}
 
-      - name: Run high-density multi-VM memory & Go GC comparison
-        if: ${{ github.event_name == 'push' || inputs.run_memcmp }}
-        working-directory: bench/compare
-        run: |
-          go build -o /tmp/memcmp memcmp.go
-          /tmp/memcmp -json memcmp.json | tee memcmp.txt
-          {
-            echo "### High-Density Multi-VM Memory & Go GC Comparison"
-            echo '```text'
-            cat memcmp.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Run cross-engine CPU benchmarks
-        working-directory: bench/compare
-        env:
-          INPUT_ENGINES: ${{ inputs.engines || '^(C|C-O3|MoeLua|Apogee-JIT|Apogee-Interp|CCGO|ArnodelGolua|GopherLua|GoLua|DCLua)$' }}
-          INPUT_PROGRAMS: ${{ inputs.programs || '' }}
-          INPUT_BENCHTIME: ${{ inputs.benchtime || '300ms' }}
-          INPUT_COUNT: ${{ inputs.count || '3' }}
-        run: |
-          set -euo pipefail
-          MAIN_ENGINES="$(python3 -c '
-          import os, re
-          pat = re.compile(os.environ["INPUT_ENGINES"])
-          names = ["C", "C-O3", "MoeLua", "Apogee-JIT", "Apogee-Interp", "CCGO", "GopherLua", "GoLua", "DCLua", "LuaJIT-joff", "LuaJIT"]
-          picked = [n for n in names if pat.search(n)]
-          print("^(" + "|".join(re.escape(n) for n in picked) + ")$" if picked else "")
-          ')"
-          RUN_GOLUA="$(python3 -c '
-          import os, re
-          print("1" if re.compile(os.environ["INPUT_ENGINES"]).search("ArnodelGolua") else "0")
-          ')"
-          : > bench_raw.txt
-          if [ -n "$MAIN_ENGINES" ]; then
-            GOMAXPROCS=1 go test -vet=off -timeout 60m -run @ -bench . \
-              -benchtime "$INPUT_BENCHTIME" -count "$INPUT_COUNT" \
-              -engines "$MAIN_ENGINES" -programs "$INPUT_PROGRAMS" . | tee -a bench_raw.txt
-          fi
-          if [ "$RUN_GOLUA" = "1" ]; then
-            GOLUA_DIR="$(go list -m -f '{{.Dir}}' github.com/arnodel/golua)"
-            PGO_ARGS=()
-            if [ -f "$GOLUA_DIR/default.pgo" ]; then
-              PGO_ARGS=(-pgo="$GOLUA_DIR/default.pgo")
-            fi
-            GOMAXPROCS=1 go test -vet=off -timeout 30m "${PGO_ARGS[@]}" -run @ -bench . \
-              -benchtime "$INPUT_BENCHTIME" -count "$INPUT_COUNT" \
-              -engines '^ArnodelGolua$' -programs "$INPUT_PROGRAMS" . | tee -a bench_raw.txt
-          fi
-          go run benchreport.go -json bench_summary.json < bench_raw.txt > bench_report.txt
-          {
-            echo "### Cross-Engine CPU Benchmarks (relative to C Lua 5.5.1 -O2, lower is faster)"
-            echo '```text'
-            awk '/^are-we-fast-yet,|^Benchmarks Game,|^SciMark|^the Go engines|^micro benchmarks,|^all but micro/{show=1} /^ms\/op, best\/median/{show=0} show{print}' bench_report.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Regenerate README performance chart SVGs
-        if: ${{ github.event_name == 'push' || inputs.run_memcmp }}
-        working-directory: bench/compare
-        run: |
-          set -euo pipefail
-          HAS_CHART_DATA="$(python3 -c '
-          import json, os
-          if not (os.path.exists("bench_summary.json") and os.path.exists("memcmp.json")):
-              print("0"); raise SystemExit
-          b = json.load(open("bench_summary.json"))
-          m = json.load(open("memcmp.json"))
-          print("1" if b.get("common_count", 0) > 0 and "C" in b.get("common_geomean", {}) and len(m) > 0 else "0")
-          ')"
-          if [ "$HAS_CHART_DATA" = "1" ]; then
-            CPU_MODEL="$(lscpu 2>/dev/null | awk -F: '/Model name/{gsub(/^[ \t]+/,"",$2); print $2; exit}')"
-            [ -n "$CPU_MODEL" ] || CPU_MODEL="$(uname -m)"
-            GO_VER="$(go env GOVERSION | sed 's/^go//')"
-            SUBTITLE="GitHub Actions (${CPU_MODEL}, $(go env GOOS)/$(go env GOARCH)) · Go ${GO_VER} · GOMAXPROCS=1 · Lower is better"
-            go run genchart.go \
-              -bench bench_summary.json \
-              -mem memcmp.json \
-              -subtitle "$SUBTITLE" \
-              -date "$(date -u +%Y-%m-%d)" \
-              -commit "${GITHUB_SHA::7}" \
-              -out ../../docs/assets/bench-compare.svg \
-              -out-multivm ../../docs/assets/bench-multivm.svg
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            echo "ERROR: push to main did not produce both C-baseline common_geomean and memcmp.json" >&2
-            exit 1
-          else
-            echo "Skipping chart regeneration (requires both C-baseline common_geomean and memcmp.json)."
-          fi
-
-      - name: Commit updated README performance charts to main
-        if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.commit_chart) }}
-        run: |
-          set -euo pipefail
-          if [ -z "$(git status --porcelain -- docs/assets/bench-compare.svg docs/assets/bench-multivm.svg)" ]; then
-            echo "Charts unchanged; skipping commit."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          cp docs/assets/bench-compare.svg /tmp/bench-compare-new.svg
-          cp docs/assets/bench-multivm.svg /tmp/bench-multivm-new.svg
-          for attempt in 1 2 3; do
-            git fetch origin main
-            git reset --hard origin/main
-            cp /tmp/bench-compare-new.svg docs/assets/bench-compare.svg
-            cp /tmp/bench-multivm-new.svg docs/assets/bench-multivm.svg
-            if [ -z "$(git status --porcelain -- docs/assets/bench-compare.svg docs/assets/bench-multivm.svg)" ]; then
-              echo "Charts already match origin/main; skipping commit."
-              exit 0
-            fi
-            git add docs/assets/bench-compare.svg docs/assets/bench-multivm.svg
-            git commit -m "chore(bench): update README performance charts (${GITHUB_SHA::7})"
-            if git push origin HEAD:main; then
-              exit 0
-            fi
-            echo "Push conflict on attempt $attempt; retrying..."
-            sleep 2
-          done
-          exit 1
+      - name: Upload generated chart SVGs
+        if: steps.bench.outputs.charts-generated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-charts
+          path: |
+            docs/assets/bench-compare.svg
+            docs/assets/bench-multivm.svg
+          if-no-files-found: error
 
       - name: Upload benchmark report artifact
         uses: actions/upload-artifact@v4
@@ -195,6 +253,135 @@ jobs:
             bench/compare/bench_summary.json
             bench/compare/memcmp.txt
             bench/compare/memcmp.json
-            docs/assets/bench-compare.svg
-            docs/assets/bench-multivm.svg
           if-no-files-found: ignore
+
+  commit-charts:
+    needs: [plan, compare]
+    if: needs.plan.outputs.commit_charts == 'true' && needs.compare.outputs.charts_generated == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download generated chart SVGs
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-charts
+          path: /tmp/bench-charts
+
+      - name: Commit verified README performance charts to main
+        uses: actions/github-script@v9
+        env:
+          BENCH_SHA: ${{ github.sha }}
+        with:
+          script: |
+            const crypto = require('crypto');
+            const fs = require('fs');
+            const path = require('path');
+
+            function findFile(dir, target) {
+              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                  const hit = findFile(full, target);
+                  if (hit) return hit;
+                } else if (entry.name === target) {
+                  return full;
+                }
+              }
+              return null;
+            }
+
+            function gitBlobSha(buf) {
+              return crypto
+                .createHash('sha1')
+                .update(`blob ${buf.length}\0`)
+                .update(buf)
+                .digest('hex');
+            }
+
+            const files = [
+              { repoPath: 'docs/assets/bench-compare.svg', name: 'bench-compare.svg' },
+              { repoPath: 'docs/assets/bench-multivm.svg', name: 'bench-multivm.svg' },
+            ];
+            const localFiles = new Map();
+            for (const f of files) {
+              const localPath = findFile('/tmp/bench-charts', f.name);
+              if (!localPath) {
+                throw new Error(`Missing generated chart artifact: ${f.name}`);
+              }
+              const buf = fs.readFileSync(localPath);
+              localFiles.set(f.repoPath, { buf, sha: gitBlobSha(buf) });
+            }
+
+            const shortSha = (process.env.BENCH_SHA || '').slice(0, 7);
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              const { data: refData } = await github.rest.git.getRef({
+                ...context.repo,
+                ref: 'heads/main',
+              });
+              const headOid = refData.object.sha;
+
+              const additions = [];
+              for (const f of files) {
+                const { buf, sha } = localFiles.get(f.repoPath);
+                let same = false;
+                try {
+                  const { data: remote } = await github.rest.repos.getContent({
+                    ...context.repo,
+                    path: f.repoPath,
+                    ref: headOid,
+                  });
+                  if (!Array.isArray(remote) && remote.type === 'file' && remote.sha === sha) {
+                    same = true;
+                  }
+                } catch (err) {
+                  if (err.status !== 404) throw err;
+                }
+                if (!same) {
+                  additions.push({
+                    path: f.repoPath,
+                    contents: buf.toString('base64'),
+                  });
+                }
+              }
+
+              if (additions.length === 0) {
+                core.info('Charts already match origin/main; skipping commit.');
+                return;
+              }
+
+              let commit;
+              try {
+                const result = await github.graphql(
+                  `mutation($input: CreateCommitOnBranchInput!) {
+                    createCommitOnBranch(input: $input) {
+                      commit { oid signature { isValid wasSignedByGitHub } }
+                    }
+                  }`,
+                  {
+                    input: {
+                      branch: {
+                        repositoryNameWithOwner: `${context.repo.owner}/${context.repo.repo}`,
+                        branchName: 'main',
+                      },
+                      expectedHeadOid: headOid,
+                      message: {
+                        headline: `chore(bench): update README performance charts (${shortSha})`,
+                      },
+                      fileChanges: { additions },
+                    },
+                  },
+                );
+                commit = result.createCommitOnBranch.commit;
+              } catch (err) {
+                if (attempt === 3) throw err;
+                core.warning(`createCommitOnBranch attempt ${attempt} failed (${err.message}); retrying...`);
+                await new Promise((r) => setTimeout(r, 2000));
+                continue;
+              }
+              if (!commit.signature?.isValid || !commit.signature.wasSignedByGitHub) {
+                throw new Error('Chart commit was not signed and verified by GitHub');
+              }
+              core.info(`Committed verified chart update ${commit.oid}`);
+              return;
+            }

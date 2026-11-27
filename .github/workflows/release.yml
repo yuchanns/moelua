@@ -1,0 +1,387 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Go SemVer version without leading v (e.g. 0.1.0 or 0.1.0-rc.1)
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: moelua-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Plan Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      base_version: ${{ steps.plan.outputs.base_version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      is_prerelease: ${{ steps.plan.outputs.is_prerelease }}
+      previous_tag: ${{ steps.plan.outputs.previous_tag }}
+      source_commit: ${{ steps.plan.outputs.source_commit }}
+      mode: ${{ steps.plan.outputs.mode }}
+      existing_release_commit: ${{ steps.plan.outputs.existing_release_commit }}
+    steps:
+      - name: Validate release input and branch
+        id: validate
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          TARGET_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$RELEASE_VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.[1-9][0-9]*)?$'; then
+            echo "::error::Version must match X.Y.Z or X.Y.Z-(alpha|beta|rc).N without a leading v, got '$RELEASE_VERSION'"
+            exit 1
+          fi
+          if [[ "$TARGET_REF" != refs/heads/* ]]; then
+            echo "::error::Releases must run from a branch ref, got '$TARGET_REF'"
+            exit 1
+          fi
+          is_prerelease="false"
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            is_prerelease="true"
+          elif [ "$TARGET_REF" != "refs/heads/main" ]; then
+            echo "::error::Stable releases must run from main"
+            exit 1
+          fi
+          base_version="${RELEASE_VERSION%%-*}"
+          echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$is_prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ github.ref }}
+
+      - name: Resolve release state and previous tag
+        id: plan
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+          BASE_VERSION: ${{ steps.validate.outputs.base_version }}
+          RELEASE_TAG: ${{ steps.validate.outputs.tag }}
+          IS_PRERELEASE: ${{ steps.validate.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+          branch_head="$(git rev-parse HEAD)"
+          branch_subject="$(git show -s --format=%s HEAD)"
+          branch_parent="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          mode="new"
+          existing_release_commit=""
+          source_commit="$DISPATCH_SHA"
+
+          child_release="$(python3 - <<'PY'
+          import os, subprocess
+          dispatch = os.environ["DISPATCH_SHA"]
+          want = "Release " + os.environ["RELEASE_TAG"]
+          out = subprocess.check_output(
+              ["git", "log", "--first-parent", "--format=%H\x00%P\x00%s", f"{dispatch}..HEAD"],
+              text=True,
+          )
+          for line in out.splitlines():
+              parts = line.split("\x00", 2)
+              if len(parts) == 3 and parts[1] == dispatch and parts[2] == want:
+                  print(parts[0])
+                  break
+          PY
+          )"
+
+          if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
+            if [ "$(git cat-file -t "refs/tags/$RELEASE_TAG")" != "tag" ]; then
+              echo "::error::Existing ref $RELEASE_TAG is not an annotated tag"
+              exit 1
+            fi
+            tagged_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+            tagged_subject="$(git show -s --format=%s "$tagged_commit")"
+            tagged_parent="$(git rev-parse "${tagged_commit}^" 2>/dev/null || true)"
+            if [ "$tagged_commit" = "$DISPATCH_SHA" ]; then
+              mode="existing"
+              existing_release_commit="$tagged_commit"
+              if [ "$tagged_subject" = "Release $RELEASE_TAG" ] && [ -n "$tagged_parent" ]; then
+                source_commit="$tagged_parent"
+              fi
+            elif [ "$tagged_subject" = "Release $RELEASE_TAG" ] && [ "$tagged_parent" = "$DISPATCH_SHA" ]; then
+              mode="existing"
+              existing_release_commit="$tagged_commit"
+              source_commit="$DISPATCH_SHA"
+            else
+              echo "::error::Tag $RELEASE_TAG already exists on $tagged_commit (expected $DISPATCH_SHA or its Release $RELEASE_TAG child)"
+              exit 1
+            fi
+          elif [ -n "$child_release" ]; then
+            mode="existing"
+            existing_release_commit="$child_release"
+            source_commit="$DISPATCH_SHA"
+          elif [ "$branch_head" = "$DISPATCH_SHA" ] && [ "$branch_subject" = "Release $RELEASE_TAG" ]; then
+            mode="existing"
+            existing_release_commit="$branch_head"
+            if [ -n "$branch_parent" ]; then
+              source_commit="$branch_parent"
+            fi
+          fi
+
+          previous_tag="$(SOURCE_COMMIT="$source_commit" python3 - <<'PY'
+          import os, re, subprocess
+
+          source_commit = os.environ["SOURCE_COMMIT"]
+          base_ver = tuple(int(x) for x in os.environ["BASE_VERSION"].split("."))
+          release_tag = os.environ["RELEASE_TAG"]
+          tags = subprocess.check_output(
+              ["git", "tag", "--merged", source_commit, "-l", "v*", "--sort=-v:refname"],
+              text=True,
+          ).splitlines()
+          for t in tags:
+              if t == release_tag:
+                  continue
+              m = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", t)
+              if m and tuple(int(x) for x in m.groups()) < base_ver:
+                  print(t)
+                  break
+          PY
+          )"
+
+          echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "base_version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "existing_release_commit=$existing_release_commit" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify Release Source
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          ref: ${{ needs.plan.outputs.existing_release_commit || needs.plan.outputs.source_commit }}
+
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version-file: go.mod
+
+      - uses: ./.github/actions/setup-lua-ref
+        with:
+          targets: build/lua55_o2 build/luac55 build/clua_mem
+
+      - uses: ./.github/actions/verify-go
+        with:
+          run-race: "true"
+          run-compare: "true"
+          run-gc-stress: "true"
+
+  prepare:
+    name: Update Changelog & Create Verified Release Commit
+    needs: [plan, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      release_commit: ${{ steps.commit.outputs.release_commit }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ needs.plan.outputs.existing_release_commit || needs.plan.outputs.source_commit }}
+
+      - name: Generate changelog and create verified release commit
+        id: new_commit
+        uses: actions/github-script@v9
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          IS_PRERELEASE: ${{ needs.plan.outputs.is_prerelease }}
+          RELEASE_BRANCH: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ needs.plan.outputs.source_commit }}
+          PREVIOUS_TAG: ${{ needs.plan.outputs.previous_tag }}
+          MODE: ${{ needs.plan.outputs.mode }}
+        with:
+          result-encoding: string
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const version = process.env.RELEASE_VERSION;
+            const tag = process.env.RELEASE_TAG;
+            const isPrerelease = process.env.IS_PRERELEASE === 'true';
+            const sourceCommit = process.env.SOURCE_COMMIT;
+            const previousTag = process.env.PREVIOUS_TAG;
+            const mode = process.env.MODE;
+
+            const generated = await github.rest.repos.generateReleaseNotes({
+              ...context.repo,
+              tag_name: tag,
+              target_commitish: sourceCommit,
+              ...(previousTag ? { previous_tag_name: previousTag } : {}),
+            });
+            const notesBody = (generated.data.body || '').trim();
+            fs.mkdirSync(path.join('build', 'release'), { recursive: true });
+            fs.writeFileSync(path.join('build', 'release', 'notes.md'), notesBody + '\n', 'utf8');
+
+            if (mode !== 'new') {
+              return '';
+            }
+
+            if (!isPrerelease) {
+              const defaultHeader = [
+                '# Changelog',
+                '',
+                'All notable changes to this project are documented in this file.',
+                '',
+                'The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),',
+                'and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).',
+                '',
+              ].join('\n');
+              const changelog = fs.existsSync('CHANGELOG.md')
+                ? fs.readFileSync('CHANGELOG.md', 'utf8')
+                : defaultHeader;
+              if (!changelog.includes('## ' + version + ' - ')) {
+                const heading = '## ' + version + ' - ' + new Date().toISOString().slice(0, 10);
+                const entry = heading + '\n\n' + notesBody + '\n';
+                const index = changelog.indexOf('\n## ');
+                const updated = index >= 0
+                  ? changelog.slice(0, index + 1) + entry + '\n' + changelog.slice(index + 1)
+                  : changelog.trimEnd() + '\n\n' + entry;
+                fs.writeFileSync('CHANGELOG.md', updated, 'utf8');
+              }
+            }
+
+            const changed = (await exec.getExecOutput('git', ['diff', '--name-only', '-z'], { silent: true }))
+              .stdout.split('\0').filter(Boolean);
+            const untracked = (await exec.getExecOutput('git', ['ls-files', '--others', '--exclude-standard', '-z', '--', 'CHANGELOG.md'], { silent: true }))
+              .stdout.split('\0').filter(Boolean);
+            const filesToCommit = [...new Set([...changed, ...untracked])];
+            if (filesToCommit.length === 0) {
+              return sourceCommit;
+            }
+
+            const input = {
+              branch: {
+                repositoryNameWithOwner: context.repo.owner + '/' + context.repo.repo,
+                branchName: process.env.RELEASE_BRANCH,
+              },
+              expectedHeadOid: sourceCommit,
+              message: { headline: 'Release ' + tag },
+              fileChanges: {
+                additions: filesToCommit.map((filePath) => ({
+                  path: filePath,
+                  contents: fs.readFileSync(filePath).toString('base64'),
+                })),
+              },
+            };
+            const result = await github.graphql(
+              'mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid signature { isValid wasSignedByGitHub } } } }',
+              { input },
+            );
+            const commit = result.createCommitOnBranch.commit;
+            if (!commit.signature?.isValid || !commit.signature.wasSignedByGitHub) {
+              throw new Error('Release commit was not signed and verified by GitHub');
+            }
+            return commit.oid;
+
+      - name: Save generated release notes artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes-${{ needs.plan.outputs.version }}
+          path: build/release/notes.md
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Verify fixed release commit
+        id: commit
+        uses: actions/github-script@v9
+        env:
+          NEW_COMMIT: ${{ steps.new_commit.outputs.result }}
+          EXISTING_COMMIT: ${{ needs.plan.outputs.existing_release_commit }}
+          SOURCE_COMMIT: ${{ needs.plan.outputs.source_commit }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        with:
+          script: |
+            const ref = process.env.NEW_COMMIT || process.env.EXISTING_COMMIT;
+            const { data } = await github.rest.repos.getCommit({ ...context.repo, ref });
+            if (data.sha !== process.env.SOURCE_COMMIT) {
+              if (
+                !data.commit.verification?.verified ||
+                data.parents.length !== 1 ||
+                data.parents[0].sha !== process.env.SOURCE_COMMIT ||
+                data.commit.message.split('\n')[0] !== 'Release ' + process.env.RELEASE_TAG
+              ) {
+                throw new Error('The release commit does not match its source and verified signature');
+              }
+            }
+            core.setOutput('release_commit', data.sha);
+
+  tag:
+    name: Push Annotated Release Tag
+    needs: [plan, prepare]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout verified release commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ needs.prepare.outputs.release_commit }}
+
+      - name: Download generated release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes-${{ needs.plan.outputs.version }}
+          path: build/release
+
+      - name: Create and push annotated tag
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
+            test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_COMMIT"
+          else
+            GIT_COMMITTER_DATE="@$source_date_epoch +0000" git tag -a "$RELEASE_TAG" -m "Release $RELEASE_TAG"
+          fi
+          git push origin "refs/tags/$RELEASE_TAG"
+          {
+            echo "### Tagged ${RELEASE_TAG}"
+            echo ""
+            echo "- **Tag**: \`${RELEASE_TAG}\`"
+            echo "- **Commit**: \`${RELEASE_COMMIT}\`"
+            echo "- **Go install**: \`go get github.com/${GITHUB_REPOSITORY}@${RELEASE_TAG}\`"
+            echo ""
+            cat build/release/notes.md
+          } >> "$GITHUB_STEP_SUMMARY"

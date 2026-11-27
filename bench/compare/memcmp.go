@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -385,10 +386,21 @@ func main() {
 	worker := flag.String("worker", "", "run single engine")
 	workerMode := flag.String("worker-mode", "idle", "worker mode: idle or active-scale")
 	jsonOut := flag.String("json", "", "optional path to write structured JSON results")
+	enginesFlag := flag.String("engines", "", "optional regex filter for engines (matches Go engine names and C)")
 	cluaMemBin := flag.String("clua-mem", "../../build/clua_mem", "optional path to compiled C Lua 5.5.1 memory reference helper")
 	count := flag.Int("n", 256, "primary VM count for summary table")
 	scaleFlag := flag.String("scale", "64,256,512,1000", "comma-separated active VM counts for scaling curve")
 	flag.Parse()
+
+	var engineRE *regexp.Regexp
+	if *enginesFlag != "" {
+		var err error
+		engineRE, err = regexp.Compile(*enginesFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "memcmp: invalid -engines regex %q: %v\n", *enginesFlag, err)
+			os.Exit(2)
+		}
+	}
 
 	scaleCounts, err := parseScaleList(*scaleFlag)
 	if err != nil {
@@ -434,6 +446,9 @@ func main() {
 	var results []memResult
 	failed := false
 	for _, h := range hs {
+		if engineRE != nil && !engineRE.MatchString(h.name) {
+			continue
+		}
 		idleCmd := exec.Command(self, "-worker", h.name, "-worker-mode", "idle", "-n", strconv.Itoa(*count), "-scale", scaleArg)
 		idleCmd.Stderr = os.Stderr
 		idleOut, err := idleCmd.Output()
@@ -486,11 +501,7 @@ func main() {
 			formatKiB(r.ActiveRSSKiB, r.HasRSS),
 			r.ActiveGCMs)
 	}
-	if failed || len(results) == 0 {
-		os.Exit(1)
-	}
-
-	if *cluaMemBin != "" {
+	if *cluaMemBin != "" && (engineRE == nil || engineRE.MatchString("C")) {
 		maxScale := scaleCounts[len(scaleCounts)-1]
 		cRes, err := runCLuaRef(*cluaMemBin, *count, maxScale)
 		if err != nil {
@@ -510,22 +521,34 @@ func main() {
 				"n/a")
 		}
 	}
-
-	fmt.Printf("\nHigh-Density Active Go GC Scaling (2,047 tables/VM):\n%-15s", "Engine")
-	for _, c := range scaleCounts {
-		fmt.Printf(" | %10s", fmt.Sprintf("%d VMs", c))
+	if failed || len(results) == 0 {
+		os.Exit(1)
 	}
-	fmt.Println()
-	fmt.Println(strings.Repeat("-", 15+13*len(scaleCounts)))
+
+	hasGoScaling := false
 	for _, r := range results {
-		if r.Engine == "C" {
-			continue
+		if r.Engine != "C" {
+			hasGoScaling = true
+			break
 		}
-		fmt.Printf("%-15s", r.Engine)
-		for _, pt := range r.Scale {
-			fmt.Printf(" | %7.2f ms", pt.ActiveGCMs)
+	}
+	if hasGoScaling {
+		fmt.Printf("\nHigh-Density Active Go GC Scaling (2,047 tables/VM):\n%-15s", "Engine")
+		for _, c := range scaleCounts {
+			fmt.Printf(" | %10s", fmt.Sprintf("%d VMs", c))
 		}
 		fmt.Println()
+		fmt.Println(strings.Repeat("-", 15+13*len(scaleCounts)))
+		for _, r := range results {
+			if r.Engine == "C" {
+				continue
+			}
+			fmt.Printf("%-15s", r.Engine)
+			for _, pt := range r.Scale {
+				fmt.Printf(" | %7.2f ms", pt.ActiveGCMs)
+			}
+			fmt.Println()
+		}
 	}
 
 	if *jsonOut != "" {

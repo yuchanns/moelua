@@ -1,0 +1,30 @@
+name: Setup Reference C Lua 5.5.1 Tools
+description: Build requested PUC-Rio Lua 5.5.1 reference binaries from the third_party/lua submodule on Unix runners.
+
+inputs:
+  targets:
+    description: Space-separated Makefile targets under build/ (e.g. "build/lua55_o2 build/luac55 build/clua_mem")
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Build reference C Lua 5.5.1 tools
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        set -euo pipefail
+        read -r -a target_list <<< "$TARGETS"
+        if [ "${#target_list[@]}" -eq 0 ]; then
+          echo "ERROR: targets input must not be empty" >&2
+          exit 2
+        fi
+        for t in "${target_list[@]}"; do
+          if [[ ! "$t" =~ ^build/[a-zA-Z0-9_]+$ ]]; then
+            echo "ERROR: unsupported build target '$t'" >&2
+            exit 2
+          fi
+        done
+        make "${target_list[@]}"
