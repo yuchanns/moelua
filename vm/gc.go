@@ -1358,6 +1358,9 @@ func (s *State) CollectFull() {
 		s.abortErr = err
 	}
 	s.compactOpenFiles()
+	if s.arena != nil {
+		s.arena.TrimIdle()
+	}
 }
 
 // collectEmergency runs an emergency GC pass under memory-limit pressure without invoking __gc finalizers.

@@ -99,19 +99,32 @@ type pageMeta struct {
 	sharedSlab bool   // true while pages[pid] is a sub-slice of a compacted/cloned flat slab
 }
 
+// maxClassOpened is the saturating page-open ramp depth at which a size class reaches
+// full PageSize (64 KiB) slabs.
+const maxClassOpened = 6
+
 // nextPageBytes computes the progressive non-moving slab page size for size class cls.
-// Small VMs start with compact pages (2 KiB..32 KiB) and ramp smoothly up to PageSize (64 KiB)
-// by the 4th page in that class so allocation-heavy workloads still run on full 64 KiB slabs.
+// Modeled after Go's runtime/gc/sizeclasses.go span philosophy for per-VM Arenas:
+//   - Large small-classes (>= 2 KiB, e.g. coroutine stacks/frames, proto tables) open
+//     exact 1-slot pages initially (matching Go's single-slot 8/16/32 KiB spans) so a
+//     VM allocating one 6–32 KiB object never wastes 50–75% of a 24–64 KiB slab.
+//   - Small classes (16 B .. 1 KiB) ramp gently (2 -> 4 -> 8 -> 8 -> 16 -> 32 -> 64 KiB),
+//     dwelling at Go's 8 KiB span granularity for compact multi-VM services while still
+//     reaching full 64 KiB slabs for allocation-heavy single-VM workloads.
 func nextPageBytes(cls uint8, opened uint8) int {
 	sz := int(classSizes[cls])
 	var target int
 	switch opened {
 	case 0:
-		target = max(4*sz, 2048)
+		target = 2048
 	case 1:
-		target = max(8*sz, 8192)
-	case 2:
-		target = max(16*sz, 32768)
+		target = 4096
+	case 2, 3:
+		target = 8192
+	case 4:
+		target = 16384
+	case 5:
+		target = 32768
 	default:
 		return PageSize
 	}
@@ -362,7 +375,7 @@ func (a *Arena) allocPage(cls uint8) (uint32, error) {
 			panic("arena: slab page not 8-byte aligned")
 		}
 	}
-	if a.classOpened[cls] < 3 {
+	if a.classOpened[cls] < maxClassOpened {
 		a.classOpened[cls]++
 	}
 	basePtr := unsafe.Pointer(unsafe.SliceData(buf))
@@ -702,6 +715,26 @@ func Slice[T any](a *Arena, ref ObjRef, byteOff, n int) []T {
 // ReleaseSpare drops the cached empty spare page back to Go.
 func (a *Arena) ReleaseSpare() {
 	a.sparePage = nil
+}
+
+// TrimIdle drops the cached empty spare page back to Go and recalibrates each size
+// class's progressive slab ramp to its currently active standalone pages. Invoked
+// at the end of an explicit full GC cycle so post-startup or idle VMs return spare
+// 64 KiB pages to Go's shared mheap and do not stay latched at 64 KiB slabs after
+// transient allocation spikes have been collected.
+func (a *Arena) TrimIdle() {
+	a.sparePage = nil
+	var active [NumClasses]uint8
+	for pid := 1; pid < len(a.pages); pid++ {
+		meta := &a.pageMeta[pid]
+		if !meta.active || meta.sharedSlab {
+			continue
+		}
+		if active[meta.class] < maxClassOpened {
+			active[meta.class]++
+		}
+	}
+	a.classOpened = active
 }
 
 // Close releases all backing slab pages, large spans, and metadata immediately back to Go.

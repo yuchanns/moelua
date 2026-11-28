@@ -158,14 +158,18 @@ func TestMultiPageGrowthFullUnlinkAndWholePageReclamation(t *testing.T) {
 	a := arena.New()
 	defer a.Close()
 
-	// Progressive 64-byte pages: 2 KiB (32) + 8 KiB (128) + 32 KiB (512) + 64 KiB (1024) + 64 KiB (1024) = 2720 slots across 5 pages.
+	// Progressive 64-byte pages:
+	//   2 KiB (32) + 4 KiB (64) + 8 KiB (128) + 8 KiB (128) + 16 KiB (256) + 32 KiB (512) + 64 KiB (1024) + 64 KiB (1024) = 3168 slots across 8 pages.
 	const (
 		p1Count = 32
-		p2Count = 128
-		p3Count = 512
-		p4Count = 1024
-		p5Count = 1024
-		total   = p1Count + p2Count + p3Count + p4Count + p5Count
+		p2Count = 64
+		p3Count = 128
+		p4Count = 128
+		p5Count = 256
+		p6Count = 512
+		p7Count = 1024
+		p8Count = 1024
+		total   = p1Count + p2Count + p3Count + p4Count + p5Count + p6Count + p7Count + p8Count
 	)
 	refs := make([]arena.ObjRef, total)
 	for i := range total {
@@ -176,31 +180,31 @@ func TestMultiPageGrowthFullUnlinkAndWholePageReclamation(t *testing.T) {
 		binary.LittleEndian.PutUint64(a.Bytes(ref, 8), uint64(i+1))
 		refs[i] = ref
 	}
-	if a.ActivePages() != 5 {
-		t.Fatalf("ActivePages=%d, want 5", a.ActivePages())
+	if a.ActivePages() != 8 {
+		t.Fatalf("ActivePages=%d, want 8", a.ActivePages())
 	}
 	if a.AllocBytes() != total*64 {
 		t.Fatalf("AllocBytes=%d, want %d", a.AllocBytes(), total*64)
 	}
-	wantBacking := int64((p1Count + p2Count + p3Count + p4Count + p5Count) * 64)
+	wantBacking := int64(total * 64)
 	if a.BackingBytes() != wantBacking {
 		t.Fatalf("BackingBytes=%d, want %d", a.BackingBytes(), wantBacking)
 	}
 
-	// Free the entire 4th page (full 64 KiB page) -> ActivePages must drop to 4 and sparePage caches the 64 KiB page.
-	p4Start := p1Count + p2Count + p3Count
-	for i := p4Start; i < p4Start+p4Count; i++ {
+	// Free the entire 7th page (full 64 KiB page) -> ActivePages must drop to 7 and sparePage caches the 64 KiB page.
+	p7Start := p1Count + p2Count + p3Count + p4Count + p5Count + p6Count
+	for i := p7Start; i < p7Start+p7Count; i++ {
 		a.Free(refs[i])
 	}
-	if a.ActivePages() != 4 {
-		t.Fatalf("after freeing full 64 KiB page: ActivePages=%d, want 4", a.ActivePages())
+	if a.ActivePages() != 7 {
+		t.Fatalf("after freeing full 64 KiB page: ActivePages=%d, want 7", a.ActivePages())
 	}
-	// Free the entire 1st page (2 KiB small page) -> ActivePages drops to 3 without displacing 64 KiB spare.
+	// Free the entire 1st page (2 KiB small page) -> ActivePages drops to 6 without displacing 64 KiB spare.
 	for i := range p1Count {
 		a.Free(refs[i])
 	}
-	if a.ActivePages() != 3 {
-		t.Fatalf("after freeing small page: ActivePages=%d, want 3", a.ActivePages())
+	if a.ActivePages() != 6 {
+		t.Fatalf("after freeing small page: ActivePages=%d, want 6", a.ActivePages())
 	}
 
 	// Free one slot in page 2 (which was previously full & unlinked from classAvail),
@@ -214,11 +218,11 @@ func TestMultiPageGrowthFullUnlinkAndWholePageReclamation(t *testing.T) {
 	if reused != refs[targetIdx] {
 		t.Fatalf("expected reused slot %v, got %v", refs[targetIdx], reused)
 	}
-	if a.ActivePages() != 3 {
+	if a.ActivePages() != 6 {
 		t.Fatalf("reusing freed slot should not allocate new page; ActivePages=%d", a.ActivePages())
 	}
-	// Verify survivors on pages 2, 3, and 5 stayed intact.
-	for i := p1Count; i < p4Start; i++ {
+	// Verify survivors on pages 2..6 and 8 stayed intact.
+	for i := p1Count; i < p7Start; i++ {
 		if i == targetIdx {
 			continue
 		}
@@ -226,9 +230,9 @@ func TestMultiPageGrowthFullUnlinkAndWholePageReclamation(t *testing.T) {
 			t.Fatalf("survivor slot %d corrupted: got %d", i, got)
 		}
 	}
-	for i := p4Start + p4Count; i < total; i++ {
+	for i := p7Start + p7Count; i < total; i++ {
 		if got := binary.LittleEndian.Uint64(a.Bytes(refs[i], 8)); got != uint64(i+1) {
-			t.Fatalf("page 5 slot %d corrupted: got %d", i, got)
+			t.Fatalf("page 8 slot %d corrupted: got %d", i, got)
 		}
 	}
 }
@@ -246,14 +250,51 @@ func TestProgressiveSlabGrowthAndSpareSafety(t *testing.T) {
 		t.Fatalf("expected compact initial 48B slab page <= 2048B, got BackingBytes=%d", a.BackingBytes())
 	}
 
-	// Freeing a small (< PageSize) page must release it immediately and NEVER stash it in sparePage,
-	// so a subsequent 64 KiB page allocation (32 KiB class) gets a valid full 64 KiB backing buffer.
+	// Freeing a small (< PageSize) page must release it immediately and NEVER stash it in sparePage.
 	a.Free(r1)
 	if a.ActivePages() != 0 || a.BackingBytes() != 0 {
 		t.Fatalf("expected small page to release without spare caching, got pages=%d backing=%d",
 			a.ActivePages(), a.BackingBytes())
 	}
 
+	// Large small-classes (>= 2 KiB) must open exact single-slot pages initially (matching Go's
+	// single-slot spans) instead of pre-allocating 4*sz or 64 KiB for a single object.
+	for _, sz := range []int{2048, 4096, 6144, 8192, 16384, arena.MaxSmallSize} {
+		sa := arena.New()
+		r, err := sa.AllocZeroed(sz)
+		if err != nil {
+			sa.Close()
+			t.Fatalf("AllocZeroed(%d) failed: %v", sz, err)
+		}
+		if sa.ActivePages() != 1 || sa.BackingBytes() != int64(sz) {
+			gotPages, gotBacking := sa.ActivePages(), sa.BackingBytes()
+			sa.Close()
+			t.Fatalf("initial %dB class should allocate exact 1-slot page (%dB), got pages=%d backing=%d",
+				sz, sz, gotPages, gotBacking)
+		}
+		sa.Free(r)
+		if sa.ActivePages() != 0 || sa.BackingBytes() != 0 {
+			gotPages, gotBacking := sa.ActivePages(), sa.BackingBytes()
+			sa.Close()
+			t.Fatalf("freeing single-slot %dB page left pages=%d backing=%d", sz, gotPages, gotBacking)
+		}
+		sa.Close()
+	}
+
+	// Ramp the 32 KiB class past its initial single-slot pages (6 x 32 KiB) onto a full 64 KiB
+	// slab page (2 x 32 KiB slots) and verify both slots and sparePage reuse remain intact.
+	var ramp [6]arena.ObjRef
+	for i := range ramp {
+		r, err := a.AllocZeroed(arena.MaxSmallSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ramp[i] = r
+	}
+	if a.ActivePages() != 6 || a.BackingBytes() != 6*arena.MaxSmallSize {
+		t.Fatalf("first 6 32 KiB allocations should use 6 single-slot pages: pages=%d backing=%d",
+			a.ActivePages(), a.BackingBytes())
+	}
 	rBig1, err := a.AllocZeroed(arena.MaxSmallSize)
 	if err != nil {
 		t.Fatal(err)
@@ -262,8 +303,8 @@ func TestProgressiveSlabGrowthAndSpareSafety(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.ActivePages() != 1 || a.BackingBytes() != arena.PageSize {
-		t.Fatalf("32 KiB class should allocate 1 full 64 KiB page: pages=%d backing=%d",
+	if a.ActivePages() != 7 || a.BackingBytes() != 6*arena.MaxSmallSize+arena.PageSize {
+		t.Fatalf("7th+8th 32 KiB slots should share 1 full 64 KiB page: pages=%d backing=%d",
 			a.ActivePages(), a.BackingBytes())
 	}
 	a.Bytes(rBig1, arena.MaxSmallSize)[arena.MaxSmallSize-1] = 0xAA
@@ -272,6 +313,32 @@ func TestProgressiveSlabGrowthAndSpareSafety(t *testing.T) {
 		a.Bytes(rBig2, arena.MaxSmallSize)[arena.MaxSmallSize-1] != 0xBB {
 		t.Fatalf("32 KiB slots corrupted")
 	}
+
+	// Freeing the full 64 KiB page caches it in sparePage; TrimIdle releases sparePage and
+	// recalibrates classOpened back to the remaining active standalone pages.
+	for _, r := range ramp {
+		a.Free(r)
+	}
+	a.Free(rBig1)
+	a.Free(rBig2)
+	if a.ActivePages() != 0 || a.BackingBytes() != arena.PageSize {
+		t.Fatalf("expected 1 cached 64 KiB sparePage after freeing full page: pages=%d backing=%d",
+			a.ActivePages(), a.BackingBytes())
+	}
+	a.TrimIdle()
+	if a.ActivePages() != 0 || a.BackingBytes() != 0 {
+		t.Fatalf("expected TrimIdle to drop sparePage: pages=%d backing=%d", a.ActivePages(), a.BackingBytes())
+	}
+	// After TrimIdle on an empty Arena, the next 32 KiB allocation must start compact again (32 KiB, not 64 KiB).
+	rAfter, err := a.AllocZeroed(arena.MaxSmallSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.ActivePages() != 1 || a.BackingBytes() != arena.MaxSmallSize {
+		t.Fatalf("expected compact 32 KiB page after TrimIdle, got pages=%d backing=%d",
+			a.ActivePages(), a.BackingBytes())
+	}
+	a.Free(rAfter)
 }
 
 func TestCompactSnapshotAndCloneSnapshot(t *testing.T) {

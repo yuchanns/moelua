@@ -552,3 +552,49 @@ func TestPhase4FreshStateCompactedFootprint(t *testing.T) {
 		t.Fatalf("small script Arena BackingBytes=%d unexpectedly high (> 256 KiB)", after)
 	}
 }
+
+func TestPhase4CollectFullReleasesSparePageAndTrimsRamps(t *testing.T) {
+	s := NewState()
+	defer s.Close()
+
+	// Create enough short-lived tables to ramp the 64B class up to full 64 KiB pages,
+	// then drop references and trigger an explicit CollectFull (collectgarbage("collect")).
+	cl, err := s.LoadChunk([]byte(`
+		local tmp = {}
+		for i = 1, 5000 do
+			tmp[i] = { a = i, b = i + 1 }
+		end
+		tmp = nil
+		collectgarbage("collect")
+		return 1
+	`), "=trim_idle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call1(cl); err != nil {
+		t.Fatal(err)
+	}
+
+	// After explicit collectgarbage("collect"), cached 64 KiB sparePage must be dropped
+	// so BackingBytes settles tightly near AllocBytes (no 64 KiB hysteresis page retained).
+	st := s.ArenaStats()
+	if st.BackingBytes-st.AllocBytes > 32*1024 {
+		t.Fatalf("post-CollectFull Arena slack too high (sparePage retained?): backing=%d alloc=%d diff=%d",
+			st.BackingBytes, st.AllocBytes, st.BackingBytes-st.AllocBytes)
+	}
+
+	// Reallocating a single small table after CollectFull must open a compact page (<= 4 KiB),
+	// not stay latched at a 64 KiB slab page from the earlier transient burst.
+	beforeBacking := st.BackingBytes
+	cl2, err := s.LoadChunk([]byte(`ONE_TBL = { x = 1 }`), "=one_tbl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Call1(cl2); err != nil {
+		t.Fatal(err)
+	}
+	afterBacking := s.ArenaStats().BackingBytes
+	if growth := afterBacking - beforeBacking; growth > 24*1024 {
+		t.Fatalf("post-CollectFull small allocation grew Arena backing by %d bytes (latched at 64 KiB slab?)", growth)
+	}
+}
