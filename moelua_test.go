@@ -582,11 +582,10 @@ func TestMetatablesAndTypedUserdata(t *testing.T) {
 
 	methods := s.NewTable(0, 2)
 	_ = methods.SetString("inc", s.NewFunc1("inc", func(st *moelua.State, args []moelua.Value) (moelua.Value, error) {
-		raw, ok := st.CheckUserdata(args[0], "moelua.Counter")
+		c, ok := st.CheckUserdata[*counter](args[0], "moelua.Counter")
 		if !ok {
 			return moelua.Nil(), errors.New("expected Counter")
 		}
-		c := raw.(*counter)
 		delta := int64(1)
 		if len(args) >= 2 {
 			if d, ok := args[1].ToInt(); ok {
@@ -600,8 +599,8 @@ func TestMetatablesAndTypedUserdata(t *testing.T) {
 
 	finalized := int64(0)
 	_ = mt.SetString("__gc", s.NewFunc1("gc", func(st *moelua.State, args []moelua.Value) (moelua.Value, error) {
-		if raw, ok := st.CheckUserdata(args[0], "moelua.Counter"); ok {
-			finalized = raw.(*counter).n
+		if c, ok := st.CheckUserdata[*counter](args[0], "moelua.Counter"); ok {
+			finalized = c.n
 		}
 		return moelua.Nil(), nil
 	}))
@@ -613,8 +612,28 @@ func TestMetatablesAndTypedUserdata(t *testing.T) {
 	if gotMT := s.GetMetatable(ud); gotMT == nil || gotMT.Raw() != mt.Raw() {
 		t.Fatalf("GetMetatable(ud) mismatch")
 	}
-	if _, ok := s.CheckUserdata(ud, "other.Type"); ok {
+	if _, ok := s.CheckUserdata[*counter](ud, "other.Type"); ok {
 		t.Fatalf("CheckUserdata should reject mismatched metatable name")
+	}
+	if _, ok := s.CheckUserdata[string](ud, "moelua.Counter"); ok {
+		t.Fatalf("CheckUserdata should reject mismatched Go payload type")
+	}
+	nilUD, err := s.NewUserdataWithMeta(nil, mt)
+	if err != nil {
+		t.Fatalf("NewUserdataWithMeta(nil): %v", err)
+	}
+	if _, ok := s.CheckUserdata[*counter](nilUD, "moelua.Counter"); ok {
+		t.Fatalf("CheckUserdata should reject nil payload")
+	}
+	if _, ok := s.CheckUserdata[any](nilUD, "moelua.Counter"); ok {
+		t.Fatalf("CheckUserdata[any] should reject nil payload")
+	}
+	if got, ok := s.CheckUserdata[any](ud, "moelua.Counter"); !ok || got.(*counter).n != 10 {
+		t.Fatalf("CheckUserdata[any] = (%v, %v), want (*counter{10}, true)", got, ok)
+	}
+	var nilState *moelua.State
+	if _, ok := nilState.CheckUserdata[*counter](ud, "moelua.Counter"); ok {
+		t.Fatalf("nil State.CheckUserdata should return false")
 	}
 	s.SetGlobal("c", ud)
 

@@ -228,7 +228,7 @@ func wrapVMState(raw *vm.State) *State {
 	if raw == nil {
 		return nil
 	}
-	if h, ok := raw.Host().(*State); ok && h != nil {
+	if h, ok := raw.Host[*State](); ok && h != nil {
 		return h
 	}
 	return &State{vm: raw}
@@ -942,16 +942,18 @@ func (s *State) Traceback(th *Thread, msg string, level int) string {
 }
 
 // CheckUserdata verifies that v is a userdata whose metatable matches the registry
-// metatable named name (analogous to luaL_testudata) and returns its Go payload.
-func (s *State) CheckUserdata(v Value, name string) (any, bool) {
+// metatable named name (analogous to luaL_testudata) and whose Go payload is non-nil
+// and assignable to T.
+func (s *State) CheckUserdata[T any](v Value, name string) (T, bool) {
+	var zero T
 	if !s.ready() || !v.IsUserdata() {
-		return nil, false
+		return zero, false
 	}
 	mt := s.GetMetatableByName(name)
 	if mt == nil || s.vm.GetMetatableOf(v) != mt.raw {
-		return nil, false
+		return zero, false
 	}
-	return s.vm.UserdataData(s.vm.AsUserdata(v)), true
+	return s.vm.UserdataData[T](s.vm.AsUserdata(v))
 }
 
 // Handle is a GC-anchored host reference to a Lua Value (analogous to luaL_ref).

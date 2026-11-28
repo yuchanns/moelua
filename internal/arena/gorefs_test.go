@@ -53,3 +53,41 @@ func TestGoRefsCloneIsolation(t *testing.T) {
 		}
 	}
 }
+
+func TestGoRefsGetAs(t *testing.T) {
+	type payload struct{ id int }
+
+	var nilRefs *GoRefs
+	if _, ok := nilRefs.GetAs[string](NullGoHandle); ok {
+		t.Fatalf("nil GoRefs.GetAs returned ok=true")
+	}
+
+	g := NewGoRefs()
+	p := &payload{id: 7}
+	hp := g.Alloc(p)
+	hNil := g.Alloc(nil)
+
+	if got, ok := g.GetAs[*payload](hp); !ok || got != p {
+		t.Fatalf("GetAs[*payload](hp) = (%v, %v), want (%v, true)", got, ok, p)
+	}
+	if got, ok := g.GetAs[any](hp); !ok || got != p {
+		t.Fatalf("GetAs[any](hp) = (%v, %v), want (%v, true)", got, ok, p)
+	}
+	if _, ok := g.GetAs[string](hp); ok {
+		t.Fatalf("GetAs[string](hp) unexpectedly succeeded")
+	}
+	if _, ok := g.GetAs[*payload](hNil); ok {
+		t.Fatalf("GetAs[*payload](hNil) unexpectedly succeeded")
+	}
+	if _, ok := g.GetAs[any](hNil); ok {
+		t.Fatalf("GetAs[any](hNil) unexpectedly succeeded")
+	}
+	if _, ok := g.GetAs[*payload](NullGoHandle); ok {
+		t.Fatalf("GetAs(NullGoHandle) unexpectedly succeeded")
+	}
+
+	g.Free(hp)
+	if _, ok := g.GetAs[*payload](hp); ok {
+		t.Fatalf("GetAs(freed hp) unexpectedly succeeded")
+	}
+}

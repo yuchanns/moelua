@@ -151,11 +151,7 @@ func (s *State) fireHook(th *Thread, event HookEvent, line int) error {
 		return nil
 	}
 	if th.hostHookRef != arena.NullGoHandle {
-		rawFn, ok := s.goRefs.Get(th.hostHookRef)
-		if !ok {
-			return nil
-		}
-		hfn, ok := rawFn.(HostHookFunc)
+		hfn, ok := s.goRefs.GetAs[HostHookFunc](th.hostHookRef)
 		if !ok || hfn == nil {
 			return nil
 		}

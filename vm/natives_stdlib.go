@@ -252,7 +252,7 @@ func nativeStringGMatch(s *State, args []Value) ([]Value, error) {
 		Fn: func(s *State, _ []Value) ([]Value, error) {
 			var gs *gmatchState
 			if uv, ok := s.nativeUpvalGet(selfVal, 2); ok && uv.IsUserdata() {
-				gs, _ = s.UserdataData(s.asUserdata(uv)).(*gmatchState)
+				gs, _ = s.UserdataData[*gmatchState](s.asUserdata(uv))
 			}
 			if gs == nil {
 				return nil, fmt.Errorf("bad gmatch iterator state")

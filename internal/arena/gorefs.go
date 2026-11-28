@@ -96,6 +96,18 @@ func (g *GoRefs) Get(h GoHandle) (any, bool) {
 	return slot.val, true
 }
 
+// GetAs retrieves the Go value pinned under h if h is live and its stored value
+// is non-nil and assignable to T.
+func (g *GoRefs) GetAs[T any](h GoHandle) (T, bool) {
+	var zero T
+	raw, ok := g.Get(h)
+	if !ok {
+		return zero, false
+	}
+	v, ok := raw.(T)
+	return v, ok
+}
+
 // Set replaces the Go value pinned under an active handle h.
 // Returns false if h is null, stale, or freed.
 func (g *GoRefs) Set(h GoHandle, v any) bool {
