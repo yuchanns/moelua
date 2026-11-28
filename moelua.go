@@ -22,6 +22,39 @@ var ErrInstructionLimit = vm.ErrInstructionLimit
 // ErrStateClosed is returned when operations are attempted on a nil or closed State/Table.
 var ErrStateClosed = errors.New("moelua: state is closed")
 
+// ErrHookYield may be returned from a HostHookFunc during a HookLine or HookCount
+// event on a yieldable coroutine to suspend execution with zero yielded values
+// (matching PUC-Rio Lua 5.5.1 lua_yield(L, 0) / CIST_HOOKYIELD inside a C hook).
+var ErrHookYield = vm.ErrHookYield
+
+// HookMask selects which debug hook events are delivered to a HostHookFunc
+// (matching PUC-Rio Lua 5.5.1 LUA_MASK* bits).
+type HookMask = vm.HookMask
+
+const (
+	HookMaskCall  HookMask = vm.HookMaskCall
+	HookMaskRet   HookMask = vm.HookMaskRet
+	HookMaskLine  HookMask = vm.HookMaskLine
+	HookMaskCount HookMask = vm.HookMaskCount
+)
+
+// HookEvent identifies the debug event delivered to a HostHookFunc.
+type HookEvent = vm.HookEvent
+
+const (
+	HookCall     HookEvent = vm.HookCall
+	HookReturn   HookEvent = vm.HookReturn
+	HookLine     HookEvent = vm.HookLine
+	HookCount    HookEvent = vm.HookCount
+	HookTailCall HookEvent = vm.HookTailCall
+)
+
+// HostHookFunc is a Go-level debug hook installed via State.SetHostHook or Thread.SetHostHook
+// (analogous to PUC-Rio lua_Hook / lua_sethook). line is the 1-based source line for HookLine
+// events and -1 for other events. Returning ErrHookYield during HookLine or HookCount on a
+// yieldable coroutine suspends the coroutine with zero yielded values.
+type HostHookFunc func(s *State, event HookEvent, line int) error
+
 // State is a single-goroutine Lua 5.5.1 execution environment.
 // Call Close when finished to flush open files and run remaining __gc finalizers in LIFO order.
 type State struct {
@@ -1548,6 +1581,37 @@ func (th *Thread) Close() error {
 		return ErrStateClosed
 	}
 	return th.state.vm.CloseThread(th.raw)
+}
+
+// SetHostHook installs or clears a Go-level debug hook on the currently executing thread
+// (analogous to PUC-Rio lua_sethook). Passing fn == nil or mask == 0 (with count <= 0)
+// disables hooks on that thread.
+func (s *State) SetHostHook(fn HostHookFunc, mask HookMask, count int) {
+	if !s.ready() {
+		return
+	}
+	var rawFn vm.HostHookFunc
+	if fn != nil {
+		rawFn = func(raw *vm.State, _ *vm.Thread, event vm.HookEvent, line int) error {
+			return fn(wrapVMState(raw), event, line)
+		}
+	}
+	_ = s.vm.SetHostHook(nil, rawFn, mask, count)
+}
+
+// SetHostHook installs or clears a Go-level debug hook on th (analogous to PUC-Rio lua_sethook).
+// Passing fn == nil or mask == 0 (with count <= 0) disables hooks on th.
+func (th *Thread) SetHostHook(fn HostHookFunc, mask HookMask, count int) {
+	if !th.ready() {
+		return
+	}
+	var rawFn vm.HostHookFunc
+	if fn != nil {
+		rawFn = func(raw *vm.State, _ *vm.Thread, event vm.HookEvent, line int) error {
+			return fn(wrapVMState(raw), event, line)
+		}
+	}
+	_ = th.state.vm.SetHostHook(th.raw, rawFn, mask, count)
 }
 
 // FormatValue formats any Lua Value owned by s as a Go string (matching tostring without metamethods).

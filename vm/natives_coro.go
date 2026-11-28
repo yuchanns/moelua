@@ -99,6 +99,7 @@ func (s *State) CloseThread(co *Thread) error {
 			s.abortErr = nil
 		}
 		co.closing = true
+		co.hookYielded = false
 		co.nframe = 0
 		co.nny++
 		hasInitErr := co.status == ThreadDead && !co.errObj.IsNil()
@@ -434,7 +435,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 			return false, []Value{ev}, nil
 		}
 		if co.hookMask&HookMaskCall != 0 && !co.inHook && !co.suppressHook {
-			if herr := s.fireHook(co, "call", NilValue()); herr != nil {
+			if herr := s.fireHook(co, HookCall, -1); herr != nil {
 				if errors.Is(herr, errCoroCloseSelf) {
 					return s.finishCoroCloseSelf(co)
 				}
@@ -468,6 +469,18 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 	} else if co.status == ThreadSuspended {
 		co.status = ThreadOK
 		co.onResume()
+		if co.hookYielded {
+			// Per PUC-Rio ldo.c:927-934: resuming a coroutine suspended inside a line/count
+			// hook discards resume arguments, clears atCurrentPC, and resumes execution at
+			// the interrupted instruction without re-firing its hook.
+			if co.nframe > 0 {
+				co.framesSlice(s.arena)[co.nframe-1].atCurrentPC = false
+			}
+			if !s.needsHookedRun(co) || co.hookMask&(HookMaskLine|HookMaskCount) == 0 {
+				co.hookYielded = false
+			}
+			goto runCoro
+		}
 		yieldedNative := co.yieldedNative
 		yieldNativeFn := co.yieldNativeFn
 		co.yieldedNative = false
@@ -500,7 +513,7 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 					dirty:     true,
 				}
 				co.nframe++
-				herr = s.fireHook(co, "return", NilValue())
+				herr = s.fireHook(co, HookReturn, -1)
 				st = co.stackSlice(s.arena)
 				if herr == nil && len(args) > 0 {
 					updated := make([]Value, len(args))
@@ -692,6 +705,7 @@ func (s *State) finishCoroCloseSelf(co *Thread) (bool, []Value, error) {
 		s.abortErr = nil
 	}
 	co.closing = true
+	co.hookYielded = false
 	co.nframe = 0
 	co.nny++
 	errVal, hasErr, _ := co.closeAllSync(s, 0, NilValue(), false)
@@ -815,6 +829,7 @@ func nativeCoroWrap(s *State, args []Value) ([]Value, error) {
 				}
 				if !wasActive {
 					co.closing = true
+					co.hookYielded = false
 					co.nframe = 0
 					errVal, _, _ = co.closeAllSync(s, 0, errVal, true)
 					co.closing = false
@@ -863,6 +878,7 @@ func nativeCoroClose(s *State, args []Value) ([]Value, error) {
 		return nil, errCoroCloseSelf
 	case "dead", "suspended":
 		co.closing = true
+		co.hookYielded = false
 		co.nframe = 0
 		co.nny++
 		hasInitErr := co.status == ThreadDead && !co.errObj.IsNil()

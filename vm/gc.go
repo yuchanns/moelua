@@ -1120,6 +1120,10 @@ func (s *State) gcFreeObject(a *arena.Arena, ref arena.ObjRef) {
 		if th.uncaughtErrRef != arena.NullGoHandle && s.goRefs != nil {
 			s.goRefs.Free(th.uncaughtErrRef)
 		}
+		if th.hostHookRef != arena.NullGoHandle && s.goRefs != nil {
+			s.goRefs.Free(th.hostHookRef)
+			th.hostHookRef = arena.NullGoHandle
+		}
 		if len(s.deferredStackFrees) > 0 {
 			keep := s.deferredStackFrees[:0]
 			for _, df := range s.deferredStackFrees {

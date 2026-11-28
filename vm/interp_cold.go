@@ -114,7 +114,7 @@ func (s *State) finishPCallReturn(th *Thread, entryDepth int) (bool, error) {
 		cf = &th.framesSlice(s.arena)[th.nframe-1]
 		cf.ftransfer = 1
 		cf.ntransfer = uint16(got)
-		if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+		if herr := s.fireHook(th, HookReturn, -1); herr != nil {
 			th.nframe--
 			return false, herr
 		}
@@ -409,7 +409,7 @@ func (s *State) handleError(th *Thread, entryDepth int, err error) bool {
 		}
 	}
 	if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
-		if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+		if herr := s.fireHook(th, HookReturn, -1); herr != nil {
 			th.nframe--
 			if errors.Is(herr, errCoroCloseSelf) || isUncatchableErr(herr) {
 				s.abortErr = herr
@@ -515,7 +515,7 @@ func (s *State) completeFinishOp(th *Thread, cf *callFrame, entryDepth int) (boo
 			cf.dirty = true
 			cf.ftransfer = uint16(retSlot - cf.base + 1)
 			cf.ntransfer = uint16(nres)
-			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+			if herr := s.fireHook(th, HookReturn, -1); herr != nil {
 				return false, herr
 			}
 			cf = &th.framesSlice(s.arena)[th.nframe-1]
@@ -1386,7 +1386,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 			}
 			th.nframe++
 			if hookedNative && th.hookMask&HookMaskCall != 0 {
-				if herr := s.fireHook(th, "call", NilValue()); herr != nil {
+				if herr := s.fireHook(th, HookCall, -1); herr != nil {
 					th.nframe--
 					return s.catchSlow(th, ev, false, herr)
 				}
@@ -1499,7 +1499,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 				dirty:     true,
 			}
 			th.nframe++
-			herr := s.fireHook(th, "return", NilValue())
+			herr := s.fireHook(th, HookReturn, -1)
 			th.nframe--
 			if herr != nil {
 				return s.catchSlow(th, ev, false, herr)
@@ -1564,7 +1564,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 						frames := th.framesSlice(s.arena)
 						frames[th.nframe-1].ftransfer = uint16(nargs + 1)
 						frames[th.nframe-1].ntransfer = uint16(len(res))
-						hookErr = s.fireHook(th, "return", NilValue())
+						hookErr = s.fireHook(th, HookReturn, -1)
 						if hookErr == nil && len(res) > 0 {
 							out := make([]Value, len(res))
 							copy(out, th.stackSlice(s.arena)[resStart:resStart+len(res)])
@@ -1595,7 +1595,7 @@ func (s *State) callSlow(th *Thread, ev *frameEnv, w bytecode.Instruction, a, na
 						dirty:     true,
 					}
 					th.nframe++
-					hookErr = s.fireHook(th, "return", NilValue())
+					hookErr = s.fireHook(th, HookReturn, -1)
 					if hookErr == nil && len(res) > 0 {
 						out := make([]Value, len(res))
 						copy(out, th.stackSlice(s.arena)[resStart:resStart+len(res)])
@@ -1729,7 +1729,7 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 		}
 		th.nframe++
 		if hookedNative && th.hookMask&HookMaskCall != 0 {
-			if herr := s.fireHook(th, "call", NilValue()); herr != nil {
+			if herr := s.fireHook(th, HookCall, -1); herr != nil {
 				th.nframe--
 				return nil, false, herr
 			}
@@ -1755,7 +1755,7 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 					frames := th.framesSlice(s.arena)
 					frames[th.nframe-1].ftransfer = uint16(nargs + 1)
 					frames[th.nframe-1].ntransfer = uint16(len(res))
-					hookErr = s.fireHook(th, "return", NilValue())
+					hookErr = s.fireHook(th, HookReturn, -1)
 					if hookErr == nil && len(res) > 0 {
 						out := make([]Value, len(res))
 						copy(out, th.stackSlice(s.arena)[resStart:resStart+len(res)])
@@ -1786,7 +1786,7 @@ func (s *State) callNativeHooked(th *Thread, fn Value, funcIdx, nargs int, extra
 					dirty:     true,
 				}
 				th.nframe++
-				hookErr = s.fireHook(th, "return", NilValue())
+				hookErr = s.fireHook(th, HookReturn, -1)
 				if hookErr == nil && len(res) > 0 {
 					out := make([]Value, len(res))
 					copy(out, th.stackSlice(s.arena)[resStart:resStart+len(res)])
@@ -1899,7 +1899,7 @@ func (s *State) pushProtectedCallMode(th *Thread, funcIdx, nargs, nresults int, 
 	}
 	th.nframe++
 	if th.hookMask&HookMaskCall != 0 && !th.inHook && !th.suppressHook {
-		if herr := s.fireHook(th, "call", NilValue()); herr != nil {
+		if herr := s.fireHook(th, HookCall, -1); herr != nil {
 			th.nframe--
 			return false, herr
 		}
@@ -2387,7 +2387,7 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 	if cf.closeResume == 2 {
 		// Finish protected-call error unwind after yieldable TBC close (locals.lua:1015)!
 		if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
-			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+			if herr := s.fireHook(th, HookReturn, -1); herr != nil {
 				th.framesSlice(s.arena)[cfIdx].closeResume = 0
 				th.nframe--
 				return false, herr
@@ -2409,7 +2409,7 @@ func (s *State) resumeCloseTBC(th *Thread, cf *callFrame, entryDepth int) (bool,
 		if th.hookMask&HookMaskRet != 0 && !th.inHook && !th.suppressHook {
 			cf.ftransfer = uint16(cf.closeRetSrc - cf.base + 1)
 			cf.ntransfer = uint16(cf.closeRetN)
-			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+			if herr := s.fireHook(th, HookReturn, -1); herr != nil {
 				return false, herr
 			}
 			cf = &th.framesSlice(s.arena)[cfIdx]
@@ -3346,7 +3346,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				nt := min(nargs, int(p.NumParams))
 				cf.ftransfer = 1
 				cf.ntransfer = uint16(nt)
-				if herr := s.fireHook(th, "tail call", NilValue()); herr != nil {
+				if herr := s.fireHook(th, HookTailCall, -1); herr != nil {
 					return coldContinue, pc, herr
 				}
 			}
@@ -3544,7 +3544,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			}
 			th.nframe++
 			if hookedNative && th.hookMask&HookMaskCall != 0 {
-				if herr := s.fireHook(th, "call", NilValue()); herr != nil {
+				if herr := s.fireHook(th, HookCall, -1); herr != nil {
 					th.nframe--
 					return coldContinue, pc, herr
 				}
@@ -3567,7 +3567,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 						frames := th.framesSlice(s.arena)
 						frames[th.nframe-1].ftransfer = 1
 						frames[th.nframe-1].ntransfer = uint16(len(res))
-						hookErr = s.fireHook(th, "return", NilValue())
+						hookErr = s.fireHook(th, HookReturn, -1)
 						if hookErr == nil && len(res) > 0 {
 							copy(res, th.stackSlice(s.arena)[srcStart+1:srcStart+1+len(res)])
 						}
@@ -3594,7 +3594,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 						dirty:     true,
 					}
 					th.nframe++
-					hookErr = s.fireHook(th, "return", NilValue())
+					hookErr = s.fireHook(th, HookReturn, -1)
 					if hookErr == nil && len(res) > 0 {
 						copy(res, th.stackSlice(s.arena)[srcStart+1:srcStart+1+len(res)])
 					}
@@ -3642,7 +3642,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 			callerCF.dirty = true
 			callerCF.ftransfer = uint16(srcStart - callerCF.base + 1)
 			callerCF.ntransfer = uint16(len(res))
-			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+			if herr := s.fireHook(th, HookReturn, -1); herr != nil {
 				return coldContinue, pc, herr
 			}
 			if len(res) > 0 {
@@ -3718,7 +3718,7 @@ func (s *State) coldOpImpl(th *Thread, ev *frameEnv, ipc int, w bytecode.Instruc
 				cf.ftransfer = uint16(srcStart - cf.base + 1)
 			}
 			cf.ntransfer = uint16(n)
-			if herr := s.fireHook(th, "return", NilValue()); herr != nil {
+			if herr := s.fireHook(th, HookReturn, -1); herr != nil {
 				return coldContinue, pc, herr
 			}
 			cf = &th.framesSlice(s.arena)[ev.ci]

@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/yuchanns/moelua/bytecode"
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
 // checkInstructionHook runs count & line debug hooks in runHooked() (never called from fast run()).
@@ -13,6 +14,9 @@ import (
 func (s *State) checkInstructionHook(th *Thread, ev *frameEnv, pc int, entryDepth int) (bool, error) {
 	err := s.checkInstructionHookImpl(th, ev, pc)
 	if err != nil {
+		if errors.Is(err, errYieldSentinel) {
+			return false, errYieldSentinel
+		}
 		if s.handleError(th, entryDepth, err) {
 			return true, nil
 		}
@@ -24,13 +28,6 @@ func (s *State) checkInstructionHook(th *Thread, ev *frameEnv, pc int, entryDept
 func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error {
 	if s.abortErr != nil {
 		return s.abortErr
-	}
-	if s.insnLimit > 0 {
-		s.insnCount++
-		if s.insnCount > s.insnLimit {
-			s.abortErr = ErrInstructionLimit
-			return ErrInstructionLimit
-		}
 	}
 	if s.intrFlag != nil || s.ctx != nil {
 		s.intrTicks++
@@ -47,6 +44,20 @@ func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error
 			}
 		}
 	}
+	// Per PUC-Rio ldebug.c:952-955 (CIST_HOOKYIELD): when resuming an instruction
+	// previously suspended by a line/count hook yield, clear the flag and execute
+	// the instruction without re-firing hooks or double-counting instruction limits.
+	if th.hookYielded {
+		th.hookYielded = false
+		return nil
+	}
+	if s.insnLimit > 0 {
+		s.insnCount++
+		if s.insnCount > s.insnLimit {
+			s.abortErr = ErrInstructionLimit
+			return ErrInstructionLimit
+		}
+	}
 	if th.hookMask == 0 || th.inHook || th.suppressHook {
 		return nil
 	}
@@ -59,6 +70,11 @@ func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error
 	frames[ev.ci].dirty = true
 	frames[ev.ci].atCurrentPC = true
 	defer func() {
+		// Keep atCurrentPC set while suspended via hook yield so debug.getinfo/getlocal/traceback
+		// inspect the exact suspended instruction; resumeThread clears it upon resume.
+		if th.hookYielded {
+			return
+		}
 		fs := th.framesSlice(s.arena)
 		if ev.ci < len(fs) {
 			fs[ev.ci].atCurrentPC = false
@@ -68,7 +84,7 @@ func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error
 		th.hookCount--
 		if th.hookCount <= 0 {
 			th.hookCount = th.baseHookCount
-			if err := s.fireHook(th, "count", NilValue()); err != nil {
+			if err := s.fireHook(th, HookCount, -1); err != nil {
 				return err
 			}
 		}
@@ -90,11 +106,7 @@ func (s *State) checkInstructionHookImpl(th *Thread, ev *frameEnv, pc int) error
 		}
 		cf.oldPC = pc
 		if fire {
-			lineVal := NilValue()
-			if line >= 0 {
-				lineVal = IntValue(int64(line))
-			}
-			if err := s.fireHook(th, "line", lineVal); err != nil {
+			if err := s.fireHook(th, HookLine, line); err != nil {
 				return err
 			}
 		}
@@ -112,7 +124,7 @@ func (s *State) fireCallHook(th *Thread, ci, nargs, nparams, entryDepth int) (bo
 	cf.dirty = true
 	cf.ftransfer = 1
 	cf.ntransfer = uint16(nt)
-	if err := s.fireHook(th, "call", NilValue()); err != nil {
+	if err := s.fireHook(th, HookCall, -1); err != nil {
 		if s.handleError(th, entryDepth, err) {
 			return true, nil
 		}
@@ -130,13 +142,68 @@ func (s *State) fireLuaCallHook(th *Thread, cl *Closure, nargs int) error {
 	cf := &th.framesSlice(s.arena)[th.nframe-1]
 	cf.ftransfer = 1
 	cf.ntransfer = uint16(nt)
-	return s.fireHook(th, "call", NilValue())
+	return s.fireHook(th, HookCall, -1)
 }
 
 //go:noinline
-func (s *State) fireHook(th *Thread, event string, line Value) error {
-	if th.hook.IsNil() || th.inHook || th.suppressHook {
+func (s *State) fireHook(th *Thread, event HookEvent, line int) error {
+	if !th.hasHook() || th.inHook || th.suppressHook {
 		return nil
+	}
+	if th.hostHookRef != arena.NullGoHandle {
+		rawFn, ok := s.goRefs.Get(th.hostHookRef)
+		if !ok {
+			return nil
+		}
+		hfn, ok := rawFn.(HostHookFunc)
+		if !ok || hfn == nil {
+			return nil
+		}
+		if s.nCcalls >= maxCCalls {
+			return &LuaError{Val: StringValue(s.intern.Intern("C stack overflow"))}
+		}
+		savedTop := th.top
+		savedNFrame := th.nframe
+		s.nCcalls++
+		th.inHook = true
+		defer func() {
+			th.top = savedTop
+			th.inHook = false
+			s.nCcalls--
+		}()
+		err := hfn(s, th, event, line)
+		if th.nframe > savedNFrame {
+			return errCoroCloseSelf
+		}
+		if err == nil && s.abortErr != nil {
+			err = s.abortErr
+		}
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, ErrHookYield) {
+			if event != HookLine && event != HookCount {
+				return &LuaError{Val: StringValue(s.intern.Intern("attempt to yield across a C-call boundary"))}
+			}
+			if !th.IsYieldable() {
+				if s.isMainThread(th) {
+					return &LuaError{Val: StringValue(s.intern.Intern("attempt to yield from outside a coroutine"))}
+				}
+				return &LuaError{Val: StringValue(s.intern.Intern("attempt to yield across a C-call boundary"))}
+			}
+			th.hookYielded = true
+			th.clearYieldVals()
+			return errYieldSentinel
+		}
+		return err
+	}
+	if th.hook.IsNil() {
+		return nil
+	}
+	eventName := event.String()
+	lineVal := NilValue()
+	if event == HookLine && line >= 0 {
+		lineVal = IntValue(int64(line))
 	}
 	th.inHook = true
 	th.nny++
@@ -160,14 +227,14 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 			}
 		}
 		funcIdx := base
-		if err := s.ensureStackWithRoots(th, funcIdx+3+int(bp.maxStack)+8, line, nil); err != nil {
+		if err := s.ensureStackWithRoots(th, funcIdx+3+int(bp.maxStack)+8, lineVal, nil); err != nil {
 			th.top = savedTop
 			return err
 		}
 		stack := th.stackSlice(s.arena)
 		stack[funcIdx] = th.hook
-		stack[funcIdx+1] = StringValue(s.intern.Intern(event))
-		stack[funcIdx+2] = line
+		stack[funcIdx+1] = StringValue(s.intern.Intern(eventName))
+		stack[funcIdx+2] = lineVal
 		th.top = funcIdx + 3
 		entryDepth := th.nframe
 		if err := th.pushLuaFrame(s, cl, funcIdx, 2, 0); err != nil {
@@ -214,6 +281,6 @@ func (s *State) fireHook(th *Thread, event string, line Value) error {
 		th.top = savedTop
 		return nil
 	}
-	_, err := s.callOnThread(th, th.hook, []Value{StringValue(s.intern.Intern(event)), line})
+	_, err := s.callOnThread(th, th.hook, []Value{StringValue(s.intern.Intern(eventName)), lineVal})
 	return err
 }
