@@ -461,7 +461,9 @@ func (s *State) AddSearcher(name string, fn GoFunc) {
 	if err != nil {
 		return
 	}
-	defer s.pinTemps(v)()
+	mark := s.vm.PinTempMark()
+	defer s.vm.UnpinTemp(mark)
+	s.vm.PinTemp(v)
 	s.vm.AddSearcher(s.vm.AsNative(v))
 	_ = s.vm.ConsumeMemErr()
 }
@@ -473,6 +475,8 @@ func (s *State) Preload(name string, loader GoFunc) error {
 	if !s.ready() {
 		return ErrStateClosed
 	}
+	mark := s.vm.PinTempMark()
+	defer s.vm.UnpinTemp(mark)
 	v := vm.NilValue()
 	var ls *vm.LuaString
 	if loader != nil {
@@ -482,19 +486,20 @@ func (s *State) Preload(name string, loader GoFunc) error {
 			return err
 		}
 		// Root the interned name across the loader allocation (emergency GC recount).
-		defer s.pinTemps(vm.StringValue(ls))()
+		s.vm.PinTemp(vm.StringValue(ls))
 		v, err = s.TryNewFunc(name, loader)
 		if err != nil {
 			return err
 		}
 		// Root the newly created loader across PreloadTable().RawSetStr (emergency GC recount).
-		defer s.pinTemps(v)()
+		s.vm.PinTemp(v)
 	} else {
 		var ok bool
 		ls, ok = s.vm.LookupString(name)
 		if !ok {
 			return nil
 		}
+		s.vm.PinTemp(vm.StringValue(ls))
 	}
 	if pt := s.vm.PreloadTable(); pt != nil {
 		pt.RawSetStr(s.vm, ls, v)
@@ -695,6 +700,8 @@ func (s *State) NewUserdataWithMeta(data any, mt *Table) (Value, error) {
 	if !s.ready() {
 		return vm.NilValue(), ErrStateClosed
 	}
+	mark := s.vm.PinTempMark()
+	defer s.vm.UnpinTemp(mark)
 	if mt != nil {
 		if !mt.ready() {
 			return vm.NilValue(), ErrStateClosed
@@ -702,14 +709,14 @@ func (s *State) NewUserdataWithMeta(data any, mt *Table) (Value, error) {
 		if mt.state != s {
 			return vm.NilValue(), fmt.Errorf("moelua: metatable belongs to another State")
 		}
-		defer s.pinTemps(vm.TableValue(mt.raw))()
+		s.vm.PinTemp(vm.TableValue(mt.raw))
 	}
 	u, err := s.TryNewUserdata(data)
 	if err != nil {
 		return vm.NilValue(), err
 	}
 	if mt != nil {
-		defer s.pinTemps(u)()
+		s.vm.PinTemp(u)
 		s.vm.SetMetatableOf(u, mt.raw)
 		if err := s.vm.ConsumeMemErr(); err != nil {
 			return vm.NilValue(), err
@@ -736,6 +743,9 @@ func (s *State) SetMetatable(v Value, mt *Table) error {
 	if !s.ready() {
 		return ErrStateClosed
 	}
+	mark := s.vm.PinTempMark()
+	defer s.vm.UnpinTemp(mark)
+	s.vm.PinTemp(v)
 	var rawMT *vm.Table
 	if mt != nil {
 		if !mt.ready() {
@@ -745,9 +755,7 @@ func (s *State) SetMetatable(v Value, mt *Table) error {
 			return fmt.Errorf("moelua: metatable belongs to another State")
 		}
 		rawMT = mt.raw
-		defer s.pinTemps(v, vm.TableValue(rawMT))()
-	} else {
-		defer s.pinTemps(v)()
+		s.vm.PinTemp(vm.TableValue(rawMT))
 	}
 	s.vm.SetMetatableOf(v, rawMT)
 	return s.vm.ConsumeMemErr()
@@ -771,17 +779,19 @@ func (s *State) TryNewMetatable(name string) (*Table, bool, error) {
 		return &Table{state: s, raw: s.vm.AsTable(existing)}, false, nil
 	}
 	// Root the interned name across the metatable allocation and insertions (emergency GC recount).
-	defer s.pinTemps(vm.StringValue(key))()
+	mark := s.vm.PinTempMark()
+	defer s.vm.UnpinTemp(mark)
+	s.vm.PinTemp(vm.StringValue(key))
 	mt, err := s.vm.TryNewTable(0, 4)
 	if err != nil {
 		return nil, false, err
 	}
-	defer s.pinTemps(vm.TableValue(mt))()
+	s.vm.PinTemp(vm.TableValue(mt))
 	nameKey, err := s.vm.TryIntern("__name")
 	if err != nil {
 		return nil, false, err
 	}
-	defer s.pinTemps(vm.StringValue(nameKey))()
+	s.vm.PinTemp(vm.StringValue(nameKey))
 	mt.RawSetStr(s.vm, nameKey, vm.StringValue(key))
 	if err := s.vm.ConsumeMemErr(); err != nil {
 		return nil, false, err
@@ -1040,30 +1050,14 @@ func (s *State) RegisterFunc1(name string, fn GoFunc1) {
 	s.SetGlobal(name, v)
 }
 
-// pinTemps temporarily roots Go-held values so an emergency GC triggered by a following
-// allocation still traces and recounts them against the memory limit. Call the returned
-// function to release the roots once the values are reachable from Lua.
-func (s *State) pinTemps(vals ...Value) func() {
-	ids := make([]int, 0, len(vals))
-	for _, v := range vals {
-		if v.IsNil() {
-			continue
-		}
-		ids = append(ids, s.vm.Ref(v))
-	}
-	return func() {
-		for _, id := range ids {
-			s.vm.Unref(id)
-		}
-	}
-}
-
 // TrySetGlobal sets a global variable in _G after checking and accounting for the key string
 // and any table growth against the State's memory limit.
 func (s *State) TrySetGlobal(name string, v Value) error {
 	if !s.ready() {
 		return ErrStateClosed
 	}
+	mark := s.vm.PinTempMark()
+	defer s.vm.UnpinTemp(mark)
 	var ls *vm.LuaString
 	if v.IsNil() {
 		var ok bool
@@ -1071,16 +1065,17 @@ func (s *State) TrySetGlobal(name string, v Value) error {
 		if !ok {
 			return nil
 		}
+		s.vm.PinTemp(vm.StringValue(ls))
 	} else {
 		// Root v (held only by Go) across key allocation so an emergency GC triggered by
 		// TryIntern recounts it against the memory limit.
-		defer s.pinTemps(v)()
+		s.vm.PinTemp(v)
 		var err error
 		ls, err = s.vm.TryIntern(name)
 		if err != nil {
 			return err
 		}
-		defer s.pinTemps(vm.StringValue(ls))()
+		s.vm.PinTemp(vm.StringValue(ls))
 	}
 	s.vm.GlobalEnv().RawSetStr(s.vm, ls, v)
 	return s.vm.ConsumeMemErr()
@@ -1318,7 +1313,11 @@ func (t *Table) Set(key, val Value) error {
 		return ErrStateClosed
 	}
 	// Root the table and operands across any array/hash growth (emergency GC recount).
-	defer t.state.pinTemps(vm.TableValue(t.raw), key, val)()
+	mark := t.state.vm.PinTempMark()
+	defer t.state.vm.UnpinTemp(mark)
+	t.state.vm.PinTemp(vm.TableValue(t.raw))
+	t.state.vm.PinTemp(key)
+	t.state.vm.PinTemp(val)
 	if err := t.raw.RawSet(t.state.vm, key, val); err != nil {
 		_ = t.state.vm.ConsumeMemErr()
 		return err
@@ -1340,7 +1339,10 @@ func (t *Table) SetInt(i int64, val Value) error {
 		return ErrStateClosed
 	}
 	// Root the table and value across any array/hash growth (emergency GC recount).
-	defer t.state.pinTemps(vm.TableValue(t.raw), val)()
+	mark := t.state.vm.PinTempMark()
+	defer t.state.vm.UnpinTemp(mark)
+	t.state.vm.PinTemp(vm.TableValue(t.raw))
+	t.state.vm.PinTemp(val)
 	t.raw.RawSetInt(t.state.vm, i, val)
 	return t.state.vm.ConsumeMemErr()
 }
@@ -1362,6 +1364,8 @@ func (t *Table) SetString(key string, val Value) error {
 	if !t.ready() {
 		return ErrStateClosed
 	}
+	mark := t.state.vm.PinTempMark()
+	defer t.state.vm.UnpinTemp(mark)
 	var ls *vm.LuaString
 	if val.IsNil() {
 		var ok bool
@@ -1369,16 +1373,19 @@ func (t *Table) SetString(key string, val Value) error {
 		if !ok {
 			return nil
 		}
+		t.state.vm.PinTemp(vm.TableValue(t.raw))
+		t.state.vm.PinTemp(vm.StringValue(ls))
 	} else {
 		// Root val and t (possibly held only by Go) across key allocation so an emergency GC
 		// triggered by TryIntern recounts them against the memory limit.
-		defer t.state.pinTemps(val, vm.TableValue(t.raw))()
+		t.state.vm.PinTemp(val)
+		t.state.vm.PinTemp(vm.TableValue(t.raw))
 		var err error
 		ls, err = t.state.vm.TryIntern(key)
 		if err != nil {
 			return err
 		}
-		defer t.state.pinTemps(vm.StringValue(ls))()
+		t.state.vm.PinTemp(vm.StringValue(ls))
 	}
 	t.raw.RawSetStr(t.state.vm, ls, val)
 	return t.state.vm.ConsumeMemErr()
@@ -1472,7 +1479,9 @@ func (s *State) NewThread(fn Value) (*Thread, error) {
 	if !s.ready() {
 		return nil, ErrStateClosed
 	}
-	defer s.pinTemps(fn)()
+	mark := s.vm.PinTempMark()
+	defer s.vm.UnpinTemp(mark)
+	s.vm.PinTemp(fn)
 	raw, err := s.vm.NewThread(fn)
 	if err != nil {
 		return nil, err

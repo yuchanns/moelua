@@ -169,9 +169,9 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 			b.Close()
 			return nil, fmt.Errorf("moelua: template setup left %d open file handle(s); close files before finalizing template", len(b.openFiles))
 		}
-		if len(b.pinnedRefs) > 0 {
+		if len(b.pinnedRefs) > 0 || len(b.tempRoots) > 0 {
 			b.Close()
-			return nil, fmt.Errorf("moelua: template setup left %d pinned Handle(s); release pins before finalizing template", len(b.pinnedRefs))
+			return nil, fmt.Errorf("moelua: template setup left %d pinned Handle(s); release pins before finalizing template", len(b.pinnedRefs)+len(b.tempRoots))
 		}
 		if th := b.cur(); th != nil && (th.nframe != 0 || th.hookMask != 0) {
 			b.Close()
@@ -190,9 +190,9 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 			b.Close()
 			return nil, fmt.Errorf("moelua: template setup left %d open file handle(s) after GC", len(b.openFiles))
 		}
-		if len(b.pinnedRefs) > 0 {
+		if len(b.pinnedRefs) > 0 || len(b.tempRoots) > 0 {
 			b.Close()
-			return nil, fmt.Errorf("moelua: template setup left %d pinned Handle(s) after GC", len(b.pinnedRefs))
+			return nil, fmt.Errorf("moelua: template setup left %d pinned Handle(s) after GC", len(b.pinnedRefs)+len(b.tempRoots))
 		}
 		if th := b.cur(); th != nil && (th.nframe != 0 || th.hookMask != 0) {
 			b.Close()

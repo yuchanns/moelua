@@ -1735,3 +1735,131 @@ func TestRetainedInlineCachesAccountedInMemoryLimit(t *testing.T) {
 		t.Fatalf("expected IC memory reclaimed after unpinning: base=%d afterFree=%d", base, afterFree)
 	}
 }
+
+func TestTempRootsZeroAllocAndEmergencyGCSafety(t *testing.T) {
+	s := moelua.New()
+	defer s.Close()
+
+	// 1. Immediate non-GC values must not push onto tempRoots or allocate.
+	raw := s.Raw()
+	if mark := raw.PinTempMark(); mark != 0 {
+		t.Fatalf("expected initial PinTempMark=0, got %d", mark)
+	}
+	raw.PinTemp(moelua.Nil())
+	raw.PinTemp(moelua.Bool(true))
+	raw.PinTemp(moelua.Int(42))
+	raw.PinTemp(moelua.Float(3.14))
+	if got := raw.PinTempMark(); got != 0 {
+		t.Fatalf("expected non-GC immediates to skip tempRoots, got depth=%d", got)
+	}
+
+	// 2. GC objects pinned via PinTemp must survive CollectFull and release cleanly on UnpinTemp.
+	unrooted := s.NewTable(0, 0)
+	mark := raw.PinTempMark()
+	raw.PinTemp(unrooted.Value())
+	if raw.PinTempMark() != mark+1 {
+		t.Fatalf("expected GC table to push onto tempRoots")
+	}
+	raw.CollectFull()
+	if err := unrooted.SetInt(1, moelua.Int(99)); err != nil {
+		t.Fatalf("pinned unrooted table should remain live across CollectFull: %v", err)
+	}
+	if got := unrooted.GetInt(1); !got.IsInt() || got.Int() != 99 {
+		t.Fatalf("unexpected value in surviving table: %v", got)
+	}
+	raw.UnpinTemp(mark)
+	if raw.PinTempMark() != 0 {
+		t.Fatalf("expected PinTempMark=0 after UnpinTemp, got %d", raw.PinTempMark())
+	}
+
+	// 3. Oversized tempRoots (>64) shrinks back to inline buffer on full unwind.
+	deepMark := raw.PinTempMark()
+	tbl := s.NewTable(0, 0)
+	s.SetGlobal("keep_tbl", tbl.Value())
+	for range 80 {
+		raw.PinTemp(tbl.Value())
+	}
+	if raw.PinTempMark() != 80 {
+		t.Fatalf("expected depth=80, got %d", raw.PinTempMark())
+	}
+	raw.UnpinTemp(deepMark)
+	if raw.PinTempMark() != 0 {
+		t.Fatalf("expected depth=0 after deep unwind, got %d", raw.PinTempMark())
+	}
+
+	// 4. High-level Table.Set, Table.SetInt, Table.SetString, and TrySetGlobal must be 0 allocs/op.
+	if err := tbl.SetString("alpha", moelua.Int(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tbl.SetInt(1, moelua.Int(1)); err != nil {
+		t.Fatal(err)
+	}
+	keyStr := s.String("alpha")
+	valStr := s.String("payload")
+	if err := s.TrySetGlobal("bench_g", valStr); err != nil {
+		t.Fatal(err)
+	}
+
+	checkZeroAlloc := func(name string, fn func()) {
+		t.Helper()
+		allocs := testing.AllocsPerRun(200, fn)
+		if allocs != 0 {
+			t.Fatalf("%s allocated %.2f allocs/op, want 0", name, allocs)
+		}
+	}
+	checkZeroAlloc("Table.Set(int, int)", func() {
+		if err := tbl.Set(moelua.Int(1), moelua.Int(123)); err != nil {
+			t.Fatal(err)
+		}
+	})
+	checkZeroAlloc("Table.Set(str, str)", func() {
+		if err := tbl.Set(keyStr, valStr); err != nil {
+			t.Fatal(err)
+		}
+	})
+	checkZeroAlloc("Table.SetInt(1, valStr)", func() {
+		if err := tbl.SetInt(1, valStr); err != nil {
+			t.Fatal(err)
+		}
+	})
+	checkZeroAlloc("Table.SetString(alpha, int)", func() {
+		if err := tbl.SetString("alpha", moelua.Int(456)); err != nil {
+			t.Fatal(err)
+		}
+	})
+	checkZeroAlloc("State.TrySetGlobal(bench_g, valStr)", func() {
+		if err := s.TrySetGlobal("bench_g", valStr); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func BenchmarkTableSet(b *testing.B) {
+	s := moelua.New()
+	defer s.Close()
+	tbl := s.NewTable(0, 0)
+	s.SetGlobal("t", tbl.Value())
+	key := s.String("field")
+	val := s.String("value")
+	_ = tbl.Set(key, val)
+	_ = tbl.SetInt(1, moelua.Int(1))
+
+	b.Run("Set_StrVal", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = tbl.Set(key, val)
+		}
+	})
+	b.Run("SetInt_Imm", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = tbl.SetInt(1, moelua.Int(42))
+		}
+	})
+	b.Run("SetString_Imm", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = tbl.SetString("field", moelua.Int(42))
+		}
+	})
+}
