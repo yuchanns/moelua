@@ -29,6 +29,49 @@ var errYieldSentinel = errors.New("moelua: yield")
 // errCoroCloseSelf is returned internally when a running coroutine calls coroutine.close() on itself.
 var errCoroCloseSelf = errors.New("moelua: close self")
 
+// ErrHookYield may be returned from a HostHookFunc during a HookLine or HookCount
+// event on a yieldable coroutine to suspend execution with zero yielded values
+// (matching PUC-Rio Lua 5.5.1 lua_yield(L, 0) / CIST_HOOKYIELD inside a C hook).
+var ErrHookYield = errors.New("moelua: hook yield")
+
+// HookMask selects which debug hook events are active on a Thread (matching Lua 5.5 lua.h).
+type HookMask uint8
+
+// HookEvent identifies the debug hook event delivered to a HostHookFunc.
+type HookEvent uint8
+
+const (
+	HookCall     HookEvent = iota // function call ("call")
+	HookReturn                    // function return ("return")
+	HookLine                      // new source line ("line")
+	HookCount                     // instruction count ("count")
+	HookTailCall                  // tail call ("tail call")
+)
+
+// String returns the Lua 5.5 event name matching debug.sethook ("call", "return",
+// "line", "count", or "tail call").
+func (e HookEvent) String() string {
+	switch e {
+	case HookCall:
+		return "call"
+	case HookReturn:
+		return "return"
+	case HookLine:
+		return "line"
+	case HookCount:
+		return "count"
+	case HookTailCall:
+		return "tail call"
+	default:
+		return ""
+	}
+}
+
+// HostHookFunc is a Go-level debug hook installed via State.SetHostHook (analogous
+// to PUC-Rio lua_Hook / lua_sethook). line is the 1-based source line for HookLine
+// events and -1 for other events.
+type HostHookFunc func(s *State, th *Thread, event HookEvent, line int) error
+
 // frameKind identifies the kind of entry on Thread.frames.
 type frameKind uint8
 
@@ -136,21 +179,22 @@ type Thread struct {
 	yieldNRes     int
 	baseHookCount int
 	hookCount     int
-	oldPC         int
 	stackGen      uint32 // window generation counter for -tags moeluaregcheck verification
 
 	errObj        Value // last error object when dead due to error
 	lastErrNative Value // native function that raised an uncaught error on this thread
 	yieldNativeFn Value // yielded native callee (for HookMaskRet frameNative on resume)
-	hook          Value // active debug hook function
+	hook          Value          // active Lua debug hook function
+	hostHookRef   arena.GoHandle // GoRefs handle for Go-level HostHookFunc (NullGoHandle if none)
 
 	// Number of non-yieldable C/Go calls active on this thread (matching Lua 5.5 L->nny).
 	// mainThread starts with nny=1; new coroutines start with nny=0.
 	nny                uint16
 	nativeArgsDepth    uint16 // >0 while Go native args slice borrows th.stackRef
 	status             ThreadStatus
-	hookMask           uint8 // bit 0=call, 1=ret, 2=line, 3=count
-	yieldedNative      bool  // true if suspended inside a native call (for HookMaskRet on resume)
+	hookMask           HookMask // bit 0=call, 1=ret, 2=line, 3=count
+	yieldedNative      bool     // true if suspended inside a native call (for HookMaskRet on resume)
+	hookYielded        bool     // true while suspended via CIST_HOOKYIELD (cleared on resumed instruction)
 	inHook             bool
 	inCCallback        bool // true while a native callee is running directly inside callOnThread
 	suppressHook       bool // true inside __gc finalizers (matching L->allowhook = 0 without clobbering hookMask)
@@ -161,11 +205,15 @@ type Thread struct {
 
 // Hook mask bits matching Lua 5.5 lua.h.
 const (
-	HookMaskCall  uint8 = 1 << 0
-	HookMaskRet   uint8 = 1 << 1
-	HookMaskLine  uint8 = 1 << 2
-	HookMaskCount uint8 = 1 << 3
+	HookMaskCall  HookMask = 1 << 0
+	HookMaskRet   HookMask = 1 << 1
+	HookMaskLine  HookMask = 1 << 2
+	HookMaskCount HookMask = 1 << 3
 )
+
+func (th *Thread) hasHook() bool {
+	return !th.hook.IsNil() || th.hostHookRef != arena.NullGoHandle
+}
 
 const (
 	defaultFrameCap = 32
@@ -916,6 +964,7 @@ func (th *Thread) clearDeadRefs(s *State) {
 	th.syncCloseLen = 0
 	th.syncCloseCap = 0
 	th.yieldedNative = false
+	th.hookYielded = false
 	th.yieldNativeFn = NilValue()
 	th.lastErrNative = NilValue()
 	th.setUncaughtErr(s, nil)
@@ -965,6 +1014,7 @@ func (th *Thread) clearUnusedRefs(s *State) {
 	th.yieldValsLen = 0
 	th.yieldValsCap = 0
 	th.yieldedNative = false
+	th.hookYielded = false
 	th.yieldNativeFn = NilValue()
 	th.setUncaughtErr(s, nil)
 }

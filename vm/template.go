@@ -173,7 +173,7 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 			b.Close()
 			return nil, fmt.Errorf("moelua: template setup left %d pinned Handle(s); release pins before finalizing template", len(b.pinnedRefs)+len(b.tempRoots))
 		}
-		if th := b.cur(); th != nil && (th.nframe != 0 || th.hookMask != 0) {
+		if th := b.cur(); th != nil && (th.nframe != 0 || th.hookMask != 0 || th.hostHookRef != arena.NullGoHandle) {
 			b.Close()
 			return nil, fmt.Errorf("moelua: template setup left active call frames or debug hooks")
 		}
@@ -194,7 +194,7 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 			b.Close()
 			return nil, fmt.Errorf("moelua: template setup left %d pinned Handle(s) after GC", len(b.pinnedRefs)+len(b.tempRoots))
 		}
-		if th := b.cur(); th != nil && (th.nframe != 0 || th.hookMask != 0) {
+		if th := b.cur(); th != nil && (th.nframe != 0 || th.hookMask != 0 || th.hostHookRef != arena.NullGoHandle) {
 			b.Close()
 			return nil, fmt.Errorf("moelua: template setup left active call frames or debug hooks after GC")
 		}
@@ -230,8 +230,12 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 	// Snapshot GoRefs, detaching bootstrap State references from mutable built-in payloads
 	// (such as *gmatchState) and recording whether Clone() must clone per-State payloads.
 	hasMutableGoRefs := false
+	hasHostHook := false
 	tmplGoRefs := b.goRefs.CloneWith(func(v any) any {
 		switch x := v.(type) {
+		case HostHookFunc:
+			hasHostHook = true
+			return nil
 		case *gmatchState:
 			hasMutableGoRefs = true
 			if x == nil {
@@ -255,6 +259,10 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 			return v
 		}
 	})
+	if hasHostHook {
+		b.Close()
+		return nil, fmt.Errorf("moelua: template setup left active host debug hook on a coroutine")
+	}
 
 	// Capture surviving boundProto descriptors (non-empty when setup defined Lua closures).
 	var protos []*tmplProtoDesc

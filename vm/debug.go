@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/yuchanns/moelua/bytecode"
+	"github.com/yuchanns/moelua/internal/arena"
 )
 
 // getFuncLine decodes the Lua 5.5 delta-encoded LineInfo + AbsLineInfo for pc
@@ -200,7 +201,7 @@ func (s *State) formatTracebackWithCancel(th *Thread, msg string, hasMsg bool, l
 	frames := th.framesSlice(s.arena)
 	var entries []string
 	if th != s.cur() {
-		if th.status == ThreadSuspended {
+		if th.status == ThreadSuspended && !th.hookYielded {
 			name, namewhat := "yield", "field"
 			if th.nframe > 0 && frames[th.nframe-1].kind == frameLua {
 				if n, nw := s.funcNameFromCallerFrame(&frames[th.nframe-1]); nw != "" {
@@ -516,7 +517,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 				}
 				return []Value{TableValue(info)}, nil
 			}
-			if th != s.cur() && th.status == ThreadSuspended && lvl == 0 {
+			if th != s.cur() && th.status == ThreadSuspended && !th.hookYielded && lvl == 0 {
 				cfunc := NilValue()
 				if s.builtinCoroYield != nil {
 					cfunc = s.NativeValue(s.builtinCoroYield)
@@ -529,7 +530,7 @@ func nativeDebugGetInfo(s *State, args []Value) ([]Value, error) {
 			}
 			target := lvl
 			if (th == s.cur() && !s.topFrameIsNative(th, s.builtinDebugGetInfo)) ||
-				(th != s.cur() && th.status == ThreadSuspended) {
+				(th != s.cur() && th.status == ThreadSuspended && !th.hookYielded) {
 				target = lvl - 1
 			}
 			if target < 0 {
@@ -971,7 +972,7 @@ func frameLocalLimit(s *State, th *Thread, cfIdx int) int {
 		if nextLim := frames[cfIdx+1].funcIdx - cf.base; nextLim >= 0 && nextLim < limit {
 			limit = nextLim
 		}
-	} else if th != s.cur() && th.status == ThreadSuspended {
+	} else if th != s.cur() && th.status == ThreadSuspended && !th.hookYielded {
 		if yLim := th.yieldDst - cf.base; yLim >= 0 && yLim < limit {
 			limit = yLim
 		}
@@ -991,7 +992,7 @@ func frameLocalLimit(s *State, th *Thread, cfIdx int) int {
 func resolveFrameIndex(s *State, th *Thread, lv int, self *NativeFunc) int {
 	target := lv
 	if (th == s.cur() && !s.topFrameIsNative(th, self)) ||
-		(th != s.cur() && th.status == ThreadSuspended) {
+		(th != s.cur() && th.status == ThreadSuspended && !th.hookYielded) {
 		target--
 	}
 	if target < 0 {
@@ -1391,10 +1392,71 @@ func nativeDebugSetUserValue(s *State, args []Value) ([]Value, error) {
 	return []Value{args[0]}, nil
 }
 
+func (s *State) clearHostHook(th *Thread) {
+	if th != nil && th.hostHookRef != arena.NullGoHandle {
+		if s.goRefs != nil {
+			s.goRefs.Free(th.hostHookRef)
+		}
+		th.hostHookRef = arena.NullGoHandle
+	}
+}
+
+// SetHostHook installs or clears a Go-level debug hook on th (or the active thread
+// when th is nil), matching PUC-Rio Lua 5.5.1 lua_sethook(L, f, mask, count).
+// Passing fn == nil or mask == 0 (with count <= 0) disables hooks on th.
+// Installing a host hook replaces any active Lua debug.sethook on th and vice versa.
+func (s *State) SetHostHook(th *Thread, fn HostHookFunc, mask HookMask, count int) error {
+	if th == nil {
+		th = s.cur()
+	}
+	if th == nil {
+		return fmt.Errorf("cannot set hook on nil thread")
+	}
+	if !s.ownsThread(th) {
+		return fmt.Errorf("cannot set hook on thread belonging to another State")
+	}
+	const validMask = HookMaskCall | HookMaskRet | HookMaskLine | HookMaskCount
+	mask &= validMask
+	if count > 0 {
+		mask |= HookMaskCount
+	} else {
+		mask &^= HookMaskCount
+		count = 0
+	}
+	th.hook = NilValue()
+	s.clearHostHook(th)
+	if fn == nil || mask == 0 {
+		th.hookMask = 0
+		th.baseHookCount = 0
+		th.hookCount = 0
+		return nil
+	}
+	th.hostHookRef = s.goRefs.Alloc(fn)
+	th.hookMask = mask
+	th.baseHookCount = count
+	th.hookCount = count
+	if !th.hookYielded {
+		idx := th.nframe - 1
+		frames := th.framesSlice(s.arena)
+		for th == s.cur() && idx >= 0 && frames[idx].kind == frameNative {
+			idx--
+		}
+		if idx >= 0 {
+			cf := &frames[idx]
+			if cf.kind == frameLua && !cf.atCurrentPC && cf.pc > 0 {
+				cf.dirty = true
+				cf.oldPC = cf.pc - 1
+			}
+		}
+	}
+	return nil
+}
+
 func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 	th, rest := optThreadArg(s, args)
 	if len(rest) == 0 || rest[0].IsNil() {
 		th.hook = NilValue()
+		s.clearHostHook(th)
 		th.hookMask = 0
 		th.baseHookCount = 0
 		th.hookCount = 0
@@ -1411,7 +1473,7 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 	if !rest[0].IsFunction() {
 		return nil, fmt.Errorf("bad argument #1 to 'sethook' (function expected, got %s)", s.objTypeName(rest[0]))
 	}
-	var mask uint8
+	var mask HookMask
 	cancelFn := s.nativeCancelFunc()
 	const allMask = HookMaskCall | HookMaskRet | HookMaskLine
 	for i := range len(maskStr) {
@@ -1448,24 +1510,28 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 	}
 	if mask == 0 {
 		th.hook = NilValue()
+		s.clearHostHook(th)
 		th.hookMask = 0
 		th.baseHookCount = 0
 		th.hookCount = 0
 		return nil, nil
 	}
+	s.clearHostHook(th)
 	th.hook = rest[0]
 	th.hookMask = mask
 	th.baseHookCount = count
 	th.hookCount = count
-	idx := th.nframe - 1
-	if th == s.cur() && s.topFrameIsNative(th, s.builtinDebugSetHook) {
-		idx--
-	}
-	if idx >= 0 {
-		cf := &th.framesSlice(s.arena)[idx]
-		if cf.kind == frameLua && cf.pc > 0 {
-			cf.dirty = true
-			cf.oldPC = cf.pc - 1
+	if !th.hookYielded {
+		idx := th.nframe - 1
+		if th == s.cur() && s.topFrameIsNative(th, s.builtinDebugSetHook) {
+			idx--
+		}
+		if idx >= 0 {
+			cf := &th.framesSlice(s.arena)[idx]
+			if cf.kind == frameLua && !cf.atCurrentPC && cf.pc > 0 {
+				cf.dirty = true
+				cf.oldPC = cf.pc - 1
+			}
 		}
 	}
 	return nil, nil
@@ -1473,7 +1539,7 @@ func nativeDebugSetHook(s *State, args []Value) ([]Value, error) {
 
 func nativeDebugGetHook(s *State, args []Value) ([]Value, error) {
 	th, _ := optThreadArg(s, args)
-	if th.hook.IsNil() && th.hookMask == 0 {
+	if !th.hasHook() && th.hookMask == 0 {
 		return []Value{NilValue()}, nil
 	}
 	var sb strings.Builder
@@ -1486,7 +1552,11 @@ func nativeDebugGetHook(s *State, args []Value) ([]Value, error) {
 	if th.hookMask&HookMaskLine != 0 {
 		sb.WriteByte('l')
 	}
-	return []Value{th.hook, StringValue(s.intern.Intern(sb.String())), IntValue(int64(th.baseHookCount))}, nil
+	hookVal := th.hook
+	if th.hostHookRef != arena.NullGoHandle {
+		hookVal = StringValue(s.intern.Intern("external hook"))
+	}
+	return []Value{hookVal, StringValue(s.intern.Intern(sb.String())), IntValue(int64(th.baseHookCount))}, nil
 }
 
 // nativeDebugDebug implements Lua 5.5 debug.debug() interactive prompt (main.lua:284).
