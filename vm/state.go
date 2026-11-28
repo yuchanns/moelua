@@ -283,6 +283,8 @@ type State struct {
 	pinnedRefs     map[int]Value
 	nextRefID      int
 	pinnedShapeRef arena.ObjRef
+	tempRoots      []arena.ObjRef
+	tempRootsBuf   [8]arena.ObjRef
 
 	out       io.Writer
 	errOut    io.Writer

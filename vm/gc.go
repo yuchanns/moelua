@@ -215,6 +215,11 @@ func (s *State) gcMarkRoots(c *arena.Collector) {
 	for _, v := range s.pinnedRefs {
 		s.markValue(c, v)
 	}
+	for _, ref := range s.tempRoots {
+		if ref != arena.NullRef {
+			c.MarkObject(ref)
+		}
+	}
 }
 
 // isWeakCollectable reports whether v can be cleared from a weak table.
@@ -1307,6 +1312,41 @@ func (s *State) Unref(id int) {
 	delete(s.pinnedRefs, id)
 }
 
+// PinTempMark returns the current depth of the transient GC root stack.
+// Pair with UnpinTemp(mark) to release any roots pushed via PinTemp.
+func (s *State) PinTempMark() int {
+	return len(s.tempRoots)
+}
+
+// PinTemp pushes a GC-managed Value onto the linear transient root stack so an emergency
+// GC triggered by a subsequent allocation still traces and recounts it. Immediate non-GC
+// values (nil, bool, int, float, light userdata, frozen strings, static natives) are skipped.
+func (s *State) PinTemp(v Value) {
+	if !v.IsGCObject() {
+		return
+	}
+	ref := v.Ref()
+	if ref == arena.NullRef {
+		return
+	}
+	if s.tempRoots == nil {
+		s.tempRoots = s.tempRootsBuf[:0]
+	}
+	s.tempRoots = append(s.tempRoots, ref)
+}
+
+// UnpinTemp restores the transient GC root stack to mark.
+func (s *State) UnpinTemp(mark int) {
+	if mark < 0 || mark >= len(s.tempRoots) {
+		return
+	}
+	if mark == 0 && cap(s.tempRoots) > 64 {
+		s.tempRoots = s.tempRootsBuf[:0]
+		return
+	}
+	s.tempRoots = s.tempRoots[:mark]
+}
+
 // CollectFull executes a complete PUC-Rio Lua 5.5.1 GC cycle (exact lgc.c atomic() 6-step order)
 // and drains all newly separated __gc finalizers synchronously on the VM thread.
 func (s *State) CollectFull() {
@@ -1356,6 +1396,7 @@ func (s *State) Close() {
 	if !wasInFin {
 		s.closeJIT()
 		s.pinnedRefs = nil
+		s.tempRoots = nil
 		s.hashedTables = nil
 		s.twups = nil
 		s.deferredStackFrees = nil
