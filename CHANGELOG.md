@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.3 - 2026-11-28
+
+## What's Changed
+* perf(api): replace pinTemps map/closure allocations with linear tempRoots stack by @yuchanns in https://github.com/yuchanns/moelua/pull/40
+* perf(arena): align progressive slab sizing with Go spans and trim idle spare page on CollectFull by @yuchanns in https://github.com/yuchanns/moelua/pull/41
+* feat(vm,api): add PUC-Rio Lua 5.5.1 Go host debug hook API with CIST_HOOKYIELD by @yuchanns in https://github.com/yuchanns/moelua/pull/43
+
+
+**Full Changelog**: https://github.com/yuchanns/moelua/compare/v0.1.2...v0.1.3
+
 ## 0.1.2 - 2026-11-27
 
 ## What's Changed
