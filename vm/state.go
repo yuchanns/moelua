@@ -395,8 +395,7 @@ func (s *State) asNative(v Value) *NativeFunc {
 
 func (s *State) asDynNative(v Value) *NativeFunc {
 	an := arena.AsSmall[ArenaNative](s.arena, v.Ref())
-	raw, _ := s.goRefs.Get(an.goRef)
-	nf, _ := raw.(*NativeFunc)
+	nf, _ := s.goRefs.GetAs[*NativeFunc](an.goRef)
 	return nf
 }
 
@@ -521,8 +520,15 @@ func (s *State) AsUserdata(v Value) *Userdata {
 // SetHost attaches an opaque host wrapper (such as *moelua.State) to this VM State.
 func (s *State) SetHost(h any) { s.host = h }
 
-// Host returns the opaque host wrapper attached via SetHost.
-func (s *State) Host() any { return s.host }
+// Host returns the opaque host wrapper attached via SetHost if present and assignable to T.
+func (s *State) Host[T any]() (T, bool) {
+	var zero T
+	if s == nil {
+		return zero, false
+	}
+	v, ok := s.host.(T)
+	return v, ok
+}
 
 // NewState creates a new Lua 5.5.1 State cloned rapidly from the frozen full-stdlib template.
 func NewState() *State {
@@ -957,13 +963,14 @@ func (s *State) dynamicNativeCancelFunc() func() error {
 	}
 }
 
-// UserdataData returns the Go host payload stored on userdata u via State.goRefs.
-func (s *State) UserdataData(u *Userdata) any {
-	if u == nil || u.dataRef == arena.NullGoHandle || s.goRefs == nil {
-		return nil
+// UserdataData returns the Go host payload stored on userdata u via State.goRefs
+// if present and assignable to T.
+func (s *State) UserdataData[T any](u *Userdata) (T, bool) {
+	var zero T
+	if s == nil || u == nil || u.dataRef == arena.NullGoHandle || s.goRefs == nil {
+		return zero, false
 	}
-	v, _ := s.goRefs.Get(u.dataRef)
-	return v
+	return s.goRefs.GetAs[T](u.dataRef)
 }
 
 // SetUserdataData updates the Go host payload stored on userdata u via State.goRefs.

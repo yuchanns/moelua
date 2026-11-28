@@ -401,8 +401,7 @@ func (th *Thread) uncaughtErr(s *State) error {
 	if th.uncaughtErrRef == arena.NullGoHandle {
 		return nil
 	}
-	raw, _ := s.goRefs.Get(th.uncaughtErrRef)
-	err, _ := raw.(error)
+	err, _ := s.goRefs.GetAs[error](th.uncaughtErrRef)
 	return err
 }
 

@@ -1146,8 +1146,7 @@ func (s *State) asLuaFile(v Value) (*luaFile, bool) {
 	if !v.IsUserdata() {
 		return nil, false
 	}
-	lf, ok := s.UserdataData(s.asUserdata(v)).(*luaFile)
-	return lf, ok
+	return s.UserdataData[*luaFile](s.asUserdata(v))
 }
 
 // formatOSErr strips Go's *os.PathError / *os.LinkError operation verb prefix ("open ", "remove ", etc.)

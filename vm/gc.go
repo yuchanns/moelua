@@ -1083,15 +1083,13 @@ func (s *State) gcFreeObject(a *arena.Arena, ref arena.ObjRef) {
 			a.Free(u.gcRefsRef)
 		}
 		if u.dataRef != arena.NullGoHandle && s.goRefs != nil {
-			if raw, ok := s.goRefs.Get(u.dataRef); ok {
-				if lf, ok := raw.(*luaFile); ok && !lf.closed {
-					if !lf.isStd {
-						if freed := lf.memBytes(); freed > 0 {
-							s.subExtraMem(freed)
-						}
-					} else if lf.w != nil {
-						s.subExtraMem(int64(lf.w.Size()))
+			if lf, ok := s.goRefs.GetAs[*luaFile](u.dataRef); ok && lf != nil && !lf.closed {
+				if !lf.isStd {
+					if freed := lf.memBytes(); freed > 0 {
+						s.subExtraMem(freed)
 					}
+				} else if lf.w != nil {
+					s.subExtraMem(int64(lf.w.Size()))
 				}
 			}
 			s.goRefs.Free(u.dataRef)

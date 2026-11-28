@@ -1058,13 +1058,12 @@ func TestCodexRound4TemplateAndLibsRegressions(t *testing.T) {
 		defer s.Close()
 		for i := range 4 {
 			name := "res_" + string(rune('0'+i))
-			got, ok := s.CheckUserdata(s.GetGlobal(name), "host_res")
+			hp, ok := s.CheckUserdata[*hostPayload](s.GetGlobal(name), "host_res")
 			if !ok {
 				t.Fatalf("CheckUserdata(%s) failed", name)
 			}
-			hp, isHP := got.(*hostPayload)
-			if !isHP || hp != want {
-				t.Fatalf("cloned %s payload corrupted: got %T (%v), want %v", name, got, got, want)
+			if hp != want {
+				t.Fatalf("cloned %s payload corrupted: got %v, want %v", name, hp, want)
 			}
 		}
 	})

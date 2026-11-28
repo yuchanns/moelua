@@ -210,9 +210,8 @@ func BuildTemplate(mask LibMask, setup func(*State) error) (*Template, error) {
 		if u.dataRef.IsNull() {
 			return arena.NullRef
 		}
-		v, ok := b.goRefs.Get(u.dataRef)
-		lf, isLF := v.(*luaFile)
-		if !ok || !isLF || lf == nil || !lf.isStd {
+		lf, ok := b.goRefs.GetAs[*luaFile](u.dataRef)
+		if !ok || lf == nil || !lf.isStd {
 			return arena.NullRef
 		}
 		if lf.w != nil {
