@@ -472,11 +472,14 @@ func (s *State) resumeThread(co *Thread, args []Value) (bool, []Value, error) {
 		if co.hookYielded {
 			// Per PUC-Rio ldo.c:927-934: resuming a coroutine suspended inside a line/count
 			// hook discards resume arguments, clears atCurrentPC, and resumes execution at
-			// the interrupted instruction without re-firing its hook.
+			// the interrupted instruction without re-firing its hook or double-counting
+			// instruction limits. Keep hookYielded set whenever runThread will enter
+			// runHooked (hooks or instruction limit active) so checkInstructionHookImpl
+			// consumes it on the resumed instruction.
 			if co.nframe > 0 {
 				co.framesSlice(s.arena)[co.nframe-1].atCurrentPC = false
 			}
-			if !s.needsHookedRun(co) || co.hookMask&(HookMaskLine|HookMaskCount) == 0 {
+			if !s.needsHookedRun(co) {
 				co.hookYielded = false
 			}
 			goto runCoro

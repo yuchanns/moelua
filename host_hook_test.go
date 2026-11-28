@@ -625,6 +625,49 @@ func TestHostHookPUCComplianceAndLifecycle(t *testing.T) {
 		t.Fatalf("expected context.Canceled on resume after cancel, got %v", rerr)
 	}
 
+	// 6b. Instruction limit does not double-count the resumed instruction when the hook is
+	// cleared while hook-suspended.
+	measureBudget := func(hookYieldAndClear bool) ([]moelua.Value, error) {
+		sl := moelua.New()
+		defer sl.Close()
+		fnL, derr := sl.DoString(`return function() local a = 1; return a + 2 end`)
+		if derr != nil {
+			t.Fatal(derr)
+		}
+		coL, cerr := sl.NewThread(fnL[0])
+		if cerr != nil {
+			t.Fatal(cerr)
+		}
+		// Exact budget: LOADI, ADDI, RETURN1 = 3 instructions.
+		sl.SetInstructionLimit(3)
+		if hookYieldAndClear {
+			coL.SetHostHook(func(_ *moelua.State, ev moelua.HookEvent, _ int) error {
+				if ev == moelua.HookCount {
+					return moelua.ErrHookYield
+				}
+				return nil
+			}, moelua.HookMaskCount, 1)
+			_, y, rerr := coL.Resume()
+			if rerr != nil || !y {
+				t.Fatalf("expected hook yield on first instruction: y=%v err=%v", y, rerr)
+			}
+			coL.SetHostHook(nil, 0, 0)
+		}
+		res, y, rerr := coL.Resume()
+		if y {
+			t.Fatalf("expected completion after clearing hook")
+		}
+		return res, rerr
+	}
+	rNoHook, errNoHook := measureBudget(false)
+	if errNoHook != nil || len(rNoHook) != 1 || rNoHook[0].Int() != 3 {
+		t.Fatalf("baseline 3-instruction budget failed: res=%v err=%v", rNoHook, errNoHook)
+	}
+	rClearedHook, errClearedHook := measureBudget(true)
+	if errClearedHook != nil || len(rClearedHook) != 1 || rClearedHook[0].Int() != 3 {
+		t.Fatalf("cleared-hook resume exceeded exact 3-instruction budget: res=%v err=%v", rClearedHook, errClearedHook)
+	}
+
 	// 7. Go GC reclaims HostHookFunc closure payload after coroutine is Lua-GC-collected.
 	type hookPayload struct{ data [64]byte }
 	var wp weak.Pointer[hookPayload]
